@@ -8,6 +8,7 @@ from app.models.document import Document
 from app.models.alert import Alert
 from app.models.webhook import Webhook
 from app.models.audit_log import AuditLog
+from app.models.sync_history import SyncHistory
 
 __all__ = [
     "Lawyer",
@@ -18,4 +19,5 @@ __all__ = [
     "Alert",
     "Webhook",
     "AuditLog",
+    "SyncHistory",
 ]

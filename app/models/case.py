@@ -19,6 +19,7 @@ class Case(Base):
     # Case identification
     rol = Column(String(50), nullable=False, index=True)  # C-1234-2024
     rit = Column(String(50), nullable=True)  # Internal PJUD ID
+    competencia = Column(String(20), default="civil")  # civil, laboral, penal
     
     # Parties
     plaintiff = Column(String(500), nullable=True)  # Demandante
