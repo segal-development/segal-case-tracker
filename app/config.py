@@ -25,6 +25,13 @@ class Settings(BaseSettings):
     SENDGRID_API_KEY: str = ""
     FROM_EMAIL: str = "notificaciones@segal.cl"
     
+    # Firebase (push notifications)
+    FIREBASE_CREDENTIALS_PATH: str = ""
+    FIREBASE_CREDENTIALS_JSON: str = ""
+    
+    # App
+    APP_URL: str = "http://localhost:3000"
+    
     # PJUD Scraper
     PJUD_SELECTORS_PATH: str = ""  # Override default selectors path
     SCRAPER_FRESH_BROWSER: bool = True  # Use fresh browser per API request
@@ -51,6 +58,7 @@ class Settings(BaseSettings):
     
     class Config:
         env_file = ".env"
+        extra = "ignore"  # Ignore extra fields in .env
 
 
 @lru_cache()
