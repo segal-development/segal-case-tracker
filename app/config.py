@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     
     # PJUD Scraper
     PJUD_SELECTORS_PATH: str = ""  # Override default selectors path
+    SCRAPER_FRESH_BROWSER: bool = True  # Use fresh browser per API request
     
     # PJUD Resilience
     PJUD_CB_FAILURE_THRESHOLD: int = 5      # Circuit breaker: failures before opening
