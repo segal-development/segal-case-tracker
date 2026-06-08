@@ -1,0 +1,179 @@
+# Penal Competency Selectors for PJUD
+# Last updated: 2026-06-08
+#
+# These selectors are derived from the PJUD Penal section.
+# Structure follows civil.yaml pattern.
+
+# Core identifiers (required by registry)
+table_body_id:
+  primary: "verDetalleMisCauPen"
+  fallbacks:
+    - "verDetallePen"
+    - "tablaMisCausasPenal"
+  description: "Case listing table body ID for Penal"
+
+modal_id:
+  primary: "modalDetalleMisCauPenal"
+  fallbacks:
+    - "modalDetallePenal"
+    - "detailModalPenal"
+  description: "Case detail modal ID for Penal"
+
+detail_function_name:
+  primary: "detalleMisCausaPenal"
+  fallbacks:
+    - "detalleCausaPenal"
+  description: "JavaScript function to fetch Penal case detail"
+
+# Table headers
+table_header_id:
+  primary: "thTableMisCauPen"
+  fallbacks:
+    - "thTablePenal"
+  description: "Table header ID for Penal cases"
+
+# Login and session (shared with Civil)
+jwt_token_input:
+  primary: "input[name*='7f9d8a']"
+  fallbacks:
+    - "input[type='hidden'][name*='token']"
+    - "input[name='7f9d8a6356360386f79afd5691435626f470dee1']"
+  description: "JWT token hidden input field"
+
+# Main container (shared)
+main_container:
+  primary: "#contMain"
+  fallbacks:
+    - ".main-content"
+    - "#mainContent"
+  description: "Main content container for SPA-style loading"
+
+# Pagination (shared pattern)
+pagination_total:
+  primary: "Total de registros:"
+  description: "Pattern for total records count"
+
+pagination_end:
+  primary: 'onclick="pagina('
+  description: "Pattern for pagination end link"
+
+# Case table patterns
+case_row_pattern:
+  primary: "<tr[^>]*>.*?</tr>"
+  description: "Regex pattern for case table rows"
+
+case_detail_token_pattern:
+  primary: "detalleMisCausaPenal\\('([^']+)'\\)"
+  fallbacks:
+    - "detalleMisCauPen\\('([^']+)'\\)"
+  description: "Regex to extract case detail token from onclick"
+
+# Detail parsing - ROL (Penal uses RUC/RIT)
+detail_rol_pattern:
+  primary: "<strong>(?:ROL|RUC|RIT):</strong>\\s*([^<]+)"
+  description: "Pattern to extract ROL/RUC/RIT from case detail"
+
+# Detail parsing - Date
+detail_fecha_pattern:
+  primary: "<strong>F\\.\\s*Ing\\.?:</strong>\\s*(\\d{2}/\\d{2}/\\d{4})"
+  description: "Pattern to extract ingreso date from case detail"
+
+# Detail parsing - Status
+detail_estado_adm_pattern:
+  primary: "<strong>Est\\.\\s*Adm\\.?:\\s*</strong>"
+  description: "Pattern for estado administrativo"
+
+detail_estado_proc_pattern:
+  primary: "<strong>Estado\\s*Proc\\.?:</strong>"
+  description: "Pattern for estado procesal"
+
+detail_procedimiento_pattern:
+  primary: "<strong>Proc\\.?:</strong>"
+  description: "Pattern for procedimiento"
+
+detail_ubicacion_pattern:
+  primary: "<strong>Ubicacion:</strong>"
+  description: "Pattern for ubicacion"
+
+detail_etapa_pattern:
+  primary: "<strong>Etapa:</strong>"
+  description: "Pattern for etapa"
+
+detail_tribunal_pattern:
+  primary: "<strong>Tribunal:</strong>"
+  description: "Pattern for tribunal"
+
+# Cuadernos
+cuaderno_option_pattern:
+  primary: '<option\\s+value="([^"]+)"[^>]*>([^<]+)</option>'
+  description: "Pattern for cuaderno select options"
+
+# Movements table
+movements_table:
+  primary: '<table[^>]*class="[^"]*table-bordered[^"]*"[^>]*>.*?<tbody>(.*?)</tbody>'
+  description: "Pattern for movements history table"
+
+movement_row_pattern:
+  primary: "<tr[^>]*>(.*?)</tr>"
+  description: "Pattern for movement table rows"
+
+# Document patterns
+document_token_pattern:
+  primary: 'name="dtaDoc"\\s+value="([^"]+)"'
+  description: "Pattern to extract document token"
+
+document_type_docuS:
+  primary: "docuS.php"
+  description: "URL pattern for resoluciones (signed docs)"
+
+document_type_docuN:
+  primary: "docuN.php"
+  description: "URL pattern for escritos (unsigned docs)"
+
+anexo_indicator:
+  primary: "dtaDoc|fa-file|fa-folder"
+  description: "Pattern to detect anexos in movement row"
+
+# Endpoints (relative to PJUD_BASE_URL)
+cases_endpoint:
+  primary: "misCausas/penal/consultaMisCausasPenal.php"
+  description: "AJAX endpoint for fetching penal cases"
+
+detail_endpoint:
+  primary: "misCausas/penal/modal/misCausasPenal.php"
+  description: "AJAX endpoint for case detail modal"
+
+search_endpoint:
+  primary: "ADIR_871/penal/consultaRitPenal.php"
+  description: "AJAX endpoint for public case search"
+
+document_docuS_endpoint:
+  primary: "misCausas/penal/documentos/docuS.php"
+  description: "Endpoint for resoluciones download"
+
+document_docuN_endpoint:
+  primary: "misCausas/penal/documentos/docuN.php"
+  description: "Endpoint for escritos download"
+
+document_default_endpoint:
+  primary: "misCausas/penal/documentos/docu.php"
+  description: "Default document download endpoint"
+
+# Public search patterns
+search_detail_token_pattern:
+  primary: "detalleCausaPenal\\('([^']+)'\\)"
+  description: "Pattern for token in public search results"
+
+# Tokens (fixed values discovered from PJUD JS)
+token_my_cases:
+  primary: "df32271e9cdca2704ff289941058a253"
+  description: "Fixed token for Mis Causas requests"
+
+token_public_search:
+  primary: "917cfa057160fbb6de2eb86da2348e42"
+  description: "Fixed token for public search requests"
+
+# Competency code
+competencia_code:
+  primary: "5"
+  description: "PJUD competency code for Penal"

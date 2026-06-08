@@ -1,0 +1,286 @@
+{
+  "info": {
+    "name": "PJUD Scraper - Complete API",
+    "description": "Full API collection for PJUD Scraper with Civil, Laboral, Penal + Resilience + Observability",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8000"
+    },
+    {
+      "key": "session_id",
+      "value": ""
+    },
+    {
+      "key": "rut",
+      "value": "16021492-9"
+    },
+    {
+      "key": "password",
+      "value": "TU_PASSWORD_AQUI"
+    },
+    {
+      "key": "captcha_token",
+      "value": "TOKEN_DEL_FRONTEND"
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Health & Status",
+      "item": [
+        {
+          "name": "1.1 Health Check",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/pjud/health"
+          }
+        },
+        {
+          "name": "1.2 Metrics (Prometheus)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/pjud/metrics"
+          }
+        },
+        {
+          "name": "1.3 Alerts History",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/pjud/alerts/history"
+          }
+        },
+        {
+          "name": "1.4 Circuit Breaker Reset",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/pjud/circuit-breaker/reset?name=pjud-civil",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "pjud", "circuit-breaker", "reset"],
+              "query": [{"key": "name", "value": "pjud-civil"}]
+            }
+          }
+        },
+        {
+          "name": "1.5 Set Health Baseline",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": "{{base_url}}/api/v1/pjud/health/baseline"
+          }
+        },
+        {
+          "name": "1.6 Reload Selectors",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": "{{base_url}}/api/v1/pjud/selectors/reload"
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. Authentication",
+      "item": [
+        {
+          "name": "2.1 Login PJUD",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "    var jsonData = pm.response.json();",
+                  "    if (jsonData.session_id) {",
+                  "        pm.collectionVariables.set('session_id', jsonData.session_id);",
+                  "        console.log('Session ID saved:', jsonData.session_id);",
+                  "    }",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {"key": "Content-Type", "value": "application/json"}
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"rut\": \"{{rut}}\",\n  \"password\": \"{{password}}\",\n  \"captcha_token\": \"{{captcha_token}}\"\n}"
+            },
+            "url": "{{base_url}}/api/v1/pjud/login"
+          }
+        },
+        {
+          "name": "2.2 Logout PJUD",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/pjud/logout?session_id={{session_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "pjud", "logout"],
+              "query": [{"key": "session_id", "value": "{{session_id}}"}]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. Civil Cases",
+      "item": [
+        {
+          "name": "3.1 Count Civil Cases",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/pjud/cases/count?session_id={{session_id}}&year=2026",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "pjud", "cases", "count"],
+              "query": [
+                {"key": "session_id", "value": "{{session_id}}"},
+                {"key": "year", "value": "2026"}
+              ]
+            }
+          }
+        },
+        {
+          "name": "3.2 List Civil Cases",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/pjud/cases?session_id={{session_id}}&year=2026&max_pages=1",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "pjud", "cases"],
+              "query": [
+                {"key": "session_id", "value": "{{session_id}}"},
+                {"key": "year", "value": "2026"},
+                {"key": "max_pages", "value": "1"}
+              ]
+            }
+          }
+        },
+        {
+          "name": "3.3 Civil Case Detail",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/pjud/cases/C-1234-2026?session_id={{session_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "pjud", "cases", "C-1234-2026"],
+              "query": [
+                {"key": "session_id", "value": "{{session_id}}"}
+              ]
+            },
+            "description": "Replace C-1234-2026 with actual ROL from list"
+          }
+        },
+        {
+          "name": "3.4 Download Document",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/pjud/documents/download?session_id={{session_id}}&token=DOC_TOKEN&url_type=docuS",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "pjud", "documents", "download"],
+              "query": [
+                {"key": "session_id", "value": "{{session_id}}"},
+                {"key": "token", "value": "DOC_TOKEN"},
+                {"key": "url_type", "value": "docuS"}
+              ]
+            },
+            "description": "Replace DOC_TOKEN with token from case detail movements"
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. Laboral Cases",
+      "item": [
+        {
+          "name": "4.1 List Laboral Cases",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/pjud/laboral/cases?session_id={{session_id}}&year=2026&max_pages=1",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "pjud", "laboral", "cases"],
+              "query": [
+                {"key": "session_id", "value": "{{session_id}}"},
+                {"key": "year", "value": "2026"},
+                {"key": "max_pages", "value": "1"}
+              ]
+            }
+          }
+        },
+        {
+          "name": "4.2 Laboral Case Detail",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/pjud/laboral/cases/O-1234-2026?session_id={{session_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "pjud", "laboral", "cases", "O-1234-2026"],
+              "query": [
+                {"key": "session_id", "value": "{{session_id}}"}
+              ]
+            },
+            "description": "Replace O-1234-2026 with actual ROL from list"
+          }
+        }
+      ]
+    },
+    {
+      "name": "5. Penal Cases",
+      "item": [
+        {
+          "name": "5.1 List Penal Cases",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/pjud/penal/cases?session_id={{session_id}}&year=2026&max_pages=1",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "pjud", "penal", "cases"],
+              "query": [
+                {"key": "session_id", "value": "{{session_id}}"},
+                {"key": "year", "value": "2026"},
+                {"key": "max_pages", "value": "1"}
+              ]
+            }
+          }
+        },
+        {
+          "name": "5.2 Penal Case Detail",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/pjud/penal/cases/RIT-1234-2026?session_id={{session_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "pjud", "penal", "cases", "RIT-1234-2026"],
+              "query": [
+                {"key": "session_id", "value": "{{session_id}}"}
+              ]
+            },
+            "description": "Replace RIT-1234-2026 with actual ROL/RUC from list"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,40 @@
+[tool.poetry]
+name = "segal-case-tracker"
+version = "0.1.0"
+description = "API for tracking civil court cases - Segal"
+authors = ["Segal Development Team"]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+fastapi = "^0.109.0"
+uvicorn = {extras = ["standard"], version = "^0.27.0"}
+sqlalchemy = "^2.0.25"
+psycopg2-binary = "^2.9.9"
+alembic = "^1.13.1"
+pydantic = "^2.6.0"
+pydantic-settings = "^2.1.0"
+python-jose = {extras = ["cryptography"], version = "^3.3.0"}
+passlib = {extras = ["bcrypt"], version = "^1.7.4"}
+redis = "^5.0.1"
+playwright = "^1.41.0"
+httpx = "^0.26.0"
+python-multipart = "^0.0.6"
+google-cloud-pubsub = "^2.19.0"
+google-cloud-storage = "^2.14.0"
+google-cloud-secret-manager = "^2.18.0"
+sendgrid = "^6.11.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.0"
+pytest-asyncio = "^0.23.4"
+httpx = "^0.26.0"
+black = "^24.1.0"
+ruff = "^0.1.14"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

@@ -1,0 +1,142 @@
+"""Security utilities - JWT, encryption, password hashing."""
+
+import base64
+from datetime import datetime, timedelta
+from typing import Optional
+
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from cryptography.fernet import Fernet
+
+from app.config import settings
+
+
+# Password hashing
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# JWT Bearer scheme
+security = HTTPBearer()
+
+
+# =============================================================================
+# JWT TOKENS
+# =============================================================================
+
+def create_access_token(
+    data: dict,
+    expires_delta: Optional[timedelta] = None,
+) -> str:
+    """Create a JWT access token."""
+    to_encode = data.copy()
+    
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(
+            minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES
+        )
+    
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(
+        to_encode,
+        settings.SECRET_KEY,
+        algorithm="HS256",
+    )
+    return encoded_jwt
+
+
+def decode_access_token(token: str) -> Optional[dict]:
+    """Decode and validate a JWT token."""
+    try:
+        payload = jwt.decode(
+            token,
+            settings.SECRET_KEY,
+            algorithms=["HS256"],
+        )
+        return payload
+    except JWTError:
+        return None
+
+
+async def get_current_lawyer(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> str:
+    """
+    Dependency to get current lawyer RUT from JWT token.
+    
+    Usage:
+        @router.get("/my-cases")
+        async def get_my_cases(rut: str = Depends(get_current_lawyer)):
+            ...
+    """
+    token = credentials.credentials
+    payload = decode_access_token(token)
+    
+    if not payload:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token inválido o expirado",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    rut = payload.get("sub")
+    if not rut:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token no contiene RUT",
+        )
+    
+    return rut
+
+
+# =============================================================================
+# PASSWORD HASHING (for internal passwords, not PJUD)
+# =============================================================================
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verify a password against its hash."""
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+def hash_password(password: str) -> str:
+    """Hash a password."""
+    return pwd_context.hash(password)
+
+
+# =============================================================================
+# PASSWORD ENCRYPTION (for PJUD passwords - reversible)
+# =============================================================================
+
+def _get_fernet() -> Fernet:
+    """Get Fernet instance with proper key."""
+    # Encryption key should be 32 url-safe base64-encoded bytes
+    key = settings.ENCRYPTION_KEY
+    
+    # If key is not base64, encode it
+    try:
+        Fernet(key.encode())
+        return Fernet(key.encode())
+    except Exception:
+        # Generate proper key from the provided string
+        key_bytes = key.encode().ljust(32)[:32]
+        key_b64 = base64.urlsafe_b64encode(key_bytes)
+        return Fernet(key_b64)
+
+
+def encrypt_pjud_password(password: str) -> str:
+    """
+    Encrypt PJUD password for storage.
+    
+    This is REVERSIBLE encryption because we need to send
+    the password to PJUD for login.
+    """
+    f = _get_fernet()
+    return f.encrypt(password.encode()).decode()
+
+
+def decrypt_pjud_password(encrypted: str) -> str:
+    """Decrypt stored PJUD password."""
+    f = _get_fernet()
+    return f.decrypt(encrypted.encode()).decode()

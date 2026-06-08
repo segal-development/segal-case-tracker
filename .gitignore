@@ -1,0 +1,38 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+*.log
+
+# Database
+*.db
+*.sqlite3
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Screenshots and test artifacts
+screenshots/
+/test_*.py
+!/tests/test_*.py
+
+# Temp files
+/tmp/
+*.tmp
+
+# OS
+.DS_Store
+Thumbs.db
