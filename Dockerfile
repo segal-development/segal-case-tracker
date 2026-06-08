@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies for Playwright
+# Install system dependencies for Playwright and PostgreSQL
 RUN apt-get update && apt-get install -y \
     libglib2.0-0 \
     libnss3 \
@@ -20,6 +20,7 @@ RUN apt-get update && apt-get install -y \
     libxrandr2 \
     libgbm1 \
     libasound2 \
+    libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Poetry
@@ -28,9 +29,9 @@ RUN pip install poetry
 # Copy dependency files
 COPY pyproject.toml poetry.lock* ./
 
-# Install dependencies
+# Install dependencies (without dev dependencies in production)
 RUN poetry config virtualenvs.create false \
-    && poetry install --no-interaction --no-ansi --no-root
+    && poetry install --no-interaction --no-ansi --no-root --only main
 
 # Install Playwright browsers
 RUN playwright install chromium
@@ -38,5 +39,5 @@ RUN playwright install chromium
 # Copy application
 COPY . .
 
-# Run
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+# Default command (can be overridden in docker-compose)
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

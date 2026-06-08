@@ -1,6 +1,9 @@
 version: '3.8'
 
 services:
+  # ==========================================================================
+  # DATABASE
+  # ==========================================================================
   postgres:
     image: postgres:16-alpine
     environment:
@@ -11,11 +14,69 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
+  # ==========================================================================
+  # REDIS (sessions, cache)
+  # ==========================================================================
   redis:
     image: redis:7-alpine
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ==========================================================================
+  # API (FastAPI)
+  # ==========================================================================
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/segal_case_tracker
+      - REDIS_URL=redis://redis:6379/0
+      - DEBUG=true
+      - ENABLE_SCHEDULER=false  # Scheduler runs in worker container
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./app:/app/app  # Hot reload in development
+    command: >
+      sh -c "alembic upgrade head && 
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+
+  # ==========================================================================
+  # WORKER (Background sync scheduler)
+  # ==========================================================================
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/segal_case_tracker
+      - REDIS_URL=redis://redis:6379/0
+      - ENABLE_SCHEDULER=true
+      - SYNC_INTERVAL_HOURS=4
+      - MAX_DATA_AGE_HOURS=4
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: python -m app.workers.sync_scheduler
 
 volumes:
   postgres_data:
