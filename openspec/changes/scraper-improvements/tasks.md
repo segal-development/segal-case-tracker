@@ -88,19 +88,19 @@ Chain strategy: stacked-to-main
 
 ### Phase 1: Foundation (~80 lines)
 
-- [ ] PR2-T1: Add Clave Única fields to `Lawyer` model
+- [x] PR2-T1: Add Clave Única fields to `Lawyer` model
   - Files: `app/models/lawyer.py`
   - Lines: ~25
   - Dependencies: PR1 merged
   - Criteria: `clave_unica_rut`, `encrypted_clave_unica_password`, `preferred_auth_method` columns
 
-- [ ] PR2-T2: Create Alembic migration for Lawyer fields
-  - Files: `alembic/versions/xxx_add_clave_unica_fields.py` (new)
+- [x] PR2-T2: Create Alembic migration for Lawyer fields
+  - Files: `alembic/versions/003_add_clave_unica_fields.py` (new)
   - Lines: ~30
   - Dependencies: PR2-T1
   - Criteria: Migration runs up/down without errors
 
-- [ ] PR2-T3: Create `ClaveUnicaCredentials` dataclass
+- [x] PR2-T3: Create `ClaveUnicaCredentials` dataclass
   - Files: `app/scrapper/pjud/clave_unica.py` (new)
   - Lines: ~25
   - Dependencies: None
@@ -108,19 +108,19 @@ Chain strategy: stacked-to-main
 
 ### Phase 2: Core Implementation (~150 lines)
 
-- [ ] PR2-T4: Implement `ClaveUnicaAuth.login()` method
+- [x] PR2-T4: Implement `ClaveUnicaAuth.login()` method
   - Files: `app/scrapper/pjud/clave_unica.py`
   - Lines: ~80
   - Dependencies: PR2-T3, PR1-T5
   - Criteria: Navigates to Clave Única portal, fills form, handles redirect
 
-- [ ] PR2-T5: Add Clave Única selectors to YAML config
+- [x] PR2-T5: Add Clave Única selectors to YAML config
   - Files: `app/scrapper/pjud/selectors/clave_unica.yaml` (new)
   - Lines: ~20
   - Dependencies: None
   - Criteria: Selectors for RUT input, password input, submit button
 
-- [ ] PR2-T6: Add `/login/clave-unica` endpoint to `app/api/v1/auth.py`
+- [x] PR2-T6: Add `/login/clave-unica` endpoint to `app/api/v1/auth.py`
   - Files: `app/api/v1/auth.py`
   - Lines: ~50
   - Dependencies: PR2-T4
@@ -128,13 +128,13 @@ Chain strategy: stacked-to-main
 
 ### Phase 3: Testing (~70 lines)
 
-- [ ] PR2-T7: Unit tests for `ClaveUnicaAuth` form filling
+- [x] PR2-T7: Unit tests for `ClaveUnicaAuth` form filling
   - Files: `tests/scrapper/pjud/test_clave_unica.py` (new)
   - Lines: ~40
   - Dependencies: PR2-T4
   - Criteria: Mock page, verify correct selectors used
 
-- [ ] PR2-T8: Integration test for dual auth detection
+- [x] PR2-T8: Integration test for dual auth detection
   - Files: `tests/api/v1/test_auth.py`
   - Lines: ~30
   - Dependencies: PR2-T6
