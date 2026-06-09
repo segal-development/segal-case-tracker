@@ -198,36 +198,26 @@ class BrowserFactory:
         # Create new page
         self._page = await self._context.new_page()
         
-        # Navigate to PJUD and load the cases panel if session provided
+        # Navigate to PJUD index page if session provided (panel loading handled by scraper)
         if session is not None:
             try:
                 from app.scrapper.pjud.base import PJUD_INDEX_URL
-                import asyncio
                 
-                # Navigate to index page (where the cases panel lives)
+                # Navigate to index page - scraper's _ensure_panel_loaded will handle the rest
                 await self._page.goto(PJUD_INDEX_URL, timeout=60000, wait_until="domcontentloaded")
                 
                 # Restore localStorage if available
                 if hasattr(session, 'local_storage') and session.local_storage:
-                    await self._page.evaluate(
-                        f"Object.assign(localStorage, {session.local_storage})"
-                    )
-                    logger.debug("Restored localStorage from session")
-                
-                # Wait for JavaScript to load and call misCausas to load the panel
-                await asyncio.sleep(2)  # Give JS time to initialize
-                
-                # Check if misCausas function exists and call it
-                has_fn = await self._page.evaluate("typeof misCausas === 'function'")
-                if has_fn:
-                    await self._page.evaluate("misCausas()")
-                    await asyncio.sleep(3)  # Wait for panel to load via AJAX
-                    logger.debug("Called misCausas() to load cases panel")
-                else:
-                    logger.warning("misCausas not found - session may have expired")
+                    try:
+                        await self._page.evaluate(
+                            f"Object.assign(localStorage, {session.local_storage})"
+                        )
+                        logger.debug("Restored localStorage from session")
+                    except Exception:
+                        pass  # localStorage restore is optional
                     
             except Exception as e:
-                logger.warning(f"Could not fully restore session: {e}")
+                logger.warning(f"Could not navigate to PJUD: {e}")
         
         creation_ms = (time.perf_counter() - start_time) * 1000
         _page_creation_times.append(creation_ms)

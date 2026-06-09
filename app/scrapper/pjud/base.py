@@ -414,23 +414,30 @@ class PJUDBaseScraper(ABC):
         has_fn = await page.evaluate("typeof misCausas === 'function'")
         
         if has_fn:
-            # Call misCausas() to load the panel
+            # Call misCausas() to load the panel - this triggers AJAX navigation
             await page.evaluate("misCausas()")
-            await asyncio.sleep(5)
             
-            # Verify content loaded
-            content_loaded = await page.evaluate("""
-                () => {
-                    const cont = document.querySelector('#contMain');
-                    return cont && cont.innerHTML.length > 1000;
-                }
-            """)
-            
-            if content_loaded:
-                self._panel_loaded = True
-                logger.info(f"{self.config.display_name} panel loaded")
-            else:
-                logger.warning("misCausas() called but content not loaded")
+            # Wait for the panel content to load (AJAX completes)
+            try:
+                await page.wait_for_selector("#contMain", state="attached", timeout=10000)
+                await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                await asyncio.sleep(2)  # Extra buffer for AJAX content
+                
+                # Verify content loaded
+                content_loaded = await page.evaluate("""
+                    () => {
+                        const cont = document.querySelector('#contMain');
+                        return cont && cont.innerHTML.length > 1000;
+                    }
+                """)
+                
+                if content_loaded:
+                    self._panel_loaded = True
+                    logger.info(f"{self.config.display_name} panel loaded")
+                else:
+                    logger.warning("misCausas() called but content not loaded")
+            except Exception as e:
+                logger.warning(f"Error waiting for panel: {e}")
         else:
             logger.warning("misCausas function not found - may not be logged in")
     
