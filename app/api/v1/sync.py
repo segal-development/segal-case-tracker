@@ -20,6 +20,7 @@ from app.services.sync_service import (
     SyncResult,
     convert_api_cases_to_scraped,
 )
+from app.services.session_store import get_session_store
 
 router = APIRouter()
 
@@ -97,21 +98,21 @@ async def sync_now(
     3. Detect new movements
     4. Create alerts for changes
     """
-    from app.api.v1.pjud import _sessions, get_scraper
+    from app.api.v1.pjud import get_scraper
     
     lawyer_id = current_lawyer.get("sub") or current_lawyer.get("lawyer_id")
     if not lawyer_id:
         raise HTTPException(status_code=401, detail="Invalid token")
     
-    # Verify PJUD session
-    if request.session_id not in _sessions:
+    # Get session from Redis store
+    store = get_session_store()
+    session = store.get_session(request.session_id)
+    
+    if not session:
         raise HTTPException(
             status_code=401,
             detail="Invalid or expired PJUD session. Please login again at /pjud/login",
         )
-    
-    session_data = _sessions[request.session_id]
-    session = session_data["session"]
     
     start_time = datetime.utcnow()
     

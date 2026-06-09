@@ -20,6 +20,7 @@ from app.scrapper.pjud.base import (
 from app.scrapper.pjud.civil import CivilScraper, reload_selectors, get_selector_registry
 from app.scrapper.pjud.laboral import LaboralScraper
 from app.scrapper.pjud.penal import PenalScraper
+from app.scrapper.pjud.browser import BrowserFactory
 
 from app.scrapper.pjud.selectors import SelectorRegistry, SelectorConfig
 
@@ -86,6 +87,9 @@ __all__ = [
     "CivilScraper",
     "LaboralScraper",
     "PenalScraper",
+    
+    # Browser Factory
+    "BrowserFactory",
     
     # Selector Registry
     "SelectorRegistry",

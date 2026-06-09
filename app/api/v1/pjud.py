@@ -3,14 +3,21 @@ PJUD Civil Scraper API endpoints.
 
 Direct endpoints to test the scraper functionality.
 Includes resilience (circuit breaker, rate limiting) and observability (metrics, logging).
+
+Architecture:
+- Login creates a session stored in Redis (via SessionStore)
+- Subsequent requests use BrowserFactory for fresh browser per request
+- Session cookies are restored from Redis into each fresh browser
+- This eliminates "Target page closed" errors from stale browser refs
 """
 
 import time
 from fastapi import APIRouter, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel, Field
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 
+from app.config import settings
 from app.scrapper.pjud.resilience.integration import (
     get_competency_circuit_breaker,
     record_scrape_success,
@@ -19,6 +26,8 @@ from app.scrapper.pjud.resilience.integration import (
 from app.scrapper.pjud.resilience import CircuitState
 from app.scrapper.pjud.observability import get_logger, get_metrics
 from app.scrapper.pjud.exceptions import CircuitOpenError
+from app.scrapper.pjud.browser import BrowserFactory
+from app.services.session_store import get_session_store, PJUDSession
 
 router = APIRouter()
 
@@ -111,10 +120,29 @@ class CountResponse(BaseModel):
 
 
 # ============================================================================
-# In-memory session store (for testing - use Redis in production)
+# Session helpers
 # ============================================================================
 
-_sessions = {}
+def _get_session_from_redis(session_id: str) -> PJUDSession:
+    """
+    Get session from Redis store.
+    
+    Args:
+        session_id: Session ID to retrieve
+        
+    Returns:
+        PJUDSession if found
+        
+    Raises:
+        HTTPException: If session not found or expired
+    """
+    store = get_session_store()
+    session = store.get_session(session_id)
+    
+    if session is None:
+        raise HTTPException(status_code=401, detail="Session not found or expired")
+    
+    return session
 
 
 def get_scraper(competency: str = "civil"):
@@ -141,35 +169,54 @@ async def login(request: LoginRequest):
     
     The captcha token must be obtained from the frontend reCAPTCHA widget.
     Returns a session that can be used for subsequent requests.
+    
+    The session is stored in Redis so subsequent requests can restore
+    the session cookies into fresh browser instances.
     """
     scraper = get_scraper()
     
     try:
-        session = await scraper.login_with_token(
+        login_session = await scraper.login_with_token(
             rut=request.rut,
             password=request.password,
             captcha_token=request.captcha_token,
         )
         
-        # Store session
+        # Generate unique session ID
         session_id = f"pjud_{request.rut}_{datetime.now().timestamp()}"
-        _sessions[session_id] = {
-            "session": session,
-            "scraper": scraper,
-            "created_at": datetime.now(),
-        }
+        
+        # Create PJUDSession for Redis storage
+        redis_session = PJUDSession(
+            session_id=session_id,
+            lawyer_id=0,  # Will be set when we have lawyer context
+            rut=request.rut,
+            cookies=login_session.cookies if hasattr(login_session, 'cookies') else [],
+            created_at=datetime.utcnow().isoformat(),
+            expires_at=login_session.expires_at.isoformat() if hasattr(login_session, 'expires_at') else (datetime.utcnow() + timedelta(hours=2)).isoformat(),
+            local_storage=login_session.local_storage if hasattr(login_session, 'local_storage') else "{}",
+            auth_method="captcha",
+        )
+        
+        # Store session in Redis
+        store = get_session_store()
+        store.save_session(redis_session)
+        
+        _logger.info(f"Login successful, session stored: {session_id}")
         
         return LoginResponse(
             success=True,
-            rut=session.rut,
+            rut=login_session.rut,
             session_id=session_id,
-            expires_at=session.expires_at,
+            expires_at=login_session.expires_at,
             message="Login successful",
         )
         
     except Exception as e:
-        await scraper.close()
+        _logger.error(f"Login failed: {e}")
         raise HTTPException(status_code=401, detail=str(e))
+    finally:
+        # Always close the login scraper - we don't reuse it
+        await scraper.close()
 
 
 @router.get("/cases/count", response_model=CountResponse)
@@ -180,29 +227,37 @@ async def get_cases_count(
     """
     Get total count of civil cases without fetching all data.
     Useful for showing totals and progress bars.
+    
+    Uses fresh browser per request with session restoration from Redis.
     """
-    if session_id not in _sessions:
-        raise HTTPException(status_code=401, detail="Session not found or expired")
+    session = _get_session_from_redis(session_id)
     
-    session_data = _sessions[session_id]
-    scraper = session_data["scraper"]
-    session = session_data["session"]
-    
-    try:
-        total_cases, total_pages = await scraper.get_cases_count(
-            session=session,
-            year=year or "",
-        )
+    # Use fresh browser for this request
+    async with BrowserFactory() as factory:
+        page = await factory.new_page(session)
         
-        return CountResponse(
-            success=True,
-            year=year,
-            total_cases=total_cases,
-            total_pages=total_pages,
-        )
+        # Create scraper with injected page
+        scraper = get_scraper("civil")
+        scraper._page = page
+        scraper._browser = factory._browser
+        scraper._context = factory._context
         
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        try:
+            total_cases, total_pages = await scraper.get_cases_count(
+                session=session,
+                year=year or "",
+            )
+            
+            return CountResponse(
+                success=True,
+                year=year,
+                total_cases=total_cases,
+                total_pages=total_pages,
+            )
+            
+        except Exception as e:
+            _logger.error(f"Failed get_cases_count: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/cases", response_model=CasesListResponse)
@@ -217,6 +272,7 @@ async def get_cases(
     Use `year` to filter by specific year.
     Use `max_pages` to limit results (useful for testing).
     
+    Uses fresh browser per request with session restoration from Redis.
     Includes resilience: circuit breaker, metrics tracking.
     """
     # Check circuit breaker
@@ -225,54 +281,59 @@ async def get_cases(
         _metrics.record_error("civil", "circuit_rejected")
         raise HTTPException(status_code=503, detail="Service temporarily unavailable (circuit open)")
     
-    if session_id not in _sessions:
-        raise HTTPException(status_code=401, detail="Session not found or expired")
-    
-    session_data = _sessions[session_id]
-    scraper = session_data["scraper"]
-    session = session_data["session"]
+    session = _get_session_from_redis(session_id)
     
     start_time = time.time()
     _logger.info(f"Starting get_cases for civil", extra={"year": year, "max_pages": max_pages})
     
-    try:
-        cases = await scraper.get_my_cases(
-            session=session,
-            year=year or "",
-            max_pages=max_pages,
-        )
+    # Use fresh browser for this request
+    async with BrowserFactory() as factory:
+        page = await factory.new_page(session)
         
-        # Record success metrics
-        duration = time.time() - start_time
-        await cb.record_success()
-        record_scrape_success("civil", len(cases))
-        _metrics.request_duration.observe(duration, competency="civil", endpoint="get_cases")
-        _logger.info(f"Completed get_cases: {len(cases)} cases in {duration:.2f}s")
+        # Create scraper with injected page
+        scraper = get_scraper("civil")
+        scraper._page = page
+        scraper._browser = factory._browser
+        scraper._context = factory._context
         
-        return CasesListResponse(
-            success=True,
-            total=len(cases),
-            filtered_by_year=year,
-            cases=[
-                CaseListSchema(
-                    rol=c.rol,
-                    tribunal=c.tribunal,
-                    caratulado=c.caratulado,
-                    fecha_ingreso=c.fecha_ingreso,
-                    estado_cuaderno=c.estado_cuaderno,
-                    cuaderno=c.cuaderno,
-                    institucion=c.institucion,
-                )
-                for c in cases
-            ],
-        )
-        
-    except Exception as e:
-        # Record failure metrics
-        await cb.record_failure()
-        record_scrape_error("civil", type(e).__name__)
-        _logger.error(f"Failed get_cases: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        try:
+            cases = await scraper.get_my_cases(
+                session=session,
+                year=year or "",
+                max_pages=max_pages,
+            )
+            
+            # Record success metrics
+            duration = time.time() - start_time
+            await cb.record_success()
+            record_scrape_success("civil", len(cases))
+            _metrics.request_duration.observe(duration, competency="civil", endpoint="get_cases")
+            _logger.info(f"Completed get_cases: {len(cases)} cases in {duration:.2f}s")
+            
+            return CasesListResponse(
+                success=True,
+                total=len(cases),
+                filtered_by_year=year,
+                cases=[
+                    CaseListSchema(
+                        rol=c.rol,
+                        tribunal=c.tribunal,
+                        caratulado=c.caratulado,
+                        fecha_ingreso=c.fecha_ingreso,
+                        estado_cuaderno=c.estado_cuaderno,
+                        cuaderno=c.cuaderno,
+                        institucion=c.institucion,
+                    )
+                    for c in cases
+                ],
+            )
+            
+        except Exception as e:
+            # Record failure metrics
+            await cb.record_failure()
+            record_scrape_error("civil", type(e).__name__)
+            _logger.error(f"Failed get_cases: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/cases/{rol}", response_model=CaseDetailResponse)
@@ -284,73 +345,80 @@ async def get_case_detail(
     Get full detail of a specific case including movements and documents.
     
     The `rol` must match exactly (e.g., C-7616-2026).
+    Uses fresh browser per request with session restoration from Redis.
     """
-    if session_id not in _sessions:
-        raise HTTPException(status_code=401, detail="Session not found or expired")
+    session = _get_session_from_redis(session_id)
     
-    session_data = _sessions[session_id]
-    scraper = session_data["scraper"]
-    session = session_data["session"]
-    
-    try:
-        # First find the case to get its token
-        cases = await scraper.get_my_cases(session=session, max_pages=20)
+    # Use fresh browser for this request
+    async with BrowserFactory() as factory:
+        page = await factory.new_page(session)
         
-        target_case = None
-        for c in cases:
-            if c.rol == rol:
-                target_case = c
-                break
+        # Create scraper with injected page
+        scraper = get_scraper("civil")
+        scraper._page = page
+        scraper._browser = factory._browser
+        scraper._context = factory._context
         
-        if not target_case:
-            raise HTTPException(status_code=404, detail=f"Case {rol} not found")
-        
-        # Get detail
-        detail = await scraper.get_case_detail(session, target_case.case_token)
-        
-        return CaseDetailResponse(
-            success=True,
-            case=CaseDetailSchema(
-                rol=detail.case.rol,
-                tribunal=detail.case.tribunal,
-                caratulado=detail.case.caratulado,
-                fecha_ingreso=detail.case.fecha_ingreso,
-                estado_procesal=detail.estado_procesal,
-                procedimiento=detail.procedimiento,
-                ubicacion=detail.ubicacion,
-                etapa=detail.etapa,
-                cuadernos=[
-                    CuadernoSchema(token=c["token"], name=c["name"])
-                    for c in detail.cuadernos
-                ],
-                movements=[
-                    MovementSchema(
-                        folio=m.folio,
-                        fecha=m.fecha,
-                        tipo_tramite=m.tipo_tramite,
-                        descripcion=m.descripcion,
-                        etapa=m.etapa,
-                        foja=m.foja,
-                        tiene_documento=m.tiene_documento,
-                        tiene_anexos=m.tiene_anexos,
-                        documentos=[
-                            DocumentSchema(
-                                token=d.token,
-                                tipo=d.tipo,
-                                url_type=d.url_type,
-                            )
-                            for d in m.documentos
-                        ],
-                    )
-                    for m in detail.movements
-                ],
-            ),
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        try:
+            # First find the case to get its token
+            cases = await scraper.get_my_cases(session=session, max_pages=20)
+            
+            target_case = None
+            for c in cases:
+                if c.rol == rol:
+                    target_case = c
+                    break
+            
+            if not target_case:
+                raise HTTPException(status_code=404, detail=f"Case {rol} not found")
+            
+            # Get detail
+            detail = await scraper.get_case_detail(session, target_case.case_token)
+            
+            return CaseDetailResponse(
+                success=True,
+                case=CaseDetailSchema(
+                    rol=detail.case.rol,
+                    tribunal=detail.case.tribunal,
+                    caratulado=detail.case.caratulado,
+                    fecha_ingreso=detail.case.fecha_ingreso,
+                    estado_procesal=detail.estado_procesal,
+                    procedimiento=detail.procedimiento,
+                    ubicacion=detail.ubicacion,
+                    etapa=detail.etapa,
+                    cuadernos=[
+                        CuadernoSchema(token=c["token"], name=c["name"])
+                        for c in detail.cuadernos
+                    ],
+                    movements=[
+                        MovementSchema(
+                            folio=m.folio,
+                            fecha=m.fecha,
+                            tipo_tramite=m.tipo_tramite,
+                            descripcion=m.descripcion,
+                            etapa=m.etapa,
+                            foja=m.foja,
+                            tiene_documento=m.tiene_documento,
+                            tiene_anexos=m.tiene_anexos,
+                            documentos=[
+                                DocumentSchema(
+                                    token=d.token,
+                                    tipo=d.tipo,
+                                    url_type=d.url_type,
+                                )
+                                for d in m.documentos
+                            ],
+                        )
+                        for m in detail.movements
+                    ],
+                ),
+            )
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            _logger.error(f"Failed get_case_detail: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/documents/download")
@@ -364,38 +432,45 @@ async def download_document(
     
     Use the `token` and `url_type` from the movement's `documentos` array.
     Returns the PDF file directly.
+    Uses fresh browser per request with session restoration from Redis.
     """
     from fastapi.responses import Response
     from app.scrapper.pjud_civil import PJUDDocument
     
-    if session_id not in _sessions:
-        raise HTTPException(status_code=401, detail="Session not found or expired")
+    session = _get_session_from_redis(session_id)
     
-    session_data = _sessions[session_id]
-    scraper = session_data["scraper"]
-    session = session_data["session"]
-    
-    try:
-        # Create document object
-        doc = PJUDDocument(
-            token=token,
-            tipo="principal",
-            url_type=url_type,
-        )
+    # Use fresh browser for this request
+    async with BrowserFactory() as factory:
+        page = await factory.new_page(session)
         
-        # Download PDF
-        pdf_bytes = await scraper.download_document(session, doc)
+        # Create scraper with injected page
+        scraper = get_scraper("civil")
+        scraper._page = page
+        scraper._browser = factory._browser
+        scraper._context = factory._context
         
-        return Response(
-            content=pdf_bytes,
-            media_type="application/pdf",
-            headers={
-                "Content-Disposition": f"attachment; filename=documento.pdf"
-            }
-        )
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        try:
+            # Create document object
+            doc = PJUDDocument(
+                token=token,
+                tipo="principal",
+                url_type=url_type,
+            )
+            
+            # Download PDF
+            pdf_bytes = await scraper.download_document(session, doc)
+            
+            return Response(
+                content=pdf_bytes,
+                media_type="application/pdf",
+                headers={
+                    "Content-Disposition": f"attachment; filename=documento.pdf"
+                }
+            )
+            
+        except Exception as e:
+            _logger.error(f"Failed download_document: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.delete("/logout")
@@ -404,19 +479,18 @@ async def logout(
 ):
     """
     Close a PJUD session and cleanup resources.
+    
+    Removes the session from Redis. No browser cleanup needed since
+    we use fresh browser per request.
     """
-    if session_id not in _sessions:
-        return {"success": True, "message": "Session already closed"}
+    store = get_session_store()
+    deleted = store.delete_session(session_id)
     
-    session_data = _sessions.pop(session_id)
-    scraper = session_data["scraper"]
-    
-    try:
-        await scraper.close()
-    except:
-        pass
-    
-    return {"success": True, "message": "Session closed"}
+    if deleted:
+        _logger.info(f"Session logged out: {session_id}")
+        return {"success": True, "message": "Session closed"}
+    else:
+        return {"success": True, "message": "Session already closed or not found"}
 
 
 # ============================================================================
@@ -436,6 +510,7 @@ async def get_laboral_cases(
     Use `max_pages` to limit results (useful for testing).
     
     Note: Laboral cases have 7 columns (vs Civil's 8) - no Institucion column.
+    Uses fresh browser per request with session restoration from Redis.
     Includes resilience: circuit breaker, metrics tracking.
     """
     # Check circuit breaker
@@ -444,58 +519,59 @@ async def get_laboral_cases(
         _metrics.record_error("laboral", "circuit_rejected")
         raise HTTPException(status_code=503, detail="Service temporarily unavailable (circuit open)")
     
-    if session_id not in _sessions:
-        raise HTTPException(status_code=401, detail="Session not found or expired")
-    
-    session_data = _sessions[session_id]
-    session = session_data["session"]
+    session = _get_session_from_redis(session_id)
     
     start_time = time.time()
     _logger.info(f"Starting get_cases for laboral", extra={"year": year, "max_pages": max_pages})
     
-    # Create laboral scraper
-    scraper = get_scraper("laboral")
-    
-    try:
-        cases = await scraper.get_my_cases(
-            session=session,
-            year=year or "",
-            max_pages=max_pages,
-        )
+    # Use fresh browser for this request
+    async with BrowserFactory() as factory:
+        page = await factory.new_page(session)
         
-        # Record success metrics
-        duration = time.time() - start_time
-        await cb.record_success()
-        record_scrape_success("laboral", len(cases))
-        _metrics.request_duration.observe(duration, competency="laboral", endpoint="get_cases")
-        _logger.info(f"Completed get_cases laboral: {len(cases)} cases in {duration:.2f}s")
+        # Create laboral scraper with injected page
+        scraper = get_scraper("laboral")
+        scraper._page = page
+        scraper._browser = factory._browser
+        scraper._context = factory._context
         
-        return CasesListResponse(
-            success=True,
-            total=len(cases),
-            filtered_by_year=year,
-            cases=[
-                CaseListSchema(
-                    rol=c.rol,
-                    tribunal=c.tribunal,
-                    caratulado=c.caratulado,
-                    fecha_ingreso=c.fecha_ingreso,
-                    estado_cuaderno=c.estado_cuaderno,
-                    cuaderno=c.cuaderno,
-                    institucion=c.institucion,
-                )
-                for c in cases
-            ],
-        )
-        
-    except Exception as e:
-        # Record failure metrics
-        await cb.record_failure()
-        record_scrape_error("laboral", type(e).__name__)
-        _logger.error(f"Failed get_cases laboral: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        await scraper.close()
+        try:
+            cases = await scraper.get_my_cases(
+                session=session,
+                year=year or "",
+                max_pages=max_pages,
+            )
+            
+            # Record success metrics
+            duration = time.time() - start_time
+            await cb.record_success()
+            record_scrape_success("laboral", len(cases))
+            _metrics.request_duration.observe(duration, competency="laboral", endpoint="get_cases")
+            _logger.info(f"Completed get_cases laboral: {len(cases)} cases in {duration:.2f}s")
+            
+            return CasesListResponse(
+                success=True,
+                total=len(cases),
+                filtered_by_year=year,
+                cases=[
+                    CaseListSchema(
+                        rol=c.rol,
+                        tribunal=c.tribunal,
+                        caratulado=c.caratulado,
+                        fecha_ingreso=c.fecha_ingreso,
+                        estado_cuaderno=c.estado_cuaderno,
+                        cuaderno=c.cuaderno,
+                        institucion=c.institucion,
+                    )
+                    for c in cases
+                ],
+            )
+            
+        except Exception as e:
+            # Record failure metrics
+            await cb.record_failure()
+            record_scrape_error("laboral", type(e).__name__)
+            _logger.error(f"Failed get_cases laboral: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/laboral/cases/{rol}", response_model=CaseDetailResponse)
@@ -507,76 +583,80 @@ async def get_laboral_case_detail(
     Get full detail of a specific laboral case including movements and documents.
     
     The `rol` must match exactly (e.g., T-123-2026).
+    Uses fresh browser per request with session restoration from Redis.
     """
-    if session_id not in _sessions:
-        raise HTTPException(status_code=401, detail="Session not found or expired")
+    session = _get_session_from_redis(session_id)
     
-    session_data = _sessions[session_id]
-    session = session_data["session"]
-    
-    scraper = get_scraper("laboral")
-    
-    try:
-        # First find the case to get its token
-        cases = await scraper.get_my_cases(session=session, max_pages=20)
+    # Use fresh browser for this request
+    async with BrowserFactory() as factory:
+        page = await factory.new_page(session)
         
-        target_case = None
-        for c in cases:
-            if c.rol == rol:
-                target_case = c
-                break
+        # Create laboral scraper with injected page
+        scraper = get_scraper("laboral")
+        scraper._page = page
+        scraper._browser = factory._browser
+        scraper._context = factory._context
         
-        if not target_case:
-            raise HTTPException(status_code=404, detail=f"Laboral case {rol} not found")
-        
-        # Get detail
-        detail = await scraper.get_case_detail(session, target_case.case_token)
-        
-        return CaseDetailResponse(
-            success=True,
-            case=CaseDetailSchema(
-                rol=detail.case.rol,
-                tribunal=detail.case.tribunal,
-                caratulado=detail.case.caratulado,
-                fecha_ingreso=detail.case.fecha_ingreso,
-                estado_procesal=detail.estado_procesal,
-                procedimiento=detail.procedimiento,
-                ubicacion=detail.ubicacion,
-                etapa=detail.etapa,
-                cuadernos=[
-                    CuadernoSchema(token=c["token"], name=c["name"])
-                    for c in detail.cuadernos
-                ],
-                movements=[
-                    MovementSchema(
-                        folio=m.folio,
-                        fecha=m.fecha,
-                        tipo_tramite=m.tipo_tramite,
-                        descripcion=m.descripcion,
-                        etapa=m.etapa,
-                        foja=m.foja,
-                        tiene_documento=m.tiene_documento,
-                        tiene_anexos=m.tiene_anexos,
-                        documentos=[
-                            DocumentSchema(
-                                token=d.token,
-                                tipo=d.tipo,
-                                url_type=d.url_type,
-                            )
-                            for d in m.documentos
-                        ],
-                    )
-                    for m in detail.movements
-                ],
-            ),
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        await scraper.close()
+        try:
+            # First find the case to get its token
+            cases = await scraper.get_my_cases(session=session, max_pages=20)
+            
+            target_case = None
+            for c in cases:
+                if c.rol == rol:
+                    target_case = c
+                    break
+            
+            if not target_case:
+                raise HTTPException(status_code=404, detail=f"Laboral case {rol} not found")
+            
+            # Get detail
+            detail = await scraper.get_case_detail(session, target_case.case_token)
+            
+            return CaseDetailResponse(
+                success=True,
+                case=CaseDetailSchema(
+                    rol=detail.case.rol,
+                    tribunal=detail.case.tribunal,
+                    caratulado=detail.case.caratulado,
+                    fecha_ingreso=detail.case.fecha_ingreso,
+                    estado_procesal=detail.estado_procesal,
+                    procedimiento=detail.procedimiento,
+                    ubicacion=detail.ubicacion,
+                    etapa=detail.etapa,
+                    cuadernos=[
+                        CuadernoSchema(token=c["token"], name=c["name"])
+                        for c in detail.cuadernos
+                    ],
+                    movements=[
+                        MovementSchema(
+                            folio=m.folio,
+                            fecha=m.fecha,
+                            tipo_tramite=m.tipo_tramite,
+                            descripcion=m.descripcion,
+                            etapa=m.etapa,
+                            foja=m.foja,
+                            tiene_documento=m.tiene_documento,
+                            tiene_anexos=m.tiene_anexos,
+                            documentos=[
+                                DocumentSchema(
+                                    token=d.token,
+                                    tipo=d.tipo,
+                                    url_type=d.url_type,
+                                )
+                                for d in m.documentos
+                            ],
+                        )
+                        for m in detail.movements
+                    ],
+                ),
+            )
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            _logger.error(f"Failed get_laboral_case_detail: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 # ============================================================================
@@ -596,6 +676,7 @@ async def get_penal_cases(
     Use `max_pages` to limit results (useful for testing).
     
     Note: Penal uses RUC (Rol Unico de Causa) instead of ROL in some contexts.
+    Uses fresh browser per request with session restoration from Redis.
     Includes resilience: circuit breaker, metrics tracking.
     """
     # Check circuit breaker
@@ -604,58 +685,59 @@ async def get_penal_cases(
         _metrics.record_error("penal", "circuit_rejected")
         raise HTTPException(status_code=503, detail="Service temporarily unavailable (circuit open)")
     
-    if session_id not in _sessions:
-        raise HTTPException(status_code=401, detail="Session not found or expired")
-    
-    session_data = _sessions[session_id]
-    session = session_data["session"]
+    session = _get_session_from_redis(session_id)
     
     start_time = time.time()
     _logger.info(f"Starting get_cases for penal", extra={"year": year, "max_pages": max_pages})
     
-    # Create penal scraper
-    scraper = get_scraper("penal")
-    
-    try:
-        cases = await scraper.get_my_cases(
-            session=session,
-            year=year or "",
-            max_pages=max_pages,
-        )
+    # Use fresh browser for this request
+    async with BrowserFactory() as factory:
+        page = await factory.new_page(session)
         
-        # Record success metrics
-        duration = time.time() - start_time
-        await cb.record_success()
-        record_scrape_success("penal", len(cases))
-        _metrics.request_duration.observe(duration, competency="penal", endpoint="get_cases")
-        _logger.info(f"Completed get_cases penal: {len(cases)} cases in {duration:.2f}s")
+        # Create penal scraper with injected page
+        scraper = get_scraper("penal")
+        scraper._page = page
+        scraper._browser = factory._browser
+        scraper._context = factory._context
         
-        return CasesListResponse(
-            success=True,
-            total=len(cases),
-            filtered_by_year=year,
-            cases=[
-                CaseListSchema(
-                    rol=c.rol,
-                    tribunal=c.tribunal,
-                    caratulado=c.caratulado,
-                    fecha_ingreso=c.fecha_ingreso,
-                    estado_cuaderno=c.estado_cuaderno,
-                    cuaderno=c.cuaderno,
-                    institucion=c.institucion,
-                )
-                for c in cases
-            ],
-        )
-        
-    except Exception as e:
-        # Record failure metrics
-        await cb.record_failure()
-        record_scrape_error("penal", type(e).__name__)
-        _logger.error(f"Failed get_cases penal: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        await scraper.close()
+        try:
+            cases = await scraper.get_my_cases(
+                session=session,
+                year=year or "",
+                max_pages=max_pages,
+            )
+            
+            # Record success metrics
+            duration = time.time() - start_time
+            await cb.record_success()
+            record_scrape_success("penal", len(cases))
+            _metrics.request_duration.observe(duration, competency="penal", endpoint="get_cases")
+            _logger.info(f"Completed get_cases penal: {len(cases)} cases in {duration:.2f}s")
+            
+            return CasesListResponse(
+                success=True,
+                total=len(cases),
+                filtered_by_year=year,
+                cases=[
+                    CaseListSchema(
+                        rol=c.rol,
+                        tribunal=c.tribunal,
+                        caratulado=c.caratulado,
+                        fecha_ingreso=c.fecha_ingreso,
+                        estado_cuaderno=c.estado_cuaderno,
+                        cuaderno=c.cuaderno,
+                        institucion=c.institucion,
+                    )
+                    for c in cases
+                ],
+            )
+            
+        except Exception as e:
+            # Record failure metrics
+            await cb.record_failure()
+            record_scrape_error("penal", type(e).__name__)
+            _logger.error(f"Failed get_cases penal: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/penal/cases/{rol:path}", response_model=CaseDetailResponse)
@@ -668,76 +750,80 @@ async def get_penal_case_detail(
     
     The `rol` can be a ROL, RUC, or RIT identifier (e.g., O-123-2026, RUC-1234567-8).
     Note: Uses path parameter to allow slashes in RUC format.
+    Uses fresh browser per request with session restoration from Redis.
     """
-    if session_id not in _sessions:
-        raise HTTPException(status_code=401, detail="Session not found or expired")
+    session = _get_session_from_redis(session_id)
     
-    session_data = _sessions[session_id]
-    session = session_data["session"]
-    
-    scraper = get_scraper("penal")
-    
-    try:
-        # First find the case to get its token
-        cases = await scraper.get_my_cases(session=session, max_pages=20)
+    # Use fresh browser for this request
+    async with BrowserFactory() as factory:
+        page = await factory.new_page(session)
         
-        target_case = None
-        for c in cases:
-            if c.rol == rol:
-                target_case = c
-                break
+        # Create penal scraper with injected page
+        scraper = get_scraper("penal")
+        scraper._page = page
+        scraper._browser = factory._browser
+        scraper._context = factory._context
         
-        if not target_case:
-            raise HTTPException(status_code=404, detail=f"Penal case {rol} not found")
-        
-        # Get detail
-        detail = await scraper.get_case_detail(session, target_case.case_token)
-        
-        return CaseDetailResponse(
-            success=True,
-            case=CaseDetailSchema(
-                rol=detail.case.rol,
-                tribunal=detail.case.tribunal,
-                caratulado=detail.case.caratulado,
-                fecha_ingreso=detail.case.fecha_ingreso,
-                estado_procesal=detail.estado_procesal,
-                procedimiento=detail.procedimiento,
-                ubicacion=detail.ubicacion,
-                etapa=detail.etapa,
-                cuadernos=[
-                    CuadernoSchema(token=c["token"], name=c["name"])
-                    for c in detail.cuadernos
-                ],
-                movements=[
-                    MovementSchema(
-                        folio=m.folio,
-                        fecha=m.fecha,
-                        tipo_tramite=m.tipo_tramite,
-                        descripcion=m.descripcion,
-                        etapa=m.etapa,
-                        foja=m.foja,
-                        tiene_documento=m.tiene_documento,
-                        tiene_anexos=m.tiene_anexos,
-                        documentos=[
-                            DocumentSchema(
-                                token=d.token,
-                                tipo=d.tipo,
-                                url_type=d.url_type,
-                            )
-                            for d in m.documentos
-                        ],
-                    )
-                    for m in detail.movements
-                ],
-            ),
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        await scraper.close()
+        try:
+            # First find the case to get its token
+            cases = await scraper.get_my_cases(session=session, max_pages=20)
+            
+            target_case = None
+            for c in cases:
+                if c.rol == rol:
+                    target_case = c
+                    break
+            
+            if not target_case:
+                raise HTTPException(status_code=404, detail=f"Penal case {rol} not found")
+            
+            # Get detail
+            detail = await scraper.get_case_detail(session, target_case.case_token)
+            
+            return CaseDetailResponse(
+                success=True,
+                case=CaseDetailSchema(
+                    rol=detail.case.rol,
+                    tribunal=detail.case.tribunal,
+                    caratulado=detail.case.caratulado,
+                    fecha_ingreso=detail.case.fecha_ingreso,
+                    estado_procesal=detail.estado_procesal,
+                    procedimiento=detail.procedimiento,
+                    ubicacion=detail.ubicacion,
+                    etapa=detail.etapa,
+                    cuadernos=[
+                        CuadernoSchema(token=c["token"], name=c["name"])
+                        for c in detail.cuadernos
+                    ],
+                    movements=[
+                        MovementSchema(
+                            folio=m.folio,
+                            fecha=m.fecha,
+                            tipo_tramite=m.tipo_tramite,
+                            descripcion=m.descripcion,
+                            etapa=m.etapa,
+                            foja=m.foja,
+                            tiene_documento=m.tiene_documento,
+                            tiene_anexos=m.tiene_anexos,
+                            documentos=[
+                                DocumentSchema(
+                                    token=d.token,
+                                    tipo=d.tipo,
+                                    url_type=d.url_type,
+                                )
+                                for d in m.documentos
+                            ],
+                        )
+                        for m in detail.movements
+                    ],
+                ),
+            )
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            _logger.error(f"Failed get_penal_case_detail: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 # ============================================================================

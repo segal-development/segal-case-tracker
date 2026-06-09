@@ -26,6 +26,7 @@ from app.core.database import SessionLocal
 from app.models.lawyer import Lawyer
 from app.models.sync_history import SyncHistory
 from app.services.sync_service import SyncService, convert_api_cases_to_scraped
+from app.services.session_store import get_session_store
 from app.config import settings
 
 # Configure logging
@@ -71,28 +72,21 @@ async def sync_lawyer_cases(
     Returns:
         Dict with sync results
     """
-    from app.api.v1.pjud import _sessions, get_scraper
+    from app.api.v1.pjud import get_scraper
     
     logger.info(f"Syncing {competencia} for lawyer {lawyer_id}")
     
-    # Find active session for this lawyer
-    active_session = None
-    session_id = None
+    # Get active session from Redis store
+    store = get_session_store()
+    pjud_session = store.get_session_by_lawyer(lawyer_id)
     
-    for sid, sdata in _sessions.items():
-        # Session IDs are like "pjud_12345678-9_timestamp"
-        if f"_{lawyer_id}_" in sid or sid.startswith(f"pjud_{lawyer_id}_"):
-            active_session = sdata
-            session_id = sid
-            break
-    
-    if not active_session:
+    if not pjud_session:
         logger.warning(f"No active PJUD session for lawyer {lawyer_id}, skipping")
         return {"skipped": True, "reason": "no_session"}
     
     try:
         scraper = get_scraper(competencia)
-        session = active_session["session"]
+        session = pjud_session  # PJUDSession object from Redis
         
         # Scrape cases
         cases = await scraper.get_my_cases(
