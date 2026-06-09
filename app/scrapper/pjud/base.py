@@ -271,15 +271,32 @@ class PJUDBaseScraper(ABC):
         Playwright raises when page.content() is called while the page is
         still navigating (e.g. mid-redirect chain).  This helper retries up to
         *attempts* times, waiting for "domcontentloaded" between each try.
+
+        Only navigation-related errors trigger a retry; non-transient errors
+        (e.g. closed context) propagate immediately.  Recovery steps on each
+        iteration are wrapped so their failures never mask the original error.
+        The recovery wait is skipped on the final iteration to avoid a useless
+        delay before re-raising.
         """
+        if attempts < 1:
+            raise ValueError("attempts must be >= 1")
+
         last_exc: Optional[Exception] = None
-        for _ in range(attempts):
+        for i in range(attempts):
             try:
                 return await page.content()
             except Exception as exc:
+                if "navigat" not in str(exc).lower():
+                    raise
                 last_exc = exc
-                await page.wait_for_load_state("domcontentloaded")
-                await asyncio.sleep(1)
+                if i < attempts - 1:
+                    try:
+                        await page.wait_for_load_state(
+                            "domcontentloaded", timeout=5000
+                        )
+                    except Exception:
+                        pass  # Recovery failure must not mask the original error.
+                    await asyncio.sleep(1)
         raise last_exc  # type: ignore[misc]
 
     # ========================================================================
