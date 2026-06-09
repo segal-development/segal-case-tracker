@@ -503,7 +503,11 @@ class PJUDBaseScraper(ABC):
         rut_num = rut[:-1] if len(rut) > 8 else rut
         dv = rut[-1] if len(rut) > 8 else session.rut.split("-")[-1]
         
-        page = await self._get_page(session)
+        # Use injected page if valid, otherwise create new one
+        if self._page is not None and not self._page.is_closed():
+            page = self._page
+        else:
+            page = await self._get_page(session)
         
         try:
             await self._ensure_panel_loaded(page)
@@ -584,7 +588,11 @@ class PJUDBaseScraper(ABC):
         Returns:
             Full case detail with movements
         """
-        page = await self._get_page(session)
+        # Use injected page if valid, otherwise create new one
+        if self._page is not None and not self._page.is_closed():
+            page = self._page
+        else:
+            page = await self._get_page(session)
         
         try:
             await self._ensure_panel_loaded(page)
@@ -642,7 +650,11 @@ class PJUDBaseScraper(ABC):
         rut_num = rut[:-1] if len(rut) > 8 else rut
         dv = rut[-1] if len(rut) > 8 else session.rut.split("-")[-1]
         
-        page = await self._get_page(session)
+        # Use injected page if valid, otherwise create new one
+        if self._page is not None and not self._page.is_closed():
+            page = self._page
+        else:
+            page = await self._get_page(session)
         await self._ensure_panel_loaded(page)
         
         html = await self._fetch_cases_page(
