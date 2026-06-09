@@ -1,5 +1,8 @@
 """Pytest configuration and fixtures."""
 
+import os
+os.environ.setdefault("ENVIRONMENT", "development")
+
 import pytest
 from typing import Generator
 from fastapi.testclient import TestClient

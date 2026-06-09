@@ -80,21 +80,44 @@ class TestSecretsValidation:
             )
         assert "SECRET_KEY" in str(exc_info.value)
 
-    def test_invalid_fernet_key_rejected_in_production(self):
-        """Production env + a non-Fernet-compatible ENCRYPTION_KEY must raise ValidationError."""
-        # This string is not valid base64 Fernet AND not a 32-byte string that can
-        # be derived (it's also not the dev default, so that check passes).
-        # Actually a 32-char non-default string gets derived via ljust — that should work.
-        # Use an extremely short key that would fail derivation logic.
-        # The derivation pads to 32 bytes, so any non-empty string works after derivation.
-        # Let's confirm the validator accepts a derivable key (custom short string).
-        fernet_key = Fernet.generate_key().decode()
+    def test_invalid_fernet_key_rejected_in_production(self, monkeypatch):
+        """Production env: if _build_fernet raises, Settings must raise ValidationError."""
+        import app.config as config_module
+
+        monkeypatch.setattr(config_module, "_build_fernet", lambda k: (_ for _ in ()).throw(Exception("bad key")))
+
+        with pytest.raises(ValidationError) as exc_info:
+            make_settings(
+                ENVIRONMENT="production",
+                SECRET_KEY="a-strong-non-default-production-key",
+                ENCRYPTION_KEY="some-encryption-key-value",
+            )
+        assert "ENCRYPTION_KEY" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# A2) Fail-closed default: omitting ENVIRONMENT must behave as production
+# ---------------------------------------------------------------------------
+
+class TestDefaultEnvironmentIsProduction:
+    def test_omit_environment_defaults_to_production(self, monkeypatch):
+        """ENVIRONMENT field default must be 'production'; omission with dev secrets raises."""
+        monkeypatch.delenv("ENVIRONMENT", raising=False)
+        monkeypatch.delenv("SECRET_KEY", raising=False)
+        monkeypatch.delenv("ENCRYPTION_KEY", raising=False)
+        with pytest.raises(ValidationError) as exc_info:
+            make_settings()
+        error_text = str(exc_info.value)
+        assert "SECRET_KEY" in error_text or "ENCRYPTION_KEY" in error_text
+
+    def test_explicit_development_with_dev_defaults_still_allowed(self):
+        """Explicit ENVIRONMENT='development' + dev defaults must still construct fine."""
         settings = make_settings(
-            ENVIRONMENT="production",
-            SECRET_KEY="strong-prod-secret-key-12345678",
-            ENCRYPTION_KEY=fernet_key,
+            ENVIRONMENT="development",
+            SECRET_KEY=_DEV_SECRET_KEY,
+            ENCRYPTION_KEY=_DEV_ENCRYPTION_KEY,
         )
-        assert settings.ENVIRONMENT == "production"
+        assert settings.ENVIRONMENT == "development"
 
 
 # ---------------------------------------------------------------------------
@@ -188,3 +211,29 @@ class TestCorsIntegration:
             )
         acao = response.headers.get("access-control-allow-origin")
         assert acao != "https://evil.example.com"
+
+
+# ---------------------------------------------------------------------------
+# E) Empty CORS validation in non-development environments (FIX 4)
+# ---------------------------------------------------------------------------
+
+class TestCorsProductionValidation:
+    def test_empty_cors_rejected_in_production(self):
+        """Empty CORS_ORIGINS in production must raise ValidationError."""
+        fernet_key = Fernet.generate_key().decode()
+        with pytest.raises(ValidationError) as exc_info:
+            make_settings(
+                ENVIRONMENT="production",
+                SECRET_KEY="a-strong-non-default-production-key-xyz",
+                ENCRYPTION_KEY=fernet_key,
+                CORS_ORIGINS="",
+            )
+        assert "CORS_ORIGINS" in str(exc_info.value)
+
+    def test_empty_cors_allowed_in_development(self):
+        """Empty CORS_ORIGINS in development must NOT raise ValidationError."""
+        settings = make_settings(
+            ENVIRONMENT="development",
+            CORS_ORIGINS="",
+        )
+        assert settings.cors_origins_list == []

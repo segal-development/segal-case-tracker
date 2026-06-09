@@ -81,7 +81,7 @@ class Settings(BaseSettings):
     PJUD_ALERTS_ENABLED: bool = True        # Enable/disable alert webhooks
 
     # Environment
-    ENVIRONMENT: str = "development"
+    ENVIRONMENT: str = "production"
     DEBUG: bool = True
 
     # ------------------------------------------------------------------
@@ -127,6 +127,12 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"ENCRYPTION_KEY cannot be used to construct a valid Fernet key: {exc}"
             ) from exc
+
+        # Reject empty CORS in non-development environments.
+        if not self.cors_origins_list:
+            raise ValueError(
+                "CORS_ORIGINS must not be empty in non-development environments."
+            )
 
         return self
 
