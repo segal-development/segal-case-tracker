@@ -7,13 +7,25 @@ Responsibilities:
 3. Detect new/changed cases and movements
 4. Create alerts for changes
 5. Track sync history
+
+Performance optimizations:
+- Parallel case detail fetching with configurable concurrency limit
 """
 
+import asyncio
+import logging
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Callable, Awaitable, TypeVar
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
+
+logger = logging.getLogger(__name__)
+
+# Maximum concurrent case detail fetches
+MAX_CONCURRENT_FETCHES = 3
+
+T = TypeVar("T")
 
 from app.models.case import Case
 from app.models.movement import Movement
@@ -464,3 +476,58 @@ def convert_api_movements_to_scraped(api_movements: list) -> List[ScrapedMovemen
         )
         for m in api_movements
     ]
+
+
+async def fetch_case_details_parallel(
+    case_ids: List[str],
+    fetch_func: Callable[[str], Awaitable[T]],
+    max_concurrent: int = MAX_CONCURRENT_FETCHES,
+) -> List[Tuple[str, Optional[T], Optional[str]]]:
+    """
+    Fetch case details in parallel with limited concurrency.
+    
+    Args:
+        case_ids: List of case ROLs to fetch
+        fetch_func: Async function that takes a ROL and returns case details
+        max_concurrent: Maximum concurrent fetches (default: 3)
+    
+    Returns:
+        List of tuples: (rol, result, error_message)
+        - result is None if fetch failed
+        - error_message is None if fetch succeeded
+    
+    Example:
+        async def fetch_detail(rol: str) -> dict:
+            async with BrowserFactory() as factory:
+                page = await factory.new_page(session)
+                scraper = CivilScraper(page=page)
+                return await scraper.get_case_detail(rol)
+        
+        results = await fetch_case_details_parallel(rols, fetch_detail)
+        for rol, detail, error in results:
+            if detail:
+                process_detail(rol, detail)
+            else:
+                log_error(rol, error)
+    """
+    semaphore = asyncio.Semaphore(max_concurrent)
+    
+    async def fetch_with_semaphore(rol: str) -> Tuple[str, Optional[T], Optional[str]]:
+        async with semaphore:
+            try:
+                logger.debug(f"Fetching case detail: {rol}")
+                result = await fetch_func(rol)
+                logger.debug(f"Fetched case detail: {rol}")
+                return (rol, result, None)
+            except Exception as e:
+                logger.warning(f"Failed to fetch case {rol}: {e}")
+                return (rol, None, str(e))
+    
+    logger.info(f"Fetching {len(case_ids)} case details (max {max_concurrent} concurrent)")
+    tasks = [fetch_with_semaphore(rol) for rol in case_ids]
+    results = await asyncio.gather(*tasks)
+    
+    successful = sum(1 for _, result, _ in results if result is not None)
+    logger.info(f"Fetched {successful}/{len(case_ids)} case details successfully")
+    
+    return results
