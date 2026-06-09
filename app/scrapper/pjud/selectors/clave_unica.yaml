@@ -1,0 +1,97 @@
+# Clave Unica Authentication Selectors for PJUD
+# Last updated: 2026-06-08
+#
+# These selectors are extracted from the SCALEX reference implementation
+# and can be updated without code changes when portals modify their HTML.
+
+# Required by registry validation (use dummy values as this is auth-specific)
+table_body_id:
+  primary: "not_applicable"
+  description: "Not used for authentication flow"
+
+modal_id:
+  primary: "not_applicable"
+  description: "Not used for authentication flow"
+
+detail_function_name:
+  primary: "not_applicable"
+  description: "Not used for authentication flow"
+
+# PJUD home page - initial modal close
+modal_close_button:
+  primary: "#no-disponible form div div div:nth-child(3) button"
+  fallbacks:
+    - "button[data-dismiss='modal']"
+    - ".modal .close"
+  description: "Close button for initial service unavailable modal"
+
+# Services dropdown button
+services_button:
+  primary: "button[onclick='myFunction()']"
+  fallbacks:
+    - "button:has-text('Servicios')"
+    - ".dropdown-toggle"
+  description: "Services dropdown button on PJUD home"
+
+# Clave Unica login link
+clave_unica_link:
+  primary: "a:has-text('Clave Única')"
+  fallbacks:
+    - "a[href*='claveunica']"
+    - "//a[contains(text(),'Clave Única')]"
+  description: "Link to Clave Unica login option"
+
+# Clave Unica portal - RUT input
+rut_input:
+  primary: "#uname"
+  fallbacks:
+    - "input[name='uname']"
+    - "input[type='text'][placeholder*='RUT']"
+  description: "RUT input field on Clave Unica portal"
+
+# Clave Unica portal - Password input
+password_input:
+  primary: "#pword"
+  fallbacks:
+    - "input[name='pword']"
+    - "input[type='password']"
+  description: "Password input field on Clave Unica portal"
+
+# Clave Unica portal - Submit button
+submit_button:
+  primary: "#login-submit"
+  fallbacks:
+    - "button[type='submit']"
+    - "button:has-text('Iniciar sesión')"
+  description: "Login submit button on Clave Unica portal"
+
+# Clave Unica portal - Error message
+error_message:
+  primary: ".alert-danger"
+  fallbacks:
+    - ".error-message"
+    - "#error"
+  description: "Error message container on Clave Unica portal"
+
+# PJUD welcome modal after login
+welcome_modal_button:
+  primary: "#btnEntendidoBienvenida"
+  fallbacks:
+    - "button:has-text('Entendido')"
+    - ".modal-footer button"
+  description: "Entendido button on PJUD welcome modal"
+
+# PJUD my cases link (to verify logged in)
+my_cases_link:
+  primary: "a[onclick='misCausas();']"
+  fallbacks:
+    - "a:has-text('Mis Causas')"
+    - "#misCausasLink"
+  description: "Mis Causas link, visible only when logged in"
+
+# PJUD my cases modal button
+my_cases_modal_button:
+  primary: "#btnEntendidoMisCausas"
+  fallbacks:
+    - "button:has-text('Entendido')"
+  description: "Entendido button on Mis Causas modal"

@@ -1,10 +1,18 @@
 """Lawyer model - Authenticated users."""
 
 from datetime import datetime
+from enum import Enum
+
 from sqlalchemy import Column, Integer, String, DateTime, Boolean
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
+
+
+class AuthMethod(str, Enum):
+    """Authentication method for PJUD login."""
+    CAPTCHA = "captcha"
+    CLAVE_UNICA = "clave_unica"
 
 
 class Lawyer(Base):
@@ -17,8 +25,13 @@ class Lawyer(Base):
     name = Column(String(255), nullable=False)
     email = Column(String(255), unique=True, index=True, nullable=True)
     
-    # Encrypted PJUD password for session refresh
+    # Encrypted PJUD password for session refresh (captcha method)
     encrypted_pjud_password = Column(String(512), nullable=True)
+    
+    # Clave Única authentication fields
+    clave_unica_rut = Column(String(12), nullable=True)  # May differ from PJUD RUT
+    encrypted_clave_unica_password = Column(String(512), nullable=True)
+    preferred_auth_method = Column(String(20), default=AuthMethod.CAPTCHA.value)
     
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
