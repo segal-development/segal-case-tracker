@@ -28,15 +28,15 @@ app = FastAPI(
     title="Segal Case Tracker API",
     description="API para seguimiento de causas civiles - Segal",
     version="0.1.0",
-    docs_url="/docs" if settings.DEBUG else None,
-    redoc_url="/redoc" if settings.DEBUG else None,
+    docs_url="/docs" if settings.effective_debug else None,
+    redoc_url="/redoc" if settings.effective_debug else None,
     lifespan=lifespan,
 )
 
-# CORS
+# CORS — explicit origins only; credentials require non-wildcard origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configurar en produccion
+    allow_origins=settings.cors_origins_list,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
