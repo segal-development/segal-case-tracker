@@ -33,8 +33,8 @@ COPY pyproject.toml poetry.lock* ./
 RUN poetry config virtualenvs.create false \
     && poetry install --no-interaction --no-ansi --no-root --only main
 
-# Install Playwright browsers
-RUN playwright install chromium
+# Install Playwright browsers and system dependencies
+RUN playwright install chromium && playwright install-deps chromium
 
 # Copy application
 COPY . .
