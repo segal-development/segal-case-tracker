@@ -67,8 +67,37 @@ class CircuitOpenError(PJUDError):
 
 class RateLimitError(PJUDError):
     """Raised when rate limit is exceeded."""
-    
+
     def __init__(self, wait_time: float):
         message = f"Rate limit exceeded. Wait {wait_time:.1f}s before retrying."
         super().__init__(message)
         self.wait_time = wait_time
+
+
+class SessionNotAuthenticatedError(PJUDError):
+    """Raised when session restoration did not produce an authenticated PJUD page.
+
+    This happens when cookies and/or localStorage were restored but the page
+    still renders as the login screen (misCausas() is absent), indicating the
+    server did not recognise the session.
+    """
+
+    def __init__(
+        self,
+        url: str,
+        jquery_present: bool,
+        looks_like_login: bool,
+    ):
+        hint = (
+            "The restored session did not yield an authenticated PJUD page "
+            "(misCausas() absent). Re-login or verify cookie/localStorage restoration."
+        )
+        message = (
+            f"Not authenticated after session restore. "
+            f"url={url}, jquery_present={jquery_present}, "
+            f"looks_like_login={looks_like_login}. {hint}"
+        )
+        super().__init__(message)
+        self.url = url
+        self.jquery_present = jquery_present
+        self.looks_like_login = looks_like_login

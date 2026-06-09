@@ -123,32 +123,35 @@ class TestBrowserFactoryNewPage:
     
     @pytest.mark.asyncio
     async def test_new_page_restores_cookies(self):
-        """new_page() should restore cookies from session."""
+        """new_page() should pass cookies via storage_state to new_context (not add_cookies)."""
         with patch('app.scrapper.pjud.browser.async_playwright') as mock_pw:
             # Setup mocks
             mock_playwright = AsyncMock()
             mock_browser = AsyncMock()
             mock_context = AsyncMock()
             mock_page = AsyncMock()
-            
+
             mock_pw.return_value.start = AsyncMock(return_value=mock_playwright)
             mock_playwright.chromium.launch = AsyncMock(return_value=mock_browser)
             mock_browser.new_context = AsyncMock(return_value=mock_context)
             mock_context.new_page = AsyncMock(return_value=mock_page)
-            
+
             from app.scrapper.pjud.browser import BrowserFactory
-            
+
             # Create mock session with cookies
             session = MockSession(
                 cookies=[{"name": "test", "value": "cookie"}],
                 local_storage="{}",
             )
-            
+
             async with BrowserFactory() as factory:
                 await factory.new_page(session)
-                
-                # Verify cookies added
-                mock_context.add_cookies.assert_called_once_with(session.cookies)
+
+                # Cookies are now passed via storage_state, NOT add_cookies
+                call_kwargs = mock_browser.new_context.call_args.kwargs
+                storage_state = call_kwargs.get("storage_state") or {}
+                assert storage_state.get("cookies") == session.cookies
+                mock_context.add_cookies.assert_not_called()
     
     @pytest.mark.asyncio
     async def test_new_page_closes_previous_context(self):

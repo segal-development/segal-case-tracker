@@ -13,6 +13,7 @@ Usage:
 Performance metrics are logged for monitoring browser startup times.
 """
 
+import json
 import logging
 import time
 from typing import Optional, List, Dict, Any
@@ -20,6 +21,9 @@ from typing import Optional, List, Dict, Any
 from playwright.async_api import async_playwright, Browser, Page, BrowserContext, Playwright
 
 from app.config import settings
+
+# Copied here to keep browser.py self-contained (no circular-import risk).
+_PJUD_BASE_URL = "https://oficinajudicialvirtual.pjud.cl"
 
 
 logger = logging.getLogger(__name__)
@@ -58,6 +62,48 @@ def reset_browser_metrics() -> None:
     global _browser_startup_times, _page_creation_times
     _browser_startup_times = []
     _page_creation_times = []
+
+
+def build_storage_state(session) -> Optional[Dict[str, Any]]:
+    """Build a Playwright ``storage_state`` dict from a PJUD session.
+
+    Returning a storage_state with both cookies **and** localStorage means the
+    browser context has them available from the very first page load, so PJUD's
+    indexN.php can authenticate the request before executing any JavaScript.
+
+    Args:
+        session: Any object with ``cookies`` (list) and ``local_storage`` (str)
+                 attributes, or ``None``.
+
+    Returns:
+        Dict suitable for ``new_context(storage_state=...)``, or ``None`` when
+        *session* is ``None``.
+    """
+    if session is None:
+        return None
+
+    cookies = getattr(session, "cookies", None) or []
+    local_storage_raw: str = getattr(session, "local_storage", None) or ""
+
+    # Parse localStorage JSON safely — any malformed/empty value → empty list.
+    ls_items: List[Dict[str, str]] = []
+    if local_storage_raw and local_storage_raw.strip() not in ("", "{}"):
+        try:
+            parsed = json.loads(local_storage_raw)
+            if isinstance(parsed, dict):
+                ls_items = [{"name": k, "value": str(v)} for k, v in parsed.items()]
+        except Exception:
+            pass  # Graceful fallback: proceed with empty localStorage
+
+    return {
+        "cookies": cookies,
+        "origins": [
+            {
+                "origin": _PJUD_BASE_URL,
+                "localStorage": ls_items,
+            }
+        ],
+    }
 
 
 class BrowserFactory:
@@ -184,38 +230,33 @@ class BrowserFactory:
             self._context = None
             self._page = None
         
-        # Create new browser context
+        # Build storage_state so both cookies AND localStorage are present
+        # when indexN.php first loads (PJUD checks localStorage at load time).
+        storage_state = build_storage_state(session)
+        if storage_state and storage_state.get("cookies"):
+            logger.debug(
+                f"Restoring {len(storage_state['cookies'])} cookies via storage_state"
+            )
+
+        # Create new browser context with storage_state pre-loaded
         self._context = await self._browser.new_context(
             viewport={"width": 1280, "height": 800},
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            storage_state=storage_state,
         )
-        
-        # Restore cookies from session if provided
-        if session is not None and hasattr(session, 'cookies') and session.cookies:
-            logger.debug(f"Restoring {len(session.cookies)} cookies from session")
-            await self._context.add_cookies(session.cookies)
-        
+
         # Create new page
         self._page = await self._context.new_page()
-        
-        # Navigate to PJUD index page if session provided (panel loading handled by scraper)
+
+        # Navigate to PJUD index page if session provided.
+        # localStorage is already present from storage_state, so no post-
+        # navigation Object.assign is needed.
         if session is not None:
             try:
                 from app.scrapper.pjud.base import PJUD_INDEX_URL
-                
-                # Navigate to index page - scraper's _ensure_panel_loaded will handle the rest
+
                 await self._page.goto(PJUD_INDEX_URL, timeout=60000, wait_until="domcontentloaded")
-                
-                # Restore localStorage if available
-                if hasattr(session, 'local_storage') and session.local_storage:
-                    try:
-                        await self._page.evaluate(
-                            f"Object.assign(localStorage, {session.local_storage})"
-                        )
-                        logger.debug("Restored localStorage from session")
-                    except Exception:
-                        pass  # localStorage restore is optional
-                    
+
             except Exception as e:
                 logger.warning(f"Could not navigate to PJUD: {e}")
         

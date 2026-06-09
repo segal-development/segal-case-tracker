@@ -22,7 +22,12 @@ from playwright.async_api import (
 )
 
 from app.scrapper.session_manager import SessionManager, PJUDSession
-from app.scrapper.pjud.exceptions import LoginError, SessionExpiredError, ScrapingError
+from app.scrapper.pjud.exceptions import (
+    LoginError,
+    ScrapingError,
+    SessionExpiredError,
+    SessionNotAuthenticatedError,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -472,7 +477,25 @@ class PJUDBaseScraper(ABC):
             except Exception as e:
                 logger.warning(f"Error waiting for panel: {e}")
         else:
-            logger.warning("misCausas function not found - may not be logged in")
+            # Gather diagnostics before raising so callers can act on them.
+            current_url = page.url
+            try:
+                jquery_present: bool = await page.evaluate(
+                    "typeof window.jQuery !== 'undefined' || typeof window.$ !== 'undefined'"
+                )
+            except Exception:
+                jquery_present = False
+            looks_like_login = "home/index.php" in current_url
+
+            logger.warning(
+                f"misCausas not found — session restore failed. "
+                f"url={current_url}, jquery={jquery_present}, login_page={looks_like_login}"
+            )
+            raise SessionNotAuthenticatedError(
+                url=current_url,
+                jquery_present=jquery_present,
+                looks_like_login=looks_like_login,
+            )
     
     # ========================================================================
     # PAGINATION HELPERS (Concrete)
