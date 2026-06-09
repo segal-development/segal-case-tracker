@@ -13,7 +13,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 
-from playwright.async_api import async_playwright, Browser, Page, BrowserContext
+from playwright.async_api import (
+    async_playwright,
+    Browser,
+    Page,
+    BrowserContext,
+    TimeoutError as PlaywrightTimeoutError,
+)
 
 from app.scrapper.session_manager import SessionManager, PJUDSession
 from app.scrapper.pjud.exceptions import LoginError, SessionExpiredError, ScrapingError
@@ -253,7 +259,24 @@ class PJUDBaseScraper(ABC):
             )
         
         return self._page
-    
+
+    async def _safe_page_content(self, page: Page, attempts: int = 3) -> str:
+        """Return page.content(), retrying if the page is mid-navigation.
+
+        Playwright raises when page.content() is called while the page is
+        still navigating (e.g. mid-redirect chain).  This helper retries up to
+        *attempts* times, waiting for "domcontentloaded" between each try.
+        """
+        last_exc: Optional[Exception] = None
+        for _ in range(attempts):
+            try:
+                return await page.content()
+            except Exception as exc:
+                last_exc = exc
+                await page.wait_for_load_state("domcontentloaded")
+                await asyncio.sleep(1)
+        raise last_exc  # type: ignore[misc]
+
     # ========================================================================
     # AUTHENTICATION (Concrete)
     # ========================================================================
@@ -338,9 +361,19 @@ class PJUDBaseScraper(ABC):
                 }}
             """)
             
-            # 4. Wait for navigation to complete
+            # 4. Wait for the redirect chain to settle at the authenticated destination.
+            # PJUD does: sessionN.php → indexN.php (sometimes an extra hop).
+            # wait_for_url pins us to the concrete final URL instead of guessing
+            # with a fixed sleep.  On timeout we fall through; the logged-in
+            # checks below will raise LoginError if auth truly failed.
+            # NOTE: networkidle was intentionally removed (caused timeouts) —
+            # do NOT reintroduce it.
+            try:
+                await page.wait_for_url("**/indexN.php**", timeout=15000)
+            except PlaywrightTimeoutError:
+                pass  # Let the logged-in checks decide
             await page.wait_for_load_state("domcontentloaded")
-            await asyncio.sleep(3)
+            await asyncio.sleep(1)
             
             current_url = page.url
             logger.info(f"Post-login URL: {current_url}")
@@ -349,8 +382,8 @@ class PJUDBaseScraper(ABC):
             if "home/index.php" in current_url:
                 raise LoginError("Session not established - still on login page")
             
-            # 6. Verify session by checking page content
-            page_content = await page.content()
+            # 6. Verify session by checking page content (retry-safe against mid-navigation reads)
+            page_content = await self._safe_page_content(page)
             has_user = (
                 rut_clean in page_content or 
                 'misCausas' in page_content.lower() or
