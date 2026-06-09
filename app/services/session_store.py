@@ -25,9 +25,13 @@ logger = logging.getLogger(__name__)
 # Session TTL in seconds (2 hours = PJUD session duration)
 SESSION_TTL_SECONDS = 2 * 60 * 60  # 7200 seconds
 
+# Session validation cache TTL (5 minutes)
+SESSION_VALIDATION_CACHE_TTL = 5 * 60  # 300 seconds
+
 # Redis key prefix
 SESSION_PREFIX = "pjud:session:"
 LAWYER_SESSIONS_PREFIX = "pjud:lawyer_sessions:"
+SESSION_VALID_CACHE_PREFIX = "pjud:session_valid:"
 
 
 @dataclass
@@ -347,6 +351,88 @@ class SessionStore:
             "last_used_at": session.last_used_at,
             "auth_method": session.auth_method,
         }
+    
+    def is_session_valid_cached(self, session_id: str) -> Optional[bool]:
+        """
+        Check if session validity is cached.
+        
+        Reduces PJUD roundtrips by caching validity for 5 minutes.
+        
+        Args:
+            session_id: Session ID to check
+            
+        Returns:
+            True if cached as valid, False if cached as invalid, None if not cached
+        """
+        if not self._is_available():
+            return None
+        
+        try:
+            cache_key = f"{SESSION_VALID_CACHE_PREFIX}{session_id}"
+            cached = self.redis.get(cache_key)
+            
+            if cached is None:
+                return None
+            
+            return cached == "valid"
+            
+        except Exception as e:
+            logger.debug(f"Cache check failed for {session_id}: {e}")
+            return None
+    
+    def cache_session_validity(self, session_id: str, is_valid: bool) -> bool:
+        """
+        Cache session validity status.
+        
+        Args:
+            session_id: Session ID
+            is_valid: Whether session is valid
+            
+        Returns:
+            True if cached successfully
+        """
+        if not self._is_available():
+            return False
+        
+        try:
+            cache_key = f"{SESSION_VALID_CACHE_PREFIX}{session_id}"
+            value = "valid" if is_valid else "invalid"
+            self.redis.setex(cache_key, SESSION_VALIDATION_CACHE_TTL, value)
+            
+            logger.debug(
+                f"Cached session validity: {session_id} = {value} "
+                f"(TTL: {SESSION_VALIDATION_CACHE_TTL}s)"
+            )
+            return True
+            
+        except Exception as e:
+            logger.debug(f"Failed to cache session validity: {e}")
+            return False
+    
+    def invalidate_session_cache(self, session_id: str) -> bool:
+        """
+        Invalidate cached session validity.
+        
+        Call this when a session is known to be expired or invalid.
+        
+        Args:
+            session_id: Session ID
+            
+        Returns:
+            True if invalidated successfully
+        """
+        if not self._is_available():
+            return False
+        
+        try:
+            cache_key = f"{SESSION_VALID_CACHE_PREFIX}{session_id}"
+            self.redis.delete(cache_key)
+            logger.debug(f"Invalidated session cache: {session_id}")
+            return True
+            
+        except Exception as e:
+            logger.debug(f"Failed to invalidate session cache: {e}")
+            return False
 
 
 # Global instance

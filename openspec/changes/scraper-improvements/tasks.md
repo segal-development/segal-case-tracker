@@ -146,7 +146,7 @@ Chain strategy: stacked-to-main
 
 ### Phase 1: Analysis (~30 lines)
 
-- [ ] PR3-T1: Add timing instrumentation to `BrowserFactory`
+- [x] PR3-T1: Add timing instrumentation to `BrowserFactory`
   - Files: `app/scrapper/pjud/browser.py`
   - Lines: ~30
   - Dependencies: PR2 merged
@@ -154,19 +154,19 @@ Chain strategy: stacked-to-main
 
 ### Phase 2: Core Implementation (~120 lines)
 
-- [ ] PR3-T2: Implement warm browser pool for batch operations
+- [x] PR3-T2: Implement warm browser pool for batch operations
   - Files: `app/scrapper/pjud/browser.py`
   - Lines: ~60
   - Dependencies: PR3-T1
   - Criteria: Pool of 2-3 browsers for batch detail fetch
 
-- [ ] PR3-T3: Add Redis caching for PJUD session validation
+- [x] PR3-T3: Add Redis caching for PJUD session validation
   - Files: `app/services/session_store.py`
   - Lines: ~40
   - Dependencies: None
   - Criteria: Cache session validity for 5 min, reduce PJUD roundtrips
 
-- [ ] PR3-T4: Parallel case detail fetching in sync worker
+- [x] PR3-T4: Parallel case detail fetching in sync worker
   - Files: `app/services/sync_service.py`
   - Lines: ~40
   - Dependencies: PR3-T2
@@ -174,13 +174,13 @@ Chain strategy: stacked-to-main
 
 ### Phase 3: Testing (~50 lines)
 
-- [ ] PR3-T5: Benchmark tests for browser startup
+- [x] PR3-T5: Benchmark tests for browser startup
   - Files: `tests/scrapper/pjud/test_performance.py` (new)
   - Lines: ~30
   - Dependencies: PR3-T1
   - Criteria: Assert browser startup < 3s
 
-- [ ] PR3-T6: Test session cache invalidation
+- [x] PR3-T6: Test session cache invalidation
   - Files: `tests/services/test_session_store.py`
   - Lines: ~20
   - Dependencies: PR3-T3
