@@ -547,7 +547,7 @@ class CivilScraper(PJUDBaseScraper):
         
         try:
             from app.scrapper.pjud.base import PJUD_INDEX_URL
-            await page.goto(PJUD_INDEX_URL, wait_until="networkidle")
+            await page.goto(PJUD_INDEX_URL, wait_until="domcontentloaded")
             await asyncio.sleep(2)
             
             result = await page.evaluate(f"""

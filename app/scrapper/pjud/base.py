@@ -287,7 +287,7 @@ class PJUDBaseScraper(ABC):
         try:
             # 1. Navigate to home to get JWT token
             logger.info(f"Logging in RUT {rut_clean}...")
-            await page.goto(PJUD_HOME_URL, wait_until="networkidle")
+            await page.goto(PJUD_HOME_URL, wait_until="domcontentloaded")
             await asyncio.sleep(1)
             
             # 2. Get the JWT token from the hidden field (dynamically find it by value pattern)
@@ -339,7 +339,7 @@ class PJUDBaseScraper(ABC):
             """)
             
             # 4. Wait for navigation to complete
-            await page.wait_for_load_state("networkidle")
+            await page.wait_for_load_state("domcontentloaded")
             await asyncio.sleep(3)
             
             current_url = page.url
@@ -407,7 +407,7 @@ class PJUDBaseScraper(ABC):
         
         # Check if we're on indexN.php
         if 'indexN.php' not in page.url:
-            await page.goto(PJUD_INDEX_URL, wait_until="networkidle")
+            await page.goto(PJUD_INDEX_URL, wait_until="domcontentloaded")
             await asyncio.sleep(2)
         
         # Check if misCausas function exists

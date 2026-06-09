@@ -100,7 +100,7 @@ class ClaveUnicaAuth:
             # Step 1: Navigate to PJUD home
             logger.info("Navigating to PJUD home page")
             await page.goto(PJUD_HOME_URL, timeout=60000)
-            await page.wait_for_load_state("networkidle", timeout=30000)
+            await page.wait_for_load_state("domcontentloaded", timeout=30000)
             
             # Step 2: Close any welcome modal
             await self._close_modal_if_present(page)
@@ -161,7 +161,7 @@ class ClaveUnicaAuth:
         await link.click()
         
         # Wait for Clave Unica portal to load
-        await page.wait_for_load_state("networkidle", timeout=30000)
+        await page.wait_for_load_state("domcontentloaded", timeout=30000)
         logger.debug("Clicked Clave Unica option, waiting for portal")
     
     async def _fill_clave_unica_form(
@@ -200,7 +200,7 @@ class ClaveUnicaAuth:
                 lambda url: "oficinajudicialvirtual.pjud.cl" in url,
                 timeout=30000
             )
-            await page.wait_for_load_state("networkidle", timeout=30000)
+            await page.wait_for_load_state("domcontentloaded", timeout=30000)
             logger.debug("Redirected back to PJUD after Clave Unica login")
         except PlaywrightTimeout:
             # Check if we got an error message on Clave Unica portal
