@@ -5,6 +5,7 @@ Inherits from PJUDBaseScraper and implements civil-specific logic.
 Uses SelectorRegistry for configurable, hot-reloadable selectors.
 """
 
+import asyncio
 import logging
 import re
 from typing import List, Optional
@@ -22,7 +23,7 @@ from app.scrapper.pjud.base import (
 )
 from app.scrapper.pjud.exceptions import ScrapingError
 from app.scrapper.pjud.selectors import SelectorRegistry
-from app.scrapper.session_manager import PJUDSession
+from app.services.pjud_session import PJUDSession
 
 
 logger = logging.getLogger(__name__)
@@ -611,7 +612,3 @@ class CivilScraper(PJUDBaseScraper):
             ))
         
         return cases
-
-
-# Add missing import at module level
-import asyncio

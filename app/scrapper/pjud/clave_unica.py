@@ -15,14 +15,12 @@ Flow:
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
-from uuid import uuid4
 
 from playwright.async_api import Page, TimeoutError as PlaywrightTimeout
 
 from app.scrapper.pjud.selectors.registry import SelectorRegistry
-from app.services.session_store import PJUDSession
+from app.services.pjud_session import PJUDSession
 
 
 logger = logging.getLogger(__name__)
@@ -259,24 +257,22 @@ class ClaveUnicaAuth:
         except Exception:
             local_storage = "{}"
         
-        # Create session
-        now = datetime.utcnow()
-        expires = now + timedelta(hours=2)  # PJUD sessions last ~2 hours
-        
-        session = PJUDSession(
-            session_id=str(uuid4()),
-            lawyer_id=lawyer_id,
+        # Playwright Cookie objects satisfy dict[str, Any] at runtime; cast
+        # avoids mypy union-attr noise.
+        cookie_dicts: List[Dict[str, Any]] = [dict(c) for c in pjud_cookies]
+
+        # Use canonical factory — UTC-aware, 25-min expiry (ADR-4b), uuid4 id.
+        session = PJUDSession.create(
             rut=rut,
-            cookies=pjud_cookies,
-            created_at=now.isoformat(),
-            expires_at=expires.isoformat(),
+            cookies=cookie_dicts,
             local_storage=local_storage,
             auth_method="clave_unica",
+            lawyer_id=lawyer_id,
         )
         
         logger.info(
             f"Extracted session with {len(pjud_cookies)} cookies, "
-            f"expires at {expires.isoformat()}"
+            f"expires at {session.expires_at.isoformat()}"
         )
         
         return session

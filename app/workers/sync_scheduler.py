@@ -76,9 +76,9 @@ async def sync_lawyer_cases(
     
     logger.info(f"Syncing {competencia} for lawyer {lawyer_id}")
     
-    # Get active session from Redis store
+    # Get active session from Redis store (async)
     store = get_session_store()
-    pjud_session = store.get_session_by_lawyer(lawyer_id)
+    pjud_session = await store.get_session_by_lawyer(lawyer_id)
     
     if not pjud_session:
         logger.warning(f"No active PJUD session for lawyer {lawyer_id}, skipping")

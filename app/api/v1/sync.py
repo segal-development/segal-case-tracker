@@ -110,10 +110,10 @@ async def sync_now(
     if not lawyer_id:
         raise HTTPException(status_code=401, detail="Invalid token")
     
-    # Get session from Redis store
+    # Get session from Redis store (async)
     store = get_session_store()
-    session = store.get_session(request.session_id)
-    
+    session = await store.aget_session_by_id(request.session_id)
+
     if not session:
         raise HTTPException(
             status_code=401,

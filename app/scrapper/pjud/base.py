@@ -21,7 +21,7 @@ from playwright.async_api import (
     TimeoutError as PlaywrightTimeoutError,
 )
 
-from app.scrapper.session_manager import SessionManager, PJUDSession
+from app.services.pjud_session import PJUDSession
 from app.scrapper.pjud.exceptions import (
     LoginError,
     ScrapingError,
@@ -152,10 +152,8 @@ class PJUDBaseScraper(ABC):
     
     def __init__(
         self,
-        session_manager: Optional[SessionManager] = None,
         headless: bool = True,
     ):
-        self.session_manager = session_manager or SessionManager()
         self.headless = headless
         
         self._playwright = None
@@ -252,7 +250,10 @@ class PJUDBaseScraper(ABC):
         
         # Restore cookies if session provided
         if session and session.cookies:
-            await self._context.add_cookies(session.cookies)
+            # session.cookies is List[Dict[str, Any]]; add_cookies expects
+            # Sequence[SetCookieParam] (a dict subclass) — compatible at
+            # runtime; suppress structural-subtype noise.
+            await self._context.add_cookies(session.cookies)  # type: ignore[arg-type]
         
         self._page = await self._context.new_page()
         
@@ -421,17 +422,20 @@ class PJUDBaseScraper(ABC):
             # 7. Extract session data
             cookies = await self._context.cookies()
             local_storage = await page.evaluate("JSON.stringify(localStorage)")
-            
-            session = PJUDSession(
+
+            # Playwright Cookie objects satisfy the dict[str, Any] contract at
+            # runtime; cast avoids mypy union-attr noise.
+            cookie_dicts: List[Dict[str, Any]] = [dict(c) for c in cookies]
+
+            # Use canonical factory — UTC-aware timestamps, uuid4 session_id.
+            # lawyer_id is resolved by the endpoint (Slice 2); default 0 here.
+            session = PJUDSession.create(
                 rut=rut,
-                cookies=cookies,
+                cookies=cookie_dicts,
                 local_storage=local_storage,
-                created_at=datetime.now(),
+                auth_method="captcha",
             )
-            
-            # 8. Cache session
-            await self.session_manager.save_session(session)
-            
+
             logger.info(f"Login successful for RUT {rut_clean}")
             return session
             
@@ -440,10 +444,6 @@ class PJUDBaseScraper(ABC):
         except Exception as e:
             logger.error(f"Login error: {e}")
             raise LoginError(f"Error during login: {str(e)}", cause=e)
-    
-    async def get_session(self, rut: str) -> Optional[PJUDSession]:
-        """Get cached session if valid."""
-        return await self.session_manager.get_session(rut)
     
     # ========================================================================
     # PANEL LOADING (Template Method - uses abstract config)
