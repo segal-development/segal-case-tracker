@@ -10,11 +10,13 @@ Use the original login endpoint to re-authenticate.
 """
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, status, Depends
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from app.core.security import create_access_token, get_current_lawyer
 from app.scrapper.pjud_civil import PJUDCivilScraper, LoginError
@@ -26,6 +28,8 @@ from app.scrapper.pjud.clave_unica import (
 )
 from app.services.session_store import get_session_store
 from app.models.lawyer import Lawyer
+from app.api.deps import get_db
+from app.utils.rut import normalize_rut
 
 
 logger = logging.getLogger(__name__)
@@ -88,12 +92,16 @@ class ClaveUnicaLoginResponse(BaseModel):
 # ============================================================================
 
 @router.post("/login", response_model=LoginResponse)
-async def login(request: LoginRequest):
+async def login(
+    request: LoginRequest,
+    db: Session = Depends(get_db),
+):
     """
     Login con credenciales PJUD (captcha).
 
-    Calls ``login_with_token`` on the scraper (ADR-4), persists the session
-    in Redis via the async store, and returns a signed JWT.
+    Calls ``login_with_token`` on the scraper (ADR-4), resolves (or creates)
+    the lawyer record in the DB, persists the session bound to the real
+    lawyer_id in Redis via the async store, and returns a signed JWT.
     """
     scraper = PJUDCivilScraper()
 
@@ -107,10 +115,9 @@ async def login(request: LoginRequest):
             captcha_token=request.captcha_token,
         )
 
-        # Resolve lawyer (Slice 2 replaces this stub with real DB lookup)
-        lawyer = await _get_or_create_lawyer(request.rut, request.password)
-        if lawyer and pjud_session.lawyer_id == 0:
-            pjud_session.lawyer_id = int(lawyer.id)
+        # Resolve (or create) the lawyer and bind the real id to the session
+        lawyer = _get_or_create_lawyer(db, rut=request.rut, auth_method="captcha")
+        pjud_session.lawyer_id = lawyer.id
 
         # Persist session via async store
         store = get_session_store()
@@ -127,8 +134,8 @@ async def login(request: LoginRequest):
             expires_in=24 * 60 * 60,
             lawyer=LawyerInfo(
                 rut=request.rut,
-                name=lawyer.name if lawyer else None,
-                email=lawyer.email if lawyer else None,
+                name=lawyer.name,
+                email=lawyer.email,
             ),
         )
 
@@ -147,25 +154,28 @@ async def login(request: LoginRequest):
 
 
 @router.post("/login/clave-unica", response_model=ClaveUnicaLoginResponse)
-async def login_clave_unica(request: ClaveUnicaLoginRequest):
+async def login_clave_unica(
+    request: ClaveUnicaLoginRequest,
+    db: Session = Depends(get_db),
+):
     """
     Login via Clave Única (Chilean digital identity).
 
     No captcha required — uses Clave Única credentials directly.
-    Persists session in Redis via the async store.
+    Resolves (or creates) the lawyer record, then persists the session
+    bound to the real lawyer_id in Redis via the async store.
     """
     credentials = ClaveUnicaCredentials(rut=request.rut, password=request.password)
 
-    # Resolve lawyer (Slice 2 wires real DB lookup)
-    lawyer = await _get_or_create_lawyer(request.rut, request.password)
-    lawyer_id = int(lawyer.id) if lawyer else 0
+    # Resolve (or create) the lawyer before starting the browser
+    lawyer = _get_or_create_lawyer(db, rut=request.rut, auth_method="clave_unica")
 
     try:
         async with BrowserFactory(headless=True) as factory:
             page = await factory.new_page()
 
             auth = ClaveUnicaAuth()
-            pjud_session = await auth.login(page, credentials, lawyer_id)
+            pjud_session = await auth.login(page, credentials, lawyer.id)
 
             # Persist session
             store = get_session_store()
@@ -186,8 +196,8 @@ async def login_clave_unica(request: ClaveUnicaLoginRequest):
                 auth_method="clave_unica",
                 lawyer=LawyerInfo(
                     rut=request.rut,
-                    name=lawyer.name if lawyer else None,
-                    email=lawyer.email if lawyer else None,
+                    name=lawyer.name,
+                    email=lawyer.email,
                 ),
             )
 
@@ -252,7 +262,50 @@ async def logout(current_rut: str = Depends(get_current_lawyer)):
 # HELPERS
 # ============================================================================
 
-async def _get_or_create_lawyer(rut: str, password: str) -> Optional[Lawyer]:
-    """Get or create lawyer in database (Slice 2 stub)."""
-    # TODO (Slice 2): implement with SQLAlchemy + _get_or_create_lawyer(db, rut, ...)
-    return None
+def _get_or_create_lawyer(
+    db: Session,
+    rut: str,
+    auth_method: str = "captcha",
+) -> Lawyer:
+    """Look up a Lawyer by normalized RUT, creating one if absent (ADR-5).
+
+    The operation is idempotent: concurrent inserts are handled by catching
+    IntegrityError and re-querying the row that won the race.
+
+    Identity-only (Slice 2): stores rut, name placeholder, and last_login_at.
+    Slice 3 will extend this function to populate encrypted credential columns.
+
+    Args:
+        db: SQLAlchemy session (sync).
+        rut: Lawyer RUT in any input format — normalized internally.
+        auth_method: "captcha" or "clave_unica"; stored as preferred_auth_method
+                     when creating a new record.
+
+    Returns:
+        Persisted Lawyer instance with a valid integer id.  Never returns None.
+    """
+    normalized = normalize_rut(rut)
+
+    lawyer = db.query(Lawyer).filter(Lawyer.rut == normalized).first()
+    if lawyer is None:
+        lawyer = Lawyer(
+            rut=normalized,
+            name=normalized,  # placeholder; Slice 3 / profile sync will update
+            preferred_auth_method=auth_method,
+            is_active=True,
+        )
+        db.add(lawyer)
+        try:
+            db.commit()
+            db.refresh(lawyer)
+        except IntegrityError:
+            # Another request won the INSERT race — roll back and fetch the winner.
+            db.rollback()
+            lawyer = db.query(Lawyer).filter(Lawyer.rut == normalized).first()
+
+    # Update last_login_at on every successful authentication
+    lawyer.last_login_at = datetime.now(tz=timezone.utc)
+    db.commit()
+    db.refresh(lawyer)
+
+    return lawyer
