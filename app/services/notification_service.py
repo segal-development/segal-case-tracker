@@ -1,71 +1,215 @@
-"""Notification service - Email and webhook notifications."""
+"""Notification service - Email (SendGrid) and HMAC-signed webhook notifications."""
 
-from typing import List, Optional
+import hashlib
+import hmac
+import json
+import logging
+from datetime import datetime
+from typing import List
+
+import httpx
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.models.alert import Alert
+from app.models.case import Case
+from app.models.lawyer import Lawyer
+from app.models.movement import Movement
 from app.models.webhook import Webhook
+
+logger = logging.getLogger(__name__)
 
 
 class NotificationService:
     """Handle email and webhook notifications."""
-    
+
     def __init__(self, db: Session):
         self.db = db
-    
-    async def send_email_alert(
-        self,
-        to_email: str,
-        subject: str,
-        body: str,
-    ) -> bool:
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def send_email_alert(self, alert: Alert, lawyer: Lawyer) -> bool:
         """
         Send an email alert via SendGrid.
-        
-        Returns:
-            True if sent successfully
+
+        Returns True on 2xx success, False otherwise.
+        Never raises — failures are logged and suppressed so callers (e.g. the
+        sync pipeline) are never blocked by notification errors.
         """
-        # TODO: Implement SendGrid email sending
-        raise NotImplementedError("Email sending not implemented")
-    
-    async def send_webhook(
+        if not settings.SENDGRID_API_KEY:
+            logger.warning(
+                "SENDGRID_API_KEY is not configured; skipping email for alert %s",
+                alert.id,
+            )
+            return False
+
+        try:
+            mail = Mail(
+                from_email=settings.FROM_EMAIL,
+                to_emails=lawyer.email,
+                subject=alert.title,
+                plain_text_content=alert.message,
+            )
+            client = SendGridAPIClient(settings.SENDGRID_API_KEY)
+            response = client.send(mail)
+
+            if 200 <= response.status_code < 300:
+                alert.email_sent = True
+                alert.email_sent_at = datetime.utcnow()
+                self.db.flush()
+                return True
+
+            logger.error(
+                "SendGrid returned non-2xx status %s for alert %s",
+                response.status_code,
+                alert.id,
+            )
+            return False
+
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to send email for alert %s: %s", alert.id, exc)
+            return False
+
+    def send_webhook(self, webhook: Webhook, payload: dict) -> bool:
+        """
+        POST a JSON payload to a webhook URL with HMAC-SHA256 signature.
+
+        The body is the canonical JSON of the payload (sorted keys, no spaces).
+        The signature covers exactly that byte sequence.
+
+        Returns True on 2xx, False otherwise.
+        Never raises — failures increment webhook.failure_count and are logged.
+        """
+        # Canonical JSON — deterministic key order, no extra whitespace
+        body = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+
+        headers: dict = {"Content-Type": "application/json"}
+
+        if webhook.secret:
+            sig = hmac.new(
+                webhook.secret.encode(),
+                body.encode(),
+                hashlib.sha256,
+            ).hexdigest()
+            headers["X-Webhook-Signature"] = f"sha256={sig}"
+        else:
+            logger.warning(
+                "Webhook %s has no secret configured; sending unsigned request",
+                webhook.id,
+            )
+
+        try:
+            with httpx.Client(timeout=10) as client:
+                response = client.post(webhook.url, content=body, headers=headers)
+
+            if 200 <= response.status_code < 300:
+                return True
+
+            logger.error(
+                "Webhook %s returned non-2xx status %s",
+                webhook.id,
+                response.status_code,
+            )
+            webhook.failure_count = (webhook.failure_count or 0) + 1
+            self.db.flush()
+            return False
+
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Webhook %s POST failed: %s", webhook.id, exc)
+            webhook.failure_count = (webhook.failure_count or 0) + 1
+            self.db.flush()
+            return False
+
+    def notify_new_movement(
         self,
-        webhook: Webhook,
-        event_type: str,
-        payload: dict,
-    ) -> bool:
-        """
-        Send a webhook notification.
-        
-        Returns:
-            True if sent successfully
-        """
-        # TODO: Implement webhook sending with HMAC signing
-        raise NotImplementedError("Webhook sending not implemented")
-    
-    async def notify_new_movement(
-        self,
-        lawyer_id: int,
-        case_id: int,
-        movement_id: int,
+        alert: Alert,
+        case: Case,
+        movement: Movement,
+        lawyer: Lawyer,
+        webhooks: List[Webhook],
     ) -> None:
         """
-        Send notifications for a new movement.
-        
-        1. Create alert record
-        2. Send email if configured
-        3. Send webhooks if configured
+        Dispatch email + webhook notifications for a new movement.
+
+        Builds the v1 event payload, sends email via SendGrid, then fans out
+        to all active webhooks.  One channel failing never blocks the other.
+        Never raises.
+
+        Field-name notes vs. the raw PJUD concepts:
+        - case.tribunal  → case.court.name  (Court relationship)
+        - case.caratulado → composed from case.plaintiff / case.defendant
+        - movement.fecha  → movement.movement_date  (DateTime field)
+        - movement.descripcion → movement.description
+        - movement.etapa → movement.stage
         """
-        # TODO: Implement notification logic
-        pass
-    
+        payload = {
+            "event": "movement.created",
+            "version": "1",
+            "data": {
+                "lawyer_id": lawyer.id,
+                "case": {
+                    "rol": case.rol,
+                    "tribunal": case.court.name if case.court else "",
+                    "caratulado": (
+                        f"{case.plaintiff}/{case.defendant}"
+                        if case.defendant
+                        else (case.plaintiff or "")
+                    ),
+                },
+                "movement": {
+                    "folio": movement.folio,
+                    "fecha": str(movement.movement_date),
+                    "descripcion": movement.description,
+                    "etapa": movement.stage,
+                },
+            },
+        }
+
+        # Email — failure must not block webhooks
+        try:
+            self.send_email_alert(alert, lawyer)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Unexpected error sending email for alert %s: %s", alert.id, exc
+            )
+
+        # Webhooks — each failure is isolated
+        webhook_success = False
+        for webhook in webhooks:
+            if not webhook.is_active:
+                continue
+            try:
+                if self.send_webhook(webhook, payload):
+                    webhook_success = True
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Unexpected error delivering webhook %s: %s", webhook.id, exc
+                )
+
+        if webhook_success:
+            alert.webhook_sent = True
+            alert.webhook_sent_at = datetime.utcnow()
+            self.db.flush()
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
     def get_lawyer_webhooks(
         self,
         lawyer_id: int,
         event_type: str,
     ) -> List[Webhook]:
         """Get active webhooks for a lawyer that handle a specific event."""
-        return self.db.query(Webhook).filter(
-            Webhook.lawyer_id == lawyer_id,
-            Webhook.is_active == True,
-        ).all()  # TODO: Filter by event type in JSON
+        return (
+            self.db.query(Webhook)
+            .filter(
+                Webhook.lawyer_id == lawyer_id,
+                Webhook.is_active == True,  # noqa: E712
+            )
+            .all()
+        )
