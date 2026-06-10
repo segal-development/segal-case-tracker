@@ -4,6 +4,30 @@ import re
 from typing import Optional
 
 
+def normalize_rut(rut: str) -> str:
+    """Normalize a Chilean RUT to canonical form ``{digits}-{verif}``.
+
+    Removes dots and extra spaces, uppercases the verification digit (k → K),
+    and ensures a hyphen separates the numeric part from the verification digit.
+    The verification digit is always preserved — never stripped — so the result
+    is safe for storage and keying (the PJUD form submission strips it
+    internally in the scraper, not here).
+
+    Examples::
+
+        normalize_rut("12.345.678-9")  → "12345678-9"
+        normalize_rut("12345678-k")    → "12345678-K"
+        normalize_rut(" 12345678-9 ")  → "12345678-9"
+
+    Args:
+        rut: RUT in any format — with or without dots, spaces, or hyphen.
+
+    Returns:
+        Canonical RUT string, e.g. ``"12345678-9"`` or ``"12345678-K"``.
+    """
+    return clean_rut(rut)
+
+
 def clean_rut(rut: str) -> str:
     """
     Clean RUT removing dots and spaces.

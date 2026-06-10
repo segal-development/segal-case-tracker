@@ -232,3 +232,50 @@ class TestPjudLoginEndpoint:
             )
 
             mock_store.asave_session.assert_awaited()
+
+    def test_login_session_bound_to_real_lawyer_id(self, client):
+        """Session persisted from /pjud/login must carry a DB-resolved lawyer_id (LID-02/03).
+
+        The scraper returns lawyer_id=0 by default; the endpoint must replace
+        it with the integer id assigned by _get_or_create_lawyer.
+        """
+        from app.services.pjud_session import PJUDSession
+
+        captured_sessions = []
+
+        async def capture_save(session):
+            captured_sessions.append(session)
+
+        fake_session = PJUDSession.create(
+            rut="12345678-9",
+            cookies=[],
+            auth_method="captcha",
+            lawyer_id=0,  # scraper default — must be replaced
+        )
+
+        with patch("app.api.v1.pjud.get_scraper") as mock_scraper_fn, \
+             patch("app.api.v1.pjud.get_session_store") as mock_store_fn:
+
+            mock_scraper = MagicMock()
+            mock_scraper.login_with_token = AsyncMock(return_value=fake_session)
+            mock_scraper.close = AsyncMock()
+            mock_scraper_fn.return_value = mock_scraper
+
+            mock_store = MagicMock()
+            mock_store.asave_session = AsyncMock(side_effect=capture_save)
+            mock_store_fn.return_value = mock_store
+
+            response = client.post(
+                "/api/v1/pjud/login",
+                json={"rut": "12345678-9", "password": "pass", "captcha_token": "tok"},
+            )
+
+        assert response.status_code == 200
+        assert len(captured_sessions) == 1
+        persisted = captured_sessions[0]
+        assert persisted.lawyer_id != 0, (
+            "Session was saved with hardcoded lawyer_id=0; "
+            "expected the DB-resolved id from _get_or_create_lawyer"
+        )
+        assert isinstance(persisted.lawyer_id, int)
+        assert persisted.lawyer_id >= 1

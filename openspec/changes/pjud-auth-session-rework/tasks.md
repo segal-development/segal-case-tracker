@@ -434,3 +434,19 @@ S3-T7/T8        ── independent of T4–T6; can run in parallel
 S3-T9 (gate)    ── blocks merge only; code can be complete before sign-off
 S3-T10 (verify) ── last in slice 3
 ```
+
+## Slice 4 — Scheduled worker movement detection (added after Slice 1)
+
+**Why:** The scheduled worker (`app/workers/sync_scheduler.py`) only syncs the case LIST; it never enters the per-case detail page, so movements and `last_movement_at` stay empty and the notification engine never fires autonomously. The PJUD case-detail "Historia" table (Folio / Etapa / Trámite / Desc. Trámite / Fec. Trámite / Foja) is the movement source. The parsing already exists (`get_case_detail` / `_parse_case_detail_html`) and is used by `POST /sync` — Slice 4 is WIRING that into the worker, not new scraping.
+
+> Tasks below are a stub; formalize (test-first, per strict TDD) when reached, after S3-T10 is green.
+
+- [ ] S4-T1 (impl): extract the movement-detection flow from `POST /sync` (`_select_cases_for_movement_check` → `get_case_detail` → `convert_api_movements_to_scraped` → `sync_service.sync_movements`) into a reusable service function, if not already reusable.
+- [ ] S4-T2 (test): given a lawyer's synced cases, the worker selects cases for movement check (scoped, not all 2524), fetches detail (mock `get_case_detail`), and persists new Movement rows + sets `last_movement_at`.
+- [ ] S4-T3 (impl): call that flow inside `sync_lawyer_cases` after the case-list sync; record `movements_new` in `sync_history`.
+- [ ] S4-T4 (test): a new movement triggers a notification dispatch (mock `NotificationService`).
+- [ ] S4-T5 (impl): apply movement-check scoping/throttle so each run doesn't scrape every case (rate-limit per PJUD-friendliness; reuse the existing `await asyncio.sleep` delay pattern).
+- [ ] S4-T6 (verify): mock-based gate green; `last_movement_at` populated in tests; no live scrape.
+
+**Depends on:** S3-T10 green (needs the autonomous session from Slice 3 to actually run unattended).
+**Est. size:** ~300-400 lines, mostly wiring + tests (reuses existing detail-parse + notification code).
