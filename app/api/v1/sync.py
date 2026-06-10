@@ -19,6 +19,8 @@ from app.services.sync_service import (
     SyncService,
     SyncResult,
     convert_api_cases_to_scraped,
+    convert_api_movements_to_scraped,
+    _select_cases_for_movement_check,
 )
 from app.services.session_store import get_session_store
 
@@ -34,6 +36,7 @@ class SyncRequest(BaseModel):
     competencia: str = "civil"  # civil, laboral, penal
     year: Optional[str] = None  # Filter by year
     session_id: str  # PJUD session ID from login
+    rol: Optional[str] = None  # If set, only fetch movements for this ROL (demo scoping)
 
 
 class SyncStatusResponse(BaseModel):
@@ -150,9 +153,95 @@ async def sync_now(
             year=request.year,
             triggered_by="manual",
         )
-        
+
+        # ------------------------------------------------------------------ #
+        # Movement detection — fetch case details and detect new movements.   #
+        # Demo scoping: if `rol` is provided → only that case;               #
+        # otherwise → cap at the first 5 cases so live demos stay fast.      #
+        # ------------------------------------------------------------------ #
+        from app.models.case import Case as CaseModel
+
+        cases_for_check = _select_cases_for_movement_check(cases, rol=request.rol)
+
+        if not cases_for_check:
+            if request.rol:
+                logger.warning(
+                    "sync: rol=%s provided but not found in PJUD results; "
+                    "skipping movement detection",
+                    request.rol,
+                )
+        else:
+            cap_msg = (
+                f"rol={request.rol}"
+                if request.rol
+                else f"first {len(cases_for_check)} of {len(cases)} cases (demo cap)"
+            )
+            logger.info("sync: fetching movements for %s", cap_msg)
+
+        for api_case in cases_for_check:
+            if not api_case.case_token:
+                logger.debug(
+                    "sync: no case_token for %s, skipping movement fetch", api_case.rol
+                )
+                continue
+
+            try:
+                detail = await scraper.get_case_detail(
+                    session=session,
+                    case_token=api_case.case_token,
+                )
+
+                scraped_movements = convert_api_movements_to_scraped([
+                    {
+                        "folio": m.folio,
+                        "fecha": m.fecha,
+                        "tipo_tramite": m.tipo_tramite,
+                        "descripcion": m.descripcion,
+                        "etapa": m.etapa,
+                        "foja": m.foja,
+                        "tiene_documento": m.tiene_documento,
+                    }
+                    for m in detail.movements
+                ])
+
+                db_case = db.query(CaseModel).filter(
+                    CaseModel.lawyer_id == int(lawyer_id),
+                    CaseModel.rol == api_case.rol,
+                ).first()
+
+                if db_case and scraped_movements:
+                    new_movements, new_alerts = sync_service.sync_movements(
+                        case_id=db_case.id,
+                        scraped_movements=scraped_movements,
+                    )
+                    result.movements_new += new_movements
+                    result.alerts_created += new_alerts
+                    logger.info(
+                        "sync: %s → %d new movements, %d alerts",
+                        api_case.rol,
+                        new_movements,
+                        new_alerts,
+                    )
+                elif not db_case:
+                    logger.warning(
+                        "sync: DB case not found for rol=%s lawyer=%s; "
+                        "movements skipped",
+                        api_case.rol,
+                        lawyer_id,
+                    )
+
+            except Exception as exc:
+                logger.error(
+                    "sync: failed to fetch/process movements for %s: %s",
+                    api_case.rol,
+                    exc,
+                )
+                result.errors.append(
+                    f"Movement fetch failed for {api_case.rol}: {str(exc)}"
+                )
+
         duration = int((datetime.utcnow() - start_time).total_seconds())
-        
+
         return SyncResponse(
             success=True,
             message=f"Synced {result.cases_total} cases from PJUD",

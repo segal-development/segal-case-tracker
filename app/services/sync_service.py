@@ -33,6 +33,8 @@ from app.models.court import Court
 from app.models.alert import Alert
 from app.models.lawyer import Lawyer
 from app.models.sync_history import SyncHistory
+from app.models.webhook import Webhook
+from app.services.notification_service import NotificationService
 
 
 @dataclass
@@ -202,6 +204,27 @@ class SyncService:
                 alert = self._create_movement_alert(case, movement)
                 if alert:
                     alert_count += 1
+                    # Dispatch notification — failure must never break the sync
+                    try:
+                        lawyer = self.db.query(Lawyer).filter(
+                            Lawyer.id == case.lawyer_id
+                        ).first()
+                        if lawyer:
+                            webhooks = self.db.query(Webhook).filter(
+                                Webhook.lawyer_id == lawyer.id,
+                                Webhook.is_active == True,  # noqa: E712
+                            ).all()
+                            NotificationService(self.db).notify_new_movement(
+                                alert, case, movement, lawyer, webhooks
+                            )
+                    except Exception as exc:
+                        logger.error(
+                            "Failed to dispatch notification for alert on case %s "
+                            "movement %s: %s",
+                            case.id,
+                            movement.id,
+                            exc,
+                        )
         
         # Update last_movement_at on case
         if scraped_movements:
@@ -529,5 +552,31 @@ async def fetch_case_details_parallel(
     
     successful = sum(1 for _, result, _ in results if result is not None)
     logger.info(f"Fetched {successful}/{len(case_ids)} case details successfully")
-    
+
     return results
+
+
+# Default cap on cases processed for movement detection in an on-demand sync
+MOVEMENT_CHECK_DEFAULT_MAX = 5
+
+
+def _select_cases_for_movement_check(
+    api_cases: list,
+    rol: Optional[str],
+    max_cases: int = MOVEMENT_CHECK_DEFAULT_MAX,
+) -> list:
+    """
+    Choose which scraped cases to run movement detection on.
+
+    Args:
+        api_cases: List of PJUDCase objects returned by get_my_cases.
+        rol: If provided, return only the case whose .rol matches.
+             If None, return at most *max_cases* from the front of the list.
+        max_cases: Cap when no rol filter is given (default: 5).
+
+    Returns:
+        Filtered/capped list of PJUDCase objects.
+    """
+    if rol:
+        return [c for c in api_cases if c.rol == rol]
+    return api_cases[:max_cases]
