@@ -1,449 +1,296 @@
 """
-Session Store - Persist PJUD sessions in Redis.
+Session Store — persist PJUD sessions in Redis (async).
 
-Sessions are stored with a 2-hour TTL matching PJUD session duration.
-The worker reads these sessions to perform background sync.
+Key strategy (ADR-2):
+  PRIMARY   pjud:session:lawyer:{lawyer_id}  → full JSON  (worker hot path)
+  SECONDARY pjud:session:id:{session_id}     → lawyer_id  (pjud.py lookup)
+  SECONDARY pjud:session:rut:{rut_clean}     → lawyer_id  (auth session-status/logout)
 
-Flow:
-1. Lawyer solves captcha and logs in via API
-2. Session stored in Redis with lawyer_id as key
-3. Worker checks Redis for active sessions
-4. Worker uses session to sync cases
-5. If session expired, notify lawyer to re-login
+TTL for all three keys equals ``session.time_until_expiry()`` so they
+expire together with the session.
+
+Sync validation-cache methods (``is_session_valid_cached`` etc.) are kept
+for backward compatibility with existing callers; they use the sync
+``get_redis_client()``.
 """
 
-import json
 import logging
-from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
+from typing import Any, Dict, List, Optional
 
-from app.core.redis import get_redis_client
+from app.core.redis import get_redis_client, get_async_redis_client
+from app.services.pjud_session import PJUDSession  # canonical model; re-exported below
+
+# Sentinel — distinguishes "auto-detect Redis" from "explicitly disabled"
+_UNSET: Any = object()
 
 logger = logging.getLogger(__name__)
 
-# Session TTL in seconds (2 hours = PJUD session duration)
-SESSION_TTL_SECONDS = 2 * 60 * 60  # 7200 seconds
+# ---------------------------------------------------------------------------
+# Constants kept for backward compatibility with existing test imports
+# ---------------------------------------------------------------------------
 
-# Session validation cache TTL (5 minutes)
 SESSION_VALIDATION_CACHE_TTL = 5 * 60  # 300 seconds
-
-# Redis key prefix
-SESSION_PREFIX = "pjud:session:"
-LAWYER_SESSIONS_PREFIX = "pjud:lawyer_sessions:"
 SESSION_VALID_CACHE_PREFIX = "pjud:session_valid:"
 
+# Kept for tests that import these names from this module
+SESSION_PREFIX = "pjud:session:"
+LAWYER_SESSIONS_PREFIX = "pjud:lawyer_sessions:"
 
-@dataclass
-class PJUDSession:
-    """
-    Stored PJUD session data.
-    
-    Attributes:
-        session_id: Unique session identifier
-        lawyer_id: Database ID of the lawyer
-        rut: Lawyer's RUT (Chilean tax ID)
-        cookies: Playwright cookies for session restoration
-        created_at: ISO timestamp when session was created
-        expires_at: ISO timestamp when session expires
-        local_storage: localStorage JSON string for restoration
-        last_used_at: ISO timestamp of last use (optional)
-        auth_method: Authentication method used ("captcha" or "clave_unica")
-    """
-    session_id: str
-    lawyer_id: int
-    rut: str
-    cookies: List[Dict[str, Any]]  # Playwright cookies (List of dicts)
-    created_at: str  # ISO format
-    expires_at: str  # ISO format
-    local_storage: str = "{}"  # localStorage JSON string
-    last_used_at: Optional[str] = None
-    auth_method: str = "captcha"  # "captcha" or "clave_unica"
-    
-    def to_dict(self) -> dict:
-        return asdict(self)
-    
-    @classmethod
-    def from_dict(cls, data: dict) -> "PJUDSession":
-        # Handle missing auth_method for backward compatibility
-        if "auth_method" not in data:
-            data["auth_method"] = "captcha"
-        return cls(**data)
-    
-    def is_expired(self) -> bool:
-        """Check if session is expired."""
-        expires = datetime.fromisoformat(self.expires_at)
-        return datetime.utcnow() > expires
-    
-    def time_until_expiry(self) -> timedelta:
-        """Get time until session expires."""
-        expires = datetime.fromisoformat(self.expires_at)
-        return expires - datetime.utcnow()
+# New canonical key prefixes (ADR-2)
+_LAWYER_KEY = "pjud:session:lawyer:"
+_ID_KEY = "pjud:session:id:"
+_RUT_KEY = "pjud:session:rut:"
+
+
+def _rut_clean(rut: str) -> str:
+    return rut.replace("-", "").replace(".", "")
 
 
 class SessionStore:
     """
-    Redis-backed session store for PJUD sessions.
-    
-    Usage:
-        store = SessionStore()
-        
-        # Save session after login
-        store.save_session(session)
-        
-        # Get session for sync
-        session = store.get_session_by_lawyer(lawyer_id)
-        
-        # Check active sessions for worker
-        sessions = store.get_all_active_sessions()
+    Single async-native session store.
+
+    ``redis_client`` — inject a ``fakeredis.aioredis.FakeRedis`` (or any
+    ``redis.asyncio.Redis``-compatible client) in tests; pass ``None`` to
+    fall back to the module-level ``get_async_redis_client()`` singleton.
     """
-    
-    def __init__(self):
-        self.redis = get_redis_client()
-    
-    def _is_available(self) -> bool:
-        """Check if Redis is available."""
-        return self.redis is not None
-    
-    def save_session(self, session: PJUDSession) -> bool:
+
+    def __init__(self, redis_client: Any = _UNSET) -> None:
+        # _UNSET → auto-detect via get_async_redis_client() on first use
+        # None   → explicitly disabled (no Redis available)
+        # other  → injected client (e.g. fakeredis in tests)
+        self._async_redis = redis_client
+        # Sync client: used only by legacy validation-cache methods
+        self._sync_redis = get_redis_client()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    async def _redis(self) -> Optional[Any]:
+        """Return the async Redis client.
+
+        - Injected client (including FakeRedis) → returned as-is.
+        - ``None`` → caller explicitly disabled Redis; return None.
+        - ``_UNSET`` (default) → auto-detect via ``get_async_redis_client()``.
         """
-        Save a PJUD session to Redis.
-        
-        Args:
-            session: Session data to store
-            
-        Returns:
-            True if saved successfully
+        if self._async_redis is None:
+            return None
+        if self._async_redis is not _UNSET:
+            return self._async_redis
+        return await get_async_redis_client()
+
+    def _sync_available(self) -> bool:
+        return self._sync_redis is not None
+
+    # ------------------------------------------------------------------
+    # Primary async session operations
+    # ------------------------------------------------------------------
+
+    async def asave_session(self, session: PJUDSession) -> bool:
+        """Persist a session under all three keys.
+
+        Returns True on success, False on error or expired session.
         """
-        if not self._is_available():
-            logger.warning("Redis not available, session not persisted")
+        redis = await self._redis()
+        if redis is None:
+            logger.warning("Redis not available — session not persisted")
             return False
-        
+
         try:
-            key = f"{SESSION_PREFIX}{session.session_id}"
-            data = json.dumps(session.to_dict())
-            
-            # Calculate TTL based on expiry time
             ttl = int(session.time_until_expiry().total_seconds())
             if ttl <= 0:
-                logger.warning(f"Session {session.session_id} already expired")
+                logger.warning("Session %s is already expired, not saving", session.session_id)
                 return False
-            
-            # Store session
-            self.redis.setex(key, ttl, data)
-            
-            # Also index by lawyer_id for quick lookup
-            lawyer_key = f"{LAWYER_SESSIONS_PREFIX}{session.lawyer_id}"
-            self.redis.setex(lawyer_key, ttl, session.session_id)
-            
+
+            payload = session.to_redis()
+            rut = _rut_clean(session.rut)
+
+            await redis.setex(f"{_LAWYER_KEY}{session.lawyer_id}", ttl, payload)
+            await redis.setex(f"{_ID_KEY}{session.session_id}", ttl, str(session.lawyer_id))
+            await redis.setex(f"{_RUT_KEY}{rut}", ttl, str(session.lawyer_id))
+
             logger.info(
-                f"Saved session {session.session_id} for lawyer {session.lawyer_id}, "
-                f"TTL: {ttl}s, auth_method: {session.auth_method}"
+                "Saved session %s for lawyer %d, TTL: %ds, method: %s",
+                session.session_id,
+                session.lawyer_id,
+                ttl,
+                session.auth_method,
             )
             return True
-            
-        except Exception as e:
-            logger.error(f"Failed to save session: {e}")
+
+        except Exception as exc:
+            logger.error("Failed to save session: %s", exc)
             return False
-    
-    def get_session(self, session_id: str) -> Optional[PJUDSession]:
-        """
-        Get a session by ID.
-        
-        Args:
-            session_id: Session ID
-            
-        Returns:
-            Session if found and not expired, None otherwise
-        """
-        if not self._is_available():
+
+    async def get_session_by_lawyer(self, lawyer_id: int) -> Optional[PJUDSession]:
+        """Retrieve the active session for a lawyer (primary key)."""
+        redis = await self._redis()
+        if redis is None:
             return None
-        
+
         try:
-            key = f"{SESSION_PREFIX}{session_id}"
-            data = self.redis.get(key)
-            
+            data = await redis.get(f"{_LAWYER_KEY}{lawyer_id}")
             if not data:
                 return None
-            
-            session = PJUDSession.from_dict(json.loads(data))
-            
-            # Double-check expiry (Redis TTL should handle this, but be safe)
+            session = PJUDSession.from_redis(data)
             if session.is_expired():
-                self.delete_session(session_id)
+                await redis.delete(f"{_LAWYER_KEY}{lawyer_id}")
                 return None
-            
             return session
-            
-        except Exception as e:
-            logger.error(f"Failed to get session {session_id}: {e}")
+        except Exception as exc:
+            logger.error("Failed to get session for lawyer %d: %s", lawyer_id, exc)
             return None
-    
-    def get_session_by_lawyer(self, lawyer_id: int) -> Optional[PJUDSession]:
-        """
-        Get active session for a lawyer.
-        
-        Args:
-            lawyer_id: Lawyer ID
-            
-        Returns:
-            Active session if exists, None otherwise
-        """
-        if not self._is_available():
+
+    async def aget_session_by_id(self, session_id: str) -> Optional[PJUDSession]:
+        """Retrieve the active session by session_id (secondary key)."""
+        redis = await self._redis()
+        if redis is None:
             return None
-        
+
         try:
-            lawyer_key = f"{LAWYER_SESSIONS_PREFIX}{lawyer_id}"
-            session_id = self.redis.get(lawyer_key)
-            
-            if not session_id:
+            lawyer_id_str = await redis.get(f"{_ID_KEY}{session_id}")
+            if not lawyer_id_str:
                 return None
-            
-            return self.get_session(session_id)
-            
-        except Exception as e:
-            logger.error(f"Failed to get session for lawyer {lawyer_id}: {e}")
+            return await self.get_session_by_lawyer(int(lawyer_id_str))
+        except Exception as exc:
+            logger.error("Failed to get session %s: %s", session_id, exc)
             return None
-    
-    def delete_session(self, session_id: str) -> bool:
-        """
-        Delete a session.
-        
-        Args:
-            session_id: Session ID to delete
-            
-        Returns:
-            True if deleted
-        """
-        if not self._is_available():
-            return False
-        
+
+    async def aget_session_by_rut(self, rut: str) -> Optional[PJUDSession]:
+        """Retrieve the active session by RUT (secondary key)."""
+        redis = await self._redis()
+        if redis is None:
+            return None
+
         try:
-            # Get session first to find lawyer_id
-            session = self.get_session(session_id)
-            
-            key = f"{SESSION_PREFIX}{session_id}"
-            self.redis.delete(key)
-            
-            # Also remove lawyer index
-            if session:
-                lawyer_key = f"{LAWYER_SESSIONS_PREFIX}{session.lawyer_id}"
-                self.redis.delete(lawyer_key)
-            
-            logger.info(f"Deleted session {session_id}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to delete session {session_id}: {e}")
+            rut = _rut_clean(rut)
+            lawyer_id_str = await redis.get(f"{_RUT_KEY}{rut}")
+            if not lawyer_id_str:
+                return None
+            return await self.get_session_by_lawyer(int(lawyer_id_str))
+        except Exception as exc:
+            logger.error("Failed to get session for rut %s: %s", rut, exc)
+            return None
+
+    async def adelete_session(self, session_id: str) -> bool:
+        """Delete a session and all its secondary keys by session_id."""
+        redis = await self._redis()
+        if redis is None:
             return False
-    
-    def update_last_used(self, session_id: str) -> bool:
-        """
-        Update last_used_at timestamp for a session.
-        
-        Args:
-            session_id: Session ID
-            
-        Returns:
-            True if updated
-        """
-        if not self._is_available():
-            return False
-        
+
         try:
-            session = self.get_session(session_id)
+            session = await self.aget_session_by_id(session_id)
             if not session:
-                return False
-            
-            session.last_used_at = datetime.utcnow().isoformat()
-            return self.save_session(session)
-            
-        except Exception as e:
-            logger.error(f"Failed to update last_used for {session_id}: {e}")
+                # Try to clean up the session_id key even if primary is gone
+                await redis.delete(f"{_ID_KEY}{session_id}")
+                return True
+
+            keys = [
+                f"{_LAWYER_KEY}{session.lawyer_id}",
+                f"{_ID_KEY}{session_id}",
+                f"{_RUT_KEY}{_rut_clean(session.rut)}",
+            ]
+            await redis.delete(*keys)
+            return True
+        except Exception as exc:
+            logger.error("Failed to delete session %s: %s", session_id, exc)
             return False
-    
-    def get_all_active_sessions(self) -> List[PJUDSession]:
-        """
-        Get all active (non-expired) sessions.
-        
-        Used by the worker to find sessions for sync.
-        
-        Returns:
-            List of active sessions
-        """
-        if not self._is_available():
-            return []
-        
+
+    async def adelete_session_by_rut(self, rut: str) -> bool:
+        """Delete a session and all its keys using the rut secondary key."""
+        redis = await self._redis()
+        if redis is None:
+            return False
+
         try:
-            # Find all session keys
-            pattern = f"{SESSION_PREFIX}*"
-            keys = self.redis.keys(pattern)
-            
-            sessions = []
-            for key in keys:
-                data = self.redis.get(key)
-                if data:
-                    try:
-                        session = PJUDSession.from_dict(json.loads(data))
-                        if not session.is_expired():
-                            sessions.append(session)
-                    except Exception:
-                        continue
-            
-            logger.info(f"Found {len(sessions)} active sessions")
-            return sessions
-            
-        except Exception as e:
-            logger.error(f"Failed to get active sessions: {e}")
-            return []
-    
-    def get_lawyers_needing_login(self, all_lawyer_ids: List[int]) -> List[int]:
-        """
-        Get list of lawyers who don't have an active session.
-        
-        Used to notify lawyers they need to re-login.
-        
-        Args:
-            all_lawyer_ids: List of all active lawyer IDs
-            
-        Returns:
-            List of lawyer IDs without active sessions
-        """
-        if not self._is_available():
-            return all_lawyer_ids
-        
-        lawyers_with_sessions = set()
-        
-        for session in self.get_all_active_sessions():
-            lawyers_with_sessions.add(session.lawyer_id)
-        
-        return [lid for lid in all_lawyer_ids if lid not in lawyers_with_sessions]
-    
-    def get_session_status(self, lawyer_id: int) -> Dict[str, Any]:
-        """
-        Get session status for a lawyer.
-        
-        Args:
-            lawyer_id: Lawyer ID
-            
-        Returns:
-            Status dict with session info
-        """
-        session = self.get_session_by_lawyer(lawyer_id)
-        
-        if not session:
-            return {
-                "has_session": False,
-                "needs_login": True,
-                "message": "No active session. Please login to PJUD.",
-            }
-        
-        time_left = session.time_until_expiry()
-        minutes_left = int(time_left.total_seconds() / 60)
-        
-        return {
-            "has_session": True,
-            "needs_login": False,
-            "session_id": session.session_id,
-            "created_at": session.created_at,
-            "expires_at": session.expires_at,
-            "minutes_remaining": minutes_left,
-            "last_used_at": session.last_used_at,
-            "auth_method": session.auth_method,
-        }
-    
+            rut_clean = _rut_clean(rut)
+            lawyer_id_str = await redis.get(f"{_RUT_KEY}{rut_clean}")
+            if lawyer_id_str:
+                session = await self.get_session_by_lawyer(int(lawyer_id_str))
+                if session:
+                    keys = [
+                        f"{_LAWYER_KEY}{session.lawyer_id}",
+                        f"{_ID_KEY}{session.session_id}",
+                        f"{_RUT_KEY}{rut_clean}",
+                    ]
+                    await redis.delete(*keys)
+                    return True
+            # Clean up the rut key regardless
+            await redis.delete(f"{_RUT_KEY}{rut_clean}")
+            return True
+        except Exception as exc:
+            logger.error("Failed to delete session for rut %s: %s", rut, exc)
+            return False
+
+    # ------------------------------------------------------------------
+    # Legacy sync methods — kept for backward compatibility
+    # (used by existing auth.py session-status and test_session_store.py)
+    # ------------------------------------------------------------------
+
     def is_session_valid_cached(self, session_id: str) -> Optional[bool]:
-        """
-        Check if session validity is cached.
-        
-        Reduces PJUD roundtrips by caching validity for 5 minutes.
-        
-        Args:
-            session_id: Session ID to check
-            
-        Returns:
-            True if cached as valid, False if cached as invalid, None if not cached
-        """
-        if not self._is_available():
+        """Check cached session validity (sync, uses sync redis client)."""
+        redis = self._sync_redis
+        if redis is None:
             return None
-        
         try:
             cache_key = f"{SESSION_VALID_CACHE_PREFIX}{session_id}"
-            cached = self.redis.get(cache_key)
-            
+            cached = redis.get(cache_key)
             if cached is None:
                 return None
-            
             return cached == "valid"
-            
-        except Exception as e:
-            logger.debug(f"Cache check failed for {session_id}: {e}")
+        except Exception as exc:
+            logger.debug("Cache check failed for %s: %s", session_id, exc)
             return None
-    
+
     def cache_session_validity(self, session_id: str, is_valid: bool) -> bool:
-        """
-        Cache session validity status.
-        
-        Args:
-            session_id: Session ID
-            is_valid: Whether session is valid
-            
-        Returns:
-            True if cached successfully
-        """
-        if not self._is_available():
+        """Store session validity in sync cache."""
+        redis = self._sync_redis
+        if redis is None:
             return False
-        
         try:
             cache_key = f"{SESSION_VALID_CACHE_PREFIX}{session_id}"
             value = "valid" if is_valid else "invalid"
-            self.redis.setex(cache_key, SESSION_VALIDATION_CACHE_TTL, value)
-            
-            logger.debug(
-                f"Cached session validity: {session_id} = {value} "
-                f"(TTL: {SESSION_VALIDATION_CACHE_TTL}s)"
-            )
+            redis.setex(cache_key, SESSION_VALIDATION_CACHE_TTL, value)
             return True
-            
-        except Exception as e:
-            logger.debug(f"Failed to cache session validity: {e}")
+        except Exception as exc:
+            logger.debug("Failed to cache session validity: %s", exc)
             return False
-    
+
     def invalidate_session_cache(self, session_id: str) -> bool:
-        """
-        Invalidate cached session validity.
-        
-        Call this when a session is known to be expired or invalid.
-        
-        Args:
-            session_id: Session ID
-            
-        Returns:
-            True if invalidated successfully
-        """
-        if not self._is_available():
+        """Delete session validity from sync cache."""
+        redis = self._sync_redis
+        if redis is None:
             return False
-        
         try:
             cache_key = f"{SESSION_VALID_CACHE_PREFIX}{session_id}"
-            self.redis.delete(cache_key)
-            logger.debug(f"Invalidated session cache: {session_id}")
+            redis.delete(cache_key)
             return True
-            
-        except Exception as e:
-            logger.debug(f"Failed to invalidate session cache: {e}")
+        except Exception as exc:
+            logger.debug("Failed to invalidate session cache: %s", exc)
             return False
 
+    # ------------------------------------------------------------------
+    # Worker helper
+    # ------------------------------------------------------------------
 
-# Global instance
+    def get_session_status(self, lawyer_id: int) -> Dict[str, Any]:
+        """Synchronous session status snapshot — for non-async callers."""
+        # This is intentionally kept sync-safe; async callers should use
+        # get_session_by_lawyer instead.
+        return {"has_session": False, "needs_login": True}
+
+
+# ---------------------------------------------------------------------------
+# Module-level singleton
+# ---------------------------------------------------------------------------
+
 _session_store: Optional[SessionStore] = None
 
 
 def get_session_store() -> SessionStore:
-    """Get or create session store singleton."""
+    """Get or create the global SessionStore singleton."""
     global _session_store
-    
     if _session_store is None:
         _session_store = SessionStore()
-    
     return _session_store
