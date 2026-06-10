@@ -81,6 +81,10 @@ uvicorn app.main:app --reload
 +-------------+     +-------------+
 ```
 
+## Security / Environment
+
+`ENVIRONMENT` defaults to `production` (fail-closed). Production requires a non-default `SECRET_KEY`, a non-default `ENCRYPTION_KEY` (valid Fernet key), and a non-empty `CORS_ORIGINS` — or the app refuses to boot. Local dev, tests, and Alembic migrations must set `ENVIRONMENT=development` (or provide real production secrets).
+
 ## Licencia
 
 Privado - Segal 2024
