@@ -5,6 +5,7 @@ POST /sync          - Trigger manual sync
 GET  /sync/status   - Get last sync status
 """
 
+import logging
 from datetime import datetime
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
@@ -23,6 +24,8 @@ from app.services.sync_service import (
     _select_cases_for_movement_check,
 )
 from app.services.session_store import get_session_store
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 

@@ -242,23 +242,23 @@ async def login_clave_unica(request: ClaveUnicaLoginRequest):
 @router.post("/refresh", response_model=RefreshResponse)
 async def refresh_session(
     request: RefreshRequest,
-    current_lawyer: Lawyer = Depends(get_current_lawyer)
+    current_rut: str = Depends(get_current_lawyer)
 ):
     """
     Refrescar sesión PJUD con nuevo captcha.
-    
+
     Llamar cuando la sesión está por expirar (~20-25 min de inactividad).
     El frontend debe mostrar un reCAPTCHA y enviar el token.
     """
     session_manager = SessionManager()
     scraper = PJUDCivilScraper(session_manager=session_manager)
-    
+
     try:
         await scraper.start()
-        
+
         # Refrescar sesión con nuevo captcha
         new_session = await scraper.refresh_session_with_captcha(
-            rut=current_lawyer.rut,
+            rut=current_rut,
             captcha_token=request.captcha_token,
         )
         
@@ -279,11 +279,11 @@ async def refresh_session(
 
 @router.get("/session-status", response_model=SessionStatus)
 async def get_session_status(
-    current_lawyer: Lawyer = Depends(get_current_lawyer)
+    current_rut: str = Depends(get_current_lawyer)
 ):
     """
     Verificar estado de la sesión PJUD.
-    
+
     El frontend puede usar esto para:
     - Mostrar indicador de sesión activa/inactiva
     - Mostrar countdown de expiración
@@ -291,7 +291,7 @@ async def get_session_status(
     - Check which auth method was used
     """
     session_manager = SessionManager()
-    session = await session_manager.get_session(current_lawyer.rut)
+    session = await session_manager.get_session(current_rut)
     
     if not session or session.is_expired():
         return SessionStatus(
@@ -314,15 +314,15 @@ async def get_session_status(
 
 
 @router.post("/logout")
-async def logout(current_lawyer: Lawyer = Depends(get_current_lawyer)):
+async def logout(current_rut: str = Depends(get_current_lawyer)):
     """
     Cerrar sesión.
-    
+
     Invalida la sesión PJUD en cache.
     """
     session_manager = SessionManager()
-    await session_manager.invalidate_session(current_lawyer.rut)
-    
+    await session_manager.invalidate_session(current_rut)
+
     return {"message": "Sesión cerrada"}
 
 
