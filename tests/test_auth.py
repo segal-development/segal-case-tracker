@@ -32,11 +32,11 @@ def test_login_with_credentials(client: TestClient):
 
 
 def test_logout(client: TestClient, auth_headers: dict):
-    """Logout should invalidate session."""
-    with patch("app.api.v1.auth.SessionManager") as mock_sm_class:
-        mock_sm = MagicMock()
-        mock_sm.invalidate_session = AsyncMock(return_value=None)
-        mock_sm_class.return_value = mock_sm
+    """Logout should delete session via the async store."""
+    with patch("app.api.v1.auth.get_session_store") as mock_store_fn:
+        mock_store = MagicMock()
+        mock_store.adelete_session_by_rut = AsyncMock(return_value=True)
+        mock_store_fn.return_value = mock_store
         response = client.post("/api/v1/auth/logout", headers=auth_headers)
     assert response.status_code == 200
     data = response.json()
