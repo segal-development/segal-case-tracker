@@ -12,10 +12,11 @@ Architecture:
 """
 
 import time
-from fastapi import APIRouter, HTTPException, Query, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import datetime, timedelta
+from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.scrapper.pjud.resilience.integration import (
@@ -29,6 +30,8 @@ from app.scrapper.pjud.exceptions import CircuitOpenError
 from app.scrapper.pjud.browser import BrowserFactory
 from app.services.session_store import get_session_store
 from app.services.pjud_session import PJUDSession
+from app.api.deps import get_db
+from app.api.v1.auth import _get_or_create_lawyer
 
 router = APIRouter()
 
@@ -42,8 +45,8 @@ _metrics = get_metrics()
 # ============================================================================
 
 class LoginRequest(BaseModel):
-    rut: str = Field(..., example="12345678-9")
-    password: str = Field(..., example="password123")
+    rut: str = Field(..., description="RUT con dígito verificador (ej: 12345678-9)")
+    password: str = Field(..., description="Clave Poder Judicial")
     captcha_token: str = Field(..., description="reCAPTCHA token from frontend")
 
 
@@ -157,18 +160,20 @@ def get_scraper(competency: str = "civil"):
 # ============================================================================
 
 @router.post("/login", response_model=LoginResponse)
-async def login(request: LoginRequest):
+async def login(
+    request: LoginRequest,
+    db: Session = Depends(get_db),
+):
     """
     Login to PJUD with RUT, password and captcha token.
-    
+
     The captcha token must be obtained from the frontend reCAPTCHA widget.
-    Returns a session that can be used for subsequent requests.
-    
-    The session is stored in Redis so subsequent requests can restore
-    the session cookies into fresh browser instances.
+    Resolves (or creates) the lawyer record in the DB and binds the real
+    lawyer_id to the session before persisting it in Redis.
+    Returns a session_id that can be used for subsequent requests.
     """
     scraper = get_scraper()
-    
+
     try:
         # login_with_token returns a canonical PJUDSession (uuid4 session_id, UTC times)
         pjud_session = await scraper.login_with_token(
@@ -176,6 +181,10 @@ async def login(request: LoginRequest):
             password=request.password,
             captcha_token=request.captcha_token,
         )
+
+        # Resolve (or create) the lawyer and bind the real id to the session (ADR-5)
+        lawyer = _get_or_create_lawyer(db, rut=request.rut, auth_method="captcha")
+        pjud_session.lawyer_id = int(lawyer.id)
 
         # Persist session via async store (ADR-3)
         store = get_session_store()
