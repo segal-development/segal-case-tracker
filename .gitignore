@@ -33,6 +33,9 @@ screenshots/
 /tmp/
 *.tmp
 
+# SDD / skill registry cache (generated)
+.atl/*.cache.json
+
 # OS
 .DS_Store
 Thumbs.db
