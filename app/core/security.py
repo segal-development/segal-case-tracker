@@ -2,7 +2,7 @@
 
 import base64
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, cast
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -44,7 +44,7 @@ def create_access_token(
         settings.SECRET_KEY,
         algorithm="HS256",
     )
-    return encoded_jwt
+    return str(encoded_jwt)
 
 
 def decode_access_token(token: str) -> Optional[dict]:
@@ -55,7 +55,7 @@ def decode_access_token(token: str) -> Optional[dict]:
             settings.SECRET_KEY,
             algorithms=["HS256"],
         )
-        return payload
+        return cast(dict, payload)
     except JWTError:
         return None
 
@@ -87,8 +87,8 @@ async def get_current_lawyer(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token no contiene RUT",
         )
-    
-    return rut
+
+    return str(rut)
 
 
 # =============================================================================
@@ -97,12 +97,12 @@ async def get_current_lawyer(
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verify a password against its hash."""
-    return pwd_context.verify(plain_password, hashed_password)
+    return bool(pwd_context.verify(plain_password, hashed_password))
 
 
 def hash_password(password: str) -> str:
     """Hash a password."""
-    return pwd_context.hash(password)
+    return str(pwd_context.hash(password))
 
 
 # =============================================================================
