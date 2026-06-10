@@ -27,6 +27,7 @@ MAX_CONCURRENT_FETCHES = 3
 
 T = TypeVar("T")
 
+from app.config import settings
 from app.models.case import Case
 from app.models.movement import Movement
 from app.models.court import Court
@@ -181,57 +182,83 @@ class SyncService:
     ) -> Tuple[int, int]:
         """
         Sync movements for a case, detecting new ones.
-        
+
         Args:
             case_id: Database case ID
             scraped_movements: Movements from PJUD scraper
-        
+
         Returns:
             Tuple of (new_count, alert_count)
         """
         new_count = 0
         alert_count = 0
-        
+        notify_dispatched = 0
+
         case = self.db.query(Case).filter(Case.id == case_id).first()
         if not case:
             return 0, 0
-        
+
+        # FIX 2: hoist Lawyer + active-Webhook queries outside the per-movement
+        # loop — they are constant for the whole call so querying them once
+        # removes O(N) round-trips and reduces the blocking-I/O window.
+        lawyer = self.db.query(Lawyer).filter(
+            Lawyer.id == case.lawyer_id
+        ).first()
+        webhooks: list = []
+        if lawyer:
+            webhooks = self.db.query(Webhook).filter(
+                Webhook.lawyer_id == lawyer.id,
+                Webhook.is_active == True,  # noqa: E712
+            ).all()
+
+        notify_max = settings.NOTIFY_MAX_PER_SYNC
+
         for scraped in scraped_movements:
             movement, is_new = self._upsert_movement(case_id, scraped)
             if is_new:
                 new_count += 1
-                # Create alert for new movement
+                # Create alert for new movement — alert is always persisted.
                 alert = self._create_movement_alert(case, movement)
                 if alert:
                     alert_count += 1
-                    # Dispatch notification — failure must never break the sync
-                    try:
-                        lawyer = self.db.query(Lawyer).filter(
-                            Lawyer.id == case.lawyer_id
-                        ).first()
-                        if lawyer:
-                            webhooks = self.db.query(Webhook).filter(
-                                Webhook.lawyer_id == lawyer.id,
-                                Webhook.is_active == True,  # noqa: E712
-                            ).all()
+                    # FIX 1: cap notifications per sync call; alerts are still
+                    # created above — only the dispatch is gated here.
+                    if lawyer and notify_dispatched < notify_max:
+                        try:
                             NotificationService(self.db).notify_new_movement(
                                 alert, case, movement, lawyer, webhooks
                             )
-                    except Exception as exc:
-                        logger.error(
-                            "Failed to dispatch notification for alert on case %s "
-                            "movement %s: %s",
-                            case.id,
-                            movement.id,
-                            exc,
-                        )
-        
+                        except Exception as exc:
+                            logger.error(
+                                "Failed to dispatch notification for alert on case %s "
+                                "movement %s: %s",
+                                case.id,
+                                movement.id,
+                                exc,
+                            )
+                        # Count every attempt (success or error) toward the cap.
+                        notify_dispatched += 1
+
+        # FIX 1: emit a clear warning when the cap prevented some dispatches.
+        if alert_count > notify_dispatched:
+            skipped = alert_count - notify_dispatched
+            logger.warning(
+                "Notification cap reached in sync_movements (case_id=%s): "
+                "dispatched %d of %d notifications, skipped %d. "
+                "Increase NOTIFY_MAX_PER_SYNC (currently %d) to raise the limit.",
+                case_id,
+                notify_dispatched,
+                alert_count,
+                skipped,
+                notify_max,
+            )
+
         # Update last_movement_at on case
         if scraped_movements:
             latest_date = self._parse_date(scraped_movements[0].fecha)
             if latest_date and (not case.last_movement_at or latest_date > case.last_movement_at):
                 case.last_movement_at = latest_date
-        
+
         self.db.commit()
         return new_count, alert_count
     
@@ -578,5 +605,8 @@ def _select_cases_for_movement_check(
         Filtered/capped list of PJUDCase objects.
     """
     if rol:
-        return [c for c in api_cases if c.rol == rol]
+        # FIX 3: normalize both sides (strip + upper) so format/whitespace
+        # mismatches don't silently return [] and skip movement detection.
+        normalized_rol = rol.strip().upper()
+        return [c for c in api_cases if c.rol.strip().upper() == normalized_rol]
     return api_cases[:max_cases]

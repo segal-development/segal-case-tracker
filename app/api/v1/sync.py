@@ -204,9 +204,12 @@ async def sync_now(
                     for m in detail.movements
                 ])
 
+                # FIX 3: normalize the rol before DB lookup so a
+                # format/whitespace difference doesn't silently miss the case.
+                normalized_rol = api_case.rol.strip().upper()
                 db_case = db.query(CaseModel).filter(
                     CaseModel.lawyer_id == int(lawyer_id),
-                    CaseModel.rol == api_case.rol,
+                    CaseModel.rol == normalized_rol,
                 ).first()
 
                 if db_case and scraped_movements:

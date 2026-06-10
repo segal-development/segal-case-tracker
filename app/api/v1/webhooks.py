@@ -33,7 +33,14 @@ def _resolve_lawyer_id(current_lawyer: dict) -> int:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token: missing lawyer identity",
         )
-    return int(raw)
+    # FIX 4: a non-numeric sub must return 401, not an unhandled 500.
+    try:
+        return int(raw)
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
+        )
 
 
 def _get_webhook_or_404(db: Session, webhook_id: int, lawyer_id: int) -> Webhook:

@@ -80,6 +80,9 @@ class Settings(BaseSettings):
     PJUD_METRICS_ENABLED: bool = True       # Enable/disable metrics collection
     PJUD_ALERTS_ENABLED: bool = True        # Enable/disable alert webhooks
 
+    # Notifications
+    NOTIFY_MAX_PER_SYNC: int = 25           # Max notifications dispatched per sync_movements call
+
     # Environment
     ENVIRONMENT: str = "production"
     DEBUG: bool = True

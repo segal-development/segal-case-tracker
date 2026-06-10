@@ -152,19 +152,21 @@ class NotificationService:
             "data": {
                 "lawyer_id": lawyer.id,
                 "case": {
-                    "rol": case.rol,
+                    "rol": case.rol or "",
+                    # FIX 5: guard court relationship — court may be None.
                     "tribunal": case.court.name if case.court else "",
+                    # FIX 5: guard None plaintiff/defendant so the literal
+                    # string "None" never appears in the serialized payload.
                     "caratulado": (
-                        f"{case.plaintiff}/{case.defendant}"
-                        if case.defendant
-                        else (case.plaintiff or "")
+                        f"{case.plaintiff or ''}/{case.defendant or ''}"
                     ),
                 },
                 "movement": {
-                    "folio": movement.folio,
-                    "fecha": str(movement.movement_date),
-                    "descripcion": movement.description,
-                    "etapa": movement.stage,
+                    "folio": movement.folio or "",
+                    # FIX 5: guard movement_date — None would produce "None".
+                    "fecha": str(movement.movement_date) if movement.movement_date else "",
+                    "descripcion": movement.description or "",
+                    "etapa": movement.stage or "",
                 },
             },
         }
