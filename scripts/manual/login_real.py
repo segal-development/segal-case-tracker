@@ -17,7 +17,8 @@ from datetime import datetime
 sys.path.insert(0, '/Users/marcelo/Projects/segal-case-tracker')
 
 from app.scrapper.pjud_civil import PJUDCivilScraper, LoginError
-from app.scrapper.session_manager import SessionManager, PJUDSession
+from app.services.pjud_session import PJUDSession
+from app.services.session_store import SessionStore  # SessionManager was deleted; SessionStore is the replacement
 
 
 async def test_login():
@@ -54,7 +55,7 @@ async def test_login():
     
     # Crear scraper (sin captcha solver, usamos el token del frontend)
     scraper = PJUDCivilScraper(
-        session_manager=SessionManager(),
+        session_manager=SessionStore(),  # formerly SessionManager
         headless=True,
     )
     

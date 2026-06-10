@@ -135,7 +135,11 @@ class SessionStore:
                 return None
             session = PJUDSession.from_redis(data)
             if session.is_expired():
-                await redis.delete(f"{_LAWYER_KEY}{lawyer_id}")
+                await redis.delete(
+                    f"{_LAWYER_KEY}{lawyer_id}",
+                    f"{_ID_KEY}{session.session_id}",
+                    f"{_RUT_KEY}{_rut_clean(session.rut)}",
+                )
                 return None
             return session
         except Exception as exc:

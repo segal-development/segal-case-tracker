@@ -10,7 +10,7 @@ Use the original login endpoint to re-authenticate.
 """
 
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, status, Depends
@@ -61,7 +61,7 @@ class LawyerInfo(BaseModel):
 class SessionStatus(BaseModel):
     """Session status response."""
     active: bool
-    expires_at: Optional[object] = None
+    expires_at: Optional[datetime] = None
     minutes_remaining: Optional[int] = None
     needs_refresh: bool = False
     auth_method: Optional[str] = None
@@ -110,7 +110,7 @@ async def login(request: LoginRequest):
         # Resolve lawyer (Slice 2 replaces this stub with real DB lookup)
         lawyer = await _get_or_create_lawyer(request.rut, request.password)
         if lawyer and pjud_session.lawyer_id == 0:
-            pjud_session.lawyer_id = lawyer.id
+            pjud_session.lawyer_id = int(lawyer.id)
 
         # Persist session via async store
         store = get_session_store()
@@ -158,7 +158,7 @@ async def login_clave_unica(request: ClaveUnicaLoginRequest):
 
     # Resolve lawyer (Slice 2 wires real DB lookup)
     lawyer = await _get_or_create_lawyer(request.rut, request.password)
-    lawyer_id = lawyer.id if lawyer else 0
+    lawyer_id = int(lawyer.id) if lawyer else 0
 
     try:
         async with BrowserFactory(headless=True) as factory:

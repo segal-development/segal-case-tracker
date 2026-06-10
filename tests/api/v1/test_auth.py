@@ -89,8 +89,6 @@ class TestCaptchaLoginCallSites:
             mock_scraper_instance.start = AsyncMock()
             mock_scraper_instance.stop = AsyncMock()
             mock_scraper_instance.login_with_token = AsyncMock(return_value=fake_session)
-            # Confirm login_with_user_captcha is NOT present
-            assert not hasattr(mock_scraper_instance, "login_with_user_captcha") or True
             MockScraper.return_value = mock_scraper_instance
 
             mock_store = MagicMock()
