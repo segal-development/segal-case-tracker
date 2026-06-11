@@ -158,6 +158,53 @@ anexo_indicator:
   primary: "dtaDoc|fa-file|fa-folder"
   description: "Pattern to detect anexos in movement row"
 
+# ============================================================================
+# Document form selectors — case-documents Slice 1
+#
+# dtaCert disambiguation rule: Two forms share the same param name "dtaCert"
+# but point at different endpoints.  ALWAYS anchor on the form action to
+# distinguish them:
+#   docCertificadoEscrito.php → escrito_cert  (movement-level)
+#   docCertificadoDemanda.php → cert_envio    (case-level)
+# ============================================================================
+
+escrito_cert_form_action:
+  primary: "docCertificadoEscrito.php"
+  description: "Action fragment for the escrito-cert (dtaCert) form inside a movement row"
+
+escrito_cert_param:
+  primary: "dtaCert"
+  description: "Param name inside the docCertificadoEscrito.php form"
+
+texto_demanda_form_action:
+  primary: "docu.php"
+  description: "Action fragment for the texto-demanda (valorEncTxtDmda) case-level form"
+
+texto_demanda_param:
+  primary: "valorEncTxtDmda"
+  description: "Param name for texto demanda"
+
+cert_envio_form_action:
+  primary: "docCertificadoDemanda.php"
+  description: "Action fragment for the cert-envio (dtaCert) case-level form — disambiguated from escrito_cert by this action"
+
+cert_envio_param:
+  primary: "dtaCert"
+  description: "Param name for cert envio (same as escrito_cert, hence action disambiguation)"
+
+ebook_form_action:
+  primary: "newebookcivil.php"
+  description: "Action fragment for the ebook (dtaEbook) case-level form"
+
+ebook_param:
+  primary: "dtaEbook"
+  description: "Param name for ebook"
+
+disabled_doc_indicator:
+  primary: "fa-ban"
+  description: "CSS class presence indicates a document slot is unavailable (fa-ban icon)"
+
+# ============================================================================
 # Endpoints (relative to PJUD_BASE_URL)
 cases_endpoint:
   primary: "misCausas/civil/consultaMisCausasCivil.php"

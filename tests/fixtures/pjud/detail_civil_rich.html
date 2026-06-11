@@ -56,7 +56,7 @@ $(document).ready(function(){
 									<td>
 										<strong>Texto Demanda:</strong>
 										<form name="form" action="misCausas/civil/documentos/docu.php" method="get" target="txtD">
-											<input type="hidden" name="valorEncTxtDmda" value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc4MTE5NTU3MiwiZXhwIjoxNzgxMTk5MTcyLCJkYXRhIjoiTVFLS3ViaUU2XC93b3V6TEllOWRGXC9DYUVVNlNyWEw0b3NGVVAwbytnZCtHTFN0bmo0RkJvZW05czhhXC9OYXlNNkJPQVpVTXNzcmJnRGdnMGNXOHMwbnFyTU9LQlVUTmlYMXNocEZic0JrWWs9In0.7j0DtdJVwRzrl19UhmI_lllpr2Uqeyt8j5qkwzBZ914">
+											<input type="hidden" name="valorEncTxtDmda" value="eyJhbGciOiJub25lIn0.e30.FAKE_TEXTO_DEMANDA">
 											<a href="#" onclick="$(this).closest(&quot;form&quot;).submit();">
 												<i class="far fa-file-pdf fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;"></i>
 											</a>
@@ -68,10 +68,15 @@ $(document).ready(function(){
 										<i class="fas fa-ban fa-lg" aria-hidden="true" style="color:#660000; cursor:no-drop;"></i>
 									</td>
 								<!-- Bloque boton Certificado -->
-						
+
 									<td>
 										<strong>Certificado de Envío:</strong><br>
-										<i class="fas fa-ban fa-lg" aria-hidden="true" style="color:#660000; cursor:no-drop;"></i>
+										<form name="form" action="misCausas/civil/documentos/docCertificadoDemanda.php" method="get" target="certEnv">
+											<input type="hidden" name="dtaCert" value="eyJhbGciOiJub25lIn0.e30.FAKE_CERT_ENVIO">
+											<a href="#" onclick="$(this).closest(&quot;form&quot;).submit();">
+												<i class="far fa-file-pdf fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;"></i>
+											</a>
+										</form>
 									</td>
 								<!-- Fin Bloque boton Certificado -->
 
@@ -79,7 +84,7 @@ $(document).ready(function(){
 								<!-- Bloque boton ebook -->
 										<strong>Ebook:</strong>
 										<form name="form" action="misCausas/civil/documentos/newebookcivil.php" method="get" target="_blank">
-											<input type="hidden" name="dtaEbook" value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc4MTE5NTU3MiwiZXhwIjoxNzgxMTk5MTcyLCJkYXRhIjoid21vY1RzbG9adWZGaEhmRTNxTVlWMkRUak8wK2hHcGZEVmt1N1RVRWhlY1k5bkttRllIRDNHMlJQRVF5YzNXViJ9.u388yQNR_bNbKBn0oZOvDu-Utr6HAuJDSAvoLqV_AkE">
+											<input type="hidden" name="dtaEbook" value="eyJhbGciOiJub25lIn0.e30.FAKE_EBOOK">
 											<a href="#" onclick="$(this).closest(&quot;form&quot;).submit();">
 												<i class="far fa-file-pdf fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;"></i>
 											</a>
@@ -103,22 +108,22 @@ $(document).ready(function(){
 									<td>
 										<strong>Historia Causa Cuaderno</strong><br>
 										<select id="selCuaderno" class="form-control form-control-sm">
-												<option value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc4MTE5NTU3MiwiZXhwIjoxNzgxMTk5MTcyLCJkYXRhIjoiU2JFaFJcL2FBN0JTMXV0bDlzeXhnOHBPa2NUQVVPclE5Z1FnN2Z0N2Y0WnNQSW10U1hQYVwvYXQ2NXVsUFNPSjBTTFR0N0RTdkt0OFwveVlhS1hVU2FwenRTdmhPMFZ0TkttUGRVQzdMYThPNDg1TGI3bVFnNnpTWGlndjBRbTd3NmpaT1wvRzhIRk1JejNaXC9ZdzRLSjQ5U1E9PSJ9.zuRLxXpQzL7yPS8bS8kvnSpz2T6xrECY2qQ-TJLEAts">1 - Principal</option>
-												<option value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc4MTE5NTU3MiwiZXhwIjoxNzgxMTk5MTcyLCJkYXRhIjoiU2JFaFJcL2FBN0JTMXV0bDlzeXhnOHBPa2NUQVVPclE5Z1FnN2Z0N2Y0WnNQSW10U1hQYVwvYXQ2NXVsUFNPSjBTSDZwRTllZG4zaERWYjQ0VGwwK3JvcWE0Z0h0NmhwYkVpaWxQVlhDaWxyYVlka1ZseDQ5NFZaRDNqeFhhSUJlS1lJdHMzYVBFOG5HbGlOTys4U2lldGc9PSJ9.5DowhgjhYvuZ1ZU9tgtvwqa0RPvZ2LSdOwXza6EAPrY">2 - Apremio Ejecutivo Obligación de Dar</option>
-												<option value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc4MTE5NTU3MiwiZXhwIjoxNzgxMTk5MTcyLCJkYXRhIjoiU2JFaFJcL2FBN0JTMXV0bDlzeXhnOHBPa2NUQVVPclE5Z1FnN2Z0N2Y0WnNQSW10U1hQYVwvYXQ2NXVsUFNPSjBTR1pKMG05UitNa0VvaERqRGpcL0JsWU5ZVjVXNlN6ZkRKbmxzWkdsZjNcL3lhVXlYK1pUOVowaStKbWk0TTl3SnI5am91MWUwU1pzK3JpYmthRDg5M0hXZz09In0.8ERnioGDNjP5bhb0jsn3xdioH8OVCOJx1PenCagMn2I" selected="selected">3 - Incidente Abandono del Proc.</option>
+												<option value="eyJhbGciOiJub25lIn0.e30.FAKE_CUADERNO_1">1 - Principal</option>
+												<option value="eyJhbGciOiJub25lIn0.e30.FAKE_CUADERNO_2">2 - Apremio Ejecutivo Obligación de Dar</option>
+												<option value="eyJhbGciOiJub25lIn0.e30.FAKE_CUADERNO_3" selected="selected">3 - Incidente Abandono del Proc.</option>
 	
 										</select>
 									</td>
 									<td>
 										<strong>Información notificaciones receptor:</strong>
 										<br>
-										<a data-toggle="modal" href="#modalReceptorCivil" onclick="receptorCivil('eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc4MTE5NTU3MiwiZXhwIjoxNzgxMTk5MTcyLCJkYXRhIjoic1dCRmw3Mm15TEtaeU5samZQc3FuYnFqOWw5WXM3dTNVMlpkd0pva1Y2c0d1ampTY1V3MHQxXC9EVExaOUU5S1BVdCtCSFNVbGZqaGJ1d0x6aFVXczVYTDhlQ1JpdVF4OVBSd1FrbzVoellycFwvUGV5b1ppQW9FMzM0SzFBOElySmVWYlA1dlBGNFNoTlFFMVRncnlXVG5YUzlsMFNjeU9Ockhmd1lxVHVsanNKODJaUURTcVJPT056YlBrSHhlMlAifQ.Liy8k40QdTfRdcxvHoMEn2oftoL-8Qb7sis6R8JOHHI');"><i class="fas fa-folder fa-2x" aria-hidden="true" style="cursor:pointer; color:#D7B926"></i></a>
+										<a data-toggle="modal" href="#modalReceptorCivil" onclick="receptorCivil('eyJhbGciOiJub25lIn0.e30.FAKE_RECEPTOR');"><i class="fas fa-folder fa-2x" aria-hidden="true" style="cursor:pointer; color:#D7B926"></i></a>
 									</td>
 									
 									<td>
 										<strong>Agenda Receptor Judicial:</strong>
 										<br>
-										<a data-toggle="modal" href="#modalReceptorCivilReserva" onclick="receptorCivilReserva('eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc4MTE5NTU3MiwiZXhwIjoxNzgxMTk5MTcyLCJkYXRhIjoic1dCRmw3Mm15TEtaeU5samZQc3FuYnFqOWw5WXM3dTNVMlpkd0pva1Y2c0d1ampTY1V3MHQxXC9EVExaOUU5S1BVdCtCSFNVbGZqaGJ1d0x6aFVXczVYTDhlQ1JpdVF4OVBSd1FrbzVoellycFwvUGV5b1ppQW9FMzM0SzFBOElySmVWYlA1dlBGNFNoTlFFMVRncnlXVG5YUzlsMFNjeU9Ockhmd1lxVHVsanVzYWFWM2JZMTZPdUNsb01GWDFoUWJDRU81aFJDcFNSZ1wvUGszWnE1N3hVYjR3NUFpYUxBTzZYWEp5aGJzYmlSWT0ifQ.z_ydL0zWbqc1rVSQKz_j9F2FWqme1hAKVsQzzMbiFug');"><i class="fas fa-calendar fa-2x" aria-hidden="true" style="cursor:pointer; color:#D7B926"></i></a>
+										<a data-toggle="modal" href="#modalReceptorCivilReserva" onclick="receptorCivilReserva('eyJhbGciOiJub25lIn0.e30.FAKE_RECEPTOR_RESERVA');"><i class="fas fa-calendar fa-2x" aria-hidden="true" style="cursor:pointer; color:#D7B926"></i></a>
 									</td>
 									
 								</tr>
@@ -165,7 +170,7 @@ $(document).ready(function(){
 												</td>
 												<td align="left">
 														<form name="form" action="misCausas/civil/documentos/docuS.php" method="get" target="p1">
-															<input type="hidden" name="dtaDoc" value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc4MTE5NTU3MiwiZXhwIjoxNzgxMTk5MTcyLCJkYXRhIjoiTVFLS3ViaUU2XC93b3V6TEllOWRGXC9IRU1EaHhmajdOejhOQTVVRThmV1VQYXgxcUNGdE5xKzdwVE4zWnI5bE5tZ2hRSzExaVc0STJIcTU0SzRWMTlRaGFYUzhPVVhtM1dMaWhhR2RLYmpYQ2hwV2ZYakt0WmUxSmlkYk1Ha3FHOHlBNnk2eEg0UlZVaEY4SjlBUTZLWmc9PSJ9.ADTM2tVvsNNy08Qu5ep7iMBfBCbzfoMCkx4HQvkheew">
+															<input type="hidden" name="dtaDoc" value="eyJhbGciOiJub25lIn0.e30.FAKE_DOC">
 															<a href="#" onclick="$(this).closest(&quot;form&quot;).submit();">
 																<i class="far fa-file-pdf fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;"></i>
 															</a>
@@ -190,14 +195,14 @@ $(document).ready(function(){
 												</td>
 												<td align="left">
 														<form name="form" action="misCausas/civil/documentos/docuN.php" method="get" target="w2" style="display: inline-block;">
-															<input type="hidden" name="dtaDoc" value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc4MTE5NTU3MiwiZXhwIjoxNzgxMTk5MTcyLCJkYXRhIjoiTVFLS3ViaUU2XC93b3V6TEllOWRGXC9HNWlNa3F5SzRzczR3aExCS2UxeFp3bXJhSVpIVE9RYjdyOXNUVU5KNDhHTjk0SEtTWUNqXC9JbHZhODlVR1VLQzgwcE9SZGxtOXJ3MW9kdlF5bnV6SVwvNUsyVlphRzBsUlwvKzgwK1wvV0dtSGQifQ.OaLGY3mvtWdXxCt0Nr7PkGWhPRwfYewPQ-A9KPa-InI">
+															<input type="hidden" name="dtaDoc" value="eyJhbGciOiJub25lIn0.e30.FAKE_DOCUN">
 															<a href="#" onclick="$(this).closest(&quot;form&quot;).submit();" style="display: inline-block;">
 																<i class="far fa-file-pdf fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;, display: inline-block;" title="Documento principal del escrito"></i><span class="sr-only">Documento principal del escrito</span>
 															</a>
 														</form>
 														 
 														  																<form name="certCivil" action="misCausas/civil/documentos/docCertificadoEscrito.php" method="get" target="cert" style="display: inline-block;">
-																<input type="hidden" name="dtaCert" value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc4MTE5NTU3MiwiZXhwIjoxNzgxMTk5MTcyLCJkYXRhIjoiTUZSZXhEOXd6UjA2cWJPSzlpcWFBYWtrU2hCblhqQ2hudmxxcGd0RXNsND0ifQ.Q8AJ5QhNYicfJO6DN-Nkev1RuKgnIF1QQ0Mt4GRTTVk">
+																<input type="hidden" name="dtaCert" value="eyJhbGciOiJub25lIn0.e30.FAKE_ESCRITO_CERT">
 																<a href="#" onclick="$(this).closest(&quot;form&quot;).submit();" style="display: inline-block;">
 																	<i class="far fa-file-pdf fa-lg" aria-hidden="true" style="color:#2693FF; cursor:pointer; display: inline-block;" title="Certificado de envio escrito."></i><span class="sr-only">Certificado de envio escrito.</span>
 																</a>
@@ -222,14 +227,14 @@ $(document).ready(function(){
 												</td>
 												<td align="left">
 														<form name="form" action="misCausas/civil/documentos/docuN.php" method="get" target="w3" style="display: inline-block;">
-															<input type="hidden" name="dtaDoc" value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc4MTE5NTU3MiwiZXhwIjoxNzgxMTk5MTcyLCJkYXRhIjoiTVFLS3ViaUU2XC93b3V6TEllOWRGXC9OdlU0Ull5NVVaU09cL0dEYjZJb0F3dzlQNzVRbHM2MGVTUmF5a1pxbVRmQ3RPZGlwTWZRdlF5cVJQMERxNHRHbFprYnREa09Sakk2R3lmU05rbWFxMGhrMlMwa3hReTRIYnZJbmZ4RkhJbVQifQ.FBE1-7Za2LjLIEOt_11BzWvE55MGAXUUjCvP6TrglwU">
+															<input type="hidden" name="dtaDoc" value="eyJhbGciOiJub25lIn0.e30.FAKE_DOC_2">
 															<a href="#" onclick="$(this).closest(&quot;form&quot;).submit();" style="display: inline-block;">
 																<i class="far fa-file-pdf fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;, display: inline-block;" title="Documento principal del escrito"></i><span class="sr-only">Documento principal del escrito</span>
 															</a>
 														</form>
 														 
 														  																<form name="certCivil" action="misCausas/civil/documentos/docCertificadoEscrito.php" method="get" target="cert" style="display: inline-block;">
-																<input type="hidden" name="dtaCert" value="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc4MTE5NTU3MiwiZXhwIjoxNzgxMTk5MTcyLCJkYXRhIjoiTUZSZXhEOXd6UjA2cWJPSzlpcWFBY0tKRHI5d2FiM1VsOVgwN2xFb0Y2TT0ifQ.gF7Jb8ODGBICPgxHDBziWFihp_MVLmwk9uSvN_uhUVg">
+																<input type="hidden" name="dtaCert" value="eyJhbGciOiJub25lIn0.e30.FAKE_ESCRITO_CERT_2">
 																<a href="#" onclick="$(this).closest(&quot;form&quot;).submit();" style="display: inline-block;">
 																	<i class="far fa-file-pdf fa-lg" aria-hidden="true" style="color:#2693FF; cursor:pointer; display: inline-block;" title="Certificado de envio escrito."></i><span class="sr-only">Certificado de envio escrito.</span>
 																</a>
@@ -388,7 +393,7 @@ $(document).ready(function(){
 											<tr>
 												<td>C-9999-2099</td>		
 												<td>Exhorto</td>
-												<td><label class="label label-info" style="cursor:pointer; font-size:13px;" data-toggle="modal" href="#modalExhortoCivil" onclick="detalleExhortosCivil('eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczpcL1wvb2ZpY2luYWp1ZGljaWFsdmlydHVhbC5wanVkLmNsIiwiYXVkIjoiaHR0cHM6XC9cL29maWNpbmFqdWRpY2lhbHZpcnR1YWwucGp1ZC5jbCIsImlhdCI6MTc4MTE5NTU3MiwiZXhwIjoxNzgxMTk5MTcyLCJkYXRhIjoiZFBjN2JwcWxYY1VIcU4wVjVkOHFIZ2dxZEZqSklhemx6SzF6U1wvaHhqeTFVTk12cld3N1FiM09QNENHK2R4UHkwNmxSakhheEc3S0tUNTI2ak5hYmRBPT0ifQ.twkjT5_XAaAeeMpEbghj62eNH2-6SrXCM-rOWdTdSlg');">E-888-2099</label></td>
+												<td><label class="label label-info" style="cursor:pointer; font-size:13px;" data-toggle="modal" href="#modalExhortoCivil" onclick="detalleExhortosCivil('eyJhbGciOiJub25lIn0.e30.FAKE_EXHORTO');">E-888-2099</label></td>
 												<td>05/05/2026</td>
 												<td>05/05/2026</td>
 												<td>8º Juzgado Civil Ficticio                      </td>

@@ -42,6 +42,7 @@ from app.models.case_notificacion import CaseNotificacion
 from app.models.case_escrito import CaseEscrito
 from app.models.case_exhorto import CaseExhorto
 from app.services.notification_service import NotificationService
+from app.services.document_persistence import DocumentPersistenceService
 
 
 @dataclass
@@ -1227,7 +1228,14 @@ async def detect_and_sync_movements(
                         budget=shared_budget,
                     )
 
-                # Commit entity upserts (sync_movements already committed).
+                # 3. Persist document tokens (Slice 1 — S1-T13).
+                # Must run after sync_movements so that Movement rows exist for
+                # the folio-based lookup inside persist_from_detail.
+                DocumentPersistenceService().persist_from_detail(
+                    detail, int(db_case.id), db
+                )
+
+                # Commit entity upserts + document tokens (sync_movements already committed).
                 db.commit()
 
         except Exception as exc:
