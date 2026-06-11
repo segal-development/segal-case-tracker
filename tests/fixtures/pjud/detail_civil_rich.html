@@ -68,10 +68,15 @@ $(document).ready(function(){
 										<i class="fas fa-ban fa-lg" aria-hidden="true" style="color:#660000; cursor:no-drop;"></i>
 									</td>
 								<!-- Bloque boton Certificado -->
-						
+
 									<td>
 										<strong>Certificado de Envío:</strong><br>
-										<i class="fas fa-ban fa-lg" aria-hidden="true" style="color:#660000; cursor:no-drop;"></i>
+										<form name="form" action="misCausas/civil/documentos/docCertificadoDemanda.php" method="get" target="certEnv">
+											<input type="hidden" name="dtaCert" value="eyJhbGciOiJub25lIn0.e30.FAKE_CERT_ENVIO">
+											<a href="#" onclick="$(this).closest(&quot;form&quot;).submit();">
+												<i class="far fa-file-pdf fa-lg" aria-hidden="true" style="color:#ab5659; cursor:pointer;"></i>
+											</a>
+										</form>
 									</td>
 								<!-- Fin Bloque boton Certificado -->
 
