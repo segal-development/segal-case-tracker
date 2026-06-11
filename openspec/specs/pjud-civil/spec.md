@@ -59,3 +59,25 @@ The system MUST wrap Civil operations with resilience decorators.
 - WHEN `get_my_cases()` is called
 - THEN `CircuitOpenError` MUST be raised immediately
 - AND no PJUD request MUST be made
+
+### Requirement: Movements Parser Scoped to #historiaCiv
+
+The `_parse_movements_table` method MUST scope to the `#historiaCiv` pane before matching `table-bordered`. Rows from any other pane MUST NOT appear in the returned movements list.
+
+#### Scenario: Multi-tab detail does not bleed rows into movements (regression)
+
+- GIVEN a detail HTML where #historiaCiv has 40 rows, #litigantesCiv has 6 rows, and #exhortosCiv has 1 row
+- WHEN `_parse_movements_table` runs
+- THEN exactly 40 movement objects are returned
+- AND no litigante or exhorto rows appear in the movements result
+
+### Requirement: All Five Tabs Populated from Single Detail HTML
+
+`_parse_case_detail_html` MUST populate all five entity lists — movements, litigantes, notificaciones, escritos, and exhortos — from the single detail HTML response.
+
+#### Scenario: All five tabs populated from single detail HTML
+
+- GIVEN a detail HTML where #historiaCiv has movements, #litigantesCiv has litigante rows, and #exhortosCiv has an exhorto row
+- WHEN `_parse_case_detail_html` runs
+- THEN the returned `PJUDCaseDetail` has non-empty `movements`, `litigantes`, and `exhortos` lists
+- AND `notificaciones` and `escritos` are empty lists (not None)

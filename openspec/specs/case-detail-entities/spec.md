@@ -102,11 +102,11 @@ Each entity type MUST upsert by its natural key. Re-running a sync with identica
 
 ### Requirement: Change Detection
 
-The system MUST detect new entities on each sync. An entity not matched by its natural key MUST be flagged `is_new=True`, MUST generate an Alert of the corresponding type, and MUST invoke the entity-specific notification method.
+The system MUST detect new entities on each sync. An entity not matched by its natural key MUST be flagged `is_new=True`, MUST generate an Alert of the corresponding type, and MUST invoke the entity-specific notification method. Litigantes are stored-only (no alerts, no notifications) per ADR-004.
 
 | New entity | Alert type | Notification method |
 |------------|------------|---------------------|
-| `CaseLitigante` | `new_litigante` | `notify_new_litigante` |
+| `CaseLitigante` | (stored only, no alert) | (not invoked) |
 | `CaseNotificacion` | `new_notificacion` | `notify_new_notificacion` |
 | `CaseEscrito` | `new_escrito` | `notify_new_escrito` |
 | `CaseExhorto` | `new_exhorto` | `notify_new_exhorto` |
@@ -132,7 +132,7 @@ The system MUST detect new entities on each sync. An entity not matched by its n
 
 #### Scenario: Cap spans mixed entity types
 
-- GIVEN `NOTIFY_MAX_PER_SYNC = 3` and a sync that produces 2 new movements and 2 new litigantes
+- GIVEN `NOTIFY_MAX_PER_SYNC = 3` and a sync that produces 2 new movements and 2 new notificaciones
 - WHEN the sync runs
 - THEN exactly 3 notifications are dispatched
-- AND the 4th new entity produces no notification call
+- AND the 4th new entity (2nd notificacion) produces no notification call
