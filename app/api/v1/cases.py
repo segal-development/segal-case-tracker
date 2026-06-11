@@ -7,6 +7,10 @@ from sqlalchemy import and_
 
 from app.api.deps import get_db, get_current_lawyer
 from app.models.case import Case
+from app.models.case_litigante import CaseLitigante
+from app.models.case_notificacion import CaseNotificacion
+from app.models.case_escrito import CaseEscrito
+from app.models.case_exhorto import CaseExhorto
 from app.models.movement import Movement
 from app.models.court import Court
 from app.models.sync_history import SyncHistory
@@ -75,11 +79,80 @@ class CaseListResponse(BaseModel):
     last_sync: Optional[datetime] = None
 
 
+class LitiganteResponse(BaseModel):
+    """Party (litigante) for a case."""
+    participante: str
+    rut: str
+    persona_type: str
+    nombre: str
+
+    class Config:
+        from_attributes = True
+
+
+class NotificacionResponse(BaseModel):
+    """Notification record for a case."""
+    rol: str
+    estado_notif: str
+    tipo_notif: str
+    fecha_tramite: Optional[datetime] = None
+    tipo_participante: str
+    nombre: str
+    tramite: str
+    obs_fallida: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class EscritoResponse(BaseModel):
+    """Filing (escrito) record for a case."""
+    fecha_ingreso: Optional[datetime] = None
+    tipo_escrito: str
+    solicitante: str
+    tiene_documento: bool
+    tiene_anexo: bool
+    doc_token: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ExhortoResponse(BaseModel):
+    """Exhorto/rogatory letter record for a case."""
+    rol_origen: str
+    tipo_exhorto: str
+    rol_destino: str
+    fecha_ordena: Optional[datetime] = None
+    fecha_ingreso: Optional[datetime] = None
+    tribunal_destino: str
+    estado: str
+
+    class Config:
+        from_attributes = True
+
+
+class CaseEntitiesResponse(BaseModel):
+    """Lightweight response containing only the 4 entity lists for a case."""
+    litigantes: List[LitiganteResponse]
+    notificaciones: List[NotificacionResponse]
+    escritos: List[EscritoResponse]
+    exhortos: List[ExhortoResponse]
+
+
 class CaseDetailResponse(BaseModel):
-    """Case with movements."""
+    """Case with movements and all scraped entity lists."""
     case: CaseResponse
     movements: List[MovementResponse]
     movements_count: int
+    litigantes: List[LitiganteResponse]
+    litigantes_count: int
+    notificaciones: List[NotificacionResponse]
+    notificaciones_count: int
+    escritos: List[EscritoResponse]
+    escritos_count: int
+    exhortos: List[ExhortoResponse]
+    exhortos_count: int
 
 
 # ============================================================================
@@ -193,7 +266,21 @@ async def get_case(
     movements = db.query(Movement).filter(
         Movement.case_id == case_id
     ).order_by(Movement.movement_date.desc()).all()
-    
+
+    # Get case-detail entities
+    litigantes = db.query(CaseLitigante).filter(
+        CaseLitigante.case_id == case_id
+    ).all()
+    notificaciones = db.query(CaseNotificacion).filter(
+        CaseNotificacion.case_id == case_id
+    ).all()
+    escritos = db.query(CaseEscrito).filter(
+        CaseEscrito.case_id == case_id
+    ).all()
+    exhortos = db.query(CaseExhorto).filter(
+        CaseExhorto.case_id == case_id
+    ).all()
+
     # Build court info
     court_info = None
     if case.court:
@@ -202,7 +289,7 @@ async def get_case(
             name=case.court.name,
             region=case.court.region,
         )
-    
+
     case_response = CaseResponse(
         id=case.id,
         rol=case.rol,
@@ -217,7 +304,7 @@ async def get_case(
         created_at=case.created_at,
         updated_at=case.updated_at,
     )
-    
+
     movements_response = [
         MovementResponse(
             id=m.id,
@@ -230,11 +317,19 @@ async def get_case(
         )
         for m in movements
     ]
-    
+
     return CaseDetailResponse(
         case=case_response,
         movements=movements_response,
         movements_count=len(movements),
+        litigantes=[LitiganteResponse.model_validate(r) for r in litigantes],
+        litigantes_count=len(litigantes),
+        notificaciones=[NotificacionResponse.model_validate(r) for r in notificaciones],
+        notificaciones_count=len(notificaciones),
+        escritos=[EscritoResponse.model_validate(r) for r in escritos],
+        escritos_count=len(escritos),
+        exhortos=[ExhortoResponse.model_validate(r) for r in exhortos],
+        exhortos_count=len(exhortos),
     )
 
 
@@ -277,6 +372,50 @@ async def get_case_movements(
         )
         for m in movements
     ]
+
+
+@router.get("/{case_id}/detail-entities", response_model=CaseEntitiesResponse)
+async def get_case_detail_entities(
+    case_id: int,
+    current_lawyer: dict = Depends(get_current_lawyer),
+    db: Session = Depends(get_db),
+):
+    """Get only the 4 entity lists for a case (litigantes, notificaciones, escritos, exhortos)."""
+    lawyer_id = current_lawyer.get("sub") or current_lawyer.get("lawyer_id")
+
+    # Verify case belongs to lawyer
+    case = db.query(Case).filter(
+        and_(
+            Case.id == case_id,
+            Case.lawyer_id == lawyer_id,
+        )
+    ).first()
+
+    if not case:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Case not found",
+        )
+
+    litigantes = db.query(CaseLitigante).filter(
+        CaseLitigante.case_id == case_id
+    ).all()
+    notificaciones = db.query(CaseNotificacion).filter(
+        CaseNotificacion.case_id == case_id
+    ).all()
+    escritos = db.query(CaseEscrito).filter(
+        CaseEscrito.case_id == case_id
+    ).all()
+    exhortos = db.query(CaseExhorto).filter(
+        CaseExhorto.case_id == case_id
+    ).all()
+
+    return CaseEntitiesResponse(
+        litigantes=[LitiganteResponse.model_validate(r) for r in litigantes],
+        notificaciones=[NotificacionResponse.model_validate(r) for r in notificaciones],
+        escritos=[EscritoResponse.model_validate(r) for r in escritos],
+        exhortos=[ExhortoResponse.model_validate(r) for r in exhortos],
+    )
 
 
 @router.delete("/{case_id}", status_code=status.HTTP_204_NO_CONTENT)
