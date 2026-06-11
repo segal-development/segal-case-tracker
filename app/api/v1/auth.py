@@ -117,7 +117,7 @@ async def login(
 
         # Resolve (or create) the lawyer and bind the real id to the session
         lawyer = _get_or_create_lawyer(db, rut=request.rut, auth_method="captcha")
-        pjud_session.lawyer_id = lawyer.id
+        pjud_session.lawyer_id = int(lawyer.id)
 
         # Persist session via async store
         store = get_session_store()
@@ -175,7 +175,7 @@ async def login_clave_unica(
             page = await factory.new_page()
 
             auth = ClaveUnicaAuth()
-            pjud_session = await auth.login(page, credentials, lawyer.id)
+            pjud_session = await auth.login(page, credentials, int(lawyer.id))
 
             # Persist session
             store = get_session_store()
@@ -301,10 +301,16 @@ def _get_or_create_lawyer(
         except IntegrityError:
             # Another request won the INSERT race — roll back and fetch the winner.
             db.rollback()
-            lawyer = db.query(Lawyer).filter(Lawyer.rut == normalized).first()
+            winner = db.query(Lawyer).filter(Lawyer.rut == normalized).first()
+            if winner is None:
+                raise RuntimeError(
+                    f"Failed to resolve lawyer for RUT {normalized} "
+                    "after IntegrityError — concurrent rollback?"
+                )
+            lawyer = winner
 
     # Update last_login_at on every successful authentication
-    lawyer.last_login_at = datetime.now(tz=timezone.utc)
+    lawyer.last_login_at = datetime.now(tz=timezone.utc)  # type: ignore[assignment]
     db.commit()
     db.refresh(lawyer)
 

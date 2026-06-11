@@ -20,7 +20,7 @@ half-async. Requires `size:exception` — see Review Workload Forecast.
 
 ### Prerequisites
 
-- [ ] **S1-T0** `[IMPL]` Add async conftest fixtures to `tests/conftest.py`:
+- [x] **S1-T0** `[IMPL]` Add async conftest fixtures to `tests/conftest.py`:
   `fake_redis` (`fakeredis.aioredis.FakeRedis()`), `session_store(fake_redis)`,
   `sample_session` (canonical `PJUDSession` with UTC-aware timestamps,
   `lawyer_id=42`, `auth_method="captcha"`), `mock_scraper` (`AsyncMock`
@@ -30,7 +30,7 @@ half-async. Requires `size:exception` — see Review Workload Forecast.
 
 ### PJUDSession canonical model
 
-- [ ] **S1-T1** `[TEST — RED]` Write `tests/services/test_pjud_session.py`:
+- [x] **S1-T1** `[TEST — RED]` Write `tests/services/test_pjud_session.py`:
   - `PJUDSession.create()` produces `created_at` and `expires_at` as UTC-aware datetimes.
   - `is_expired()` returns `False` for a freshly created session and `True` when
     `expires_at` is in the past — compares aware vs aware (no timezone mismatch).
@@ -39,7 +39,7 @@ half-async. Requires `size:exception` — see Review Workload Forecast.
     (back-compat for sessions cached before the rename).
   _Satisfies_: SESS-01, SESS-04.
 
-- [ ] **S1-T2** `[IMPL]` Create `app/services/pjud_session.py` — canonical
+- [x] **S1-T2** `[IMPL]` Create `app/services/pjud_session.py` — canonical
   `PJUDSession` dataclass with fields: `session_id`, `lawyer_id`, `rut`, `cookies`,
   `created_at`, `expires_at`, `local_storage`, `last_used_at`, `auth_method`.
   Include `_utcnow()`, `DEFAULT_SESSION_MINUTES = 25`, `create()` classmethod,
@@ -49,13 +49,13 @@ half-async. Requires `size:exception` — see Review Workload Forecast.
 
 ### Async Redis client
 
-- [ ] **S1-T3** `[IMPL]` Add `get_async_redis_client() -> redis.asyncio.Redis` to
+- [x] **S1-T3** `[IMPL]` Add `get_async_redis_client() -> redis.asyncio.Redis` to
   `app/core/redis.py` (lazy singleton, `redis.asyncio.from_url`, `decode_responses=True`).
   _Satisfies_: ADR-3 prerequisite.
 
 ### Async SessionStore
 
-- [ ] **S1-T4** `[TEST — RED]` Write `tests/services/test_session_store_async.py`:
+- [x] **S1-T4** `[TEST — RED]` Write `tests/services/test_session_store_async.py`:
   - `asave_session(s)` then `get_session_by_lawyer(s.lawyer_id)` returns an equal
     session — verifies the root-cause bug is fixed (no longer RUT-keyed / lawyer-keyed split).
   - Primary key is `pjud:session:lawyer:{lawyer_id}`.
@@ -67,7 +67,7 @@ half-async. Requires `size:exception` — see Review Workload Forecast.
   - Redis unreachable on `get_session_by_lawyer` → returns `None`; no unhandled exception.
   _Satisfies_: SESS-02, SESS-03, SESS-05.
 
-- [ ] **S1-T5** `[IMPL]` Refactor `app/services/session_store.py`:
+- [x] **S1-T5** `[IMPL]` Refactor `app/services/session_store.py`:
   - Replace local `PJUDSession` dataclass with `from app.services.pjud_session import PJUDSession`.
   - Replace sync redis client with async: `get_async_redis_client()`.
   - Convert all store methods to `async def`:
@@ -86,7 +86,7 @@ half-async. Requires `size:exception` — see Review Workload Forecast.
 
 ### Login endpoint rewiring
 
-- [ ] **S1-T6** `[TEST — RED]` Update `tests/api/v1/test_auth.py`:
+- [x] **S1-T6** `[TEST — RED]` Update `tests/api/v1/test_auth.py`:
   - `/auth/login` with mocked `login_with_token` (not `login_with_user_captcha`):
     asserts `login_with_token` was awaited with correct args; asserts
     `login_with_user_captcha` symbol does not exist in the `auth` module
@@ -100,7 +100,7 @@ half-async. Requires `size:exception` — see Review Workload Forecast.
   - `/auth/refresh` endpoint no longer exists (HTTP 404 or route not registered).
   _Satisfies_: AUTH-01, AUTH-02, AUTH-03.
 
-- [ ] **S1-T7** `[IMPL]` Rewrite `app/api/v1/auth.py` login wiring:
+- [x] **S1-T7** `[IMPL]` Rewrite `app/api/v1/auth.py` login wiring:
   - Replace `from app.scrapper.session_manager import SessionManager, PJUDSession`
     with `from app.services.pjud_session import PJUDSession`.
   - `/auth/login`: call `scraper.login_with_token(rut, password, captcha_token)`;
@@ -117,52 +117,52 @@ half-async. Requires `size:exception` — see Review Workload Forecast.
 
 ### pjud.py and sync_scheduler call sites
 
-- [ ] **S1-T8** `[TEST — RED]` Update `tests/api/v1/test_pjud_stateless.py`:
+- [x] **S1-T8** `[TEST — RED]` Update `tests/api/v1/test_pjud_stateless.py`:
   - `/pjud/login` with mocked scraper: asserts `store.asave_session` awaited;
     asserts `PJUDSession.create()` used (uuid4 `session_id`, not manual timestamp string).
   _Satisfies_: SESS-02 (async store, canonical factory).
 
-- [ ] **S1-T9** `[IMPL]` Rewire `app/api/v1/pjud.py` `/pjud/login`:
+- [x] **S1-T9** `[IMPL]` Rewire `app/api/v1/pjud.py` `/pjud/login`:
   - Import `PJUDSession` from `app.services.pjud_session`.
   - Use `PJUDSession.create(session_id=str(uuid4()), ...)` factory.
   - `await store.asave_session(redis_session)`.
   - `lawyer_id` stays at 0 (slice 2 wires the real value).
   _Satisfies_: SESS-02, ADR-3 (call site).
 
-- [ ] **S1-T10** `[TEST — RED]` Write `tests/workers/test_sync_scheduler.py`:
+- [x] **S1-T10** `[TEST — RED]` Write `tests/workers/test_sync_scheduler.py`:
   - `sync_lawyer_cases` calls `await store.get_session_by_lawyer(lawyer_id)`.
   - When store returns `None` → result has `skipped=True, reason="no_session"`.
   _Satisfies_: SESS-03.
 
-- [ ] **S1-T11** `[IMPL]` Rewire `app/workers/sync_scheduler.py`:
+- [x] **S1-T11** `[IMPL]` Rewire `app/workers/sync_scheduler.py`:
   - Replace `store.get_session_by_lawyer(lawyer_id)` with
     `await store.get_session_by_lawyer(lawyer_id)` (single `await` change).
   _Satisfies_: ADR-3 (call site).
 
 ### Mechanical fixes and deletions
 
-- [ ] **S1-T12** `[IMPL]` Move `import asyncio` from `app/scrapper/pjud/civil.py:617`
+- [x] **S1-T12** `[IMPL]` Move `import asyncio` from `app/scrapper/pjud/civil.py:617`
   to the top-level import block. No logic change.
   _Satisfies_: design side-bug (civil.py import at bottom).
 
-- [ ] **S1-T13** `[IMPL]` Update imports in `app/scrapper/pjud/base.py`:
+- [x] **S1-T13** `[IMPL]` Update imports in `app/scrapper/pjud/base.py`:
   replace `from app.scrapper.session_manager import SessionManager, PJUDSession`
   with `from app.services.pjud_session import PJUDSession`.
   Remove `SessionManager` instantiation in `__init__` if present.
   _Satisfies_: SESS-02 (no import from deleted module).
 
-- [ ] **S1-T14** `[IMPL]` Update import in `app/scrapper/pjud/clave_unica.py`:
+- [x] **S1-T14** `[IMPL]` Update import in `app/scrapper/pjud/clave_unica.py`:
   replace `from app.services.session_store import PJUDSession`
   with `from app.services.pjud_session import PJUDSession`.
   _Satisfies_: SESS-02.
 
-- [ ] **S1-T15** `[IMPL]` Delete `app/scrapper/session_manager.py`.
+- [x] **S1-T15** `[IMPL]` Delete `app/scrapper/session_manager.py`.
   No module in `app/` may import from it after S1-T13 and S1-T14.
   _Satisfies_: SESS-02 (no parallel store implementations).
 
 ### Slice 1 verification
 
-- [ ] **S1-T16** `[VERIFY]` Run:
+- [x] **S1-T16** `[VERIFY]` Run:
   ```
   .venv/bin/python -m pytest -m "not integration" -x
   .venv/bin/python -m mypy app/services/pjud_session.py \
@@ -185,14 +185,14 @@ half-async. Requires `size:exception` — see Review Workload Forecast.
 
 ### normalize_rut shared helper
 
-- [ ] **S2-T1** `[TEST — RED]` Add tests to `tests/test_rut.py`:
+- [x] **S2-T1** `[TEST — RED]` Add tests to `tests/test_rut.py`:
   - `normalize_rut("16.021.492-9")` == `normalize_rut("16021492-9")`.
   - Both captcha-style (strips formatting, keeps verif digit) and
     clave_unica-style produce the same output for the same underlying RUT.
   - Output format: digits + hyphen + verif digit, no dots (e.g. `"16021492-9"`).
   _Satisfies_: design R4 (RUT normalization — single shared normalizer).
 
-- [ ] **S2-T2** `[IMPL]` Add `normalize_rut(rut: str) -> str` to `app/utils/rut.py`:
+- [x] **S2-T2** `[IMPL]` Add `normalize_rut(rut: str) -> str` to `app/utils/rut.py`:
   strips dots and spaces; ensures hyphen before verif digit; returns
   canonical form `"{digits}-{verif}"`. This is the single normalizer called
   before any `Lawyer.rut` query or `PJUDSession.rut` assignment.
@@ -200,7 +200,7 @@ half-async. Requires `size:exception` — see Review Workload Forecast.
 
 ### Real _get_or_create_lawyer (identity-only)
 
-- [ ] **S2-T3** `[TEST — RED]` Write `tests/services/test_lawyer_identity.py`:
+- [x] **S2-T3** `[TEST — RED]` Write `tests/services/test_lawyer_identity.py`:
   - `_get_or_create_lawyer(db, rut, password, "captcha")` returns existing lawyer
     when RUT already in DB (no duplicate created — idempotent).
   - Returns new lawyer with a DB-assigned `id` (not 0 or 1) when RUT not in DB.
@@ -210,7 +210,7 @@ half-async. Requires `size:exception` — see Review Workload Forecast.
   Use in-memory SQLite `db` fixture from `conftest.py`.
   _Satisfies_: LID-01, LID-02, LID-03.
 
-- [ ] **S2-T4** `[IMPL]` Implement real `_get_or_create_lawyer(db, rut, password, auth_method)
+- [x] **S2-T4** `[IMPL]` Implement real `_get_or_create_lawyer(db, rut, password, auth_method)
   -> Lawyer` in `app/api/v1/auth.py`:
   - `normalize_rut(rut)` before query.
   - `db.query(Lawyer).filter(Lawyer.rut == rut_norm).first()`.
@@ -223,24 +223,24 @@ half-async. Requires `size:exception` — see Review Workload Forecast.
 
 ### Wire db dependency into login handlers
 
-- [ ] **S2-T5** `[TEST — RED]` Update `tests/api/v1/test_auth.py`:
+- [x] **S2-T5** `[TEST — RED]` Update `tests/api/v1/test_auth.py`:
   - `/auth/login`: stored `session.lawyer_id` equals the `Lawyer.id` returned by
     `_get_or_create_lawyer` (not 0).
   - `/auth/login/clave-unica`: `session.lawyer_id` not 1 (hardcode killed).
   _Satisfies_: LID-02, LID-03.
 
-- [ ] **S2-T6** `[IMPL]` Update `app/api/v1/auth.py` login handlers:
+- [x] **S2-T6** `[IMPL]` Update `app/api/v1/auth.py` login handlers:
   - Add `db: Session = Depends(get_db)` to `/auth/login` and `/auth/login/clave-unica`.
   - Call real `_get_or_create_lawyer(db, rut, password, auth_method)` before
     `PJUDSession.create(...)`.
   - Pass `lawyer.id` as `lawyer_id` to `PJUDSession.create()`.
   _Satisfies_: LID-02, LID-03, AUTH-01, AUTH-02.
 
-- [ ] **S2-T7** `[TEST — RED]` Update `tests/api/v1/test_pjud_stateless.py`:
+- [x] **S2-T7** `[TEST — RED]` Update `tests/api/v1/test_pjud_stateless.py`:
   - `/pjud/login` stored session `lawyer_id != 0` after real resolution.
   _Satisfies_: LID-02.
 
-- [ ] **S2-T8** `[IMPL]` Add `db: Session = Depends(get_db)` to `/pjud/login`;
+- [x] **S2-T8** `[IMPL]` Add `db: Session = Depends(get_db)` to `/pjud/login`;
   call `_get_or_create_lawyer`; pass `lawyer.id` to `PJUDSession.create()`.
   (Import `_get_or_create_lawyer` from `app.api.v1.auth` or extract to
   `app/services/lawyer_service.py` — whichever keeps imports clean.)
@@ -248,7 +248,7 @@ half-async. Requires `size:exception` — see Review Workload Forecast.
 
 ### Slice 2 verification
 
-- [ ] **S2-T9** `[VERIFY]` Run:
+- [x] **S2-T9** `[VERIFY]` Run:
   ```
   .venv/bin/python -m pytest -m "not integration" -x
   .venv/bin/python -m mypy app/utils/rut.py app/api/v1/auth.py app/api/v1/pjud.py
