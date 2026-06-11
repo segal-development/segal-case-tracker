@@ -25,6 +25,12 @@ from app.scrapper.pjud import (
     PJUDError,
     ScrapingError,
 )
+from app.scrapper.pjud.base import (
+    PJUDLitigante,
+    PJUDNotificacion,
+    PJUDEscrito,
+    PJUDExhorto,
+)
 
 
 class TestPJUDBaseScraper:
@@ -262,3 +268,86 @@ class TestCompetencyConfig:
         
         assert config.name == "test"
         assert config.competencia_code == "99"
+
+
+class TestNewEntityDataclasses:
+    """Test the four new entity dataclasses added for case detail parsing (S1-T02)."""
+
+    def test_pjud_litigante_exists_and_fields(self):
+        """PJUDLitigante should have participante, rut, persona_type, nombre."""
+        lit = PJUDLitigante(
+            participante="DTE.",
+            rut="76543210-K",
+            persona_type="JURIDICA",
+            nombre="CAJA FICTICIA DE PREVISION SOCIAL SA",
+        )
+        assert lit.participante == "DTE."
+        assert lit.rut == "76543210-K"
+        assert lit.persona_type == "JURIDICA"
+        assert lit.nombre == "CAJA FICTICIA DE PREVISION SOCIAL SA"
+
+    def test_pjud_notificacion_exists_and_fields(self):
+        """PJUDNotificacion should have all 8 fields."""
+        notif = PJUDNotificacion(
+            rol="C-1253-2015",
+            estado_notif="Notificada",
+            tipo_notif="Personal",
+            fecha_tramite="15/03/2026",
+            tipo_participante="DTE.",
+            nombre="CAJA FICTICIA DE PREVISION SOCIAL SA",
+            tramite="Auto acordado",
+            obs_fallida="",
+        )
+        assert notif.rol == "C-1253-2015"
+        assert notif.obs_fallida == ""
+
+    def test_pjud_escrito_exists_and_boolean_fields(self):
+        """PJUDEscrito should have boolean tiene_documento and tiene_anexo."""
+        escrito = PJUDEscrito(
+            fecha_ingreso="10/01/2026",
+            tipo_escrito="Demanda",
+            solicitante="CAJA FICTICIA DE PREVISION SOCIAL SA",
+            tiene_documento=True,
+            tiene_anexo=False,
+            doc_token="fake-token",
+        )
+        assert isinstance(escrito.tiene_documento, bool)
+        assert isinstance(escrito.tiene_anexo, bool)
+        assert escrito.doc_token == "fake-token"
+
+    def test_pjud_exhorto_exists_and_optional_token(self):
+        """PJUDExhorto should have optional detalle_token defaulting to None."""
+        exhorto = PJUDExhorto(
+            rol_origen="C-1253-2015",
+            tipo_exhorto="Exhorto",
+            rol_destino="E-355-2026",
+            fecha_ordena="05/05/2026",
+            fecha_ingreso="05/05/2026",
+            tribunal_destino="8º Juzgado Civil de Santiago",
+            estado="Generado",
+        )
+        assert exhorto.rol_destino == "E-355-2026"
+        assert exhorto.detalle_token is None
+
+    def test_pjud_case_detail_has_four_new_list_fields(self):
+        """PJUDCaseDetail should have litigantes, notificaciones, escritos, exhortos lists."""
+        case = PJUDCase(
+            rol="C-1253-2015",
+            tribunal="Test",
+            caratulado="Test",
+            fecha_ingreso="01/06/2026",
+        )
+        detail = PJUDCaseDetail(case=case)
+
+        # All four new fields must exist and default to empty lists
+        assert hasattr(detail, "litigantes")
+        assert hasattr(detail, "notificaciones")
+        assert hasattr(detail, "escritos")
+        assert hasattr(detail, "exhortos")
+        assert detail.litigantes == []
+        assert detail.notificaciones == []
+        assert detail.escritos == []
+        assert detail.exhortos == []
+
+        # partes must still exist (backward compat)
+        assert hasattr(detail, "partes")
