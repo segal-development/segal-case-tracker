@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.security import create_access_token, get_current_lawyer
+from app.core.security import create_access_token, get_current_lawyer, encrypt_pjud_password
 from app.scrapper.pjud_civil import PJUDCivilScraper, LoginError
 from app.scrapper.pjud.browser import BrowserFactory
 from app.scrapper.pjud.clave_unica import (
@@ -116,7 +116,9 @@ async def login(
         )
 
         # Resolve (or create) the lawyer and bind the real id to the session
-        lawyer = _get_or_create_lawyer(db, rut=request.rut, auth_method="captcha")
+        lawyer = _get_or_create_lawyer(
+            db, rut=request.rut, password=request.password, auth_method="captcha"
+        )
         pjud_session.lawyer_id = int(lawyer.id)
 
         # Persist session via async store
@@ -168,7 +170,9 @@ async def login_clave_unica(
     credentials = ClaveUnicaCredentials(rut=request.rut, password=request.password)
 
     # Resolve (or create) the lawyer before starting the browser
-    lawyer = _get_or_create_lawyer(db, rut=request.rut, auth_method="clave_unica")
+    lawyer = _get_or_create_lawyer(
+        db, rut=request.rut, password=request.password, auth_method="clave_unica"
+    )
 
     try:
         async with BrowserFactory(headless=True) as factory:
@@ -265,6 +269,7 @@ async def logout(current_rut: str = Depends(get_current_lawyer)):
 def _get_or_create_lawyer(
     db: Session,
     rut: str,
+    password: str = "",
     auth_method: str = "captcha",
 ) -> Lawyer:
     """Look up a Lawyer by normalized RUT, creating one if absent (ADR-5).
@@ -272,14 +277,27 @@ def _get_or_create_lawyer(
     The operation is idempotent: concurrent inserts are handled by catching
     IntegrityError and re-querying the row that won the race.
 
-    Identity-only (Slice 2): stores rut, name placeholder, and last_login_at.
-    Slice 3 will extend this function to populate encrypted credential columns.
+    Stores encrypted credentials when *password* is non-empty (Slice 3 / LID-04).
+
+    SECURITY NOTE (ADR-6 / R1):
+    - What is stored: Fernet-encrypted ciphertext of the PJUD or Clave Única
+      password in ``lawyers.encrypted_pjud_password`` (captcha path) or
+      ``lawyers.encrypted_clave_unica_password`` (clave_unica path).
+    - This is REVERSIBLE encryption, NOT a hash — the scheduled worker must
+      replay the plaintext password to PJUD during autonomous re-authentication.
+    - The symmetric key (``settings.ENCRYPTION_KEY``) MUST be sourced from a
+      secret manager, restricted to the worker/API roles only, and rotated on
+      exposure.  Plaintext passwords are NEVER written to any other persistent
+      field, log, or cache.
+    - This slice has a mandatory human security-review gate before merge (S3-T9).
 
     Args:
         db: SQLAlchemy session (sync).
         rut: Lawyer RUT in any input format — normalized internally.
-        auth_method: "captcha" or "clave_unica"; stored as preferred_auth_method
-                     when creating a new record.
+        password: Plaintext credential.  When non-empty the encrypted value is
+                  stored; when empty the credential columns are left unchanged.
+        auth_method: ``"captcha"`` or ``"clave_unica"``; stored as
+                     ``preferred_auth_method`` when creating a new record.
 
     Returns:
         Persisted Lawyer instance with a valid integer id.  Never returns None.
@@ -290,7 +308,7 @@ def _get_or_create_lawyer(
     if lawyer is None:
         lawyer = Lawyer(
             rut=normalized,
-            name=normalized,  # placeholder; Slice 3 / profile sync will update
+            name=normalized,  # placeholder; profile sync will update
             preferred_auth_method=auth_method,
             is_active=True,
         )
@@ -311,6 +329,18 @@ def _get_or_create_lawyer(
 
     # Update last_login_at on every successful authentication
     lawyer.last_login_at = datetime.now(tz=timezone.utc)  # type: ignore[assignment]
+
+    # Persist encrypted credentials when provided (Fernet-reversible, see SECURITY NOTE above).
+    if password:
+        encrypted = encrypt_pjud_password(password)
+        if auth_method == "clave_unica":
+            lawyer.clave_unica_rut = normalized  # type: ignore[assignment]
+            lawyer.encrypted_clave_unica_password = encrypted  # type: ignore[assignment]
+            lawyer.preferred_auth_method = "clave_unica"  # type: ignore[assignment]
+        else:
+            # captcha (default)
+            lawyer.encrypted_pjud_password = encrypted  # type: ignore[assignment]
+
     db.commit()
     db.refresh(lawyer)
 
