@@ -253,16 +253,17 @@ No existing behavior is altered; Alert/Movement paths are untouched.
 ### S1-T12 — Extend `detect_and_sync_movements` with 4 entity sync calls  *(needs S1-T11, S1-T07)*
 
 **Spec:** "All five tabs populated from single detail HTML" (end-to-end storage)
+**Status:** DONE (Slice 2, commit 6d037d0)
 **Work:**
-- [ ] Add failing test `test_detect_and_sync_stores_all_entity_types`:
+- [x] Add failing test `test_detect_and_sync_stores_all_entity_types`:
       mock scraper returning `PJUDCaseDetail` with rich fixture data;
       after `detect_and_sync_movements` assert DB has 6 litigantes + 1 exhorto
       + 0 notificaciones + 0 escritos — **red**
-- [ ] Update `detect_and_sync_movements` in `sync_service.py`:
+- [x] Update `detect_and_sync_movements` in `sync_service.py`:
       after existing `sync_movements` call, call `_sync_entities` for each of the 4 specs
       using the `detail.{litigantes,notificaciones,escritos,exhortos}` lists
       (no extra network fetch — same `detail` object)
-- [ ] Run test — **green**
+- [x] Run test — **green**
 
 ---
 
@@ -290,8 +291,9 @@ no schema change required (columns land in Slice 1).
 ### S2-T01 — Flip spec flags + Alert entity wiring in `_sync_entities`  *(first Slice 2 task)*
 
 **Spec:** "Change Detection" — all BDD scenarios; ADR-003; ADR-004
+**Status:** DONE (Slice 2, commit 6d037d0)
 **Work:**
-- [ ] Write failing L2 tests in `tests/services/test_case_detail_sync.py`:
+- [x] Write failing L2 tests in `tests/services/test_case_detail_sync.py`:
       - `test_new_exhorto_creates_alert_with_entity_type`: run `_sync_entities` on 1 exhorto
         → 1 Alert with `type="new_exhorto"`, `entity_type="exhorto"`, `entity_id=<row.id>`
       - `test_existing_exhorto_no_alert`: seed CaseExhorto first; re-run → 0 new Alerts
@@ -299,22 +301,23 @@ no schema change required (columns land in Slice 1).
       - `test_new_escrito_creates_alert`: synthetic fixture, 2 escritos → 2 Alerts
       - `test_litigante_creates_no_alert`: 6 litigantes → 0 Alerts (policy: litigantes silent)
       — **red** for all
-- [ ] In `app/services/sync_service.py`:
+- [x] In `app/services/sync_service.py`:
       - Flip `creates_alert=True` on SPEC_NOTIFICACION, SPEC_ESCRITO, SPEC_EXHORTO
         (SPEC_LITIGANTE stays `creates_alert=False`)
       - Wire alert creation in `_sync_entities` when `is_new and spec.creates_alert`:
         `Alert(type="new_{entity_type}", entity_type=spec.entity_type, entity_id=row.id,
                lawyer_id=lawyer.id, case_id=case_id, title=spec.alert_title_fn(...),
                message=spec.alert_message_fn(...))`
-- [ ] Run tests — **green**
+- [x] Run tests — **green**
 
 ---
 
 ### S2-T02 — `NotificationService`: new methods + `_dispatch` helper + webhook events  *(parallel with S2-T01)*
 
 **Spec:** "Change Detection" (notify_new_* methods); ADR-004 (event strings); ADR-003
+**Status:** DONE (Slice 2, commit abf0557)
 **Work:**
-- [ ] Write failing L3 tests in `tests/services/test_notification_service.py`:
+- [x] Write failing L3 tests in `tests/services/test_notification_service.py`:
       - `test_notify_new_notificacion_sends_email`: mock SendGrid → assert `send_email_alert`
         called with correct subject and body
       - `test_notify_new_escrito_sends_webhook`: mock httpx → assert webhook body is
@@ -322,23 +325,24 @@ no schema change required (columns land in Slice 1).
       - `test_notify_new_exhorto_sends_webhook`: event `"exhorto.created"`, HMAC present
       - `test_dispatch_helper_calls_email_and_all_webhooks`: 2 webhooks → 2 webhook calls + 1 email
       — **red** for all
-- [ ] Add to `app/services/notification_service.py`:
+- [x] Add to `app/services/notification_service.py`:
       - Private `_dispatch(self, alert, lawyer, webhooks, payload: dict)` absorbing
         `send_email_alert` + HMAC webhook fan-out (eliminates copy-paste from next 3 methods)
-      - `notify_new_notificacion(self, db, case, notificacion_row, lawyer, webhooks, alert)`
-      - `notify_new_escrito(self, db, case, escrito_row, lawyer, webhooks, alert)`
-      - `notify_new_exhorto(self, db, case, exhorto_row, lawyer, webhooks, alert)`
+      - `notify_new_notificacion(self, case, notificacion_row, lawyer, webhooks, alert)`
+      - `notify_new_escrito(self, case, escrito_row, lawyer, webhooks, alert)`
+      - `notify_new_exhorto(self, case, exhorto_row, lawyer, webhooks, alert)`
       - Each builds v1 envelope: `{event, version:"1", data:{lawyer_id, case:{...}, <entity>:{...}}}`
       - Event strings: `"notificacion.created"`, `"escrito.created"`, `"exhorto.created"`
-- [ ] Run tests — **green**
+- [x] Run tests — **green**
 
 ---
 
 ### S2-T03 — Notify dispatch wiring in `_sync_entities` + shared budget refactor  *(needs S2-T01 + S2-T02)*
 
 **Spec:** "Notification Cap Across All Entity Types"; ADR-005; "Change Detection" (dispatch path)
+**Status:** DONE (Slice 2, commit 6d037d0)
 **Work:**
-- [ ] Write failing tests:
+- [x] Write failing tests:
       - `test_sync_entities_calls_notify_fn_per_new_row`: mock `NotificationService`;
         3 new exhortos → `notify_new_exhorto` called 3 times
       - `test_litigante_notify_never_called_even_when_new`:
@@ -349,8 +353,8 @@ no schema change required (columns land in Slice 1).
       - `test_sync_movements_still_works_with_shared_budget`:
         existing `sync_movements` callers work unchanged (additive default signature)
       — **red** for all
-- [ ] In `app/services/sync_service.py`:
-      - Introduce `class NotifyBudget` (mutable counter) or `list[int]` wrapper
+- [x] In `app/services/sync_service.py`:
+      - Introduce `class NotifyBudget` (mutable counter)
       - Refactor `sync_movements` to accept optional `budget: NotifyBudget = None`
         (if None, creates own local budget — backward compat)
       - Flip `notify=True` on SPEC_NOTIFICACION, SPEC_ESCRITO, SPEC_EXHORTO
@@ -358,10 +362,10 @@ no schema change required (columns land in Slice 1).
       - Wire dispatch in `_sync_entities`: when `is_new and spec.notify and budget.remaining > 0`:
         call `getattr(notification_svc, spec.notify_fn_name)(...)`, decrement budget
         else log cap-reached warning
-      - Update `detect_and_sync_movements` to create ONE shared `NotifyBudget` and pass it
+      - Updated `detect_and_sync_movements` to create ONE shared `NotifyBudget` and pass it
         into `sync_movements` + all 4 `_sync_entities` calls in priority order
         (movements → notificaciones → escritos → exhortos)
-- [ ] Run tests — **green**
+- [x] Run tests — **green**
 
 ---
 
