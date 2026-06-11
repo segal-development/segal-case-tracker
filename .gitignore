@@ -36,6 +36,10 @@ screenshots/
 # SDD / skill registry cache (generated)
 .atl/*.cache.json
 
+# Manual PJUD debug scripts — contain real credentials, keep local only
+scripts/manual/
+test_captcha.html
+
 # OS
 .DS_Store
 Thumbs.db
