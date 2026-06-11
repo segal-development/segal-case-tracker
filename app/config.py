@@ -101,6 +101,16 @@ class Settings(BaseSettings):
         """True only when DEBUG is set AND we are in the development environment."""
         return self.DEBUG and self.ENVIRONMENT.lower() == "development"
 
+    @property
+    def has_2captcha(self) -> bool:
+        """True when a 2Captcha API key is configured (single decision point, ADR-7).
+
+        Controls the autonomous captcha re-auth path in the worker scheduler.
+        When False, lawyers authenticated via captcha are skipped on session
+        expiry (reason=``captcha_no_2captcha_key``) rather than crashing.
+        """
+        return bool(self.CAPTCHA_API_KEY)
+
     # ------------------------------------------------------------------
     # Fail-fast secrets validation
     # ------------------------------------------------------------------
