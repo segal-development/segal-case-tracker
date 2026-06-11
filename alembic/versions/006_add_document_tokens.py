@@ -83,6 +83,9 @@ def upgrade() -> None:
         ),
     )
 
+    # Index on escrito_id FK to avoid full-table scans on reverse FK joins.
+    op.create_index("ix_documents_escrito_id", "documents", ["escrito_id"])
+
     # Make filename nullable (document not yet downloaded at persist time)
     op.alter_column("documents", "filename", nullable=True)
 
@@ -100,6 +103,7 @@ def downgrade() -> None:
 
     # documents — drop in reverse order of upgrade
     op.alter_column("documents", "filename", nullable=False)
+    op.drop_index("ix_documents_escrito_id", table_name="documents")
     op.drop_column("documents", "escrito_id")
     op.drop_column("documents", "status")
     op.drop_index("ix_documents_pjud_token_hash", table_name="documents")

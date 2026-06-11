@@ -31,9 +31,11 @@ class Document(Base):
     doc_type = Column(String(50), nullable=True)           # e.g. "resolution", "cert_envio"
     pjud_endpoint = Column(String(255), nullable=True)     # e.g. "documentos/docuS.php"
     pjud_token = Column(Text, nullable=True)               # Live JWT, refreshed each sync
-    pjud_token_hash = Column(String(64), nullable=True, index=True)
+    pjud_token_hash = Column(String(64), nullable=True)
     # ^ Stable identity hash: sha256(doc_type|case_rol|scope_key) — NOT the JWT hash.
-    # Unique partial index (WHERE pjud_token_hash IS NOT NULL) added in migration 006.
+    # Unique partial index (WHERE pjud_token_hash IS NOT NULL) owned by migration 006
+    # (ix_documents_pjud_token_hash). Do NOT add index=True here: that creates a plain
+    # index duplicate that breaks alembic autogenerate (plain vs unique partial mismatch).
 
     # Status: pending → (download) → stored | failed | unavailable
     status = Column(String(20), nullable=False, server_default="pending")

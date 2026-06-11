@@ -118,13 +118,25 @@ class DocumentPersistenceService:
 
             movement_id = db_movement.id if db_movement is not None else None
 
+            # Guard: skip movement docs when folio is falsy to avoid hash collision.
+            # Two movements with folio=None would share the same stable_hash and
+            # silently overwrite each other.
+            if not pjud_movement.folio:
+                logger.warning(
+                    "Skipping document persistence for movement with falsy folio "
+                    "(case_id=%s, doc_count=%d): cannot build stable identity hash.",
+                    case_id,
+                    len(pjud_movement.documentos),
+                )
+                continue
+
             for pjud_doc in pjud_movement.documentos:
                 if not pjud_doc.doc_type:
                     continue
                 token_hash = document_identity_hash(
                     pjud_doc.doc_type,
                     case_rol,
-                    scope_key=pjud_movement.folio or "",
+                    scope_key=pjud_movement.folio,
                 )
                 doc = self._upsert_document(
                     db=db,
@@ -162,6 +174,11 @@ class DocumentPersistenceService:
         """
         from app.models.document import Document
 
+        # Use a SAVEPOINT so a flush failure inside this single document
+        # rolls back only its own changes and leaves the outer session healthy.
+        # Without this, a failed db.flush() poisons the session and all
+        # subsequent queries in the same transaction will also fail.
+        savepoint = db.begin_nested()
         try:
             existing: Optional[Document] = (
                 db.query(Document)
@@ -172,10 +189,12 @@ class DocumentPersistenceService:
             if existing is not None:
                 if existing.status == "stored":
                     # Already downloaded — idempotent skip
+                    savepoint.commit()
                     return existing
                 # Refresh the live JWT; preserve status
                 existing.pjud_token = pjud_doc.token
                 db.flush()
+                savepoint.commit()
                 return existing
 
             # New document row
@@ -191,10 +210,12 @@ class DocumentPersistenceService:
             )
             db.add(doc)
             db.flush()
+            savepoint.commit()
             return doc
 
         except Exception as exc:
-            logger.error(
+            savepoint.rollback()
+            logger.warning(
                 "Failed to upsert Document (case_id=%s, doc_type=%s, hash=%s): %s",
                 case_id,
                 pjud_doc.doc_type,

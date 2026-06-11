@@ -412,6 +412,39 @@ class CivilScraper(PJUDBaseScraper):
 
         return None  # No form, no fa-ban → absent
 
+    def _parse_fa_ban_slot(
+        self,
+        html: str,
+        td_label_pattern: str,
+        url_type: str,
+        doc_type: str,
+        form_action: str,
+        param_name: str,
+    ) -> Optional[PJUDDocument]:
+        """Return PJUDDocument(available=False) when fa-ban is found in a labelled <td>.
+
+        Scopes the fa-ban search to the <td> whose text content starts with the
+        given label (e.g. "Texto Demanda:", "Ebook:").
+
+        Returns None when no fa-ban is found in the matching <td> (slot absent/empty).
+        """
+        td_match = re.search(td_label_pattern, html, re.DOTALL | re.IGNORECASE)
+        if td_match and re.search(
+            self.get_selector("disabled_doc_indicator"),
+            td_match.group(0),
+            re.IGNORECASE,
+        ):
+            return PJUDDocument(
+                token=None,
+                tipo="caso",
+                url_type=url_type,
+                doc_type=doc_type,
+                endpoint=f"documentos/{form_action}",
+                param_name=param_name,
+                available=False,
+            )
+        return None
+
     def _parse_case_documents(self, html: str) -> List[PJUDDocument]:
         """Extract the 3 case-level static document tokens.
 
@@ -420,26 +453,37 @@ class CivilScraper(PJUDBaseScraper):
         - cert_envio:    docCertificadoDemanda.php?dtaCert  (disambiguated by action)
         - ebook:         newebookcivil.php?dtaEbook
 
-        fa-ban → PJUDDocument(available=False); missing form → not included.
+        fa-ban → PJUDDocument(available=False) for all three slots (symmetric).
+        Missing form AND no fa-ban → not included (slot absent).
         """
         docs: List[PJUDDocument] = []
 
         # texto_demanda
-        td_token = self._extract_form_token(
-            html,
-            self.get_selector("texto_demanda_form_action"),
-            self.get_selector("texto_demanda_param"),
-        )
+        td_action = self.get_selector("texto_demanda_form_action")
+        td_param = self.get_selector("texto_demanda_param")
+        td_token = self._extract_form_token(html, td_action, td_param)
         if td_token is not None:
             docs.append(PJUDDocument(
                 token=td_token,
                 tipo="caso",
                 url_type="texto_demanda",
                 doc_type="texto_demanda",
-                endpoint=f"documentos/{self.get_selector('texto_demanda_form_action')}",
-                param_name=self.get_selector("texto_demanda_param"),
+                endpoint=f"documentos/{td_action}",
+                param_name=td_param,
                 available=True,
             ))
+        else:
+            # fa-ban in the "Texto Demanda:" <td> → available=False row
+            fa_doc = self._parse_fa_ban_slot(
+                html,
+                td_label_pattern=r'<td>\s*(?:<[^>]+>\s*)*Texto Demanda:.*?</td>',
+                url_type="texto_demanda",
+                doc_type="texto_demanda",
+                form_action=td_action,
+                param_name=td_param,
+            )
+            if fa_doc is not None:
+                docs.append(fa_doc)
 
         # cert_envio (with fa-ban + missing-form handling)
         cert_envio_doc = self._parse_cert_envio(html)
@@ -447,21 +491,31 @@ class CivilScraper(PJUDBaseScraper):
             docs.append(cert_envio_doc)
 
         # ebook
-        eb_token = self._extract_form_token(
-            html,
-            self.get_selector("ebook_form_action"),
-            self.get_selector("ebook_param"),
-        )
+        eb_action = self.get_selector("ebook_form_action")
+        eb_param = self.get_selector("ebook_param")
+        eb_token = self._extract_form_token(html, eb_action, eb_param)
         if eb_token is not None:
             docs.append(PJUDDocument(
                 token=eb_token,
                 tipo="caso",
                 url_type="ebook",
                 doc_type="ebook",
-                endpoint=f"documentos/{self.get_selector('ebook_form_action')}",
-                param_name=self.get_selector("ebook_param"),
+                endpoint=f"documentos/{eb_action}",
+                param_name=eb_param,
                 available=True,
             ))
+        else:
+            # fa-ban in the "Ebook:" <td> → available=False row
+            fa_doc = self._parse_fa_ban_slot(
+                html,
+                td_label_pattern=r'<td[^>]*>\s*(?:<[^>]+>\s*)*Ebook:.*?</td>',
+                url_type="ebook",
+                doc_type="ebook",
+                form_action=eb_action,
+                param_name=eb_param,
+            )
+            if fa_doc is not None:
+                docs.append(fa_doc)
 
         return docs
 

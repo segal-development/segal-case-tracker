@@ -419,3 +419,81 @@ class TestDocumentPersistenceService:
         # as unavailable without raising exceptions.
         assert all(d.status == "unavailable" for d in docs if not d.doc_type)
         assert docs[0].status == "unavailable"
+
+    def test_movement_with_falsy_folio_is_skipped(
+        self, seeded_case, mem_db: Session
+    ) -> None:
+        """FIX 3: movements with folio=None/empty must be skipped, not silently collide.
+
+        Two movements both with folio=None would hash to the same stable_hash and
+        overwrite each other. The guard logs a warning and skips both — no Document
+        rows created, no exception raised.
+        """
+        from app.services.document_persistence import DocumentPersistenceService
+
+        null_folio_movement = PJUDMovement(
+            folio="",          # falsy folio — should be skipped
+            fecha="01/01/2026",
+            tipo_tramite="Resolución",
+            descripcion="Test movement with no folio",
+            documento_token=None,
+            documentos=[
+                PJUDDocument(
+                    token="eyJhbGciOiJub25lIn0.e30.FAKE_TOK",
+                    tipo="principal",
+                    url_type="docuS",
+                    doc_type="resolution",
+                    endpoint="documentos/docuS.php",
+                    param_name="dtaDoc",
+                    available=True,
+                )
+            ],
+            tiene_documento=True,
+        )
+        detail = _make_detail(rol=seeded_case.rol, movements=[null_folio_movement])
+
+        svc = DocumentPersistenceService()
+        docs = svc.persist_from_detail(detail, seeded_case.id, mem_db)
+        mem_db.commit()
+
+        # No Document rows should be created for a falsy-folio movement
+        count = mem_db.query(Document).filter(Document.case_id == seeded_case.id).count()
+        assert count == 0, (
+            f"Expected 0 Document rows for falsy-folio movement; got {count}"
+        )
+        assert docs == [], "persist_from_detail must return [] when all movements skipped"
+
+    def test_none_folio_movement_also_skipped(
+        self, seeded_case, mem_db: Session
+    ) -> None:
+        """FIX 3: folio=None must also be skipped (same guard as empty string)."""
+        from app.services.document_persistence import DocumentPersistenceService
+
+        none_folio_movement = PJUDMovement(
+            folio=None,
+            fecha="01/01/2026",
+            tipo_tramite="Resolución",
+            descripcion="Test movement with None folio",
+            documento_token=None,
+            documentos=[
+                PJUDDocument(
+                    token="eyJhbGciOiJub25lIn0.e30.FAKE_TOK",
+                    tipo="principal",
+                    url_type="docuS",
+                    doc_type="resolution",
+                    endpoint="documentos/docuS.php",
+                    param_name="dtaDoc",
+                    available=True,
+                )
+            ],
+            tiene_documento=True,
+        )
+        detail = _make_detail(rol=seeded_case.rol, movements=[none_folio_movement])
+
+        svc = DocumentPersistenceService()
+        docs = svc.persist_from_detail(detail, seeded_case.id, mem_db)
+        mem_db.commit()
+
+        count = mem_db.query(Document).filter(Document.case_id == seeded_case.id).count()
+        assert count == 0
+        assert docs == []

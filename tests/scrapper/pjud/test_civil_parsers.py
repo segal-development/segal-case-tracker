@@ -540,3 +540,93 @@ class TestStaticDocumentTokenExtraction:
         assert cert_envio_doc is None, (
             "No cert_envio doc expected when neither form nor fa-ban is present"
         )
+
+    def test_texto_demanda_fa_ban_yields_unavailable(
+        self, scraper: CivilScraper
+    ) -> None:
+        """FIX 6: texto_demanda with fa-ban → PJUDDocument(available=False, token=None).
+
+        Previously texto_demanda with fa-ban yielded None (slot silently absent),
+        making it impossible to distinguish 'never seen' from 'seen-unavailable'.
+        After the fix, both texto_demanda and ebook behave consistently with cert_envio.
+        """
+        html = """
+        <div>
+          <strong>ROL:</strong> C-0001-2099
+          <strong>F. Ing.:</strong> 01/01/2026
+          <table class="table table-responsive table-titulos">
+            <tbody>
+              <tr>
+                <td>
+                  <strong>Texto Demanda:</strong>
+                  <br>
+                  <i class="fas fa-ban fa-lg" aria-hidden="true" style="color:#660000;"></i>
+                </td>
+                <td><strong>Certificado de Envío:</strong></td>
+                <td id="boton"><strong>Ebook:</strong></td>
+              </tr>
+            </tbody>
+          </table>
+          <div id="historiaCiv">
+            <table class="table table-bordered table-striped table-hover">
+              <thead><tr><th>Folio</th><th>Doc.</th><th>Anexo</th><th>Etapa</th><th>Trámite</th>
+              <th>Desc.</th><th>Fecha</th><th>Foja</th><th>Geo</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+        """
+        detail = scraper._parse_case_detail_html(html, "fake-token")
+
+        texto_demanda_doc = next(
+            (d for d in detail.case_documents if d.doc_type == "texto_demanda"), None
+        )
+        assert texto_demanda_doc is not None, (
+            "texto_demanda must be present as unavailable when fa-ban is shown"
+        )
+        assert texto_demanda_doc.token is None
+        assert texto_demanda_doc.available is False
+
+    def test_ebook_fa_ban_yields_unavailable(
+        self, scraper: CivilScraper
+    ) -> None:
+        """FIX 6: ebook with fa-ban → PJUDDocument(available=False, token=None).
+
+        Symmetric with cert_envio and texto_demanda fa-ban handling.
+        """
+        html = """
+        <div>
+          <strong>ROL:</strong> C-0001-2099
+          <strong>F. Ing.:</strong> 01/01/2026
+          <table class="table table-responsive table-titulos">
+            <tbody>
+              <tr>
+                <td><strong>Texto Demanda:</strong></td>
+                <td><strong>Certificado de Envío:</strong></td>
+                <td id="boton">
+                  <strong>Ebook:</strong>
+                  <br>
+                  <i class="fas fa-ban fa-lg" aria-hidden="true" style="color:#660000;"></i>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+          <div id="historiaCiv">
+            <table class="table table-bordered table-striped table-hover">
+              <thead><tr><th>Folio</th><th>Doc.</th><th>Anexo</th><th>Etapa</th><th>Trámite</th>
+              <th>Desc.</th><th>Fecha</th><th>Foja</th><th>Geo</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+        """
+        detail = scraper._parse_case_detail_html(html, "fake-token")
+
+        ebook_doc = next(
+            (d for d in detail.case_documents if d.doc_type == "ebook"), None
+        )
+        assert ebook_doc is not None, (
+            "ebook must be present as unavailable when fa-ban is shown"
+        )
+        assert ebook_doc.token is None
+        assert ebook_doc.available is False
