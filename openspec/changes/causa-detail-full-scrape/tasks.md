@@ -192,100 +192,61 @@ No existing behavior is altered; Alert/Movement paths are untouched.
 ### S1-T08 — SQLAlchemy models: 4 entity tables + Alert columns + Case back-refs  *(parallel with S1-T03 onwards)*
 
 **Spec:** "Natural Key Upsert — Idempotency" (natural_key dedup spine); ADR-002; ADR-003
+**Status:** DONE (Slice 1b, commit bb29f3b)
 **Work:**
-- [ ] Write failing import/attribute test in `tests/test_models_case_detail.py`:
-      assert all 4 new model classes exist; assert each has `natural_key` attribute;
-      assert `Alert` has `entity_type` and `entity_id` attributes;
-      assert `Case` has `litigantes`, `notificaciones`, `escritos`, `exhortos` relationships
-      — **red**
-- [ ] Create `app/models/case_litigante.py` (`CaseLitigante`):
-      id PK, case_id FK, participante, rut, persona_type, nombre, natural_key VARCHAR(64),
-      created_at; `UniqueConstraint("case_id", "natural_key")`; case relationship
-- [ ] Create `app/models/case_notificacion.py` (`CaseNotificacion`):
-      id PK, case_id FK, rol, estado_notif, tipo_notif, fecha_tramite DATETIME NULL,
-      tipo_participante, nombre, tramite, obs_fallida TEXT NULL, natural_key VARCHAR(64),
-      created_at; `UniqueConstraint("case_id", "natural_key")`; case relationship
-- [ ] Create `app/models/case_escrito.py` (`CaseEscrito`):
-      id PK, case_id FK, fecha_ingreso DATETIME NULL, tipo_escrito, solicitante,
-      tiene_documento BOOLEAN, tiene_anexo BOOLEAN, doc_token VARCHAR(1024) NULL,
-      natural_key VARCHAR(64), created_at; `UniqueConstraint("case_id", "natural_key")`
-- [ ] Create `app/models/case_exhorto.py` (`CaseExhorto`):
-      id PK, case_id FK, rol_origen, tipo_exhorto, rol_destino, fecha_ordena DATETIME NULL,
-      fecha_ingreso DATETIME NULL, tribunal_destino, estado, natural_key VARCHAR(64),
-      created_at; `UniqueConstraint("case_id", "natural_key")`
-- [ ] Update `app/models/alert.py`: add `entity_type = Column(String(30), nullable=True)`
-      and `entity_id = Column(Integer, nullable=True)` (no DB FK — code-enforced)
-- [ ] Update `app/models/case.py`: add 4 back-ref relationships (litigantes, notificaciones,
-      escritos, exhortos)
-- [ ] Update `app/models/__init__.py`: export 4 new model classes
-- [ ] Run attribute test — **green**
-- [ ] `mypy app/core` — clean
+- [x] Write failing import/attribute test in `tests/test_models_case_detail.py` — **red**
+- [x] Create `app/models/case_litigante.py` (`CaseLitigante`)
+- [x] Create `app/models/case_notificacion.py` (`CaseNotificacion`)
+- [x] Create `app/models/case_escrito.py` (`CaseEscrito`)
+- [x] Create `app/models/case_exhorto.py` (`CaseExhorto`)
+- [ ] Update `app/models/alert.py`: entity_type + entity_id (DEFERRED to Slice 2)
+- [x] Update `app/models/case.py`: 4 back-ref relationships
+- [x] Update `app/models/__init__.py`: export 4 new model classes
+- [x] Run attribute test — **green** (12 tests)
+- [x] `mypy app/core` — clean
 
 ---
 
 ### S1-T09 — Single Alembic migration  *(needs S1-T08)*
 
 **Spec:** "Natural Key Upsert — Idempotency" (persistence prerequisite)
+**Status:** DONE (Slice 1b, commit 0afd12e)
 **Work:**
-- [ ] Write failing test `test_migration_importable` asserting the migration file is
-      importable and has `upgrade` and `downgrade` callables — **red**
-- [ ] Generate migration: `alembic revision --autogenerate -m "add_case_detail_entities"`
-      then review and fix any autogenerate errors to match the exact schema
-- [ ] Verify upgrade script creates: `case_litigantes`, `case_notificaciones`,
-      `case_escritos`, `case_exhortos` tables each with `UNIQUE(case_id, natural_key)`,
-      and adds `entity_type` + `entity_id` columns to `alerts`
-- [ ] Verify downgrade drops all 4 tables and removes the 2 alert columns
-- [ ] Run import test — **green**
-- [ ] Run `alembic upgrade head` against a local test DB — no errors
+- [x] Write failing test `test_migration_importable` — **red** then **green**
+- [x] Write migration `alembic/versions/004_add_case_detail_entities.py` (down_revision='003')
+- [x] Verify upgrade creates 4 tables with UNIQUE(case_id, natural_key)
+- [x] Verify downgrade drops all 4 tables cleanly (Alert columns deferred to Slice 2)
+- [x] Run import test — **green** (5 tests)
+- [x] Run `alembic upgrade head` against local Postgres — no errors
+- [x] `alembic downgrade -1 && alembic upgrade head` — reversibility verified
 
 ---
 
 ### S1-T10 — Scraped DTOs + converters + `natural_key` functions  *(needs S1-T02, parallel with S1-T08/T09)*
 
 **Spec:** "Natural Key Upsert — Idempotency"; ADR-002 (natural_key recipe)
+**Status:** DONE (Slice 1b, commit a2cfa42)
 **Work:**
-- [ ] Write failing tests in `tests/services/test_case_detail_sync.py`:
-      - `test_natural_key_litigante_with_rut`: known RUT → expected normalized string
-      - `test_natural_key_litigante_fallback_no_rut`: empty RUT → sha256 of participante|nombre
-      - `test_natural_key_exhorto`: sha256 of rol_origen|rol_destino|tipo_exhorto
-      - `test_natural_key_notificacion_stable`: same row → same hash; different row → different hash
-      - `test_normalize_cell_strips_and_collapses`: PJUD-padded string → clean string
-      — **red** for all
-- [ ] Add to `app/services/sync_service.py`:
-      - `normalize_cell(s: str) -> str` (strip + collapse whitespace + casefold for hashing)
-      - `@dataclass ScrapedLitigante` + `convert_litigante_to_scraped` + `litigante_natural_key`
-      - `@dataclass ScrapedNotificacion` + `convert_notificacion_to_scraped` + `notificacion_natural_key` (row_hash)
-      - `@dataclass ScrapedEscrito` + `convert_escrito_to_scraped` + `escrito_natural_key` (row_hash)
-      - `@dataclass ScrapedExhorto` + `convert_exhorto_to_scraped` + `exhorto_natural_key`
-- [ ] Run tests — **green**
+- [x] Write failing tests in `tests/services/test_case_detail_sync.py` — **red** then **green**
+- [x] Add to `app/services/sync_service.py`:
+      - `normalize_cell(s: str) -> str`
+      - `litigante_natural_key`, `exhorto_natural_key`, `notificacion_natural_key`, `escrito_natural_key`
+      (Note: Scraped* dataclasses omitted per ADR-001 — natural_key fns take PJUDLitigante/etc directly)
+- [x] Run tests — **green** (43 total in test_case_detail_sync.py)
 
 ---
 
 ### S1-T11 — `EntitySyncSpec` + `_sync_entities` engine (storage-only)  *(needs S1-T09, S1-T10)*
 
 **Spec:** "Natural Key Upsert — Idempotency" — all BDD scenarios
+**Status:** DONE (Slice 1b, commit a2cfa42)
 **Work:**
-- [ ] Add failing L2 tests in `tests/services/test_case_detail_sync.py`:
-      - `test_sync_litigantes_first_run_inserts_6_rows`: in-memory SQLite, mock
-        `NotificationService`; seed Case; run `_sync_entities` on rich fixture data →
-        6 `CaseLitigante` rows in DB
-      - `test_sync_litigantes_idempotent`: second `_sync_entities` call with same data →
-        0 new rows inserted, DB still has exactly 6
-      - `test_sync_exhortos_first_run_inserts_1_row` + idempotency variant
-      - `test_sync_entities_no_alerts_created_in_slice1_mode`: assert `Alert` table has 0 rows
-        after sync (creates_alert=False for all specs)
-      - `test_sync_entities_no_notify_called_in_slice1_mode`: assert `NotificationService`
-        mock never called
-      — **red** for all
-- [ ] Add to `app/services/sync_service.py`:
-      - `@dataclass EntitySyncSpec` (model, entity_type, natural_key_fn, to_model_fields,
-        creates_alert, notify, alert_title_fn, alert_message_fn, notify_fn_name, event, priority)
-      - 4 spec instances (SPEC_LITIGANTE, SPEC_NOTIFICACION, SPEC_ESCRITO, SPEC_EXHORTO)
-        all with `creates_alert=False, notify=False`
-      - `_sync_entities(db, case_id, scraped_list, spec, lawyer, webhooks, budget) -> int`
-        reproducing the sync_movements loop: hoist, upsert-by-natural-key, alert gate
-        (not reached this slice), dispatch gate (not reached this slice)
-- [ ] Run tests — **green**
+- [x] Add L2 tests (idempotency, 0 alerts, mock NotificationService) — **red** then **green**
+- [x] Add `EntitySyncSpec` dataclass + 4 spec instances (creates_alert=False, notify=False)
+- [x] Add `_sync_entities(db, case_id, scraped_list, spec, ...)` generic engine
+- [x] Add `upsert_litigantes/notificaciones/escritos/exhortos` convenience wrappers
+- [x] End-to-end tests: rich fixture → 6 litigantes + 1 exhorto in DB; synthetic → 2 notif + 2 escritos
+- [x] Run tests — **green** (43 tests, 0 Alert rows, NotificationService never called)
 
 ---
 
