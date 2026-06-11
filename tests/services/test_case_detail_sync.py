@@ -11,7 +11,7 @@ import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine
@@ -41,7 +41,10 @@ from app.services.sync_service import (
     SPEC_EXHORTO,
     SPEC_LITIGANTE,
     SPEC_NOTIFICACION,
+    NotifyBudget,
+    SyncService,
     _sync_entities,
+    detect_and_sync_movements,
     escrito_natural_key,
     exhorto_natural_key,
     litigante_natural_key,
@@ -86,7 +89,12 @@ def sqlite_db():
 
 @pytest.fixture(scope="function")
 def seeded_case(sqlite_db):
-    """Lawyer + Court + Case pre-seeded."""
+    """Lawyer + Court + Case pre-seeded.
+
+    Returns {"db", "case", "lawyer"} — the "lawyer" key was added in Slice 2 so
+    that S2 tests can pass the lawyer object to _sync_entities / detect_and_sync.
+    Existing tests that only access "db" and "case" are unaffected.
+    """
     db = sqlite_db
     lawyer = Lawyer(
         rut="11111111-1",
@@ -107,6 +115,8 @@ def seeded_case(sqlite_db):
         lawyer_id=lawyer.id,
         court_id=court.id,
         rol="C-9999-2025",
+        plaintiff="BANCO ITAU",
+        defendant="FERNANDEZ",
         status="active",
         competencia="civil",
         created_at=datetime.utcnow(),
@@ -114,7 +124,7 @@ def seeded_case(sqlite_db):
     )
     db.add(case)
     db.commit()
-    return {"db": db, "case": case}
+    return {"db": db, "case": case, "lawyer": lawyer}
 
 
 # ---------------------------------------------------------------------------
@@ -399,16 +409,18 @@ class TestSyncEntitiesSlice1Mode:
         MockNotif.assert_not_called()
 
     def test_spec_litigante_creates_alert_false(self):
+        """Litigantes are permanently silent (ADR-004)."""
         assert SPEC_LITIGANTE.creates_alert is False
 
-    def test_spec_notificacion_creates_alert_false(self):
-        assert SPEC_NOTIFICACION.creates_alert is False
+    # S2-T01: flags flipped in Slice 2 — notificacion/escrito/exhorto now alert.
+    def test_spec_notificacion_creates_alert_true(self):
+        assert SPEC_NOTIFICACION.creates_alert is True
 
-    def test_spec_escrito_creates_alert_false(self):
-        assert SPEC_ESCRITO.creates_alert is False
+    def test_spec_escrito_creates_alert_true(self):
+        assert SPEC_ESCRITO.creates_alert is True
 
-    def test_spec_exhorto_creates_alert_false(self):
-        assert SPEC_EXHORTO.creates_alert is False
+    def test_spec_exhorto_creates_alert_true(self):
+        assert SPEC_EXHORTO.creates_alert is True
 
 
 # ---------------------------------------------------------------------------
@@ -480,8 +492,13 @@ class TestSyncEntitiesEndToEnd:
         _sync_entities(db, case.id, detail.escritos, SPEC_ESCRITO)
         assert db.query(CaseEscrito).filter(CaseEscrito.case_id == case.id).count() == 2
 
-    def test_no_alerts_after_full_sync(self, seeded_case):
-        """After syncing all entity types, Alert table must remain empty."""
+    def test_no_alerts_when_called_without_context(self, seeded_case):
+        """_sync_entities called without case/lawyer kwargs creates 0 alerts.
+
+        Even though creates_alert=True on notificacion/escrito/exhorto specs,
+        alert creation requires both 'case' and 'lawyer' to be passed explicitly.
+        Callers that omit them (e.g. simple storage tests) remain safe.
+        """
         db = seeded_case["db"]
         case = seeded_case["case"]
         detail = self._parse_rich()
@@ -648,3 +665,337 @@ class TestSyncCaseDetailAtomicity:
         assert db.query(CaseNotificacion).count() == 0
         assert db.query(CaseEscrito).count() == 0
         assert db.query(CaseExhorto).count() == 0
+
+
+# ---------------------------------------------------------------------------
+# S2-T01: Alert entity_type / entity_id wiring
+# ---------------------------------------------------------------------------
+
+
+class TestSyncEntitiesSlice2AlertWiring:
+    """S2-T01 — _sync_entities creates polymorphic Alert rows when
+    spec.creates_alert=True AND case+lawyer context is provided."""
+
+    def test_new_exhorto_creates_alert_with_entity_type(self, seeded_case):
+        db = seeded_case["db"]
+        case = seeded_case["case"]
+        lawyer = seeded_case["lawyer"]
+
+        results = _sync_entities(
+            db, case.id, [_exh()], SPEC_EXHORTO,
+            case=case, lawyer=lawyer,
+        )
+        alerts = db.query(Alert).all()
+
+        assert len(alerts) == 1
+        assert alerts[0].type == "new_exhorto"
+        assert alerts[0].entity_type == "exhorto"
+        assert alerts[0].entity_id == results[0][0].id
+        assert alerts[0].lawyer_id == lawyer.id
+        assert alerts[0].case_id == case.id
+
+    def test_existing_exhorto_creates_no_additional_alert(self, seeded_case):
+        """Re-syncing an existing exhorto must not create a duplicate alert."""
+        db = seeded_case["db"]
+        case = seeded_case["case"]
+        lawyer = seeded_case["lawyer"]
+
+        _sync_entities(db, case.id, [_exh()], SPEC_EXHORTO, case=case, lawyer=lawyer)
+        _sync_entities(db, case.id, [_exh()], SPEC_EXHORTO, case=case, lawyer=lawyer)
+
+        assert db.query(Alert).count() == 1  # only first insert triggered an alert
+
+    def test_new_notificacion_creates_alert(self, seeded_case):
+        db = seeded_case["db"]
+        case = seeded_case["case"]
+        lawyer = seeded_case["lawyer"]
+
+        _sync_entities(
+            db, case.id, [_notif("FERNANDEZ"), _notif("GONZALEZ")], SPEC_NOTIFICACION,
+            case=case, lawyer=lawyer,
+        )
+        alerts = db.query(Alert).all()
+
+        assert len(alerts) == 2
+        for a in alerts:
+            assert a.entity_type == "notificacion"
+            assert a.type == "new_notificacion"
+
+    def test_new_escrito_creates_alert(self, seeded_case):
+        db = seeded_case["db"]
+        case = seeded_case["case"]
+        lawyer = seeded_case["lawyer"]
+
+        _sync_entities(
+            db, case.id, [_escrito("BANCO ITAU"), _escrito("BANCO BCI")], SPEC_ESCRITO,
+            case=case, lawyer=lawyer,
+        )
+        alerts = db.query(Alert).all()
+
+        assert len(alerts) == 2
+        for a in alerts:
+            assert a.entity_type == "escrito"
+            assert a.type == "new_escrito"
+
+    def test_litigante_creates_no_alert(self, seeded_case):
+        """ADR-004: litigantes are SILENT — no alerts, no notifications ever."""
+        db = seeded_case["db"]
+        case = seeded_case["case"]
+        lawyer = seeded_case["lawyer"]
+
+        items = [_lit(rut=f"1111111{i}-{i}", participante="DTE.") for i in range(6)]
+        _sync_entities(
+            db, case.id, items, SPEC_LITIGANTE,
+            case=case, lawyer=lawyer,
+        )
+
+        assert db.query(Alert).count() == 0
+
+
+# ---------------------------------------------------------------------------
+# S2-T03: NotifyBudget + shared budget across entity types
+# ---------------------------------------------------------------------------
+
+
+class TestNotifyBudget:
+    def test_budget_starts_with_full_remaining(self):
+        b = NotifyBudget(5)
+        assert b.remaining == 5
+
+    def test_decrement_reduces_remaining(self):
+        b = NotifyBudget(3)
+        b.decrement()
+        assert b.remaining == 2
+
+    def test_exhausted_when_remaining_zero(self):
+        b = NotifyBudget(1)
+        b.decrement()
+        assert b.exhausted() is True
+
+    def test_decrement_below_zero_stays_at_zero(self):
+        b = NotifyBudget(1)
+        b.decrement()
+        b.decrement()  # should be a no-op
+        assert b.remaining == 0
+
+    def test_not_exhausted_when_remaining_positive(self):
+        b = NotifyBudget(2)
+        assert b.exhausted() is False
+
+
+class TestSyncEntitiesBudgetDispatch:
+    """S2-T03 — _sync_entities dispatches notifications through the shared budget."""
+
+    def test_sync_entities_calls_notify_fn_per_new_row(self, seeded_case):
+        """3 new exhortos → notify_new_exhorto called 3 times (budget ≥ 3)."""
+        db = seeded_case["db"]
+        case = seeded_case["case"]
+        lawyer = seeded_case["lawyer"]
+        budget = NotifyBudget(10)
+        mock_notif_svc = MagicMock()
+
+        exhortos = [
+            _exh(rol_origen=f"C-{i}-2015", rol_destino=f"E-{i}-2026")
+            for i in range(1, 4)
+        ]
+        _sync_entities(
+            db, case.id, exhortos, SPEC_EXHORTO,
+            case=case, lawyer=lawyer, webhooks=[],
+            notification_svc=mock_notif_svc, budget=budget,
+        )
+
+        assert mock_notif_svc.notify_new_exhorto.call_count == 3
+        assert budget.remaining == 7  # 10 - 3
+
+    def test_litigante_notify_never_called_even_when_new(self, seeded_case):
+        """ADR-004: litigantes SILENT — no notify call regardless of context."""
+        db = seeded_case["db"]
+        case = seeded_case["case"]
+        lawyer = seeded_case["lawyer"]
+        budget = NotifyBudget(10)
+        mock_notif_svc = MagicMock()
+
+        items = [_lit(rut=f"1111111{i}-{i}", participante="DTE.") for i in range(6)]
+        _sync_entities(
+            db, case.id, items, SPEC_LITIGANTE,
+            case=case, lawyer=lawyer, webhooks=[],
+            notification_svc=mock_notif_svc, budget=budget,
+        )
+
+        # No alerts, no notify calls, budget untouched
+        assert db.query(Alert).count() == 0
+        assert budget.remaining == 10
+        mock_notif_svc.notify_new_litigante.assert_not_called()
+
+    def test_budget_cap_across_entity_types(self, seeded_case, caplog):
+        """ADR-005: shared cap of 2 across notificacion + escrito types.
+
+        3 new items total → 2 dispatches (cap), all 3 alerts persisted.
+        A cap-reached warning is logged.
+        """
+        import logging
+
+        db = seeded_case["db"]
+        case = seeded_case["case"]
+        lawyer = seeded_case["lawyer"]
+        budget = NotifyBudget(2)
+        mock_notif_svc = MagicMock()
+
+        # 1 notificacion (1 dispatch)
+        _sync_entities(
+            db, case.id, [_notif()], SPEC_NOTIFICACION,
+            case=case, lawyer=lawyer, webhooks=[],
+            notification_svc=mock_notif_svc, budget=budget,
+        )
+        # 2 escritos — budget has 1 remaining → only 1 more dispatch
+        _sync_entities(
+            db, case.id, [_escrito("BCI"), _escrito("ITAU")], SPEC_ESCRITO,
+            case=case, lawyer=lawyer, webhooks=[],
+            notification_svc=mock_notif_svc, budget=budget,
+        )
+
+        # 3 alerts persisted (always, regardless of budget)
+        assert db.query(Alert).count() == 3
+        # Only 2 dispatches
+        total_dispatches = (
+            mock_notif_svc.notify_new_notificacion.call_count
+            + mock_notif_svc.notify_new_escrito.call_count
+        )
+        assert total_dispatches == 2
+        assert budget.exhausted()
+
+    def test_sync_movements_accepts_budget_kwarg(self, sqlite_db, caplog):
+        """sync_movements accepts budget as keyword-only arg; backward compat preserved."""
+        from app.models.webhook import Webhook
+        from app.services.sync_service import ScrapedMovement
+
+        db = sqlite_db
+
+        lawyer = Lawyer(
+            rut="12345678-9",
+            name="Test Lawyer",
+            email="t@t.cl",
+            is_active=True,
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
+        )
+        db.add(lawyer)
+        db.flush()
+        court = Court(code="T-BUDGET", name="Budget Test Court", region="RM", type="civil")
+        db.add(court)
+        db.flush()
+        case = Case(
+            lawyer_id=lawyer.id,
+            court_id=court.id,
+            rol="C-BUDGET-2025",
+            status="active",
+            competencia="civil",
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
+        )
+        db.add(case)
+        db.commit()
+
+        budget = NotifyBudget(5)
+        sync = SyncService(db)
+
+        with patch("app.services.sync_service.NotificationService"):
+            new_count, alert_count = sync.sync_movements(
+                case.id,
+                [ScrapedMovement(
+                    folio="1",
+                    fecha="11/06/2026",
+                    tipo_tramite="Resolución",
+                    descripcion="Test",
+                )],
+                budget=budget,
+            )
+
+        assert new_count == 1
+        assert alert_count == 1
+        # Budget was decremented by one movement dispatch
+        assert budget.remaining == 4
+
+
+# ---------------------------------------------------------------------------
+# S1-T12: detect_and_sync_movements persists all entity types
+# ---------------------------------------------------------------------------
+
+
+_RICH_HTML_PATH = _FIXTURE_DIR / "detail_civil_rich.html"
+
+
+@pytest.mark.skipif(
+    not _RICH_HTML_PATH.exists(),
+    reason="Rich HTML fixture not found",
+)
+class TestDetectAndSyncStoresAllEntityTypes:
+    """S1-T12 — detect_and_sync_movements calls entity sync after movement sync.
+
+    Uses the real rich fixture (6 litigantes, 3 movements, 1 exhorto).
+    Scraper is mocked to return the parsed PJUDCaseDetail without a live fetch.
+    """
+
+    async def test_detect_and_sync_stores_all_entity_types(self, seeded_case):
+        """After detect_and_sync_movements: 6 litigantes + 1 exhorto + 0 notif + 0 escritos."""
+        db = seeded_case["db"]
+        case = seeded_case["case"]
+
+        # Parse the real fixture (no live network call)
+        rich_html = _RICH_HTML_PATH.read_text(encoding="utf-8")
+        detail = CivilScraper()._parse_case_detail_html(rich_html, "token")
+
+        # Build a minimal PJUDCase stub matching the seeded case ROL
+        api_case = MagicMock()
+        api_case.rol = case.rol  # "C-9999-2025"
+        api_case.case_token = "test-token"
+        # detail.movements = list of PJUDMovement (3 items in rich fixture)
+        for m in detail.movements:
+            api_case.folio = getattr(m, "folio", "")
+
+        mock_scraper = MagicMock()
+        mock_scraper.get_case_detail = AsyncMock(return_value=detail)
+        mock_pjud_session = MagicMock()
+
+        with patch("app.services.sync_service.NotificationService"):
+            movements_new, alerts_created, errors = await detect_and_sync_movements(
+                db=db,
+                scraper=mock_scraper,
+                pjud_session=mock_pjud_session,
+                lawyer_id=case.lawyer_id,
+                api_cases=[api_case],
+            )
+
+        assert errors == [], f"Unexpected errors: {errors}"
+        assert db.query(CaseLitigante).filter(CaseLitigante.case_id == case.id).count() == 6
+        assert db.query(CaseExhorto).filter(CaseExhorto.case_id == case.id).count() == 1
+        assert db.query(CaseNotificacion).filter(CaseNotificacion.case_id == case.id).count() == 0
+        assert db.query(CaseEscrito).filter(CaseEscrito.case_id == case.id).count() == 0
+
+    async def test_detect_and_sync_idempotent_on_second_run(self, seeded_case):
+        """Running detect_and_sync_movements twice creates no duplicate entities."""
+        db = seeded_case["db"]
+        case = seeded_case["case"]
+
+        rich_html = _RICH_HTML_PATH.read_text(encoding="utf-8")
+        detail = CivilScraper()._parse_case_detail_html(rich_html, "token")
+
+        api_case = MagicMock()
+        api_case.rol = case.rol
+        api_case.case_token = "test-token"
+
+        mock_scraper = MagicMock()
+        mock_scraper.get_case_detail = AsyncMock(return_value=detail)
+
+        with patch("app.services.sync_service.NotificationService"):
+            await detect_and_sync_movements(
+                db=db, scraper=mock_scraper, pjud_session=MagicMock(),
+                lawyer_id=case.lawyer_id, api_cases=[api_case],
+            )
+            await detect_and_sync_movements(
+                db=db, scraper=mock_scraper, pjud_session=MagicMock(),
+                lawyer_id=case.lawyer_id, api_cases=[api_case],
+            )
+
+        assert db.query(CaseLitigante).filter(CaseLitigante.case_id == case.id).count() == 6
+        assert db.query(CaseExhorto).filter(CaseExhorto.case_id == case.id).count() == 1

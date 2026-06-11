@@ -278,3 +278,227 @@ class TestNotifyNewMovement:
         # Webhook succeeded -> alert marked
         assert alert.webhook_sent is True
         assert alert.webhook_sent_at is not None
+
+
+# ---------------------------------------------------------------------------
+# S2-T02: _dispatch helper
+# ---------------------------------------------------------------------------
+
+
+class TestDispatchHelper:
+    def test_dispatch_calls_email_and_all_active_webhooks(self, service):
+        """_dispatch must call send_email_alert once and send_webhook for each active webhook."""
+        alert = _make_alert()
+        lawyer = _make_lawyer()
+        webhook1 = _make_webhook(id=10)
+        webhook2 = _make_webhook(id=11)
+        payload = {"event": "test.created", "version": "1", "data": {}}
+
+        with patch.object(service, "send_email_alert", return_value=True) as mock_email:
+            with patch.object(service, "send_webhook", return_value=True) as mock_wh:
+                service._dispatch(alert, lawyer, [webhook1, webhook2], payload)
+
+        mock_email.assert_called_once_with(alert, lawyer)
+        assert mock_wh.call_count == 2
+        # At least one webhook succeeded → alert.webhook_sent must be True
+        assert alert.webhook_sent is True
+        assert alert.webhook_sent_at is not None
+
+    def test_dispatch_skips_inactive_webhooks(self, service):
+        """_dispatch must not call send_webhook for webhooks where is_active=False."""
+        alert = _make_alert()
+        lawyer = _make_lawyer()
+        inactive = _make_webhook(is_active=False)
+        payload = {"event": "test.created", "version": "1", "data": {}}
+
+        with patch.object(service, "send_email_alert", return_value=True):
+            with patch.object(service, "send_webhook", return_value=True) as mock_wh:
+                service._dispatch(alert, lawyer, [inactive], payload)
+
+        mock_wh.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# S2-T02: notify_new_notificacion
+# ---------------------------------------------------------------------------
+
+
+def _make_notificacion_row(**kwargs):
+    row = MagicMock()
+    row.rol = "C-123-2025"
+    row.tipo_notif = "PERSONAL"
+    row.fecha_tramite = None
+    row.nombre = "FERNANDEZ"
+    row.tramite = "Demanda"
+    for k, v in kwargs.items():
+        setattr(row, k, v)
+    return row
+
+
+def _make_escrito_row(**kwargs):
+    row = MagicMock()
+    row.tipo_escrito = "DEMANDA"
+    row.solicitante = "BANCO ITAU"
+    row.fecha_ingreso = None
+    for k, v in kwargs.items():
+        setattr(row, k, v)
+    return row
+
+
+def _make_exhorto_row(**kwargs):
+    row = MagicMock()
+    row.tipo_exhorto = "ACTIVO"
+    row.rol_destino = "E-355-2026"
+    row.tribunal_destino = "Juzgado Destino"
+    for k, v in kwargs.items():
+        setattr(row, k, v)
+    return row
+
+
+class TestNotifyNewNotificacion:
+    def test_sends_email_via_send_email_alert(self, service):
+        """notify_new_notificacion must call send_email_alert once."""
+        alert = _make_alert()
+        case = _make_case()
+        lawyer = _make_lawyer()
+        notif_row = _make_notificacion_row()
+
+        with patch.object(service, "send_email_alert", return_value=True) as mock_email:
+            with patch.object(service, "send_webhook", return_value=True):
+                service.notify_new_notificacion(case, notif_row, lawyer, [], alert)
+
+        mock_email.assert_called_once_with(alert, lawyer)
+
+    def test_event_string_is_notificacion_created(self, service):
+        """Webhook payload must carry event='notificacion.created'."""
+        alert = _make_alert()
+        case = _make_case()
+        lawyer = _make_lawyer()
+        webhook = _make_webhook()
+        notif_row = _make_notificacion_row()
+
+        captured_payloads = []
+
+        def capture(wh, payload):
+            captured_payloads.append(payload)
+            return True
+
+        with patch.object(service, "send_email_alert", return_value=True):
+            with patch.object(service, "send_webhook", side_effect=capture):
+                service.notify_new_notificacion(case, notif_row, lawyer, [webhook], alert)
+
+        assert len(captured_payloads) == 1
+        assert captured_payloads[0]["event"] == "notificacion.created"
+        assert captured_payloads[0]["version"] == "1"
+        assert "notificacion" in captured_payloads[0]["data"]
+
+
+# ---------------------------------------------------------------------------
+# S2-T02: notify_new_escrito
+# ---------------------------------------------------------------------------
+
+
+class TestNotifyNewEscrito:
+    def test_sends_webhook_with_hmac_signature(self, service):
+        """notify_new_escrito → canonical JSON body with X-Webhook-Signature header."""
+        import json
+
+        alert = _make_alert()
+        case = _make_case()
+        lawyer = _make_lawyer()
+        webhook = _make_webhook()
+        escrito_row = _make_escrito_row()
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+
+        with patch.object(service, "send_email_alert", return_value=True):
+            with patch("app.services.notification_service.httpx") as mock_httpx:
+                mock_client = MagicMock()
+                mock_httpx.Client.return_value.__enter__.return_value = mock_client
+                mock_httpx.Client.return_value.__exit__.return_value = False
+                mock_client.post.return_value = mock_response
+
+                service.notify_new_escrito(case, escrito_row, lawyer, [webhook], alert)
+
+        mock_client.post.assert_called_once()
+        call_kwargs = mock_client.post.call_args.kwargs
+        body = json.loads(call_kwargs["content"])
+        assert body["event"] == "escrito.created"
+        assert body["version"] == "1"
+        assert "escrito" in body["data"]
+        assert "X-Webhook-Signature" in call_kwargs["headers"]
+
+    def test_event_string_is_escrito_created(self, service):
+        """Webhook payload event must be exactly 'escrito.created'."""
+        alert = _make_alert()
+        case = _make_case()
+        lawyer = _make_lawyer()
+        webhook = _make_webhook()
+        escrito_row = _make_escrito_row()
+
+        captured = []
+
+        def capture(wh, payload):
+            captured.append(payload)
+            return True
+
+        with patch.object(service, "send_email_alert", return_value=True):
+            with patch.object(service, "send_webhook", side_effect=capture):
+                service.notify_new_escrito(case, escrito_row, lawyer, [webhook], alert)
+
+        assert captured[0]["event"] == "escrito.created"
+
+
+# ---------------------------------------------------------------------------
+# S2-T02: notify_new_exhorto
+# ---------------------------------------------------------------------------
+
+
+class TestNotifyNewExhorto:
+    def test_sends_webhook_with_hmac_and_correct_event(self, service):
+        """notify_new_exhorto → event='exhorto.created', HMAC header present."""
+        import json
+
+        alert = _make_alert()
+        case = _make_case()
+        lawyer = _make_lawyer()
+        webhook = _make_webhook()
+        exhorto_row = _make_exhorto_row()
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+
+        with patch.object(service, "send_email_alert", return_value=True):
+            with patch("app.services.notification_service.httpx") as mock_httpx:
+                mock_client = MagicMock()
+                mock_httpx.Client.return_value.__enter__.return_value = mock_client
+                mock_httpx.Client.return_value.__exit__.return_value = False
+                mock_client.post.return_value = mock_response
+
+                service.notify_new_exhorto(case, exhorto_row, lawyer, [webhook], alert)
+
+        call_kwargs = mock_client.post.call_args.kwargs
+        body = json.loads(call_kwargs["content"])
+        assert body["event"] == "exhorto.created"
+        assert body["version"] == "1"
+        assert "exhorto" in body["data"]
+        assert "X-Webhook-Signature" in call_kwargs["headers"]
+
+    def test_event_string_is_exhorto_created(self, service):
+        alert = _make_alert()
+        case = _make_case()
+        lawyer = _make_lawyer()
+        exhorto_row = _make_exhorto_row()
+
+        captured = []
+
+        def capture(wh, payload):
+            captured.append(payload)
+            return True
+
+        with patch.object(service, "send_email_alert", return_value=True):
+            with patch.object(service, "send_webhook", side_effect=capture):
+                service.notify_new_exhorto(case, exhorto_row, lawyer, [_make_webhook()], alert)
+
+        assert captured[0]["event"] == "exhorto.created"
