@@ -48,16 +48,17 @@ No existing behavior is altered; Alert/Movement paths are untouched.
 ### S1-T01 — HTML test fixture files  *(no deps — can run parallel with S1-T02)*
 
 **Spec:** Tab-Scoped Parsing, Litigante Parsing, Exhorto Parsing (test data prerequisite)
+**Status:** DONE (Slice 1a, commit 0e0a0f3)
 **Work:**
-- [ ] Create `tests/fixtures/` and `tests/fixtures/pjud/` directories with `__init__.py` files
-- [ ] Commit `/tmp/detail_rich.html` content as `tests/fixtures/pjud/detail_rich_C-1253-2015.html`
+- [x] Create `tests/fixtures/` and `tests/fixtures/pjud/` directories with `__init__.py` files
+- [x] Commit `/tmp/detail_rich.html` content as `tests/fixtures/pjud/detail_civil_rich.html`
       (real PJUD: 3 movements in #historiaCiv, 6 litigantes in #litigantesCiv,
        0 notificaciones, 0 escritos, 1 exhorto in #exhortosCiv)
-- [ ] Build `tests/fixtures/pjud/detail_synthetic_full.html` by editing the rich fixture to add:
+- [x] Build `tests/fixtures/pjud/detail_civil_synthetic.html` by editing the rich fixture to add:
       - 2 notificacion `<tr>` rows inside `#notificacionesCiv tbody`
-      - 2 escrito `<tr>` rows inside `#escritosCiv tbody`
+      - 2 escrito `<tr>` rows inside `#escritosCiv tbody` (row 1 has dtaDoc, row 2 does not)
       (used for L1 notif/escrito row-count tests and all L2 change-detection tests)
-- [ ] Add `tests/fixtures/pjud/conftest.py` with `@pytest.fixture` helpers
+- [x] Add `tests/fixtures/pjud/conftest.py` with `@pytest.fixture` helpers
       `rich_html()` and `synthetic_html()` that read the fixture files by path
 
 **Verification:** files exist and are readable; `synthetic_html` contains target pane content.
@@ -67,12 +68,13 @@ No existing behavior is altered; Alert/Movement paths are untouched.
 ### S1-T02 — `base.py`: 4 scraper dataclasses + `PJUDCaseDetail` extension  *(parallel with S1-T01)*
 
 **Spec:** Litigante Parsing, Notificacion Parsing, Escrito Parsing, Exhorto Parsing
+**Status:** DONE (Slice 1a, commit 9e10f44)
 **Work:**
-- [ ] Write a failing mypy-typed test in `tests/test_pjud_base.py` asserting the four new
+- [x] Write a failing mypy-typed test in `tests/test_pjud_base.py` asserting the four new
       dataclasses (`PJUDLitigante`, `PJUDNotificacion`, `PJUDEscrito`, `PJUDExhorto`) exist
       and that `PJUDCaseDetail` has `.litigantes`, `.notificaciones`, `.escritos`, `.exhortos`
       defaulting to empty lists — **red**
-- [ ] Add to `app/scrapper/pjud/base.py`:
+- [x] Add to `app/scrapper/pjud/base.py`:
       - `PJUDLitigante(participante, rut, persona_type, nombre)`
       - `PJUDNotificacion(rol, estado_notif, tipo_notif, fecha_tramite, tipo_participante,
                           nombre, tramite, obs_fallida)`
@@ -82,37 +84,39 @@ No existing behavior is altered; Alert/Movement paths are untouched.
                      tribunal_destino, estado, detalle_token=None)`
       - Extend `PJUDCaseDetail` with 4 additive fields (default_factory=list)
       (`partes` left in place, not removed)
-- [ ] Run test — **green**
-- [ ] `mypy app/core` — clean
+- [x] Run test — **green**
+- [x] `mypy app/core` — clean
 
 ---
 
 ### S1-T03 — Scoping regression test + `_extract_pane_tbody` + movements re-scope  *(needs S1-T01, S1-T02)*
 
+**Status:** DONE (Slice 1a, commit bd8b316)
 **Spec:** "Movements Parser Scoped to #historiaCiv"; "Tab-Scoped Parsing" (regression guard)
 **Work:**
-- [ ] Write failing test in `tests/scrapper/pjud/test_civil_parsers.py`:
+- [x] Write failing test in `tests/scrapper/pjud/test_civil_parsers.py`:
       Craft an HTML string where `#litigantesCiv` appears BEFORE `#historiaCiv`;
       assert `_parse_movements_table` returns ONLY rows from `#historiaCiv` — **red**
       (this FAILS against the old unscoped selector, proving the bug)
-- [ ] Add `_extract_pane_tbody(self, html: str, pane_id: str) -> Optional[str]` to
+- [x] Add `_extract_pane_tbody(self, html: str, pane_id: str) -> Optional[str]` to
       `app/scrapper/pjud/civil.py`; scopes to `id="pane_id"` before matching
       the first `table-bordered tbody`
-- [ ] Refactor `_parse_movements_table` to call `_extract_pane_tbody(html, "historiaCiv")`
+- [x] Refactor `_parse_movements_table` to call `_extract_pane_tbody(html, "historiaCiv")`
       instead of the current full-doc table match
-- [ ] Update `app/scrapper/pjud/selectors/civil.yaml`:
+- [x] Update `app/scrapper/pjud/selectors/civil.yaml`:
       - Add `movements_pane_id: primary: "historiaCiv"` entry
       - Add `pane_table_pattern` (parametrizable by pane id) for future parsers
       - Add `entity_row_pattern` and `exhorto_detail_token_pattern`
       - Keep old `movements_table` unscoped pattern as `fallback` under the existing key
         (zero-regression: if PJUD drops the pane id, code degrades to today's behavior)
-- [ ] Run regression test — **green**
-- [ ] Existing movement tests still pass (zero regression)
+- [x] Run regression test — **green**
+- [x] Existing movement tests still pass (zero regression)
 
 ---
 
 ### S1-T04 — Litigante parser  *(needs S1-T03)*
 
+**Status:** DONE (Slice 1a, commit bd8b316)
 **Spec:** "Litigante Parsing" — all BDD scenarios
 **Work:**
 - [ ] In `tests/scrapper/pjud/test_civil_parsers.py` add:
@@ -129,6 +133,7 @@ No existing behavior is altered; Alert/Movement paths are untouched.
 
 ### S1-T05 — Exhorto parser  *(needs S1-T03, parallel with S1-T04)*
 
+**Status:** DONE (Slice 1a, commit bd8b316)
 **Spec:** "Exhorto Parsing" — all BDD scenarios
 **Work:**
 - [ ] In `tests/scrapper/pjud/test_civil_parsers.py` add:
@@ -148,6 +153,7 @@ No existing behavior is altered; Alert/Movement paths are untouched.
 
 ### S1-T06 — Notificacion + Escrito parsers  *(needs S1-T03, parallel with S1-T04 and S1-T05)*
 
+**Status:** DONE (Slice 1a, commit bd8b316)
 **Spec:** "Notificacion Parsing"; "Escrito Parsing"
 **Work:**
 - [ ] Add to `tests/scrapper/pjud/test_civil_parsers.py`:
@@ -169,6 +175,7 @@ No existing behavior is altered; Alert/Movement paths are untouched.
 
 ### S1-T07 — `_parse_case_detail_html` extension  *(needs S1-T04, S1-T05, S1-T06)*
 
+**Status:** DONE (Slice 1a, commit bd8b316)
 **Spec:** "All five tabs populated from single detail HTML" (pjud-civil delta spec)
 **Work:**
 - [ ] Write failing test `test_parse_case_detail_html_populates_all_five_lists`:
