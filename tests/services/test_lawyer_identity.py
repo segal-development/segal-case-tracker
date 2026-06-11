@@ -115,3 +115,60 @@ class TestGetOrCreateLawyer:
         assert isinstance(lawyer.id, int)
         # SQLite autoincrement starts at 1; any legitimate id >= 1
         assert lawyer.id >= 1
+
+
+class TestEncryptedCredentials:
+    """S3-T2: encrypted credential columns are populated on login (LID-04).
+
+    SECURITY NOTE: The stored value is Fernet-reversible ciphertext — NOT a hash.
+    This is intentional: the worker must replay the plaintext password to PJUD.
+    The ``ENCRYPTION_KEY`` must be sourced from a secret manager and restricted
+    to the worker/API roles only.  See ADR-6 and the PR security checklist.
+    """
+
+    def test_captcha_login_stores_encrypted_pjud_password(self, db):
+        """After captcha login, encrypted_pjud_password is set to ciphertext."""
+        password = "secretpass123"
+        lawyer = _get_or_create_lawyer(db, rut="12345678-9", password=password, auth_method="captcha")
+
+        assert lawyer.encrypted_pjud_password is not None
+        # Must be ciphertext, not the plaintext value
+        assert lawyer.encrypted_pjud_password != password
+
+    def test_captcha_encrypted_password_is_decryptable(self, db):
+        """decrypt_pjud_password(lawyer.encrypted_pjud_password) returns the original."""
+        from app.core.security import decrypt_pjud_password
+
+        password = "secretpass123"
+        lawyer = _get_or_create_lawyer(db, rut="12345678-9", password=password, auth_method="captcha")
+
+        decrypted = decrypt_pjud_password(str(lawyer.encrypted_pjud_password))
+        assert decrypted == password
+
+    def test_clave_unica_login_stores_encrypted_password(self, db):
+        """After clave_unica login, encrypted_clave_unica_password is set to ciphertext."""
+        password = "clavepass456"
+        lawyer = _get_or_create_lawyer(
+            db, rut="12345678-9", password=password, auth_method="clave_unica"
+        )
+
+        assert lawyer.encrypted_clave_unica_password is not None
+        assert lawyer.encrypted_clave_unica_password != password
+
+    def test_clave_unica_encrypted_password_is_decryptable(self, db):
+        """decrypt_pjud_password returns the original clave_unica password."""
+        from app.core.security import decrypt_pjud_password
+
+        password = "clavepass456"
+        lawyer = _get_or_create_lawyer(
+            db, rut="12345678-9", password=password, auth_method="clave_unica"
+        )
+
+        decrypted = decrypt_pjud_password(str(lawyer.encrypted_clave_unica_password))
+        assert decrypted == password
+
+    def test_empty_password_skips_credential_storage(self, db):
+        """When password is empty, encrypted fields remain None (no dummy ciphertext)."""
+        lawyer = _get_or_create_lawyer(db, rut="12345678-9", password="", auth_method="captcha")
+
+        assert lawyer.encrypted_pjud_password is None

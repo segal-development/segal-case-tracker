@@ -43,6 +43,9 @@ class ClaveUnicaCredentials:
     rut: str
     password: str
     
+    def __repr__(self) -> str:
+        return f"ClaveUnicaCredentials(rut={self.rut!r}, password='***')"
+
     def validate(self) -> bool:
         """Validate credentials are not empty."""
         return bool(self.rut and self.password)

@@ -183,7 +183,9 @@ async def login(
         )
 
         # Resolve (or create) the lawyer and bind the real id to the session (ADR-5)
-        lawyer = _get_or_create_lawyer(db, rut=request.rut, auth_method="captcha")
+        lawyer = _get_or_create_lawyer(
+            db, rut=request.rut, password=request.password, auth_method="captcha"
+        )
         pjud_session.lawyer_id = int(lawyer.id)
 
         # Persist session via async store (ADR-3)

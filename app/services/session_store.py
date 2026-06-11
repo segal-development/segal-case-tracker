@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 
 from app.core.redis import get_redis_client, get_async_redis_client
 from app.services.pjud_session import PJUDSession  # canonical model; re-exported below
+from app.utils.rut import normalize_rut
 
 # Sentinel — distinguishes "auto-detect Redis" from "explicitly disabled"
 _UNSET: Any = object()
@@ -43,7 +44,13 @@ _RUT_KEY = "pjud:session:rut:"
 
 
 def _rut_clean(rut: str) -> str:
-    return rut.replace("-", "").replace(".", "")
+    """Normalize a RUT for use as a Redis secondary-index key.
+
+    Delegates to the canonical ``normalize_rut`` helper (``app.utils.rut``)
+    so write and read paths always produce the same key format.  Sessions are
+    ephemeral (25 min TTL), so re-keying on the first deploy is safe.
+    """
+    return normalize_rut(rut)
 
 
 class SessionStore:
