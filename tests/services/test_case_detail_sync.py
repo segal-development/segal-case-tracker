@@ -10,6 +10,7 @@ Coverage:
 import hashlib
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -46,6 +47,7 @@ from app.services.sync_service import (
     litigante_natural_key,
     normalize_cell,
     notificacion_natural_key,
+    sync_case_detail,
     upsert_escritos,
     upsert_exhortos,
     upsert_litigantes,
@@ -491,3 +493,158 @@ class TestSyncEntitiesEndToEnd:
         ]:
             _sync_entities(db, case.id, items, spec)
         assert db.query(Alert).count() == 0
+
+
+# ---------------------------------------------------------------------------
+# FIX 2 — updatable_fields: volatile fields are refreshed on re-sync
+# ---------------------------------------------------------------------------
+
+
+def _escrito_with_token(token: str) -> "PJUDEscrito":
+    return PJUDEscrito(
+        fecha_ingreso="10/06/2026",
+        tipo_escrito="DEMANDA",
+        solicitante="BANCO ITAU",
+        tiene_documento=True,
+        tiene_anexo=False,
+        doc_token=token,
+    )
+
+
+class TestUpdatableFields:
+    def test_escrito_doc_token_refreshed_on_resync(self, seeded_case):
+        """Re-syncing an escrito with a new doc_token updates the stored token.
+        The natural_key is unchanged (same fecha/tipo/solicitante/flags), so
+        is_new must be False and the row's doc_token must reflect the new value.
+        """
+        db = seeded_case["db"]
+        case = seeded_case["case"]
+
+        r1 = upsert_escritos(db, case.id, [_escrito_with_token("token-v1")])
+        assert r1[0][1] is True  # new row
+
+        r2 = upsert_escritos(db, case.id, [_escrito_with_token("token-v2")])
+        assert r2[0][1] is False  # same row, not new
+
+        row = db.query(CaseEscrito).filter(CaseEscrito.case_id == case.id).one()
+        assert row.doc_token == "token-v2"
+
+    def test_exhorto_estado_refreshed_on_resync(self, seeded_case):
+        """Re-syncing an exhorto with a changed estado updates estado in-place.
+        The natural_key is unchanged (same rol_origen/rol_destino/tipo_exhorto),
+        so is_new must be False and the row's estado must reflect the new value.
+        """
+        db = seeded_case["db"]
+        case = seeded_case["case"]
+
+        r1 = upsert_exhortos(db, case.id, [_exh()])  # estado="PENDIENTE"
+        assert r1[0][1] is True
+
+        exh_updated = PJUDExhorto(
+            rol_origen="C-1253-2015",
+            tipo_exhorto="ACTIVO",
+            rol_destino="E-355-2026",
+            fecha_ordena="01/01/2026",
+            fecha_ingreso="02/01/2026",
+            tribunal_destino="JUZGADO TEST",
+            estado="CUMPLIDO",
+        )
+        r2 = upsert_exhortos(db, case.id, [exh_updated])
+        assert r2[0][1] is False  # same row
+
+        row = db.query(CaseExhorto).filter(CaseExhorto.case_id == case.id).one()
+        assert row.estado == "CUMPLIDO"
+
+    def test_notificacion_estado_notif_refreshed_on_resync(self, seeded_case):
+        """Re-syncing a notificacion with a changed estado_notif updates the
+        existing row.  estado_notif and obs_fallida are excluded from the natural
+        key so state changes don't create duplicate rows.
+        """
+        db = seeded_case["db"]
+        case = seeded_case["case"]
+
+        r1 = upsert_notificaciones(db, case.id, [_notif()])  # estado_notif="REALIZADA"
+        assert r1[0][1] is True
+
+        notif_updated = PJUDNotificacion(
+            rol="C-9999-2025",
+            estado_notif="FALLIDA",
+            tipo_notif="PERSONAL",
+            fecha_tramite="10/06/2026",
+            tipo_participante="DDO.",
+            nombre="FERNANDEZ",
+            tramite="Demanda",
+            obs_fallida="Dirección no encontrada",
+        )
+        r2 = upsert_notificaciones(db, case.id, [notif_updated])
+        assert r2[0][1] is False  # same row
+
+        row = db.query(CaseNotificacion).filter(CaseNotificacion.case_id == case.id).one()
+        assert row.estado_notif == "FALLIDA"
+        assert row.obs_fallida == "Dirección no encontrada"
+
+    def test_litigante_has_no_updatable_fields(self):
+        """Litigantes are static — SPEC_LITIGANTE.updatable_fields must be empty."""
+        assert SPEC_LITIGANTE.updatable_fields == []
+
+
+# ---------------------------------------------------------------------------
+# FIX 1 — sync_case_detail: atomicity contract
+# ---------------------------------------------------------------------------
+
+
+class TestSyncCaseDetailAtomicity:
+    def _make_detail(self) -> Any:
+        from app.scrapper.pjud.base import PJUDCase, PJUDCaseDetail
+
+        case_meta = PJUDCase(
+            rol="C-9999-2025",
+            tribunal="TEST",
+            caratulado="A/B",
+            fecha_ingreso="01/01/2026",
+        )
+        return PJUDCaseDetail(
+            case=case_meta,
+            litigantes=[_lit()],
+            notificaciones=[_notif()],
+            escritos=[_escrito()],
+            exhortos=[_exh()],
+        )
+
+    def test_sync_case_detail_inserts_all_entities(self, seeded_case):
+        """Happy path: sync_case_detail persists all four entity types in one commit."""
+        db = seeded_case["db"]
+        case = seeded_case["case"]
+        counts = sync_case_detail(db, case.id, self._make_detail())
+
+        assert counts["litigantes_new"] == 1
+        assert counts["notificaciones_new"] == 1
+        assert counts["escritos_new"] == 1
+        assert counts["exhortos_new"] == 1
+        assert db.query(CaseLitigante).count() == 1
+        assert db.query(CaseNotificacion).count() == 1
+        assert db.query(CaseEscrito).count() == 1
+        assert db.query(CaseExhorto).count() == 1
+
+    def test_sync_case_detail_rollback_on_failure(self, seeded_case):
+        """If any entity upsert raises after others have flushed, rolling back
+        leaves the DB empty — litigantes/notificaciones/escritos that were flushed
+        must NOT survive when the commit is never reached.
+        """
+        db = seeded_case["db"]
+        case = seeded_case["case"]
+        detail = self._make_detail()
+
+        with patch(
+            "app.services.sync_service.upsert_exhortos",
+            side_effect=RuntimeError("simulated failure"),
+        ):
+            with pytest.raises(RuntimeError, match="simulated failure"):
+                sync_case_detail(db, case.id, detail)
+
+        db.rollback()
+
+        assert db.query(CaseLitigante).count() == 0
+        assert db.query(CaseNotificacion).count() == 0
+        assert db.query(CaseEscrito).count() == 0
+        assert db.query(CaseExhorto).count() == 0

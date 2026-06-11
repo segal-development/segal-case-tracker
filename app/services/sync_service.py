@@ -123,8 +123,6 @@ def litigante_natural_key(lit: Any) -> str:
       — includes participante so the same RUT in different roles is distinct.
     - Fallback (no RUT): sha256(normalize(participante) | normalize(nombre))
     """
-    from app.scrapper.pjud.base import PJUDLitigante  # local import avoids circular dep
-
     rut = normalize_cell(lit.rut)
     participante = normalize_cell(lit.participante)
     nombre = normalize_cell(lit.nombre)
@@ -151,19 +149,19 @@ def exhorto_natural_key(exh: Any) -> str:
 
 
 def notificacion_natural_key(notif: Any) -> str:
-    """Derive a stable 64-char hex key for a PJUDNotificacion (row hash).
+    """Derive a stable 64-char hex key for a PJUDNotificacion.
 
-    All cell values are normalised and joined with '|' before hashing.
+    Volatile fields (estado_notif, obs_fallida) are excluded from the key so
+    that a state change updates the existing row instead of inserting a new one.
+    Key: sha256(rol | tipo_notif | fecha_tramite | tipo_participante | nombre | tramite)
     """
     raw = "|".join([
         normalize_cell(notif.rol),
-        normalize_cell(notif.estado_notif),
         normalize_cell(notif.tipo_notif),
         normalize_cell(notif.fecha_tramite),
         normalize_cell(notif.tipo_participante),
         normalize_cell(notif.nombre),
         normalize_cell(notif.tramite),
-        normalize_cell(notif.obs_fallida),
     ])
     return hashlib.sha256(raw.encode()).hexdigest()
 
@@ -201,6 +199,8 @@ class EntitySyncSpec:
     to_model_fields: Callable[[Any, int], dict]  # (pjud_item, case_id) -> field dict
     creates_alert: bool = False
     notify: bool = False
+    updatable_fields: List[str] = field(default_factory=list)
+    # Fields NOT in the natural_key that should be refreshed on the existing row.
 
 
 def _parse_date_for_entity(date_str: Optional[str]) -> Optional[datetime]:
@@ -249,6 +249,7 @@ SPEC_NOTIFICACION = EntitySyncSpec(
     },
     creates_alert=False,
     notify=False,
+    updatable_fields=["estado_notif", "obs_fallida"],
 )
 
 SPEC_ESCRITO = EntitySyncSpec(
@@ -266,6 +267,7 @@ SPEC_ESCRITO = EntitySyncSpec(
     },
     creates_alert=False,
     notify=False,
+    updatable_fields=["doc_token"],
 )
 
 SPEC_EXHORTO = EntitySyncSpec(
@@ -284,6 +286,7 @@ SPEC_EXHORTO = EntitySyncSpec(
     },
     creates_alert=False,
     notify=False,
+    updatable_fields=["estado"],
 )
 
 
@@ -296,14 +299,15 @@ def _sync_entities(
     case_id: int,
     scraped_list: list,
     spec: EntitySyncSpec,
-    lawyer: Any = None,
-    webhooks: Optional[list] = None,
-    budget: int = 0,
 ) -> list:
     """Upsert a list of scraped PJUD entity objects for a given case.
 
     Performs a SELECT-then-INSERT per item keyed on (case_id, natural_key).
-    Idempotent: re-running with identical data inserts 0 new rows.
+    Existing rows have their spec.updatable_fields refreshed from the incoming
+    item.  Idempotent when data is unchanged.
+
+    DOES NOT COMMIT — callers are responsible for the surrounding transaction.
+    Use sync_case_detail to persist all four entity types atomically.
 
     Slice 1b: creates_alert and notify are False on all specs — no Alert rows
     are created, NotificationService is never called.
@@ -311,6 +315,8 @@ def _sync_entities(
 
     Returns:
         List of (row, is_new) tuples — one per input item.
+        is_new=True only for genuine inserts; an updatable-field refresh on an
+        existing row yields is_new=False.
     """
     results: list = []
     for item in scraped_list:
@@ -320,6 +326,12 @@ def _sync_entities(
             spec.model.natural_key == key,
         ).first()
         if existing:
+            if spec.updatable_fields:
+                fields = spec.to_model_fields(item, case_id)
+                for col in spec.updatable_fields:
+                    if col in fields:
+                        setattr(existing, col, fields[col])
+                db.flush()
             results.append((existing, False))
             continue
 
@@ -328,10 +340,9 @@ def _sync_entities(
         fields["created_at"] = datetime.utcnow()
         row = spec.model(**fields)
         db.add(row)
-        db.flush()  # assign PK without committing the outer transaction
+        db.flush()  # assign PK within the outer transaction
         results.append((row, True))
 
-    db.commit()
     return results
 
 
@@ -365,6 +376,36 @@ def upsert_exhortos(
 ) -> list:
     """Upsert PJUDExhorto objects for a case. Returns [(row, is_new), ...]."""
     return _sync_entities(db, case_id, items, SPEC_EXHORTO)
+
+
+def sync_case_detail(db: Session, case_id: int, detail: Any) -> dict:
+    """Persist all entity types for a case detail in a single atomic commit.
+
+    Calls the four upsert_* helpers (each flush-only) and commits once at the
+    end so litigantes, notificaciones, escritos, and exhortos for a case all
+    persist atomically.  If any upsert raises, no entities for this case are
+    committed (the caller's SQLAlchemy transaction rolls back on exception).
+
+    Args:
+        db:      Active SQLAlchemy session.
+        case_id: Primary key of the Case row to associate entities with.
+        detail:  PJUDCaseDetail returned by the scraper.
+
+    Returns:
+        Dict with new-row counts per entity type, e.g.
+        {"litigantes_new": 3, "notificaciones_new": 0, ...}
+    """
+    lit_results = upsert_litigantes(db, case_id, detail.litigantes)
+    notif_results = upsert_notificaciones(db, case_id, detail.notificaciones)
+    escrito_results = upsert_escritos(db, case_id, detail.escritos)
+    exhorto_results = upsert_exhortos(db, case_id, detail.exhortos)
+    db.commit()
+    return {
+        "litigantes_new": sum(1 for _, is_new in lit_results if is_new),
+        "notificaciones_new": sum(1 for _, is_new in notif_results if is_new),
+        "escritos_new": sum(1 for _, is_new in escrito_results if is_new),
+        "exhortos_new": sum(1 for _, is_new in exhorto_results if is_new),
+    }
 
 
 class SyncService:
