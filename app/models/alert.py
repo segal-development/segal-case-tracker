@@ -16,7 +16,13 @@ class Alert(Base):
     lawyer_id = Column(Integer, ForeignKey("lawyers.id"), nullable=False)
     case_id = Column(Integer, ForeignKey("cases.id"), nullable=False)
     movement_id = Column(Integer, ForeignKey("movements.id"), nullable=True)
-    
+
+    # Polymorphic entity target (ADR-003)
+    # Identifies the non-movement entity that triggered this alert.
+    # movement_id covers the Movement path; these two columns cover all others.
+    entity_type = Column(String(30), nullable=True)   # "notificacion" | "escrito" | "exhorto"
+    entity_id = Column(Integer, nullable=True)         # PK in the corresponding entity table
+
     # Alert details
     type = Column(String(50), nullable=False)  # new_movement, status_change, etc.
     title = Column(String(255), nullable=False)

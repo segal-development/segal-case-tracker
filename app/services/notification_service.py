@@ -15,6 +15,9 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.models.alert import Alert
 from app.models.case import Case
+from app.models.case_escrito import CaseEscrito
+from app.models.case_exhorto import CaseExhorto
+from app.models.case_notificacion import CaseNotificacion
 from app.models.lawyer import Lawyer
 from app.models.movement import Movement
 from app.models.webhook import Webhook
@@ -171,6 +174,130 @@ class NotificationService:
             },
         }
 
+        self._dispatch(alert, lawyer, webhooks, payload)
+
+    def notify_new_notificacion(
+        self,
+        case: Case,
+        notificacion_row: CaseNotificacion,
+        lawyer: Lawyer,
+        webhooks: List[Webhook],
+        alert: Alert,
+    ) -> None:
+        """Dispatch email + webhook notifications for a new notificacion.
+
+        Builds a v1 event payload with event='notificacion.created' and fans out
+        via _dispatch (mirrors notify_new_movement structure).  Never raises.
+        """
+        payload = {
+            "event": "notificacion.created",
+            "version": "1",
+            "data": {
+                "lawyer_id": lawyer.id,
+                "case": {
+                    "rol": case.rol or "",
+                    "tribunal": case.court.name if case.court else "",
+                    "caratulado": f"{case.plaintiff or ''}/{case.defendant or ''}",
+                },
+                "notificacion": {
+                    "rol": notificacion_row.rol or "",
+                    "tipo_notif": notificacion_row.tipo_notif or "",
+                    "fecha_tramite": (
+                        str(notificacion_row.fecha_tramite)
+                        if notificacion_row.fecha_tramite
+                        else ""
+                    ),
+                    "nombre": notificacion_row.nombre or "",
+                    "tramite": notificacion_row.tramite or "",
+                },
+            },
+        }
+        self._dispatch(alert, lawyer, webhooks, payload)
+
+    def notify_new_escrito(
+        self,
+        case: Case,
+        escrito_row: CaseEscrito,
+        lawyer: Lawyer,
+        webhooks: List[Webhook],
+        alert: Alert,
+    ) -> None:
+        """Dispatch email + webhook notifications for a new escrito.
+
+        Builds a v1 event payload with event='escrito.created'.  Never raises.
+        """
+        payload = {
+            "event": "escrito.created",
+            "version": "1",
+            "data": {
+                "lawyer_id": lawyer.id,
+                "case": {
+                    "rol": case.rol or "",
+                    "tribunal": case.court.name if case.court else "",
+                    "caratulado": f"{case.plaintiff or ''}/{case.defendant or ''}",
+                },
+                "escrito": {
+                    "tipo_escrito": escrito_row.tipo_escrito or "",
+                    "solicitante": escrito_row.solicitante or "",
+                    "fecha_ingreso": (
+                        str(escrito_row.fecha_ingreso)
+                        if escrito_row.fecha_ingreso
+                        else ""
+                    ),
+                },
+            },
+        }
+        self._dispatch(alert, lawyer, webhooks, payload)
+
+    def notify_new_exhorto(
+        self,
+        case: Case,
+        exhorto_row: CaseExhorto,
+        lawyer: Lawyer,
+        webhooks: List[Webhook],
+        alert: Alert,
+    ) -> None:
+        """Dispatch email + webhook notifications for a new exhorto.
+
+        Builds a v1 event payload with event='exhorto.created'.  Never raises.
+        """
+        payload = {
+            "event": "exhorto.created",
+            "version": "1",
+            "data": {
+                "lawyer_id": lawyer.id,
+                "case": {
+                    "rol": case.rol or "",
+                    "tribunal": case.court.name if case.court else "",
+                    "caratulado": f"{case.plaintiff or ''}/{case.defendant or ''}",
+                },
+                "exhorto": {
+                    "tipo_exhorto": exhorto_row.tipo_exhorto or "",
+                    "rol_destino": exhorto_row.rol_destino or "",
+                    "tribunal_destino": exhorto_row.tribunal_destino or "",
+                },
+            },
+        }
+        self._dispatch(alert, lawyer, webhooks, payload)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _dispatch(
+        self,
+        alert: Alert,
+        lawyer: Lawyer,
+        webhooks: List[Webhook],
+        payload: dict,
+    ) -> None:
+        """Send email + fan out to all active webhooks.
+
+        Shared implementation for all notify_new_* methods — absorbs the
+        send_email_alert + webhook fan-out loop that would otherwise be
+        copy-pasted across every entity type.  One channel failing never
+        blocks the other.  Never raises.
+        """
         # Email — failure must not block webhooks
         try:
             self.send_email_alert(alert, lawyer)
@@ -196,10 +323,6 @@ class NotificationService:
             alert.webhook_sent = True
             alert.webhook_sent_at = datetime.utcnow()
             self.db.flush()
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
 
     def get_lawyer_webhooks(
         self,
