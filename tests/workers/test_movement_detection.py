@@ -29,8 +29,15 @@ def _make_api_case(rol: str, case_token: str = "token-123"):
 
 
 def _make_detail_with_movements(movements_data: list):
-    """Build a mock scraper detail response with the given movement dicts."""
+    """Build a mock scraper detail response with the given movement dicts.
+
+    Includes all PJUDCaseDetail fields consumed by DocumentPersistenceService
+    so that wiring the service into detect_and_sync_movements does not cause
+    unexpected MagicMock-truthy attribute access failures.
+    """
     detail = MagicMock()
+    # Case-level documents (texto_demanda, cert_envio, ebook) — none in unit tests.
+    detail.case_documents = []
     mocks = []
     for d in movements_data:
         mv = MagicMock()
@@ -41,6 +48,9 @@ def _make_detail_with_movements(movements_data: list):
         mv.etapa = d.get("etapa", "Cuaderno Principal")
         mv.foja = d.get("foja", "1")
         mv.tiene_documento = d.get("tiene_documento", False)
+        # Document token fields — None/empty so persist_from_detail is a no-op.
+        mv.documento_token = None
+        mv.documentos = []
         mocks.append(mv)
     detail.movements = mocks
     return detail
