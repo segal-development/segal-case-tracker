@@ -1,27 +1,25 @@
 """
 Authentication endpoints.
 
-Two login methods supported:
-1. Captcha-based: RUT + Password + reCAPTCHA token (traditional)
-2. Clave Unica: RUT + Password via Chilean digital identity (no captcha needed)
+Two login methods supported (ADR-4):
+1. Captcha-based:   RUT + Password + reCAPTCHA token → login_with_token
+2. Clave Única:     RUT + Password via Chilean digital identity
 
-Flow for both:
-1. Frontend shows appropriate login form
-2. Backend authenticates with PJUD
-3. Backend stores session cookies in Redis
-4. Backend returns JWT for API authentication
+Session refresh is intentionally removed (AUTH-03 / ADR-4).
+Use the original login endpoint to re-authenticate.
 """
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, status, Depends
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
-from app.core.security import create_access_token, get_current_lawyer
+from app.core.security import create_access_token, get_current_lawyer, encrypt_pjud_password
 from app.scrapper.pjud_civil import PJUDCivilScraper, LoginError
-from app.scrapper.session_manager import SessionManager, PJUDSession
 from app.scrapper.pjud.browser import BrowserFactory
 from app.scrapper.pjud.clave_unica import (
     ClaveUnicaAuth,
@@ -30,6 +28,8 @@ from app.scrapper.pjud.clave_unica import (
 )
 from app.services.session_store import get_session_store
 from app.models.lawyer import Lawyer
+from app.api.deps import get_db
+from app.utils.rut import normalize_rut
 
 
 logger = logging.getLogger(__name__)
@@ -41,17 +41,17 @@ router = APIRouter()
 # ============================================================================
 
 class LoginRequest(BaseModel):
-    """Login request from frontend."""
+    """Captcha login request."""
     rut: str = Field(..., description="RUT con dígito verificador (ej: 16021492-9)")
     password: str = Field(..., description="Clave Poder Judicial")
     captcha_token: str = Field(..., description="Token reCAPTCHA v3 resuelto por el usuario")
 
 
 class LoginResponse(BaseModel):
-    """Login response."""
+    """Captcha login response."""
     access_token: str
     token_type: str = "bearer"
-    expires_in: int  # segundos
+    expires_in: int
     lawyer: "LawyerInfo"
 
 
@@ -60,18 +60,6 @@ class LawyerInfo(BaseModel):
     rut: str
     name: Optional[str] = None
     email: Optional[str] = None
-
-
-class RefreshRequest(BaseModel):
-    """Refresh session request."""
-    captcha_token: str = Field(..., description="Nuevo token reCAPTCHA")
-
-
-class RefreshResponse(BaseModel):
-    """Refresh session response."""
-    success: bool
-    message: str
-    session_expires_at: datetime
 
 
 class SessionStatus(BaseModel):
@@ -84,13 +72,13 @@ class SessionStatus(BaseModel):
 
 
 class ClaveUnicaLoginRequest(BaseModel):
-    """Clave Unica login request."""
+    """Clave Única login request."""
     rut: str = Field(..., description="RUT Clave Unica (ej: 16021492-9)")
     password: str = Field(..., description="Clave Unica password")
 
 
 class ClaveUnicaLoginResponse(BaseModel):
-    """Clave Unica login response."""
+    """Clave Única login response."""
     access_token: str
     token_type: str = "bearer"
     expires_in: int
@@ -104,114 +92,109 @@ class ClaveUnicaLoginResponse(BaseModel):
 # ============================================================================
 
 @router.post("/login", response_model=LoginResponse)
-async def login(request: LoginRequest):
+async def login(
+    request: LoginRequest,
+    db: Session = Depends(get_db),
+):
     """
-    Login con credenciales PJUD.
-    
-    El frontend debe:
-    1. Mostrar formulario con RUT + Password
-    2. Incluir reCAPTCHA v3 de Google (sitekey: 6LelLWkUAAAAANPDMkBxllo_QJe5RQVpg6V2pIDt)
-    3. Enviar el token del captcha resuelto por el usuario
-    
-    El backend:
-    1. Usa las credenciales + token para login en PJUD
-    2. Guarda las cookies de sesión PJUD en Redis
-    3. Retorna un JWT propio para autenticar requests al API
+    Login con credenciales PJUD (captcha).
+
+    Calls ``login_with_token`` on the scraper (ADR-4), resolves (or creates)
+    the lawyer record in the DB, persists the session bound to the real
+    lawyer_id in Redis via the async store, and returns a signed JWT.
     """
-    session_manager = SessionManager()
-    scraper = PJUDCivilScraper(session_manager=session_manager)
-    
+    scraper = PJUDCivilScraper()
+
     try:
         await scraper.start()
-        
-        # Login en PJUD con el token del captcha que resolvió el usuario
-        pjud_session = await scraper.login_with_user_captcha(
+
+        # AUTH-01: call login_with_token (not login_with_user_captcha)
+        pjud_session = await scraper.login_with_token(
             rut=request.rut,
             password=request.password,
             captcha_token=request.captcha_token,
         )
-        
-        # Crear o actualizar lawyer en DB
-        lawyer = await _get_or_create_lawyer(request.rut, request.password)
-        
-        # Generar JWT propio
+
+        # Resolve (or create) the lawyer and bind the real id to the session
+        lawyer = _get_or_create_lawyer(
+            db, rut=request.rut, password=request.password, auth_method="captcha"
+        )
+        pjud_session.lawyer_id = int(lawyer.id)
+
+        # Persist session via async store
+        store = get_session_store()
+        await store.asave_session(pjud_session)
+
         access_token = create_access_token(
             data={"sub": request.rut},
-            expires_delta=timedelta(hours=24)
+            expires_delta=timedelta(hours=24),
         )
-        
+
         return LoginResponse(
             access_token=access_token,
             token_type="bearer",
-            expires_in=24 * 60 * 60,  # 24 horas
+            expires_in=24 * 60 * 60,
             lawyer=LawyerInfo(
                 rut=request.rut,
-                name=lawyer.name if lawyer else None,
-                email=lawyer.email if lawyer else None,
-            )
+                name=lawyer.name,
+                email=lawyer.email,
+            ),
         )
-        
-    except LoginError as e:
+
+    except LoginError as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Login PJUD fallido: {str(e)}"
+            detail=f"Login PJUD fallido: {exc}",
         )
-    except Exception as e:
+    except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error interno: {str(e)}"
+            detail=f"Error interno: {exc}",
         )
     finally:
         await scraper.stop()
 
 
 @router.post("/login/clave-unica", response_model=ClaveUnicaLoginResponse)
-async def login_clave_unica(request: ClaveUnicaLoginRequest):
+async def login_clave_unica(
+    request: ClaveUnicaLoginRequest,
+    db: Session = Depends(get_db),
+):
     """
-    Login via Clave Unica (Chilean digital identity).
-    
-    Alternative to captcha-based login. No captcha required - uses
-    the user's Clave Unica credentials directly.
-    
-    Flow:
-    1. Frontend collects Clave Unica RUT + password
-    2. Backend navigates to PJUD -> Clave Unica portal
-    3. Backend fills form and handles redirect
-    4. Backend extracts session cookies
-    5. Returns JWT for API authentication
-    
-    Note: Clave Unica credentials may differ from PJUD credentials.
-    The RUT used here is the Clave Unica RUT.
+    Login via Clave Única (Chilean digital identity).
+
+    No captcha required — uses Clave Única credentials directly.
+    Resolves (or creates) the lawyer record, then persists the session
+    bound to the real lawyer_id in Redis via the async store.
     """
-    credentials = ClaveUnicaCredentials(
-        rut=request.rut,
-        password=request.password,
-    )
-    
-    # Get or create lawyer (use RUT as lawyer_id placeholder for now)
-    # In production, this would query the database
-    lawyer = await _get_or_create_lawyer(request.rut, request.password)
-    lawyer_id = lawyer.id if lawyer else 1  # Default to 1 for testing
-    
+    credentials = ClaveUnicaCredentials(rut=request.rut, password=request.password)
+
+    # FIX 2: resolve (or create) the lawyer WITHOUT storing credentials yet.
+    # Credentials are persisted only after login succeeds to avoid committing
+    # a bad credential when the portal rejects it.
+    lawyer = _get_or_create_lawyer(db, rut=request.rut)
+
     try:
         async with BrowserFactory(headless=True) as factory:
             page = await factory.new_page()
-            
+
             auth = ClaveUnicaAuth()
-            pjud_session = await auth.login(page, credentials, lawyer_id)
-            
-            # Store session in Redis
+            pjud_session = await auth.login(page, credentials, int(lawyer.id))
+
+            # FIX 2: store credentials only AFTER login succeeds.
+            _store_encrypted_credentials(db, lawyer, request.password, "clave_unica")
+
+            # Persist session
             store = get_session_store()
-            store.save_session(pjud_session)
-            
-            # Generate JWT
+            await store.asave_session(pjud_session)
+
             access_token = create_access_token(
                 data={"sub": request.rut},
-                expires_delta=timedelta(hours=24)
+                expires_delta=timedelta(hours=24),
             )
-            
-            logger.info(f"Clave Unica login successful for {request.rut}")
-            
+
+            logger.info("Clave Única login successful for %s", request.rut)
+
             return ClaveUnicaLoginResponse(
                 access_token=access_token,
                 token_type="bearer",
@@ -220,109 +203,65 @@ async def login_clave_unica(request: ClaveUnicaLoginRequest):
                 auth_method="clave_unica",
                 lawyer=LawyerInfo(
                     rut=request.rut,
-                    name=lawyer.name if lawyer else None,
-                    email=lawyer.email if lawyer else None,
-                )
+                    name=lawyer.name,
+                    email=lawyer.email,
+                ),
             )
-            
-    except ClaveUnicaAuthError as e:
-        logger.warning(f"Clave Unica login failed: {e}")
+
+    except ClaveUnicaAuthError as exc:
+        logger.warning("Clave Única login failed: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Clave Unica login failed: {str(e)}"
+            detail=f"Clave Unica login failed: {exc}",
         )
-    except Exception as e:
-        logger.error(f"Unexpected error in Clave Unica login: {e}")
+    except Exception as exc:
+        logger.error("Unexpected error in Clave Única login: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Internal error: {str(e)}"
+            detail=f"Internal error: {exc}",
         )
 
 
-@router.post("/refresh", response_model=RefreshResponse)
-async def refresh_session(
-    request: RefreshRequest,
-    current_lawyer: Lawyer = Depends(get_current_lawyer)
-):
-    """
-    Refrescar sesión PJUD con nuevo captcha.
-    
-    Llamar cuando la sesión está por expirar (~20-25 min de inactividad).
-    El frontend debe mostrar un reCAPTCHA y enviar el token.
-    """
-    session_manager = SessionManager()
-    scraper = PJUDCivilScraper(session_manager=session_manager)
-    
-    try:
-        await scraper.start()
-        
-        # Refrescar sesión con nuevo captcha
-        new_session = await scraper.refresh_session_with_captcha(
-            rut=current_lawyer.rut,
-            captcha_token=request.captcha_token,
-        )
-        
-        return RefreshResponse(
-            success=True,
-            message="Sesión renovada exitosamente",
-            session_expires_at=new_session.expires_at,
-        )
-        
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Error renovando sesión: {str(e)}"
-        )
-    finally:
-        await scraper.stop()
+# NOTE: /refresh endpoint is intentionally removed (ADR-4 / AUTH-03).
+# Clients must call /login again to re-authenticate.
 
 
 @router.get("/session-status", response_model=SessionStatus)
 async def get_session_status(
-    current_lawyer: Lawyer = Depends(get_current_lawyer)
+    current_rut: str = Depends(get_current_lawyer),
 ):
     """
-    Verificar estado de la sesión PJUD.
-    
-    El frontend puede usar esto para:
-    - Mostrar indicador de sesión activa/inactiva
-    - Mostrar countdown de expiración
-    - Decidir cuándo pedir nuevo captcha (or use Clave Unica)
-    - Check which auth method was used
+    Verify PJUD session status.
+
+    Looks up the session by RUT using the rut secondary index in Redis.
     """
-    session_manager = SessionManager()
-    session = await session_manager.get_session(current_lawyer.rut)
-    
+    store = get_session_store()
+    session = await store.aget_session_by_rut(current_rut)
+
     if not session or session.is_expired():
-        return SessionStatus(
-            active=False,
-            needs_refresh=True,
-        )
-    
-    minutes_remaining = int((session.expires_at - datetime.now()).total_seconds() / 60)
-    
-    # Get auth_method if available (newer sessions have it)
-    auth_method = getattr(session, 'auth_method', 'captcha')
-    
+        return SessionStatus(active=False, needs_refresh=True)
+
+    time_left = session.time_until_expiry()
+    minutes_remaining = int(time_left.total_seconds() / 60)
+
     return SessionStatus(
         active=True,
         expires_at=session.expires_at,
         minutes_remaining=minutes_remaining,
         needs_refresh=minutes_remaining < 5,
-        auth_method=auth_method,
+        auth_method=session.auth_method,
     )
 
 
 @router.post("/logout")
-async def logout(current_lawyer: Lawyer = Depends(get_current_lawyer)):
+async def logout(current_rut: str = Depends(get_current_lawyer)):
     """
-    Cerrar sesión.
-    
-    Invalida la sesión PJUD en cache.
+    Close PJUD session.
+
+    Deletes the session from Redis using the rut secondary index.
     """
-    session_manager = SessionManager()
-    await session_manager.invalidate_session(current_lawyer.rut)
-    
+    store = get_session_store()
+    await store.adelete_session_by_rut(current_rut)
     return {"message": "Sesión cerrada"}
 
 
@@ -330,8 +269,107 @@ async def logout(current_lawyer: Lawyer = Depends(get_current_lawyer)):
 # HELPERS
 # ============================================================================
 
-async def _get_or_create_lawyer(rut: str, password: str) -> Optional[Lawyer]:
-    """Get or create lawyer in database."""
-    # TODO: Implementar con SQLAlchemy
-    # Por ahora retorna None
-    return None
+def _store_encrypted_credentials(
+    db: Session,
+    lawyer: Lawyer,
+    password: str,
+    auth_method: str,
+) -> None:
+    """Encrypt and persist login credentials, updating preferred_auth_method.
+
+    SECURITY NOTE (ADR-6 / R1): stores Fernet-encrypted ciphertext only — the
+    plaintext password is NEVER written to any persistent field, log, or cache.
+    Call this ONLY after the login attempt has succeeded so a rejected credential
+    is never committed to the database.
+
+    FIX 5: ``preferred_auth_method`` is updated symmetrically for both captcha
+    and clave_unica so the worker re-auths via the correct branch.
+    """
+    encrypted = encrypt_pjud_password(password)
+    if auth_method == "clave_unica":
+        lawyer.clave_unica_rut = str(lawyer.rut)  # type: ignore[assignment]
+        lawyer.encrypted_clave_unica_password = encrypted  # type: ignore[assignment]
+    else:
+        # captcha (default)
+        lawyer.encrypted_pjud_password = encrypted  # type: ignore[assignment]
+    lawyer.preferred_auth_method = auth_method  # type: ignore[assignment]
+    db.commit()
+    db.refresh(lawyer)
+
+
+def _get_or_create_lawyer(
+    db: Session,
+    rut: str,
+    password: Optional[str] = None,
+    auth_method: str = "captcha",
+) -> Lawyer:
+    """Look up a Lawyer by normalized RUT, creating one if absent (ADR-5).
+
+    The operation is idempotent: concurrent inserts are handled by catching
+    IntegrityError and re-querying the row that won the race.
+
+    When *password* is provided the encrypted credential is stored via
+    ``_store_encrypted_credentials`` (Slice 3 / LID-04).  Callers that need
+    post-login credential storage (e.g. clave_unica endpoint) MUST call this
+    function WITHOUT a password first, then call ``_store_encrypted_credentials``
+    after the login succeeds — never before.
+
+    SECURITY NOTE (ADR-6 / R1):
+    - What is stored: Fernet-encrypted ciphertext of the PJUD or Clave Única
+      password in ``lawyers.encrypted_pjud_password`` (captcha path) or
+      ``lawyers.encrypted_clave_unica_password`` (clave_unica path).
+    - This is REVERSIBLE encryption, NOT a hash — the scheduled worker must
+      replay the plaintext password to PJUD during autonomous re-authentication.
+    - The symmetric key (``settings.ENCRYPTION_KEY``) MUST be sourced from a
+      secret manager, restricted to the worker/API roles only, and rotated on
+      exposure.  Plaintext passwords are NEVER written to any other persistent
+      field, log, or cache.
+    - This slice has a mandatory human security-review gate before merge (S3-T9).
+
+    Args:
+        db: SQLAlchemy session (sync).
+        rut: Lawyer RUT in any input format — normalized internally.
+        password: Plaintext credential.  When non-None the encrypted value is
+                  stored; when None the credential columns are left unchanged.
+        auth_method: ``"captcha"`` or ``"clave_unica"``; stored as
+                     ``preferred_auth_method`` when creating a new record.
+
+    Returns:
+        Persisted Lawyer instance with a valid integer id.  Never returns None.
+    """
+    normalized = normalize_rut(rut)
+
+    lawyer = db.query(Lawyer).filter(Lawyer.rut == normalized).first()
+    if lawyer is None:
+        lawyer = Lawyer(
+            rut=normalized,
+            name=normalized,  # placeholder; profile sync will update
+            preferred_auth_method=auth_method,
+            is_active=True,
+        )
+        db.add(lawyer)
+        try:
+            db.commit()
+            db.refresh(lawyer)
+        except IntegrityError:
+            # Another request won the INSERT race — roll back and fetch the winner.
+            db.rollback()
+            winner = db.query(Lawyer).filter(Lawyer.rut == normalized).first()
+            if winner is None:
+                raise RuntimeError(
+                    f"Failed to resolve lawyer for RUT {normalized} "
+                    "after IntegrityError — concurrent rollback?"
+                )
+            lawyer = winner
+
+    # Update last_login_at on every successful authentication
+    lawyer.last_login_at = datetime.now(tz=timezone.utc)  # type: ignore[assignment]
+
+    # Persist encrypted credentials when provided (Fernet-reversible, see SECURITY NOTE above).
+    if password:
+        _store_encrypted_credentials(db, lawyer, password, auth_method)
+    else:
+        db.commit()
+        db.refresh(lawyer)
+
+    return lawyer

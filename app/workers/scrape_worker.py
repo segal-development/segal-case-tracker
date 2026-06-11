@@ -7,38 +7,36 @@ from typing import Callable
 from app.config import settings
 from app.core.database import SessionLocal
 from app.scrapper.pjud_civil import PJUDCivilScraper
-from app.scrapper.session_manager import SessionManager
+from app.services.session_store import get_session_store
 from app.services.scrapper_service import ScrapperService
 
 
 class ScrapeWorker:
     """Process scraping jobs from Pub/Sub queue."""
-    
-    def __init__(self):
-        self.session_manager = SessionManager()
-    
+
     async def process_search_job(self, job_data: dict) -> dict:
         """
         Process a search job.
-        
+
         Args:
             job_data: {job_id, lawyer_id, rol?, rut?, court_id?}
-        
+
         Returns:
             Results dict with found cases
         """
         job_id = job_data["job_id"]
         lawyer_id = job_data["lawyer_id"]
-        
+
         db = SessionLocal()
         try:
             service = ScrapperService(db)
-            
+
             # Update status to processing
             await service.update_job_status(job_id, "processing", progress=10)
-            
-            # Get PJUD session
-            session = await self.session_manager.get_session(lawyer_id)
+
+            # Get PJUD session from async store
+            store = get_session_store()
+            session = await store.get_session_by_lawyer(lawyer_id)
             if not session:
                 await service.update_job_status(
                     job_id, "failed", error="PJUD session expired"

@@ -143,7 +143,7 @@ class TestClaveUnicaAuthFormFilling:
     async def test_login_returns_session(self, mock_page, mock_registry):
         """Successful login should return PJUDSession."""
         from app.scrapper.pjud.clave_unica import ClaveUnicaAuth, ClaveUnicaCredentials
-        from app.services.session_store import PJUDSession
+        from app.services.pjud_session import PJUDSession
         
         auth = ClaveUnicaAuth()
         auth._registry = mock_registry

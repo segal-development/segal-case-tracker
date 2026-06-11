@@ -12,10 +12,11 @@ Architecture:
 """
 
 import time
-from fastapi import APIRouter, HTTPException, Query, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import datetime, timedelta
+from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.scrapper.pjud.resilience.integration import (
@@ -27,7 +28,10 @@ from app.scrapper.pjud.resilience import CircuitState
 from app.scrapper.pjud.observability import get_logger, get_metrics
 from app.scrapper.pjud.exceptions import CircuitOpenError
 from app.scrapper.pjud.browser import BrowserFactory
-from app.services.session_store import get_session_store, PJUDSession
+from app.services.session_store import get_session_store
+from app.services.pjud_session import PJUDSession
+from app.api.deps import get_db
+from app.api.v1.auth import _get_or_create_lawyer
 
 router = APIRouter()
 
@@ -41,8 +45,8 @@ _metrics = get_metrics()
 # ============================================================================
 
 class LoginRequest(BaseModel):
-    rut: str = Field(..., example="12345678-9")
-    password: str = Field(..., example="password123")
+    rut: str = Field(..., description="RUT con dígito verificador (ej: 12345678-9)")
+    password: str = Field(..., description="Clave Poder Judicial")
     captcha_token: str = Field(..., description="reCAPTCHA token from frontend")
 
 
@@ -123,25 +127,18 @@ class CountResponse(BaseModel):
 # Session helpers
 # ============================================================================
 
-def _get_session_from_redis(session_id: str) -> PJUDSession:
-    """
-    Get session from Redis store.
-    
-    Args:
-        session_id: Session ID to retrieve
-        
-    Returns:
-        PJUDSession if found
-        
+async def _get_session_from_redis(session_id: str) -> PJUDSession:
+    """Retrieve a session from Redis by session_id (async).
+
     Raises:
-        HTTPException: If session not found or expired
+        HTTPException 401: If session not found or expired.
     """
     store = get_session_store()
-    session = store.get_session(session_id)
-    
+    session = await store.aget_session_by_id(session_id)
+
     if session is None:
         raise HTTPException(status_code=401, detail="Session not found or expired")
-    
+
     return session
 
 
@@ -163,59 +160,52 @@ def get_scraper(competency: str = "civil"):
 # ============================================================================
 
 @router.post("/login", response_model=LoginResponse)
-async def login(request: LoginRequest):
+async def login(
+    request: LoginRequest,
+    db: Session = Depends(get_db),
+):
     """
     Login to PJUD with RUT, password and captcha token.
-    
+
     The captcha token must be obtained from the frontend reCAPTCHA widget.
-    Returns a session that can be used for subsequent requests.
-    
-    The session is stored in Redis so subsequent requests can restore
-    the session cookies into fresh browser instances.
+    Resolves (or creates) the lawyer record in the DB and binds the real
+    lawyer_id to the session before persisting it in Redis.
+    Returns a session_id that can be used for subsequent requests.
     """
     scraper = get_scraper()
-    
+
     try:
-        login_session = await scraper.login_with_token(
+        # login_with_token returns a canonical PJUDSession (uuid4 session_id, UTC times)
+        pjud_session = await scraper.login_with_token(
             rut=request.rut,
             password=request.password,
             captcha_token=request.captcha_token,
         )
-        
-        # Generate unique session ID
-        session_id = f"pjud_{request.rut}_{datetime.now().timestamp()}"
-        
-        # Create PJUDSession for Redis storage
-        redis_session = PJUDSession(
-            session_id=session_id,
-            lawyer_id=0,  # Will be set when we have lawyer context
-            rut=request.rut,
-            cookies=login_session.cookies if hasattr(login_session, 'cookies') else [],
-            created_at=datetime.utcnow().isoformat(),
-            expires_at=login_session.expires_at.isoformat() if hasattr(login_session, 'expires_at') else (datetime.utcnow() + timedelta(hours=2)).isoformat(),
-            local_storage=login_session.local_storage if hasattr(login_session, 'local_storage') else "{}",
-            auth_method="captcha",
+
+        # Resolve (or create) the lawyer and bind the real id to the session (ADR-5)
+        lawyer = _get_or_create_lawyer(
+            db, rut=request.rut, password=request.password, auth_method="captcha"
         )
-        
-        # Store session in Redis
+        pjud_session.lawyer_id = int(lawyer.id)
+
+        # Persist session via async store (ADR-3)
         store = get_session_store()
-        store.save_session(redis_session)
-        
-        _logger.info(f"Login successful, session stored: {session_id}")
-        
+        await store.asave_session(pjud_session)
+
+        _logger.info("Login successful, session stored: %s", pjud_session.session_id)
+
         return LoginResponse(
             success=True,
-            rut=login_session.rut,
-            session_id=session_id,
-            expires_at=login_session.expires_at,
+            rut=pjud_session.rut,
+            session_id=pjud_session.session_id,
+            expires_at=pjud_session.expires_at,
             message="Login successful",
         )
-        
+
     except Exception as e:
-        _logger.error(f"Login failed: {e}")
+        _logger.error("Login failed: %s", e)
         raise HTTPException(status_code=401, detail=str(e))
     finally:
-        # Always close the login scraper - we don't reuse it
         await scraper.close()
 
 
@@ -230,7 +220,7 @@ async def get_cases_count(
     
     Uses fresh browser per request with session restoration from Redis.
     """
-    session = _get_session_from_redis(session_id)
+    session = await _get_session_from_redis(session_id)
     
     # Use fresh browser for this request
     async with BrowserFactory() as factory:
@@ -281,7 +271,7 @@ async def get_cases(
         _metrics.record_error("civil", "circuit_rejected")
         raise HTTPException(status_code=503, detail="Service temporarily unavailable (circuit open)")
     
-    session = _get_session_from_redis(session_id)
+    session = await _get_session_from_redis(session_id)
     
     start_time = time.time()
     _logger.info(f"Starting get_cases for civil", extra={"year": year, "max_pages": max_pages})
@@ -347,7 +337,7 @@ async def get_case_detail(
     The `rol` must match exactly (e.g., C-7616-2026).
     Uses fresh browser per request with session restoration from Redis.
     """
-    session = _get_session_from_redis(session_id)
+    session = await _get_session_from_redis(session_id)
     
     # Use fresh browser for this request
     async with BrowserFactory() as factory:
@@ -437,7 +427,7 @@ async def download_document(
     from fastapi.responses import Response
     from app.scrapper.pjud_civil import PJUDDocument
     
-    session = _get_session_from_redis(session_id)
+    session = await _get_session_from_redis(session_id)
     
     # Use fresh browser for this request
     async with BrowserFactory() as factory:
@@ -484,13 +474,10 @@ async def logout(
     we use fresh browser per request.
     """
     store = get_session_store()
-    deleted = store.delete_session(session_id)
-    
-    if deleted:
-        _logger.info(f"Session logged out: {session_id}")
-        return {"success": True, "message": "Session closed"}
-    else:
-        return {"success": True, "message": "Session already closed or not found"}
+    await store.adelete_session(session_id)
+
+    _logger.info("Session logged out: %s", session_id)
+    return {"success": True, "message": "Session closed"}
 
 
 # ============================================================================
@@ -519,7 +506,7 @@ async def get_laboral_cases(
         _metrics.record_error("laboral", "circuit_rejected")
         raise HTTPException(status_code=503, detail="Service temporarily unavailable (circuit open)")
     
-    session = _get_session_from_redis(session_id)
+    session = await _get_session_from_redis(session_id)
     
     start_time = time.time()
     _logger.info(f"Starting get_cases for laboral", extra={"year": year, "max_pages": max_pages})
@@ -585,7 +572,7 @@ async def get_laboral_case_detail(
     The `rol` must match exactly (e.g., T-123-2026).
     Uses fresh browser per request with session restoration from Redis.
     """
-    session = _get_session_from_redis(session_id)
+    session = await _get_session_from_redis(session_id)
     
     # Use fresh browser for this request
     async with BrowserFactory() as factory:
@@ -685,7 +672,7 @@ async def get_penal_cases(
         _metrics.record_error("penal", "circuit_rejected")
         raise HTTPException(status_code=503, detail="Service temporarily unavailable (circuit open)")
     
-    session = _get_session_from_redis(session_id)
+    session = await _get_session_from_redis(session_id)
     
     start_time = time.time()
     _logger.info(f"Starting get_cases for penal", extra={"year": year, "max_pages": max_pages})
@@ -752,7 +739,7 @@ async def get_penal_case_detail(
     Note: Uses path parameter to allow slashes in RUC format.
     Uses fresh browser per request with session restoration from Redis.
     """
-    session = _get_session_from_redis(session_id)
+    session = await _get_session_from_redis(session_id)
     
     # Use fresh browser for this request
     async with BrowserFactory() as factory:

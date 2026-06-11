@@ -22,7 +22,7 @@ from app.scrapper.pjud.base import (
 )
 from app.scrapper.pjud.exceptions import ScrapingError
 from app.scrapper.pjud.selectors import SelectorRegistry
-from app.scrapper.session_manager import PJUDSession
+from app.services.pjud_session import PJUDSession
 
 
 logger = logging.getLogger(__name__)

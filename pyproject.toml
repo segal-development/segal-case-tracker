@@ -29,13 +29,49 @@ pyyaml = "^6.0.1"
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0.0"
 pytest-asyncio = "^0.23.4"
+pytest-cov = "^4.1.0"
 httpx = "^0.26.0"
 black = "^24.1.0"
 ruff = "^0.1.14"
+mypy = "^1.8.0"
+fakeredis = "^2.0"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+# Only collect the curated suite. Root-level test_*.py files are exploratory
+# scripts that hit the live PJUD portal and must never run in CI.
+testpaths = ["tests"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests requiring live external services such as Redis",
+]
+
+[tool.coverage.run]
+source = ["app"]
+branch = true
+omit = ["tests/*", "scripts/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
+[tool.mypy]
+python_version = "3.11"
+plugins = ["pydantic.mypy"]
+# Gradual adoption: lax globally so the suite stays green today.
+ignore_missing_imports = true
+warn_unused_configs = true
+warn_redundant_casts = true
+check_untyped_defs = true
+
+# Strict gate: pure-logic core only. app/services still emits SQLAlchemy
+# Column[T]-vs-T noise until the models migrate to Mapped[...] annotations,
+# so it stays lax for now. Ratchet outward (services, then api) over time.
+[[tool.mypy.overrides]]
+module = ["app.core.*"]
+disallow_untyped_defs = true
+warn_return_any = true
 
 [build-system]
 requires = ["poetry-core"]
