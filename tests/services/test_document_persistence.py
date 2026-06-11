@@ -58,7 +58,7 @@ def seeded_case(mem_db: Session):
     lawyer = Lawyer(
         rut="11111111-1",
         email="test@example.com",
-        nombre="Test Lawyer",
+        name="Test Lawyer",
         created_at=datetime.utcnow(),
     )
     mem_db.add(lawyer)
