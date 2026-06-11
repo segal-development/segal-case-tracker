@@ -112,7 +112,12 @@ async def _reauth(
             logger.warning("Lawyer %d: no encrypted clave_unica password stored", lawyer.id)
             return None, "no_credentials"
 
-        password = decrypt_pjud_password(str(enc_pass))
+        try:
+            password = decrypt_pjud_password(str(enc_pass))
+        except Exception as exc:
+            logger.error("Lawyer %d: failed to decrypt stored credential: %s", lawyer.id, exc)
+            return None, "decrypt_failed"
+
         clave_rut = str(getattr(lawyer, "clave_unica_rut", None) or lawyer.rut)
 
         # Lazy imports keep Playwright out of the module-level namespace so the
@@ -148,7 +153,11 @@ async def _reauth(
             )
             return None, "captcha_no_2captcha_key"
 
-        password = decrypt_pjud_password(str(enc_pass))
+        try:
+            password = decrypt_pjud_password(str(enc_pass))
+        except Exception as exc:
+            logger.error("Lawyer %d: failed to decrypt stored credential: %s", lawyer.id, exc)
+            return None, "decrypt_failed"
 
         from app.scrapper.captcha_solver import CaptchaSolver
         from app.scrapper.pjud_civil import PJUDCivilScraper, RECAPTCHA_SITEKEY

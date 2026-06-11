@@ -1,10 +1,11 @@
 """S3-T4: Tests for autonomous worker re-auth — _reauth function.
 
-Tests four branches (ADR-7):
+Tests five branches (ADR-7 + FIX-1):
 1. clave_unica nominal: ClaveUnicaAuth.login called, session stored.
 2. captcha + has_2captcha=True: 2Captcha solver called, login_with_token called.
 3. captcha + has_2captcha=False: no crash, returns captcha_no_2captcha_key.
 4. No stored credentials: no crash, returns no_credentials.
+5. Corrupt ciphertext: decrypt raises → returns decrypt_failed, never raises.
 
 All tests mock Playwright, browser, and scraper — no live connections.
 """
@@ -199,6 +200,31 @@ class TestReauthCaptcha:
 
         assert session is None
         assert reason == "no_credentials"
+
+
+# ---------------------------------------------------------------------------
+# Decrypt-failure guard (FIX 1)
+# ---------------------------------------------------------------------------
+
+class TestReauthDecryptFailure:
+    """FIX-1: corrupt ciphertext must never propagate — _reauth returns (None, 'decrypt_failed')."""
+
+    @pytest.mark.asyncio
+    async def test_clave_unica_corrupt_ciphertext_returns_decrypt_failed(self, fake_redis):
+        """stored encrypted_clave_unica_password is garbage → decrypt raises → (None, 'decrypt_failed')."""
+        from app.workers.sync_scheduler import _reauth
+        from app.services.session_store import SessionStore
+
+        lawyer = _make_lawyer(
+            preferred_auth_method="clave_unica",
+            encrypted_clave_unica_password="not-valid-fernet-ciphertext",
+        )
+        store = SessionStore(redis_client=fake_redis)
+
+        session, reason = await _reauth(lawyer, store)
+
+        assert session is None
+        assert reason == "decrypt_failed"
 
 
 # ---------------------------------------------------------------------------
