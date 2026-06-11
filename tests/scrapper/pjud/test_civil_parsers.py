@@ -508,7 +508,7 @@ class TestStaticDocumentTokenExtraction:
         self, scraper: CivilScraper
     ) -> None:
         """HTML with neither form nor fa-ban for cert_envio → no cert_envio doc, no exception."""
-        # Minimal valid HTML with correct ROL but no cert_envio form or fa-ban
+        # Minimal valid HTML with correct ROL but no cert_envio form or icon
         html = """
         <div>
           <strong>ROL:</strong> C-0001-2099
@@ -518,7 +518,7 @@ class TestStaticDocumentTokenExtraction:
               <tr>
                 <td><strong>Texto Demanda:</strong></td>
                 <td><strong>Anexos de la causa:</strong></td>
-                <td><strong>Certificado de Envío:</strong><br><!-- no form, no fa-ban --></td>
+                <td><strong>Certificado de Envío:</strong><br><!-- empty slot --></td>
                 <td id="boton"><strong>Ebook:</strong></td>
               </tr>
             </tbody>

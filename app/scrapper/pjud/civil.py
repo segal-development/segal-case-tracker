@@ -288,6 +288,9 @@ class CivilScraper(PJUDBaseScraper):
         escritos = self._parse_escritos_table(html)
         exhortos = self._parse_exhortos_table(html)
 
+        # Parse case-level static document tokens (texto_demanda, cert_envio, ebook)
+        case_documents = self._parse_case_documents(html)
+
         # Validate ROL format
         if not rol or not re.match(r'^[A-Z]+-\d+-\d{4}$', rol):
             logger.warning(f"Invalid ROL format: '{rol}'")
@@ -322,8 +325,146 @@ class CivilScraper(PJUDBaseScraper):
             notificaciones=notificaciones,
             escritos=escritos,
             exhortos=exhortos,
+            case_documents=case_documents,
         )
     
+    # ========================================================================
+    # STATIC DOCUMENT TOKEN HELPERS  (case-documents Slice 1)
+    # ========================================================================
+
+    @staticmethod
+    def _extract_form_token(html: str, action_fragment: str, param_name: str) -> Optional[str]:
+        """Extract a token from a form anchored on its action attribute.
+
+        Anchoring on the form action disambiguates dtaCert:
+        - docCertificadoEscrito.php → escrito_cert (movement-level)
+        - docCertificadoDemanda.php → cert_envio   (case-level)
+
+        Returns None when no matching form or param is found.
+        """
+        import re as _re
+        pattern = (
+            r'<form[^>]+action="[^"]*'
+            + _re.escape(action_fragment)
+            + r'[^"]*"[^>]*>(.*?)</form>'
+        )
+        form_match = _re.search(pattern, html, _re.DOTALL | _re.IGNORECASE)
+        if not form_match:
+            return None
+        body = form_match.group(1)
+        # Try name before value, then reversed attribute order
+        for pat in (
+            rf'name="{_re.escape(param_name)}"[^>]*value="([^"]+)"',
+            rf'value="([^"]+)"[^>]*name="{_re.escape(param_name)}"',
+        ):
+            m = _re.search(pat, body, _re.IGNORECASE)
+            if m:
+                return m.group(1)
+        return None
+
+    def _parse_cert_envio(self, html: str) -> Optional[PJUDDocument]:
+        """Extract the cert_envio document from the case-level docs area.
+
+        Uses docCertificadoDemanda.php form action for disambiguation from
+        movement-level escrito_cert (docCertificadoEscrito.php).
+
+        Returns:
+        - PJUDDocument(available=True)  when form with token found
+        - PJUDDocument(available=False) when fa-ban icon found in the cert-envio <td>
+        - None when neither form nor fa-ban present (slot absent/empty)
+        """
+        token = self._extract_form_token(
+            html,
+            self.get_selector("cert_envio_form_action"),
+            self.get_selector("cert_envio_param"),
+        )
+        if token is not None:
+            return PJUDDocument(
+                token=token,
+                tipo="caso",
+                url_type="cert_envio",
+                doc_type="cert_envio",
+                endpoint=f"documentos/{self.get_selector('cert_envio_form_action')}",
+                param_name=self.get_selector("cert_envio_param"),
+                available=True,
+            )
+
+        # No form found — check for fa-ban in the Certificado de Envío <td>
+        cert_td_match = re.search(
+            r'<td>\s*(?:<[^>]+>\s*)*Certificado de Env[íi]o:.*?</td>',
+            html,
+            re.DOTALL | re.IGNORECASE,
+        )
+        if cert_td_match and re.search(
+            self.get_selector("disabled_doc_indicator"),
+            cert_td_match.group(0),
+            re.IGNORECASE,
+        ):
+            return PJUDDocument(
+                token=None,
+                tipo="caso",
+                url_type="cert_envio",
+                doc_type="cert_envio",
+                endpoint=f"documentos/{self.get_selector('cert_envio_form_action')}",
+                param_name=self.get_selector("cert_envio_param"),
+                available=False,
+            )
+
+        return None  # No form, no fa-ban → absent
+
+    def _parse_case_documents(self, html: str) -> List[PJUDDocument]:
+        """Extract the 3 case-level static document tokens.
+
+        Tokens extracted (all case-scoped, scope_key=""):
+        - texto_demanda: docu.php?valorEncTxtDmda
+        - cert_envio:    docCertificadoDemanda.php?dtaCert  (disambiguated by action)
+        - ebook:         newebookcivil.php?dtaEbook
+
+        fa-ban → PJUDDocument(available=False); missing form → not included.
+        """
+        docs: List[PJUDDocument] = []
+
+        # texto_demanda
+        td_token = self._extract_form_token(
+            html,
+            self.get_selector("texto_demanda_form_action"),
+            self.get_selector("texto_demanda_param"),
+        )
+        if td_token is not None:
+            docs.append(PJUDDocument(
+                token=td_token,
+                tipo="caso",
+                url_type="texto_demanda",
+                doc_type="texto_demanda",
+                endpoint=f"documentos/{self.get_selector('texto_demanda_form_action')}",
+                param_name=self.get_selector("texto_demanda_param"),
+                available=True,
+            ))
+
+        # cert_envio (with fa-ban + missing-form handling)
+        cert_envio_doc = self._parse_cert_envio(html)
+        if cert_envio_doc is not None:
+            docs.append(cert_envio_doc)
+
+        # ebook
+        eb_token = self._extract_form_token(
+            html,
+            self.get_selector("ebook_form_action"),
+            self.get_selector("ebook_param"),
+        )
+        if eb_token is not None:
+            docs.append(PJUDDocument(
+                token=eb_token,
+                tipo="caso",
+                url_type="ebook",
+                doc_type="ebook",
+                endpoint=f"documentos/{self.get_selector('ebook_form_action')}",
+                param_name=self.get_selector("ebook_param"),
+                available=True,
+            ))
+
+        return docs
+
     # ========================================================================
     # PRIVATE HELPERS
     # ========================================================================
@@ -449,14 +590,39 @@ class CivilScraper(PJUDBaseScraper):
             if doc_token is not None:
                 if docuS_indicator in doc_cell:
                     url_type = 'docuS'
+                    doc_type_val = 'resolution'
                 elif docuN_indicator in doc_cell:
                     url_type = 'docuN'
+                    doc_type_val = 'escrito_doc'
                 else:
                     url_type = 'unknown'
+                    doc_type_val = 'unknown'
                 documentos.append(PJUDDocument(
                     token=doc_token,
                     tipo='principal',
                     url_type=url_type,
+                    doc_type=doc_type_val,
+                    endpoint=f"documentos/{url_type}.php",
+                    param_name='dtaDoc',
+                    available=True,
+                ))
+
+            # Extract escrito_cert (docCertificadoEscrito.php?dtaCert) from the same cell
+            # Disambiguation: this uses docCertificadoEscrito.php action (not docCertificadoDemanda.php)
+            escrito_cert_token = self._extract_form_token(
+                doc_cell,
+                self.get_selector("escrito_cert_form_action"),
+                self.get_selector("escrito_cert_param"),
+            )
+            if escrito_cert_token is not None:
+                documentos.append(PJUDDocument(
+                    token=escrito_cert_token,
+                    tipo='cert',
+                    url_type='escrito_cert',
+                    doc_type='escrito_cert',
+                    endpoint=f"documentos/{self.get_selector('escrito_cert_form_action')}",
+                    param_name=self.get_selector("escrito_cert_param"),
+                    available=True,
                 ))
 
             # Check for anexos in cell 2
