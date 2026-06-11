@@ -289,7 +289,7 @@ class TestNewEntityDataclasses:
     def test_pjud_notificacion_exists_and_fields(self):
         """PJUDNotificacion should have all 8 fields."""
         notif = PJUDNotificacion(
-            rol="C-1253-2015",
+            rol="C-9999-2099",
             estado_notif="Notificada",
             tipo_notif="Personal",
             fecha_tramite="15/03/2026",
@@ -298,7 +298,7 @@ class TestNewEntityDataclasses:
             tramite="Auto acordado",
             obs_fallida="",
         )
-        assert notif.rol == "C-1253-2015"
+        assert notif.rol == "C-9999-2099"
         assert notif.obs_fallida == ""
 
     def test_pjud_escrito_exists_and_boolean_fields(self):
@@ -318,21 +318,21 @@ class TestNewEntityDataclasses:
     def test_pjud_exhorto_exists_and_optional_token(self):
         """PJUDExhorto should have optional detalle_token defaulting to None."""
         exhorto = PJUDExhorto(
-            rol_origen="C-1253-2015",
+            rol_origen="C-9999-2099",
             tipo_exhorto="Exhorto",
-            rol_destino="E-355-2026",
+            rol_destino="E-888-2099",
             fecha_ordena="05/05/2026",
             fecha_ingreso="05/05/2026",
             tribunal_destino="8º Juzgado Civil de Santiago",
             estado="Generado",
         )
-        assert exhorto.rol_destino == "E-355-2026"
+        assert exhorto.rol_destino == "E-888-2099"
         assert exhorto.detalle_token is None
 
     def test_pjud_case_detail_has_four_new_list_fields(self):
         """PJUDCaseDetail should have litigantes, notificaciones, escritos, exhortos lists."""
         case = PJUDCase(
-            rol="C-1253-2015",
+            rol="C-9999-2099",
             tribunal="Test",
             caratulado="Test",
             fecha_ingreso="01/06/2026",

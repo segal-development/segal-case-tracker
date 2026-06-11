@@ -116,9 +116,13 @@ class TestMovementsScopingRegression:
         assert "39" in folios
 
     def test_movements_rich_fixture_returns_3_rows(self, scraper: CivilScraper, rich_html: str):
-        """Verify rich fixture still returns exactly 3 movement rows."""
+        """Verify rich fixture still returns exactly 3 movement rows with correct folios."""
         movements = scraper._parse_movements_table(rich_html)
         assert len(movements) == 3
+        folios = {m.folio for m in movements}
+        assert "40" in folios, f"Expected folio 40 in historiaCiv rows, got {folios}"
+        assert "39" in folios, f"Expected folio 39 in historiaCiv rows, got {folios}"
+        assert "38" in folios, f"Expected folio 38 in historiaCiv rows, got {folios}"
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +198,7 @@ class TestExhortoParser:
     ):
         """rol_destino must be extracted as plain text from the <label> element."""
         exhortos = scraper._parse_exhortos_table(rich_html)
-        assert exhortos[0].rol_destino == "E-355-2026"
+        assert exhortos[0].rol_destino == "E-888-2099"
 
     def test_parse_exhortos_detalle_token_captured(
         self, scraper: CivilScraper, rich_html: str
@@ -209,13 +213,13 @@ class TestExhortoParser:
         exhortos = scraper._parse_exhortos_table(rich_html)
         tribunal = exhortos[0].tribunal_destino
         assert tribunal == tribunal.strip()
-        assert "Juzgado Civil de Santiago" in tribunal
+        assert "Juzgado Civil Ficticio" in tribunal
 
     def test_parse_exhortos_other_fields(self, scraper: CivilScraper, rich_html: str):
         """Verify remaining fields from the single exhorto row."""
         exhortos = scraper._parse_exhortos_table(rich_html)
         ex = exhortos[0]
-        assert ex.rol_origen == "C-1253-2015"
+        assert ex.rol_origen == "C-9999-2099"
         assert ex.tipo_exhorto == "Exhorto"
         assert ex.fecha_ordena == "05/05/2026"
         assert ex.estado == "Generado"
@@ -369,3 +373,44 @@ class TestParseDetailHtmlIntegration:
         assert len(detail.escritos) == 0
         assert detail.escritos is not None
         assert len(detail.exhortos) == 1
+        # Field spot-checks to catch scoping bugs returning wrong rows
+        assert detail.litigantes[0].participante == "DTE."
+        assert detail.exhortos[0].rol_destino == "E-888-2099"
+
+
+# ---------------------------------------------------------------------------
+# FIX 3 — document_token_pattern attribute-order tolerance
+# ---------------------------------------------------------------------------
+
+class TestDocTokenAttributeOrderTolerance:
+    """document_token_pattern extraction must be tolerant of attribute order."""
+
+    def test_doc_token_value_before_name_in_escrito(self, scraper: CivilScraper):
+        """Extract token when value= appears BEFORE name= (reversed attribute order)."""
+        html = """
+        <div id="escritosCiv">
+          <table class="table table-bordered">
+            <tbody>
+              <tr>
+                <td align="left">
+                  <form>
+                    <input type="hidden" value="TOKEN-REVERSED-XYZ" name="dtaDoc">
+                  </form>
+                </td>
+                <td align="center"></td>
+                <td>01/01/2099</td>
+                <td>Demanda</td>
+                <td>PARTE FICTICIA</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        """
+        result = scraper._parse_escritos_table(html)
+        assert len(result) == 1, "Expected 1 escrito row"
+        assert result[0].tiene_documento is True, (
+            "tiene_documento must be True when dtaDoc token is present (value before name)"
+        )
+        assert result[0].doc_token == "TOKEN-REVERSED-XYZ", (
+            f"doc_token extraction failed for reversed attribute order; got {result[0].doc_token!r}"
+        )

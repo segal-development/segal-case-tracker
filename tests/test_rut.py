@@ -30,11 +30,11 @@ class TestNormalizeRut:
 
     def test_clave_unica_format_preserved(self):
         # Clave Única input — verification digit must NOT be stripped
-        assert normalize_rut("16021492-9") == "16021492-9"
+        assert normalize_rut("12345678-9") == "12345678-9"
 
     def test_captcha_user_input_with_dots(self):
         # Captcha users often type with dots
-        assert normalize_rut("16.021.492-9") == "16021492-9"
+        assert normalize_rut("12.345.678-9") == "12345678-9"
 
     def test_idempotent(self):
         # normalize_rut(normalize_rut(x)) == normalize_rut(x)

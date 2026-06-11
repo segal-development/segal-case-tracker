@@ -21,7 +21,7 @@ class TestDualAuthEndpoints:
         response = client.post(
             "/api/v1/auth/login",
             json={
-                "rut": "16021492-9",
+                "rut": "12345678-9",
                 "password": "testpass",
                 # Missing captcha_token
             }
@@ -34,7 +34,7 @@ class TestDualAuthEndpoints:
         response = client.post(
             "/api/v1/auth/login/clave-unica",
             json={
-                "rut": "16021492-9",
+                "rut": "12345678-9",
                 "password": "testpass",
             }
         )
@@ -51,7 +51,7 @@ class TestDualAuthEndpoints:
     def test_clave_unica_requires_password(self, client: TestClient):
         response = client.post(
             "/api/v1/auth/login/clave-unica",
-            json={"rut": "16021492-9"}
+            json={"rut": "12345678-9"}
         )
         assert response.status_code == 422
         assert "password" in response.text
@@ -77,7 +77,7 @@ class TestCaptchaLoginCallSites:
         """POST /auth/login must call login_with_token on the scraper."""
         from app.services.pjud_session import PJUDSession
         fake_session = PJUDSession.create(
-            rut="16021492-9",
+            rut="12345678-9",
             cookies=[],
             auth_method="captcha",
         )
@@ -98,7 +98,7 @@ class TestCaptchaLoginCallSites:
             response = client.post(
                 "/api/v1/auth/login",
                 json={
-                    "rut": "16021492-9",
+                    "rut": "12345678-9",
                     "password": "testpass",
                     "captcha_token": "captcha-123",
                 }
@@ -118,7 +118,7 @@ class TestCaptchaLoginCallSites:
     def test_store_asave_session_is_awaited(self, client: TestClient):
         """asave_session must be awaited (async store) on captcha login."""
         from app.services.pjud_session import PJUDSession
-        fake_session = PJUDSession.create(rut="16021492-9", cookies=[], auth_method="captcha")
+        fake_session = PJUDSession.create(rut="12345678-9", cookies=[], auth_method="captcha")
 
         with patch("app.api.v1.auth.PJUDCivilScraper") as MockScraper, \
              patch("app.api.v1.auth.get_session_store") as mock_store_fn:
@@ -135,7 +135,7 @@ class TestCaptchaLoginCallSites:
 
             client.post(
                 "/api/v1/auth/login",
-                json={"rut": "16021492-9", "password": "p", "captcha_token": "c"},
+                json={"rut": "12345678-9", "password": "p", "captcha_token": "c"},
             )
 
             # asave_session must be an AsyncMock that was actually awaited
@@ -150,7 +150,7 @@ class TestClaveUnicaLoginMocked:
         """Successful Clave Unica login should return token and session_id."""
         from app.services.pjud_session import PJUDSession
         mock_session = PJUDSession.create(
-            rut="16021492-9",
+            rut="12345678-9",
             cookies=[],
             lawyer_id=1,
             auth_method="clave_unica",
@@ -177,7 +177,7 @@ class TestClaveUnicaLoginMocked:
 
             response = client.post(
                 "/api/v1/auth/login/clave-unica",
-                json={"rut": "16021492-9", "password": "testpass"}
+                json={"rut": "12345678-9", "password": "testpass"}
             )
 
             assert response.status_code == 200

@@ -13,7 +13,7 @@ FIXTURES_DIR = pathlib.Path(__file__).parent
 
 @pytest.fixture(scope="session")
 def rich_html() -> str:
-    """Anonymized C-1253-2015 detail HTML.
+    """Anonymized civil case detail HTML.
 
     Contains:
     - 3 movements in #historiaCiv
