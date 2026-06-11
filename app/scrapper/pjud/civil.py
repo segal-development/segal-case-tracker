@@ -18,6 +18,10 @@ from app.scrapper.pjud.base import (
     PJUDDocument,
     PJUDMovement,
     PJUDCaseDetail,
+    PJUDLitigante,
+    PJUDNotificacion,
+    PJUDEscrito,
+    PJUDExhorto,
     CompetencyConfig,
     PJUD_BASE_URL,
 )
@@ -277,14 +281,25 @@ class CivilScraper(PJUDBaseScraper):
         
         # Parse movements from the history table
         movements = self._parse_movements_table(html)
-        
+
+        # Parse all four additional entity tabs from the same HTML response
+        litigantes = self._parse_litigantes_table(html)
+        notificaciones = self._parse_notificaciones_table(html)
+        escritos = self._parse_escritos_table(html)
+        exhortos = self._parse_exhortos_table(html)
+
         # Validate ROL format
         if not rol or not re.match(r'^[A-Z]+-\d+-\d{4}$', rol):
             logger.warning(f"Invalid ROL format: '{rol}'")
             raise ValueError(f"Invalid ROL format: '{rol}'")
-        
-        logger.info(f"Parsed case {rol}: {len(movements)} movements, {len(cuadernos)} cuadernos")
-        
+
+        logger.info(
+            f"Parsed case {rol}: {len(movements)} movements, "
+            f"{len(litigantes)} litigantes, {len(notificaciones)} notificaciones, "
+            f"{len(escritos)} escritos, {len(exhortos)} exhortos, "
+            f"{len(cuadernos)} cuadernos"
+        )
+
         case = PJUDCase(
             rol=rol,
             tribunal=tribunal,
@@ -292,7 +307,7 @@ class CivilScraper(PJUDBaseScraper):
             fecha_ingreso=fecha_ingreso,
             case_token=case_token,
         )
-        
+
         return PJUDCaseDetail(
             case=case,
             movements=movements,
@@ -303,20 +318,69 @@ class CivilScraper(PJUDBaseScraper):
             estado_procesal=estado_proc,
             etapa=etapa,
             raw_html=html,
+            litigantes=litigantes,
+            notificaciones=notificaciones,
+            escritos=escritos,
+            exhortos=exhortos,
         )
     
+    # ========================================================================
+    # PRIVATE HELPERS
+    # ========================================================================
+
+    @staticmethod
+    def _clean_cell(s: str) -> str:
+        """Strip HTML tags and collapse internal whitespace."""
+        s = re.sub(r'<[^>]+>', '', s)
+        s = re.sub(r'\s+', ' ', s)
+        return s.strip()
+
+    @staticmethod
+    def _extract_cell_content(raw: str) -> str:
+        """Remove the leading <td...> opening tag from a split cell fragment."""
+        return re.sub(r'^.*?<td[^>]*>', '', raw, flags=re.IGNORECASE | re.DOTALL)
+
+    def _extract_pane_tbody(self, html: str, pane_id: str) -> Optional[str]:
+        """Return inner HTML of the <tbody> inside the tab-pane with id=pane_id.
+
+        Scopes the search to the pane div by slicing from the id= attribute
+        position before matching the first table-bordered <tbody>.
+        Returns None when the pane or table is absent (caller yields []).
+        """
+        pane_marker = re.search(
+            r'id\s*=\s*["\']' + re.escape(pane_id) + r'["\']',
+            html,
+            re.IGNORECASE,
+        )
+        if not pane_marker:
+            return None
+        scoped_html = html[pane_marker.start():]
+        tbody_match = re.search(
+            r'<tbody>(.*?)</tbody>',
+            scoped_html,
+            re.DOTALL | re.IGNORECASE,
+        )
+        return tbody_match.group(1) if tbody_match else None
+
+    # ========================================================================
+    # ENTITY PARSERS
+    # ========================================================================
+
     def _parse_movements_table(self, html: str) -> List[PJUDMovement]:
-        """Parse movements from the history table."""
+        """Parse movements from the #historiaCiv history table."""
         movements = []
-        
-        # Find the history table - pattern from registry
-        table_pattern = self.get_selector("movements_table")
-        table_match = re.search(table_pattern, html, re.DOTALL | re.IGNORECASE)
-        
-        if not table_match:
-            return movements
-        
-        tbody = table_match.group(1)
+
+        # Scope to #historiaCiv pane before matching table (scoping bug fix).
+        # Fallback: if the pane id is absent, use the registry unscoped pattern
+        # so behaviour degrades to today's rather than silently returning [].
+        tbody = self._extract_pane_tbody(html, "historiaCiv")
+        if tbody is None:
+            table_pattern = self.get_selector("movements_table")
+            table_match = re.search(table_pattern, html, re.DOTALL | re.IGNORECASE)
+            if not table_match:
+                return movements
+            tbody = table_match.group(1)
+
         row_pattern = self.get_selector("movement_row_pattern")
         
         for row_match in re.finditer(row_pattern, tbody, re.DOTALL | re.IGNORECASE):
@@ -395,7 +459,157 @@ class CivilScraper(PJUDBaseScraper):
             ))
         
         return movements
-    
+
+    def _parse_litigantes_table(self, html: str) -> List[PJUDLitigante]:
+        """Parse litigants from the #litigantesCiv pane.
+
+        Columns: participante(0) rut(1) persona_type(2) nombre(3).
+        """
+        tbody = self._extract_pane_tbody(html, "litigantesCiv")
+        if not tbody:
+            return []
+
+        result: List[PJUDLitigante] = []
+        row_pattern = self.get_selector("movement_row_pattern")
+
+        for row_match in re.finditer(row_pattern, tbody, re.DOTALL | re.IGNORECASE):
+            raw_cells = re.split(r'</td>', row_match.group(1), flags=re.IGNORECASE)
+            if len(raw_cells) < 4:
+                continue
+            cells = [
+                self._clean_cell(self._extract_cell_content(c)) for c in raw_cells
+            ]
+            result.append(PJUDLitigante(
+                participante=cells[0],
+                rut=cells[1],
+                persona_type=cells[2],
+                nombre=cells[3],
+            ))
+
+        return result
+
+    def _parse_notificaciones_table(self, html: str) -> List[PJUDNotificacion]:
+        """Parse notifications from the #notificacionesCiv pane.
+
+        Columns: rol(0) estado_notif(1) tipo_notif(2) fecha_tramite(3)
+                 tipo_participante(4) nombre(5) tramite(6) obs_fallida(7).
+
+        # TODO(validate-real-rich-case): column mapping unconfirmed on real data.
+        """
+        tbody = self._extract_pane_tbody(html, "notificacionesCiv")
+        if not tbody:
+            return []
+
+        result: List[PJUDNotificacion] = []
+        row_pattern = self.get_selector("movement_row_pattern")
+
+        for row_match in re.finditer(row_pattern, tbody, re.DOTALL | re.IGNORECASE):
+            raw_cells = re.split(r'</td>', row_match.group(1), flags=re.IGNORECASE)
+            if len(raw_cells) < 8:
+                continue
+            cells = [
+                self._clean_cell(self._extract_cell_content(c)) for c in raw_cells
+            ]
+            result.append(PJUDNotificacion(
+                rol=cells[0],
+                estado_notif=cells[1],
+                tipo_notif=cells[2],
+                fecha_tramite=cells[3],
+                tipo_participante=cells[4],
+                nombre=cells[5],
+                tramite=cells[6],
+                obs_fallida=cells[7] if len(cells) > 7 else "",
+            ))
+
+        return result
+
+    def _parse_escritos_table(self, html: str) -> List[PJUDEscrito]:
+        """Parse filings from the #escritosCiv pane.
+
+        Columns: doc(0) anexo(1) fecha_ingreso(2) tipo_escrito(3) solicitante(4).
+        tiene_documento is True when cell 0 contains a dtaDoc hidden input.
+        tiene_anexo is True when cell 1 contains an anexo indicator.
+
+        # TODO(validate-real-rich-case): column mapping unconfirmed on real data.
+        """
+        tbody = self._extract_pane_tbody(html, "escritosCiv")
+        if not tbody:
+            return []
+
+        result: List[PJUDEscrito] = []
+        row_pattern = self.get_selector("movement_row_pattern")
+        doc_token_pattern = self.get_selector("document_token_pattern")
+        anexo_pattern = self.get_selector("anexo_indicator")
+
+        for row_match in re.finditer(row_pattern, tbody, re.DOTALL | re.IGNORECASE):
+            raw_cells = re.split(r'</td>', row_match.group(1), flags=re.IGNORECASE)
+            if len(raw_cells) < 5:
+                continue
+            cells_raw = [self._extract_cell_content(c) for c in raw_cells]
+
+            doc_match = re.search(doc_token_pattern, cells_raw[0], re.IGNORECASE)
+            doc_token: Optional[str] = doc_match.group(1) if doc_match else None
+            tiene_documento: bool = doc_token is not None
+            tiene_anexo: bool = bool(
+                re.search(anexo_pattern, cells_raw[1], re.IGNORECASE)
+            )
+
+            result.append(PJUDEscrito(
+                fecha_ingreso=self._clean_cell(cells_raw[2]),
+                tipo_escrito=self._clean_cell(cells_raw[3]),
+                solicitante=self._clean_cell(cells_raw[4]),
+                tiene_documento=tiene_documento,
+                tiene_anexo=tiene_anexo,
+                doc_token=doc_token,
+            ))
+
+        return result
+
+    def _parse_exhortos_table(self, html: str) -> List[PJUDExhorto]:
+        """Parse rogatory letters from the #exhortosCiv pane.
+
+        Columns: rol_origen(0) tipo_exhorto(1) rol_destino(2)
+                 fecha_ordena(3) fecha_ingreso(4) tribunal_destino(5) estado(6).
+        rol_destino text is extracted by tag-stripping the <label onclick=...> element.
+        detalle_token is captured from detalleExhortosCivil('TOKEN') in cell 2.
+        """
+        tbody = self._extract_pane_tbody(html, "exhortosCiv")
+        if not tbody:
+            return []
+
+        result: List[PJUDExhorto] = []
+        row_pattern = self.get_selector("movement_row_pattern")
+
+        for row_match in re.finditer(row_pattern, tbody, re.DOTALL | re.IGNORECASE):
+            raw_cells = re.split(r'</td>', row_match.group(1), flags=re.IGNORECASE)
+            if len(raw_cells) < 7:
+                continue
+            cells_raw = [self._extract_cell_content(c) for c in raw_cells]
+
+            # rol_destino: plain text extracted via tag-stripping (handles <label> naturally)
+            rol_destino = self._clean_cell(cells_raw[2])
+
+            # detalle_token: JWT stored for future use, NOT fetched here
+            token_match = re.search(
+                r"detalleExhortosCivil\('([^']+)'\)",
+                cells_raw[2],
+                re.IGNORECASE,
+            )
+            detalle_token: Optional[str] = token_match.group(1) if token_match else None
+
+            result.append(PJUDExhorto(
+                rol_origen=self._clean_cell(cells_raw[0]),
+                tipo_exhorto=self._clean_cell(cells_raw[1]),
+                rol_destino=rol_destino,
+                fecha_ordena=self._clean_cell(cells_raw[3]),
+                fecha_ingreso=self._clean_cell(cells_raw[4]),
+                tribunal_destino=self._clean_cell(cells_raw[5]),
+                estado=self._clean_cell(cells_raw[6]),
+                detalle_token=detalle_token,
+            ))
+
+        return result
+
     # ========================================================================
     # DOCUMENT DOWNLOAD (Civil-specific endpoints)
     # ========================================================================
