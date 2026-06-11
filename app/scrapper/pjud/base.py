@@ -242,28 +242,21 @@ class PJUDBaseScraper(ABC):
             await self._context.close()
             self._panel_loaded = False
         
-        # Create new context
+        # Build a Playwright storage_state so cookies AND localStorage are
+        # present from the very FIRST page load. PJUD's JS checks localStorage
+        # (the "logged-in" token) at load time; restoring localStorage AFTER
+        # navigating (the old approach) lands on the login page and breaks the
+        # session. storage_state injects both before any navigation.
+        from app.scrapper.pjud.browser import build_storage_state
+
+        storage_state = build_storage_state(session) if session else None
         self._context = await self._browser.new_context(
             viewport={"width": 1280, "height": 800},
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            storage_state=storage_state,
         )
-        
-        # Restore cookies if session provided
-        if session and session.cookies:
-            # session.cookies is List[Dict[str, Any]]; add_cookies expects
-            # Sequence[SetCookieParam] (a dict subclass) — compatible at
-            # runtime; suppress structural-subtype noise.
-            await self._context.add_cookies(session.cookies)  # type: ignore[arg-type]
-        
+
         self._page = await self._context.new_page()
-        
-        # Restore localStorage if session provided
-        if session and session.local_storage:
-            await self._page.goto(PJUD_HOME_URL)
-            await self._page.evaluate(
-                f"Object.assign(localStorage, {session.local_storage})"
-            )
-        
         return self._page
 
     async def _safe_page_content(self, page: Page, attempts: int = 3) -> str:
@@ -465,13 +458,36 @@ class PJUDBaseScraper(ABC):
             await page.goto(PJUD_INDEX_URL, wait_until="domcontentloaded")
             await asyncio.sleep(2)
         
-        # Check if misCausas function exists
-        has_fn = await page.evaluate("typeof misCausas === 'function'")
+        # Let any client-side redirect after the initial load settle before we
+        # evaluate — PJUD can navigate post-domcontentloaded, which would destroy
+        # the execution context mid-evaluate.
+        try:
+            await page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass
+
+        # Check if misCausas function exists. Retry once if a late navigation
+        # destroys the execution context mid-evaluate.
+        try:
+            has_fn = await page.evaluate("typeof misCausas === 'function'")
+        except Exception as e:
+            if "Execution context was destroyed" not in str(e):
+                raise
+            await page.wait_for_load_state("domcontentloaded", timeout=10000)
+            await asyncio.sleep(1)
+            has_fn = await page.evaluate("typeof misCausas === 'function'")
         
         if has_fn:
-            # Call misCausas() to load the panel - this triggers AJAX navigation
-            await page.evaluate("misCausas()")
-            
+            # Call misCausas() to load the panel. It can trigger a navigation
+            # that destroys the JS execution context mid-call — that specific
+            # error is EXPECTED here, so swallow it and wait for the panel below.
+            try:
+                await page.evaluate("misCausas()")
+            except Exception as e:
+                if "Execution context was destroyed" not in str(e):
+                    raise
+                logger.debug("misCausas() triggered navigation (context destroyed) — expected")
+
             # Wait for the panel content to load (AJAX completes)
             try:
                 await page.wait_for_selector("#contMain", state="attached", timeout=10000)
