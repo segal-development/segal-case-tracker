@@ -605,8 +605,139 @@ def _select_cases_for_movement_check(
         Filtered/capped list of PJUDCase objects.
     """
     if rol:
-        # FIX 3: normalize both sides (strip + upper) so format/whitespace
+        # Normalize both sides (strip + upper) so format/whitespace
         # mismatches don't silently return [] and skip movement detection.
         normalized_rol = rol.strip().upper()
         return [c for c in api_cases if c.rol.strip().upper() == normalized_rol]
     return api_cases[:max_cases]
+
+
+async def detect_and_sync_movements(
+    db: Session,
+    scraper,
+    pjud_session,
+    lawyer_id: int,
+    api_cases: list,
+    rol: Optional[str] = None,
+    delay_between_fetches: float = 0.0,
+) -> Tuple[int, int, List[str]]:
+    """Fetch case details for selected cases and sync new movements to the database.
+
+    This is the canonical movement-detection implementation shared by the
+    ``POST /sync`` endpoint (on-demand) and the scheduled worker (autonomous).
+    Keeping a single implementation ensures one code path to test and maintain.
+
+    Selection is governed by ``_select_cases_for_movement_check``:
+    - If *rol* is given, only that case is fetched (targeted/demo mode).
+    - Otherwise, at most ``MOVEMENT_CHECK_DEFAULT_MAX`` cases from the front of
+      the list are fetched (rate-limit-friendly default).
+
+    Notifications are dispatched automatically by ``SyncService.sync_movements``
+    via the existing ``NotificationService`` path (email + HMAC webhooks).
+
+    Args:
+        db: Active SQLAlchemy session.
+        scraper: Scraper instance with ``get_case_detail(session, case_token)``.
+        pjud_session: Active ``PJUDSession`` used for authenticated scraping.
+        lawyer_id: Owner of the cases being checked.
+        api_cases: List of PJUDCase objects returned by ``get_my_cases``.
+        rol: Optional ROL filter — when set, only that case is detail-fetched.
+        delay_between_fetches: Seconds to sleep between consecutive detail
+            fetches.  Use ``0.0`` (default) for on-demand endpoint calls; use
+            a small positive value (e.g. ``1.0``) in scheduled workers to be
+            considerate toward the PJUD infrastructure.
+
+    Returns:
+        Tuple of ``(movements_new, alerts_created, errors)`` where *errors* is
+        a list of human-readable strings for any case whose fetch or processing
+        failed (the function never raises — errors are accumulated instead).
+    """
+    movements_new: int = 0
+    alerts_created: int = 0
+    errors: List[str] = []
+
+    cases_for_check = _select_cases_for_movement_check(api_cases, rol=rol)
+
+    if not cases_for_check:
+        if rol:
+            logger.warning(
+                "detect_and_sync_movements: rol=%s not found in results; "
+                "skipping movement detection",
+                rol,
+            )
+    else:
+        cap_msg = (
+            f"rol={rol}"
+            if rol
+            else f"first {len(cases_for_check)} of {len(api_cases)} cases"
+        )
+        logger.info("detect_and_sync_movements: fetching movements for %s", cap_msg)
+
+    sync_svc = SyncService(db)
+
+    for api_case in cases_for_check:
+        if not api_case.case_token:
+            logger.debug(
+                "detect_and_sync_movements: no case_token for %s, skipping",
+                api_case.rol,
+            )
+            continue
+
+        try:
+            detail = await scraper.get_case_detail(
+                session=pjud_session,
+                case_token=api_case.case_token,
+            )
+
+            scraped_movements = convert_api_movements_to_scraped([
+                {
+                    "folio": m.folio,
+                    "fecha": m.fecha,
+                    "tipo_tramite": m.tipo_tramite,
+                    "descripcion": m.descripcion,
+                    "etapa": m.etapa,
+                    "foja": m.foja,
+                    "tiene_documento": m.tiene_documento,
+                }
+                for m in detail.movements
+            ])
+
+            normalized_rol = api_case.rol.strip().upper()
+            db_case = db.query(Case).filter(
+                Case.lawyer_id == lawyer_id,
+                Case.rol == normalized_rol,
+            ).first()
+
+            if db_case and scraped_movements:
+                new_count, alert_count = sync_svc.sync_movements(
+                    case_id=int(db_case.id),
+                    scraped_movements=scraped_movements,
+                )
+                movements_new += new_count
+                alerts_created += alert_count
+                logger.info(
+                    "detect_and_sync_movements: %s → %d new movements, %d alerts",
+                    api_case.rol,
+                    new_count,
+                    alert_count,
+                )
+            elif not db_case:
+                logger.warning(
+                    "detect_and_sync_movements: DB case not found for rol=%s lawyer=%s; "
+                    "movements skipped",
+                    api_case.rol,
+                    lawyer_id,
+                )
+
+        except Exception as exc:
+            logger.error(
+                "detect_and_sync_movements: failed to fetch/process movements for %s: %s",
+                api_case.rol,
+                exc,
+            )
+            errors.append(f"Movement fetch failed for {api_case.rol}: {str(exc)}")
+
+        if delay_between_fetches > 0:
+            await asyncio.sleep(delay_between_fetches)
+
+    return movements_new, alerts_created, errors

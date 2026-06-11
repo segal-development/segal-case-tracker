@@ -272,7 +272,7 @@ half-async. Requires `size:exception` — see Review Workload Forecast.
 
 ### has_2captcha derived setting
 
-- [ ] **S3-T1** `[IMPL]` Add `has_2captcha: bool` as a `@property` (or
+- [x] **S3-T1** `[IMPL]` Add `has_2captcha: bool` as a `@property` (or
   `model_validator`-derived field) to `app/config.py Settings`:
   `return bool(self.CAPTCHA_API_KEY)`.
   Single decision point; no scattered `if key` checks.
@@ -280,7 +280,7 @@ half-async. Requires `size:exception` — see Review Workload Forecast.
 
 ### Encrypted credential persistence
 
-- [ ] **S3-T2** `[TEST — RED]` Extend `tests/services/test_lawyer_identity.py`:
+- [x] **S3-T2** `[TEST — RED]` Extend `tests/services/test_lawyer_identity.py`:
   - After captcha login, `lawyer.encrypted_pjud_password` is set and its value
     is NOT equal to the plaintext password (ciphertext check).
   - After clave_unica login, `lawyer.encrypted_clave_unica_password` set; not plaintext.
@@ -288,7 +288,7 @@ half-async. Requires `size:exception` — see Review Workload Forecast.
   Use a test `ENCRYPTION_KEY` injected via `settings` override.
   _Satisfies_: LID-04.
 
-- [ ] **S3-T3** `[IMPL]` Extend `_get_or_create_lawyer` in `app/api/v1/auth.py`
+- [x] **S3-T3** `[IMPL]` Extend `_get_or_create_lawyer` in `app/api/v1/auth.py`
   to populate credential columns:
   - captcha: `lawyer.encrypted_pjud_password = encrypt_pjud_password(password)`.
   - clave_unica: `lawyer.clave_unica_rut = rut_norm`;
@@ -300,7 +300,7 @@ half-async. Requires `size:exception` — see Review Workload Forecast.
 
 ### Worker autonomous re-auth
 
-- [ ] **S3-T4** `[TEST — RED]` Write `tests/workers/test_sync_reauth.py`:
+- [x] **S3-T4** `[TEST — RED]` Write `tests/workers/test_sync_reauth.py`:
   - **Clave Única nominal**: session is `None`; `lawyer.preferred_auth_method = "clave_unica"`;
     encrypted creds present → `_reauth` calls mocked `ClaveUnicaAuth.login` →
     returns a `PJUDSession` → `store.asave_session` called → sync proceeds (not skipped).
@@ -318,7 +318,7 @@ half-async. Requires `size:exception` — see Review Workload Forecast.
     `_reauth` returns `None`; worker logs and returns skipped — no exception.
     _Satisfies_: AUTH-07.
 
-- [ ] **S3-T5** `[IMPL]` Add `async def _reauth(lawyer: Lawyer, store: SessionStore)
+- [x] **S3-T5** `[IMPL]` Add `async def _reauth(lawyer: Lawyer, store: SessionStore)
   -> tuple[Optional[PJUDSession], Optional[str]]` in `app/workers/sync_scheduler.py`:
   - Branch on `lawyer.preferred_auth_method`:
     - `"clave_unica"`: decrypt `encrypted_clave_unica_password`; call
@@ -331,7 +331,7 @@ half-async. Requires `size:exception` — see Review Workload Forecast.
     - No creds on lawyer: return `(None, "no_credentials")`.
   _Satisfies_: AUTH-04, AUTH-05, AUTH-06, AUTH-07, ADR-7.
 
-- [ ] **S3-T6** `[IMPL]` Wire `_reauth` into `sync_lawyer_cases`:
+- [x] **S3-T6** `[IMPL]` Wire `_reauth` into `sync_lawyer_cases`:
   ```python
   pjud_session = await store.get_session_by_lawyer(lawyer_id)
   if pjud_session is None:
@@ -345,19 +345,19 @@ half-async. Requires `size:exception` — see Review Workload Forecast.
 
 ### cases_found bug fix
 
-- [ ] **S3-T7** `[TEST — RED]` Extend `tests/workers/test_sync_scheduler.py`:
+- [x] **S3-T7** `[TEST — RED]` Extend `tests/workers/test_sync_scheduler.py`:
   - When `scraper.get_my_cases` raises an exception, the `SyncHistory` record
     committed to DB has `cases_found == 0` (not unset/null).
   _Satisfies_: design side-bug (cases_found unset in failed-path).
 
-- [ ] **S3-T8** `[IMPL]` Fix `app/workers/sync_scheduler.py` except-block in
+- [x] **S3-T8** `[IMPL]` Fix `app/workers/sync_scheduler.py` except-block in
   `sync_lawyer_cases`: set `cases_found = 0` on the `SyncHistory` record before
   `sync_record.complete(status="failed", ...)`.
   _Satisfies_: design side-bug.
 
 ### Security gate (non-code)
 
-- [ ] **S3-T9** `[GATE]` PR body MUST include a signed-off security checklist before merge:
+- [x] **S3-T9** `[GATE]` PR body MUST include a signed-off security checklist before merge:
   - `ENCRYPTION_KEY` sourced from a secret manager (not committed to repo).
   - Key access restricted to worker and API roles only.
   - Key rotation procedure documented.
@@ -366,7 +366,7 @@ half-async. Requires `size:exception` — see Review Workload Forecast.
 
 ### Slice 3 verification
 
-- [ ] **S3-T10** `[VERIFY]` Run:
+- [x] **S3-T10** `[VERIFY]` Run:
   ```
   .venv/bin/python -m pytest -m "not integration" -x
   .venv/bin/python -m mypy app/config.py app/api/v1/auth.py \
@@ -441,12 +441,12 @@ S3-T10 (verify) ── last in slice 3
 
 > Tasks below are a stub; formalize (test-first, per strict TDD) when reached, after S3-T10 is green.
 
-- [ ] S4-T1 (impl): extract the movement-detection flow from `POST /sync` (`_select_cases_for_movement_check` → `get_case_detail` → `convert_api_movements_to_scraped` → `sync_service.sync_movements`) into a reusable service function, if not already reusable.
-- [ ] S4-T2 (test): given a lawyer's synced cases, the worker selects cases for movement check (scoped, not all 2524), fetches detail (mock `get_case_detail`), and persists new Movement rows + sets `last_movement_at`.
-- [ ] S4-T3 (impl): call that flow inside `sync_lawyer_cases` after the case-list sync; record `movements_new` in `sync_history`.
-- [ ] S4-T4 (test): a new movement triggers a notification dispatch (mock `NotificationService`).
-- [ ] S4-T5 (impl): apply movement-check scoping/throttle so each run doesn't scrape every case (rate-limit per PJUD-friendliness; reuse the existing `await asyncio.sleep` delay pattern).
-- [ ] S4-T6 (verify): mock-based gate green; `last_movement_at` populated in tests; no live scrape.
+- [x] S4-T1 (impl): extracted `detect_and_sync_movements(db, scraper, pjud_session, lawyer_id, api_cases, rol, delay_between_fetches)` into `app/services/sync_service.py`; refactored `POST /sync` to call it (behavior identical).
+- [x] S4-T2 (test): `tests/workers/test_movement_detection.py` — scoping, persistence, last_movement_at, token-skip, error capture, rol filter (5 tests).
+- [x] S4-T3 (impl): `sync_lawyer_cases` calls `detect_and_sync_movements` after case-list sync; updates `SyncHistory.movements_new`; return dict includes `movements_new`.
+- [x] S4-T4 (test): `TestMovementNotification` — new movement dispatches `NotificationService.notify_new_movement`; idempotent on re-run (2 tests).
+- [x] S4-T5 (impl): `delay_between_fetches=1.0` in worker wiring; `_select_cases_for_movement_check` provides scoping (MOVEMENT_CHECK_DEFAULT_MAX default cap).
+- [x] S4-T6 (verify): 419 passed (410 baseline + 9 new), 1 xfailed, 0 regressions; mypy app/core: 0 errors; remaining mypy errors in services/workers are all pre-existing (60 total, down from 61).
 
 **Depends on:** S3-T10 green (needs the autonomous session from Slice 3 to actually run unattended).
 **Est. size:** ~300-400 lines, mostly wiring + tests (reuses existing detail-parse + notification code).

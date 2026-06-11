@@ -26,7 +26,11 @@ from app.core.database import SessionLocal
 from app.core.security import decrypt_pjud_password
 from app.models.lawyer import Lawyer
 from app.models.sync_history import SyncHistory
-from app.services.sync_service import SyncService, convert_api_cases_to_scraped
+from app.services.sync_service import (
+    SyncService,
+    convert_api_cases_to_scraped,
+    detect_and_sync_movements,
+)
 from app.services.session_store import get_session_store, SessionStore
 from app.services.pjud_session import PJUDSession
 from app.config import settings
@@ -262,7 +266,7 @@ async def sync_lawyer_cases(
             for c in cases
         ])
 
-        # Sync to database
+        # Sync case list to database
         sync_service = SyncService(db)
         result = sync_service.sync_cases(
             lawyer_id=lawyer_id,
@@ -271,15 +275,52 @@ async def sync_lawyer_cases(
             triggered_by="scheduled",
         )
 
+        # S4-T3/S4-T5: movement detection — reuse the shared implementation.
+        # delay_between_fetches=1.0 throttles requests to PJUD so the worker
+        # does not hammer the server on each scheduled run.
+        movements_new, alerts_created, mov_errors = await detect_and_sync_movements(
+            db=db,
+            scraper=scraper,
+            pjud_session=session,
+            lawyer_id=lawyer_id,
+            api_cases=cases,
+            delay_between_fetches=1.0,
+        )
+
+        if mov_errors:
+            for err in mov_errors:
+                logger.warning("sync_lawyer_cases movement error: %s", err)
+
+        # Update the SyncHistory record created by sync_cases with movements_new.
+        if movements_new > 0:
+            last_sync_history = (
+                db.query(SyncHistory)
+                .filter(
+                    SyncHistory.lawyer_id == lawyer_id,
+                    SyncHistory.competencia == competencia,
+                )
+                .order_by(SyncHistory.started_at.desc())
+                .first()
+            )
+            if last_sync_history:
+                last_sync_history.movements_new = movements_new  # type: ignore[assignment]
+                last_sync_history.alerts_created = alerts_created  # type: ignore[assignment]
+                db.commit()
+
         logger.info(
-            f"Synced {competencia} for lawyer {lawyer_id}: "
-            f"{result.cases_total} cases, {result.cases_new} new"
+            "Synced %s for lawyer %d: %d cases, %d new, %d new movements",
+            competencia,
+            lawyer_id,
+            result.cases_total,
+            result.cases_new,
+            movements_new,
         )
 
         return {
             "success": True,
             "cases_total": result.cases_total,
             "cases_new": result.cases_new,
+            "movements_new": movements_new,
         }
 
     except Exception as e:
