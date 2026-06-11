@@ -4,8 +4,8 @@
 
 ### Requirement: Civil Scraper Architecture
 
-The `PJUDCivilScraper` MUST extend `PJUDBaseScraper` and use selector registry instead of hardcoded selectors.
-(Previously: Standalone class with hardcoded CSS selectors and table IDs)
+The `PJUDCivilScraper` MUST extend `PJUDBaseScraper` and use the selector registry instead of hardcoded selectors. `_parse_case_detail_html` MUST populate all five entity lists — movements, litigantes, notificaciones, escritos, and exhortos — from the single detail HTML response.
+(Previously: `_parse_case_detail_html` populated only movements; the movements parser matched the first `table-bordered` table in the full HTML rather than scoping to `#historiaCiv`)
 
 #### Scenario: Civil inherits from base
 
@@ -28,6 +28,13 @@ The `PJUDCivilScraper` MUST extend `PJUDBaseScraper` and use selector registry i
 - THEN return type MUST be `List[PJUDCase]`
 - AND all existing fields MUST be present
 - AND no breaking changes to method signatures
+
+#### Scenario: All five tabs populated from single detail HTML
+
+- GIVEN a detail HTML where #historiaCiv has movements, #litigantesCiv has litigante rows, and #exhortosCiv has an exhorto row
+- WHEN `_parse_case_detail_html` runs
+- THEN the returned `PJUDCaseDetail` has non-empty `movements`, `litigantes`, and `exhortos` lists
+- AND `notificaciones` and `escritos` are empty lists (not None)
 
 ## ADDED Requirements
 
@@ -70,14 +77,3 @@ The `_parse_movements_table` method MUST scope to the `#historiaCiv` pane before
 - WHEN `_parse_movements_table` runs
 - THEN exactly 40 movement objects are returned
 - AND no litigante or exhorto rows appear in the movements result
-
-### Requirement: All Five Tabs Populated from Single Detail HTML
-
-`_parse_case_detail_html` MUST populate all five entity lists — movements, litigantes, notificaciones, escritos, and exhortos — from the single detail HTML response.
-
-#### Scenario: All five tabs populated from single detail HTML
-
-- GIVEN a detail HTML where #historiaCiv has movements, #litigantesCiv has litigante rows, and #exhortosCiv has an exhorto row
-- WHEN `_parse_case_detail_html` runs
-- THEN the returned `PJUDCaseDetail` has non-empty `movements`, `litigantes`, and `exhortos` lists
-- AND `notificaciones` and `escritos` are empty lists (not None)

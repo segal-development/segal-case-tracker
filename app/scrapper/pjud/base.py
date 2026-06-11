@@ -104,18 +104,69 @@ class PJUDMovement:
 
 
 @dataclass
+class PJUDLitigante:
+    """Litigant/party extracted from the Litigantes tab of a civil case detail."""
+    participante: str    # Role code: "DTE.", "DDO.", "AB.DTE", "AB.DDO", …
+    rut: str             # RUT with verification digit (may be "" when absent)
+    persona_type: str    # "JURIDICA" or "NATURAL"
+    nombre: str          # Full name or company name
+
+
+@dataclass
+class PJUDNotificacion:
+    """Notification record extracted from the Notificaciones tab."""
+    rol: str
+    estado_notif: str
+    tipo_notif: str
+    fecha_tramite: str
+    tipo_participante: str
+    nombre: str
+    tramite: str
+    obs_fallida: str     # Observation for failed notification; may be ""
+
+
+@dataclass
+class PJUDEscrito:
+    """Filing/escrito extracted from the Escritos por Resolver tab."""
+    fecha_ingreso: str
+    tipo_escrito: str
+    solicitante: str
+    tiene_documento: bool
+    tiene_anexo: bool
+    doc_token: Optional[str] = None   # JWT for document download (stored, not fetched here)
+
+
+@dataclass
+class PJUDExhorto:
+    """Exhorto/rogatory letter extracted from the Exhortos tab."""
+    rol_origen: str
+    tipo_exhorto: str
+    rol_destino: str           # Text inside the <label onclick=detalleExhortosCivil(...)>
+    fecha_ordena: str
+    fecha_ingreso: str
+    tribunal_destino: str
+    estado: str
+    detalle_token: Optional[str] = None   # JWT from detalleExhortosCivil (stored, not fetched)
+
+
+@dataclass
 class PJUDCaseDetail:
-    """Full case detail including movements."""
+    """Full case detail including movements and all tab entities."""
     case: PJUDCase
     movements: List[PJUDMovement] = field(default_factory=list)
     cuadernos: List[Dict[str, str]] = field(default_factory=list)  # [{name, token}]
-    partes: Dict[str, str] = field(default_factory=dict)
+    partes: Dict[str, str] = field(default_factory=dict)           # superseded by litigantes
     estado_administrativo: Optional[str] = None
     procedimiento: Optional[str] = None
     ubicacion: Optional[str] = None
     estado_procesal: Optional[str] = None
     etapa: Optional[str] = None
     raw_html: Optional[str] = None
+    # New entity lists populated from the four non-Historia tabs
+    litigantes: List[PJUDLitigante] = field(default_factory=list)
+    notificaciones: List[PJUDNotificacion] = field(default_factory=list)
+    escritos: List[PJUDEscrito] = field(default_factory=list)
+    exhortos: List[PJUDExhorto] = field(default_factory=list)
 
 
 @dataclass

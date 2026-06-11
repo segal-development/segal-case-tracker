@@ -13,10 +13,12 @@ Performance optimizations:
 """
 
 import asyncio
+import hashlib
 import logging
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Optional, Tuple, Callable, Awaitable, TypeVar
+from typing import Any, Callable, List, Optional, Tuple, Awaitable, TypeVar
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
 
@@ -35,6 +37,10 @@ from app.models.alert import Alert
 from app.models.lawyer import Lawyer
 from app.models.sync_history import SyncHistory
 from app.models.webhook import Webhook
+from app.models.case_litigante import CaseLitigante
+from app.models.case_notificacion import CaseNotificacion
+from app.models.case_escrito import CaseEscrito
+from app.models.case_exhorto import CaseExhorto
 from app.services.notification_service import NotificationService
 
 
@@ -86,6 +92,458 @@ class SyncResult:
             "alerts_created": self.alerts_created,
             "errors": self.errors,
         }
+
+
+# ============================================================================
+# NotifyBudget — shared dispatch counter (ADR-005, Slice 2)
+# ============================================================================
+
+
+class NotifyBudget:
+    """Mutable notification dispatch counter shared across all entity types in one sync.
+
+    ADR-005: NOTIFY_MAX_PER_SYNC is a single per-sync budget that applies across
+    movements + all entity types combined.  Each entity type drains from this
+    shared pool rather than having its own independent cap.  Alerts are ALWAYS
+    persisted; only the email/webhook DISPATCH is gated by this counter.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._remaining = limit
+
+    @classmethod
+    def from_settings(cls) -> "NotifyBudget":
+        """Create a budget initialised from settings.NOTIFY_MAX_PER_SYNC."""
+        return cls(settings.NOTIFY_MAX_PER_SYNC)
+
+    @property
+    def remaining(self) -> int:
+        return self._remaining
+
+    def decrement(self) -> None:
+        """Consume one dispatch slot (no-op if already exhausted)."""
+        if self._remaining > 0:
+            self._remaining -= 1
+
+    def exhausted(self) -> bool:
+        """True when no dispatch slots remain."""
+        return self._remaining <= 0
+
+
+# ============================================================================
+# Case-detail entity persistence helpers (Slice 1b — S1-T10 + S1-T11)
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# normalize_cell: single normalisation point used by ALL natural_key helpers
+# ---------------------------------------------------------------------------
+
+def normalize_cell(s: str) -> str:
+    """Strip, collapse whitespace, and casefold a cell string from PJUD HTML.
+
+    PJUD table cells are frequently padded with multiple spaces and mixed case.
+    Normalising before hashing ensures consistent natural_keys across syncs.
+    """
+    return re.sub(r"\s+", " ", s.strip()).casefold()
+
+
+# ---------------------------------------------------------------------------
+# natural_key functions — one per entity type
+# ---------------------------------------------------------------------------
+
+def litigante_natural_key(lit: Any) -> str:
+    """Derive a stable 64-char hex key for a PJUDLitigante.
+
+    Key strategy (ADR-002):
+    - If RUT is present: sha256(normalize(rut) | normalize(participante))
+      — includes participante so the same RUT in different roles is distinct.
+    - Fallback (no RUT): sha256(normalize(participante) | normalize(nombre))
+    """
+    rut = normalize_cell(lit.rut)
+    participante = normalize_cell(lit.participante)
+    nombre = normalize_cell(lit.nombre)
+
+    if rut:
+        raw = f"{rut}|{participante}"
+    else:
+        raw = f"{participante}|{nombre}"
+
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def exhorto_natural_key(exh: Any) -> str:
+    """Derive a stable 64-char hex key for a PJUDExhorto.
+
+    Key: sha256(normalize(rol_origen) | normalize(rol_destino) | normalize(tipo_exhorto))
+    """
+    raw = "|".join([
+        normalize_cell(exh.rol_origen),
+        normalize_cell(exh.rol_destino),
+        normalize_cell(exh.tipo_exhorto),
+    ])
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def notificacion_natural_key(notif: Any) -> str:
+    """Derive a stable 64-char hex key for a PJUDNotificacion.
+
+    Volatile fields (estado_notif, obs_fallida) are excluded from the key so
+    that a state change updates the existing row instead of inserting a new one.
+    Key: sha256(rol | tipo_notif | fecha_tramite | tipo_participante | nombre | tramite)
+    """
+    raw = "|".join([
+        normalize_cell(notif.rol),
+        normalize_cell(notif.tipo_notif),
+        normalize_cell(notif.fecha_tramite),
+        normalize_cell(notif.tipo_participante),
+        normalize_cell(notif.nombre),
+        normalize_cell(notif.tramite),
+    ])
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def escrito_natural_key(escrito: Any) -> str:
+    """Derive a stable 64-char hex key for a PJUDEscrito (row hash).
+
+    All cell values (including boolean flags) are normalised and joined.
+    """
+    raw = "|".join([
+        normalize_cell(escrito.fecha_ingreso),
+        normalize_cell(escrito.tipo_escrito),
+        normalize_cell(escrito.solicitante),
+        str(escrito.tiene_documento),
+        str(escrito.tiene_anexo),
+    ])
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# EntitySyncSpec — configuration object for the generic _sync_entities engine
+# ---------------------------------------------------------------------------
+
+@dataclass
+class EntitySyncSpec:
+    """Configuration for one entity type in the generic _sync_entities engine (ADR-001).
+
+    Encodes the per-entity differences as data so the engine loop is written
+    once and shared across all entity types.  Adding a new entity type later
+    is a new EntitySyncSpec instance, not a new sync_* method.
+    """
+
+    model: type                              # SQLAlchemy model class
+    entity_type: str                         # "litigante", "notificacion", etc.
+    natural_key_fn: Callable[[Any], str]     # (pjud_item) -> 64-char hex key
+    to_model_fields: Callable[[Any, int], dict]  # (pjud_item, case_id) -> field dict
+    creates_alert: bool = False
+    notify: bool = False
+    updatable_fields: List[str] = field(default_factory=list)
+    # Fields NOT in the natural_key that should be refreshed on the existing row.
+
+    # Slice 2: alert content and notification dispatch wiring
+    alert_title_fn: Optional[Callable] = None    # (case, row) -> str
+    alert_message_fn: Optional[Callable] = None  # (case, row) -> str
+    notify_fn_name: str = ""                     # method name on NotificationService
+    event: str = ""                              # webhook event string
+    priority: int = 0                            # drain order within shared budget
+
+
+def _parse_date_for_entity(date_str: Optional[str]) -> Optional[datetime]:
+    """Parse a DD/MM/YYYY date string into a datetime (None if blank/invalid)."""
+    if not date_str:
+        return None
+    try:
+        return datetime.strptime(date_str, "%d/%m/%Y")
+    except ValueError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Spec instances — all Slice 1b with creates_alert=False, notify=False
+# ---------------------------------------------------------------------------
+
+SPEC_LITIGANTE = EntitySyncSpec(
+    model=CaseLitigante,
+    entity_type="litigante",
+    natural_key_fn=litigante_natural_key,
+    to_model_fields=lambda item, case_id: {
+        "case_id": case_id,
+        "participante": item.participante,
+        "rut": item.rut,
+        "persona_type": item.persona_type,
+        "nombre": item.nombre,
+    },
+    # ADR-004: litigantes are SILENT — no alert, no notification, ever.
+    creates_alert=False,
+    notify=False,
+)
+
+SPEC_NOTIFICACION = EntitySyncSpec(
+    model=CaseNotificacion,
+    entity_type="notificacion",
+    natural_key_fn=notificacion_natural_key,
+    to_model_fields=lambda item, case_id: {
+        "case_id": case_id,
+        "rol": item.rol,
+        "estado_notif": item.estado_notif,
+        "tipo_notif": item.tipo_notif,
+        "fecha_tramite": _parse_date_for_entity(item.fecha_tramite),
+        "tipo_participante": item.tipo_participante,
+        "nombre": item.nombre,
+        "tramite": item.tramite,
+        "obs_fallida": item.obs_fallida,
+    },
+    creates_alert=True,  # Slice 2: flipped from False
+    notify=True,         # Slice 2: flipped from False
+    updatable_fields=["estado_notif", "obs_fallida"],
+    alert_title_fn=lambda case, row: f"Nueva notificación en {case.rol}",
+    alert_message_fn=lambda case, row: f"{row.tipo_notif}: {row.nombre}",
+    notify_fn_name="notify_new_notificacion",
+    event="notificacion.created",
+    priority=1,
+)
+
+SPEC_ESCRITO = EntitySyncSpec(
+    model=CaseEscrito,
+    entity_type="escrito",
+    natural_key_fn=escrito_natural_key,
+    to_model_fields=lambda item, case_id: {
+        "case_id": case_id,
+        "fecha_ingreso": _parse_date_for_entity(item.fecha_ingreso),
+        "tipo_escrito": item.tipo_escrito,
+        "solicitante": item.solicitante,
+        "tiene_documento": item.tiene_documento,
+        "tiene_anexo": item.tiene_anexo,
+        "doc_token": item.doc_token,
+    },
+    creates_alert=True,  # Slice 2: flipped from False
+    notify=True,         # Slice 2: flipped from False
+    updatable_fields=["doc_token"],
+    alert_title_fn=lambda case, row: f"Nuevo escrito en {case.rol}",
+    alert_message_fn=lambda case, row: f"{row.tipo_escrito}: {row.solicitante}",
+    notify_fn_name="notify_new_escrito",
+    event="escrito.created",
+    priority=2,
+)
+
+SPEC_EXHORTO = EntitySyncSpec(
+    model=CaseExhorto,
+    entity_type="exhorto",
+    natural_key_fn=exhorto_natural_key,
+    to_model_fields=lambda item, case_id: {
+        "case_id": case_id,
+        "rol_origen": item.rol_origen,
+        "tipo_exhorto": item.tipo_exhorto,
+        "rol_destino": item.rol_destino,
+        "fecha_ordena": _parse_date_for_entity(item.fecha_ordena),
+        "fecha_ingreso": _parse_date_for_entity(item.fecha_ingreso),
+        "tribunal_destino": item.tribunal_destino,
+        "estado": item.estado,
+    },
+    creates_alert=True,  # Slice 2: flipped from False
+    notify=True,         # Slice 2: flipped from False
+    updatable_fields=["estado"],
+    alert_title_fn=lambda case, row: f"Nuevo exhorto en {case.rol}",
+    alert_message_fn=lambda case, row: (
+        f"{row.tipo_exhorto}: {row.rol_destino} → {row.tribunal_destino}"
+    ),
+    notify_fn_name="notify_new_exhorto",
+    event="exhorto.created",
+    priority=3,
+)
+
+
+# ---------------------------------------------------------------------------
+# Generic _sync_entities engine
+# ---------------------------------------------------------------------------
+
+def _sync_entities(
+    db: Session,
+    case_id: int,
+    scraped_list: list,
+    spec: EntitySyncSpec,
+    *,
+    case: Optional[Any] = None,
+    lawyer: Optional[Any] = None,
+    webhooks: Optional[list] = None,
+    notification_svc: Optional[Any] = None,
+    budget: Optional[NotifyBudget] = None,
+) -> list:
+    """Upsert a list of scraped PJUD entity objects for a given case.
+
+    Performs a SELECT-then-INSERT per item keyed on (case_id, natural_key).
+    Existing rows have their spec.updatable_fields refreshed.  Idempotent
+    when data is unchanged.
+
+    DOES NOT COMMIT — callers are responsible for the surrounding transaction.
+
+    Slice 2 keyword args (all optional — backward compatible):
+        case            Case ORM row; required for alert creation.
+        lawyer          Lawyer ORM row; required for alert creation.
+        webhooks        Active Webhook list; forwarded to the notify method.
+        notification_svc NotificationService instance; required for dispatch.
+        budget          Shared NotifyBudget; gates notification dispatch (ADR-005).
+                        Alerts are ALWAYS created when spec.creates_alert=True;
+                        only the email/webhook dispatch is budget-gated.
+
+    Alert creation is skipped when case or lawyer is None (safe for callers that
+    only need storage and omit the notification context).
+
+    Returns:
+        List of (row, is_new) tuples — one per input item.
+        is_new=True only for genuine inserts; an updatable-field refresh on an
+        existing row yields is_new=False.
+    """
+    results: list = []
+    alerts_created = 0
+    dispatched = 0
+
+    for item in scraped_list:
+        key = spec.natural_key_fn(item)
+        existing = db.query(spec.model).filter(
+            spec.model.case_id == case_id,
+            spec.model.natural_key == key,
+        ).first()
+        if existing:
+            if spec.updatable_fields:
+                fields = spec.to_model_fields(item, case_id)
+                for col in spec.updatable_fields:
+                    if col in fields:
+                        setattr(existing, col, fields[col])
+                db.flush()
+            results.append((existing, False))
+            continue
+
+        # New row — insert and assign PK within the outer transaction
+        fields = spec.to_model_fields(item, case_id)
+        fields["natural_key"] = key
+        fields["created_at"] = datetime.utcnow()
+        row = spec.model(**fields)
+        db.add(row)
+        db.flush()
+
+        # Slice 2: create Alert when spec.creates_alert and context is available.
+        # Guard: silently skip when case/lawyer is absent (backward compat for
+        # storage-only callers that never pass notification context).
+        alert = None
+        if spec.creates_alert and case is not None and lawyer is not None:
+            title = (
+                spec.alert_title_fn(case, row)
+                if spec.alert_title_fn
+                else f"Nuevo {spec.entity_type} detectado"
+            )
+            message = (
+                spec.alert_message_fn(case, row)
+                if spec.alert_message_fn
+                else ""
+            )
+            alert = Alert(
+                lawyer_id=lawyer.id,
+                case_id=case_id,
+                entity_type=spec.entity_type,
+                entity_id=row.id,
+                type=f"new_{spec.entity_type}",
+                title=title,
+                message=message,
+                created_at=datetime.utcnow(),
+            )
+            db.add(alert)
+            db.flush()
+            alerts_created += 1
+
+        # Slice 2: dispatch notification when budget allows.
+        # Alerts are already persisted above; only DISPATCH is budget-gated.
+        if (
+            alert is not None
+            and spec.notify
+            and notification_svc is not None
+            and budget is not None
+            and not budget.exhausted()
+        ):
+            try:
+                notify_fn = getattr(notification_svc, spec.notify_fn_name)
+                notify_fn(case, row, lawyer, webhooks or [], alert)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Failed to dispatch %s notification for entity %s (case_id=%s): %s",
+                    spec.entity_type, row.id, case_id, exc,
+                )
+            budget.decrement()
+            dispatched += 1
+
+        results.append((row, True))
+
+    # Cap-reached warning when the budget prevented some dispatches.
+    if spec.notify and alerts_created > dispatched:
+        skipped = alerts_created - dispatched
+        logger.warning(
+            "Notification cap reached in _sync_entities "
+            "(entity_type=%s, case_id=%s): dispatched %d of %d, skipped %d.",
+            spec.entity_type, case_id, dispatched, alerts_created, skipped,
+        )
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Convenience wrappers — one per entity type
+# ---------------------------------------------------------------------------
+
+def upsert_litigantes(
+    db: Session, case_id: int, items: list
+) -> list:
+    """Upsert PJUDLitigante objects for a case. Returns [(row, is_new), ...]."""
+    return _sync_entities(db, case_id, items, SPEC_LITIGANTE)
+
+
+def upsert_notificaciones(
+    db: Session, case_id: int, items: list
+) -> list:
+    """Upsert PJUDNotificacion objects for a case. Returns [(row, is_new), ...]."""
+    return _sync_entities(db, case_id, items, SPEC_NOTIFICACION)
+
+
+def upsert_escritos(
+    db: Session, case_id: int, items: list
+) -> list:
+    """Upsert PJUDEscrito objects for a case. Returns [(row, is_new), ...]."""
+    return _sync_entities(db, case_id, items, SPEC_ESCRITO)
+
+
+def upsert_exhortos(
+    db: Session, case_id: int, items: list
+) -> list:
+    """Upsert PJUDExhorto objects for a case. Returns [(row, is_new), ...]."""
+    return _sync_entities(db, case_id, items, SPEC_EXHORTO)
+
+
+def sync_case_detail(db: Session, case_id: int, detail: Any) -> dict:
+    """Persist all entity types for a case detail in a single atomic commit.
+
+    Calls the four upsert_* helpers (each flush-only) and commits once at the
+    end so litigantes, notificaciones, escritos, and exhortos for a case all
+    persist atomically.  If any upsert raises, no entities for this case are
+    committed (the caller's SQLAlchemy transaction rolls back on exception).
+
+    Args:
+        db:      Active SQLAlchemy session.
+        case_id: Primary key of the Case row to associate entities with.
+        detail:  PJUDCaseDetail returned by the scraper.
+
+    Returns:
+        Dict with new-row counts per entity type, e.g.
+        {"litigantes_new": 3, "notificaciones_new": 0, ...}
+    """
+    lit_results = upsert_litigantes(db, case_id, detail.litigantes)
+    notif_results = upsert_notificaciones(db, case_id, detail.notificaciones)
+    escrito_results = upsert_escritos(db, case_id, detail.escritos)
+    exhorto_results = upsert_exhortos(db, case_id, detail.exhortos)
+    db.commit()
+    return {
+        "litigantes_new": sum(1 for _, is_new in lit_results if is_new),
+        "notificaciones_new": sum(1 for _, is_new in notif_results if is_new),
+        "escritos_new": sum(1 for _, is_new in escrito_results if is_new),
+        "exhortos_new": sum(1 for _, is_new in exhorto_results if is_new),
+    }
 
 
 class SyncService:
@@ -179,16 +637,21 @@ class SyncService:
         self,
         case_id: int,
         scraped_movements: List[ScrapedMovement],
+        *,
+        budget: Optional[NotifyBudget] = None,
     ) -> Tuple[int, int]:
-        """
-        Sync movements for a case, detecting new ones.
+        """Sync movements for a case, detecting new ones.
 
         Args:
-            case_id: Database case ID
-            scraped_movements: Movements from PJUD scraper
+            case_id: Database case ID.
+            scraped_movements: Movements from PJUD scraper.
+            budget: Optional shared NotifyBudget (ADR-005).  When provided, the
+                    caller's budget is drained instead of a local one.  When
+                    omitted (existing callers), a fresh local budget is created
+                    from settings.NOTIFY_MAX_PER_SYNC — backward compatible.
 
         Returns:
-            Tuple of (new_count, alert_count)
+            Tuple of (new_count, alert_count).
         """
         new_count = 0
         alert_count = 0
@@ -198,12 +661,9 @@ class SyncService:
         if not case:
             return 0, 0
 
-        # FIX 2: hoist Lawyer + active-Webhook queries outside the per-movement
-        # loop — they are constant for the whole call so querying them once
-        # removes O(N) round-trips and reduces the blocking-I/O window.
-        lawyer = self.db.query(Lawyer).filter(
-            Lawyer.id == case.lawyer_id
-        ).first()
+        # Hoist Lawyer + active-Webhook queries outside the per-movement loop
+        # (constant for the whole call → removes O(N) round-trips).
+        lawyer = self.db.query(Lawyer).filter(Lawyer.id == case.lawyer_id).first()
         webhooks: list = []
         if lawyer:
             webhooks = self.db.query(Webhook).filter(
@@ -211,35 +671,33 @@ class SyncService:
                 Webhook.is_active == True,  # noqa: E712
             ).all()
 
-        notify_max = settings.NOTIFY_MAX_PER_SYNC
+        # Use the caller's shared budget or create a local one (backward compat).
+        _budget = budget if budget is not None else NotifyBudget.from_settings()
 
         for scraped in scraped_movements:
             movement, is_new = self._upsert_movement(case_id, scraped)
             if is_new:
                 new_count += 1
-                # Create alert for new movement — alert is always persisted.
+                # Alert is always persisted; only DISPATCH is budget-gated.
                 alert = self._create_movement_alert(case, movement)
                 if alert:
                     alert_count += 1
-                    # FIX 1: cap notifications per sync call; alerts are still
-                    # created above — only the dispatch is gated here.
-                    if lawyer and notify_dispatched < notify_max:
+                    if lawyer and not _budget.exhausted():
                         try:
                             NotificationService(self.db).notify_new_movement(
                                 alert, case, movement, lawyer, webhooks
                             )
                         except Exception as exc:
                             logger.error(
-                                "Failed to dispatch notification for alert on case %s "
-                                "movement %s: %s",
-                                case.id,
-                                movement.id,
-                                exc,
+                                "Failed to dispatch notification for alert on "
+                                "case %s movement %s: %s",
+                                case.id, movement.id, exc,
                             )
                         # Count every attempt (success or error) toward the cap.
+                        _budget.decrement()
                         notify_dispatched += 1
 
-        # FIX 1: emit a clear warning when the cap prevented some dispatches.
+        # Emit a warning when the cap prevented some dispatches.
         if alert_count > notify_dispatched:
             skipped = alert_count - notify_dispatched
             logger.warning(
@@ -250,13 +708,15 @@ class SyncService:
                 notify_dispatched,
                 alert_count,
                 skipped,
-                notify_max,
+                _budget.remaining + notify_dispatched,  # original limit
             )
 
         # Update last_movement_at on case
         if scraped_movements:
             latest_date = self._parse_date(scraped_movements[0].fecha)
-            if latest_date and (not case.last_movement_at or latest_date > case.last_movement_at):
+            if latest_date and (
+                not case.last_movement_at or latest_date > case.last_movement_at
+            ):
                 case.last_movement_at = latest_date
 
         self.db.commit()
@@ -708,30 +1168,71 @@ async def detect_and_sync_movements(
                 Case.rol == normalized_rol,
             ).first()
 
-            if db_case and scraped_movements:
-                new_count, alert_count = sync_svc.sync_movements(
-                    case_id=int(db_case.id),
-                    scraped_movements=scraped_movements,
-                )
-                movements_new += new_count
-                alerts_created += alert_count
-                logger.info(
-                    "detect_and_sync_movements: %s → %d new movements, %d alerts",
-                    api_case.rol,
-                    new_count,
-                    alert_count,
-                )
-            elif not db_case:
+            if not db_case:
                 logger.warning(
-                    "detect_and_sync_movements: DB case not found for rol=%s lawyer=%s; "
-                    "movements skipped",
+                    "detect_and_sync_movements: DB case not found for "
+                    "rol=%s lawyer=%s; movements and entity sync skipped",
                     api_case.rol,
                     lawyer_id,
                 )
+            else:
+                # Hoist lawyer + webhooks once (used by both movements and entities).
+                case_lawyer = db.query(Lawyer).filter(
+                    Lawyer.id == db_case.lawyer_id
+                ).first()
+                case_webhooks: list = []
+                if case_lawyer:
+                    case_webhooks = db.query(Webhook).filter(
+                        Webhook.lawyer_id == case_lawyer.id,
+                        Webhook.is_active == True,  # noqa: E712
+                    ).all()
+
+                # Shared budget across movements + all entity types (ADR-005).
+                shared_budget = NotifyBudget.from_settings()
+                notification_svc = NotificationService(db)
+
+                # 1. Sync movements (with shared budget).
+                if scraped_movements:
+                    new_count, alert_count = sync_svc.sync_movements(
+                        case_id=int(db_case.id),
+                        scraped_movements=scraped_movements,
+                        budget=shared_budget,
+                    )
+                    movements_new += new_count
+                    alerts_created += alert_count
+                    logger.info(
+                        "detect_and_sync_movements: %s → %d new movements, %d alerts",
+                        api_case.rol,
+                        new_count,
+                        alert_count,
+                    )
+
+                # 2. Sync entity types in priority order (S1-T12 + S2-T03).
+                # Litigantes are stored but SILENT (ADR-004); the rest alert + notify.
+                for entity_list, spec in [
+                    (detail.litigantes, SPEC_LITIGANTE),
+                    (detail.notificaciones, SPEC_NOTIFICACION),
+                    (detail.escritos, SPEC_ESCRITO),
+                    (detail.exhortos, SPEC_EXHORTO),
+                ]:
+                    _sync_entities(
+                        db,
+                        int(db_case.id),
+                        entity_list,
+                        spec,
+                        case=db_case,
+                        lawyer=case_lawyer,
+                        webhooks=case_webhooks,
+                        notification_svc=notification_svc,
+                        budget=shared_budget,
+                    )
+
+                # Commit entity upserts (sync_movements already committed).
+                db.commit()
 
         except Exception as exc:
             logger.error(
-                "detect_and_sync_movements: failed to fetch/process movements for %s: %s",
+                "detect_and_sync_movements: failed to fetch/process for %s: %s",
                 api_case.rol,
                 exc,
             )

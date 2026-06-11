@@ -101,10 +101,37 @@ cuaderno_option_pattern:
   primary: '<option\\s+value="([^"]+)"[^>]*>([^<]+)</option>'
   description: "Pattern for cuaderno select options"
 
-# Movements table
+# Tab pane ids — used by _extract_pane_tbody to scope each parser to its own pane.
+# All five are defined here so code never hardcodes DOM ids.
+movements_pane_id:
+  primary: "historiaCiv"
+  description: "DOM id of the Historia tab pane; used to scope movements_table match"
+
+litigantes_pane_id:
+  primary: "litigantesCiv"
+  description: "DOM id of the Litigantes tab pane"
+
+notificaciones_pane_id:
+  primary: "notificacionesCiv"
+  description: "DOM id of the Notificaciones tab pane"
+
+escritos_pane_id:
+  primary: "escritosCiv"
+  description: "DOM id of the Escritos tab pane"
+
+exhortos_pane_id:
+  primary: "exhortosCiv"
+  description: "DOM id of the Exhortos tab pane"
+
+# Movements table (fallback unscoped pattern kept for zero-regression degradation)
 movements_table:
   primary: '<table[^>]*class="[^"]*table-bordered[^"]*"[^>]*>.*?<tbody>(.*?)</tbody>'
-  description: "Pattern for movements history table"
+  description: "Unscoped fallback for movements history table. Primary scoping done via movements_pane_id + _extract_pane_tbody in code."
+
+# Exhorto detail token extraction
+exhorto_detail_token_pattern:
+  primary: "detalleExhortosCivil\\('([^']+)'\\)"
+  description: "Pattern to capture JWT token from detalleExhortosCivil onclick handler"
 
 movement_row_pattern:
   primary: "<tr[^>]*>(.*?)</tr>"
@@ -112,8 +139,12 @@ movement_row_pattern:
 
 # Document patterns
 document_token_pattern:
-  primary: 'name="dtaDoc"\\s+value="([^"]+)"'
-  description: "Pattern to extract document token"
+  # Primary matches the common attribute order: name before value.
+  # Fallback handles reversed attribute order (value before name) for robustness.
+  primary: 'name="dtaDoc"[^>]*value="([^"]+)"'
+  fallbacks:
+    - 'value="([^"]+)"[^>]*name="dtaDoc"'
+  description: "Pattern to extract document token from hidden dtaDoc input; tolerates attribute order"
 
 document_type_docuS:
   primary: "docuS.php"

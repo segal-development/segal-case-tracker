@@ -21,7 +21,7 @@ class TestClaveUnicaCredentials:
         from app.scrapper.pjud.clave_unica import ClaveUnicaCredentials
         
         creds = ClaveUnicaCredentials(
-            rut="16021492-9",
+            rut="12345678-9",
             password="secret123",
         )
         
@@ -43,7 +43,7 @@ class TestClaveUnicaCredentials:
         from app.scrapper.pjud.clave_unica import ClaveUnicaCredentials
         
         creds = ClaveUnicaCredentials(
-            rut="16021492-9",
+            rut="12345678-9",
             password="",
         )
         
@@ -98,7 +98,7 @@ class TestClaveUnicaAuthFormFilling:
         auth._registry = mock_registry
         
         credentials = ClaveUnicaCredentials(
-            rut="16021492-9",
+            rut="12345678-9",
             password="secret123",
         )
         
@@ -113,7 +113,7 @@ class TestClaveUnicaAuthFormFilling:
         
         # Extract the values that were filled
         filled_values = [call.args[0] for call in fill_calls]
-        assert "16021492-9" in filled_values
+        assert "12345678-9" in filled_values
         assert "secret123" in filled_values
     
     @pytest.mark.asyncio
@@ -125,7 +125,7 @@ class TestClaveUnicaAuthFormFilling:
         auth._registry = mock_registry
         
         credentials = ClaveUnicaCredentials(
-            rut="16021492-9",
+            rut="12345678-9",
             password="secret123",
         )
         
@@ -149,14 +149,14 @@ class TestClaveUnicaAuthFormFilling:
         auth._registry = mock_registry
         
         credentials = ClaveUnicaCredentials(
-            rut="16021492-9",
+            rut="12345678-9",
             password="secret123",
         )
         
         session = await auth.login(mock_page, credentials, lawyer_id=1)
         
         assert isinstance(session, PJUDSession)
-        assert session.rut == "16021492-9"
+        assert session.rut == "12345678-9"
         assert session.lawyer_id == 1
         assert session.auth_method == "clave_unica"
         assert len(session.cookies) == 2  # From mock
@@ -199,7 +199,7 @@ class TestClaveUnicaAuthErrors:
         auth = ClaveUnicaAuth()
         
         credentials = ClaveUnicaCredentials(
-            rut="16021492-9",
+            rut="12345678-9",
             password="secret123",
         )
         
@@ -256,7 +256,7 @@ class TestClaveUnicaAuthSessionExtraction:
             auth = ClaveUnicaAuth()
             auth._registry = registry
             
-            credentials = ClaveUnicaCredentials(rut="16021492-9", password="secret")
+            credentials = ClaveUnicaCredentials(rut="12345678-9", password="secret")
             session = await auth.login(mock_page, credentials, lawyer_id=1)
             
             # Should only have PJUD cookies
