@@ -13,10 +13,12 @@ Performance optimizations:
 """
 
 import asyncio
+import hashlib
 import logging
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Optional, Tuple, Callable, Awaitable, TypeVar
+from typing import Any, Callable, List, Optional, Tuple, Awaitable, TypeVar
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
 
@@ -35,6 +37,10 @@ from app.models.alert import Alert
 from app.models.lawyer import Lawyer
 from app.models.sync_history import SyncHistory
 from app.models.webhook import Webhook
+from app.models.case_litigante import CaseLitigante
+from app.models.case_notificacion import CaseNotificacion
+from app.models.case_escrito import CaseEscrito
+from app.models.case_exhorto import CaseExhorto
 from app.services.notification_service import NotificationService
 
 
@@ -86,6 +92,279 @@ class SyncResult:
             "alerts_created": self.alerts_created,
             "errors": self.errors,
         }
+
+
+# ============================================================================
+# Case-detail entity persistence helpers (Slice 1b — S1-T10 + S1-T11)
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# normalize_cell: single normalisation point used by ALL natural_key helpers
+# ---------------------------------------------------------------------------
+
+def normalize_cell(s: str) -> str:
+    """Strip, collapse whitespace, and casefold a cell string from PJUD HTML.
+
+    PJUD table cells are frequently padded with multiple spaces and mixed case.
+    Normalising before hashing ensures consistent natural_keys across syncs.
+    """
+    return re.sub(r"\s+", " ", s.strip()).casefold()
+
+
+# ---------------------------------------------------------------------------
+# natural_key functions — one per entity type
+# ---------------------------------------------------------------------------
+
+def litigante_natural_key(lit: Any) -> str:
+    """Derive a stable 64-char hex key for a PJUDLitigante.
+
+    Key strategy (ADR-002):
+    - If RUT is present: sha256(normalize(rut) | normalize(participante))
+      — includes participante so the same RUT in different roles is distinct.
+    - Fallback (no RUT): sha256(normalize(participante) | normalize(nombre))
+    """
+    from app.scrapper.pjud.base import PJUDLitigante  # local import avoids circular dep
+
+    rut = normalize_cell(lit.rut)
+    participante = normalize_cell(lit.participante)
+    nombre = normalize_cell(lit.nombre)
+
+    if rut:
+        raw = f"{rut}|{participante}"
+    else:
+        raw = f"{participante}|{nombre}"
+
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def exhorto_natural_key(exh: Any) -> str:
+    """Derive a stable 64-char hex key for a PJUDExhorto.
+
+    Key: sha256(normalize(rol_origen) | normalize(rol_destino) | normalize(tipo_exhorto))
+    """
+    raw = "|".join([
+        normalize_cell(exh.rol_origen),
+        normalize_cell(exh.rol_destino),
+        normalize_cell(exh.tipo_exhorto),
+    ])
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def notificacion_natural_key(notif: Any) -> str:
+    """Derive a stable 64-char hex key for a PJUDNotificacion (row hash).
+
+    All cell values are normalised and joined with '|' before hashing.
+    """
+    raw = "|".join([
+        normalize_cell(notif.rol),
+        normalize_cell(notif.estado_notif),
+        normalize_cell(notif.tipo_notif),
+        normalize_cell(notif.fecha_tramite),
+        normalize_cell(notif.tipo_participante),
+        normalize_cell(notif.nombre),
+        normalize_cell(notif.tramite),
+        normalize_cell(notif.obs_fallida),
+    ])
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def escrito_natural_key(escrito: Any) -> str:
+    """Derive a stable 64-char hex key for a PJUDEscrito (row hash).
+
+    All cell values (including boolean flags) are normalised and joined.
+    """
+    raw = "|".join([
+        normalize_cell(escrito.fecha_ingreso),
+        normalize_cell(escrito.tipo_escrito),
+        normalize_cell(escrito.solicitante),
+        str(escrito.tiene_documento),
+        str(escrito.tiene_anexo),
+    ])
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# EntitySyncSpec — configuration object for the generic _sync_entities engine
+# ---------------------------------------------------------------------------
+
+@dataclass
+class EntitySyncSpec:
+    """Configuration for one entity type in the generic _sync_entities engine.
+
+    Slice 1b: creates_alert and notify are False for all four specs.
+    Slice 2 will flip those flags and wire Alert + NotificationService.
+    """
+
+    model: type                          # SQLAlchemy model class
+    entity_type: str                     # "litigante", "notificacion", etc.
+    natural_key_fn: Callable[[Any], str] # (pjud_item) -> 64-char hex key
+    to_model_fields: Callable[[Any, int], dict]  # (pjud_item, case_id) -> field dict
+    creates_alert: bool = False
+    notify: bool = False
+
+
+def _parse_date_for_entity(date_str: Optional[str]) -> Optional[datetime]:
+    """Parse a DD/MM/YYYY date string into a datetime (None if blank/invalid)."""
+    if not date_str:
+        return None
+    try:
+        return datetime.strptime(date_str, "%d/%m/%Y")
+    except ValueError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Spec instances — all Slice 1b with creates_alert=False, notify=False
+# ---------------------------------------------------------------------------
+
+SPEC_LITIGANTE = EntitySyncSpec(
+    model=CaseLitigante,
+    entity_type="litigante",
+    natural_key_fn=litigante_natural_key,
+    to_model_fields=lambda item, case_id: {
+        "case_id": case_id,
+        "participante": item.participante,
+        "rut": item.rut,
+        "persona_type": item.persona_type,
+        "nombre": item.nombre,
+    },
+    creates_alert=False,
+    notify=False,
+)
+
+SPEC_NOTIFICACION = EntitySyncSpec(
+    model=CaseNotificacion,
+    entity_type="notificacion",
+    natural_key_fn=notificacion_natural_key,
+    to_model_fields=lambda item, case_id: {
+        "case_id": case_id,
+        "rol": item.rol,
+        "estado_notif": item.estado_notif,
+        "tipo_notif": item.tipo_notif,
+        "fecha_tramite": _parse_date_for_entity(item.fecha_tramite),
+        "tipo_participante": item.tipo_participante,
+        "nombre": item.nombre,
+        "tramite": item.tramite,
+        "obs_fallida": item.obs_fallida,
+    },
+    creates_alert=False,
+    notify=False,
+)
+
+SPEC_ESCRITO = EntitySyncSpec(
+    model=CaseEscrito,
+    entity_type="escrito",
+    natural_key_fn=escrito_natural_key,
+    to_model_fields=lambda item, case_id: {
+        "case_id": case_id,
+        "fecha_ingreso": _parse_date_for_entity(item.fecha_ingreso),
+        "tipo_escrito": item.tipo_escrito,
+        "solicitante": item.solicitante,
+        "tiene_documento": item.tiene_documento,
+        "tiene_anexo": item.tiene_anexo,
+        "doc_token": item.doc_token,
+    },
+    creates_alert=False,
+    notify=False,
+)
+
+SPEC_EXHORTO = EntitySyncSpec(
+    model=CaseExhorto,
+    entity_type="exhorto",
+    natural_key_fn=exhorto_natural_key,
+    to_model_fields=lambda item, case_id: {
+        "case_id": case_id,
+        "rol_origen": item.rol_origen,
+        "tipo_exhorto": item.tipo_exhorto,
+        "rol_destino": item.rol_destino,
+        "fecha_ordena": _parse_date_for_entity(item.fecha_ordena),
+        "fecha_ingreso": _parse_date_for_entity(item.fecha_ingreso),
+        "tribunal_destino": item.tribunal_destino,
+        "estado": item.estado,
+    },
+    creates_alert=False,
+    notify=False,
+)
+
+
+# ---------------------------------------------------------------------------
+# Generic _sync_entities engine
+# ---------------------------------------------------------------------------
+
+def _sync_entities(
+    db: Session,
+    case_id: int,
+    scraped_list: list,
+    spec: EntitySyncSpec,
+    lawyer: Any = None,
+    webhooks: Optional[list] = None,
+    budget: int = 0,
+) -> list:
+    """Upsert a list of scraped PJUD entity objects for a given case.
+
+    Performs a SELECT-then-INSERT per item keyed on (case_id, natural_key).
+    Idempotent: re-running with identical data inserts 0 new rows.
+
+    Slice 1b: creates_alert and notify are False on all specs — no Alert rows
+    are created, NotificationService is never called.
+    Slice 2 will extend this function to wire alerts and dispatch.
+
+    Returns:
+        List of (row, is_new) tuples — one per input item.
+    """
+    results: list = []
+    for item in scraped_list:
+        key = spec.natural_key_fn(item)
+        existing = db.query(spec.model).filter(
+            spec.model.case_id == case_id,
+            spec.model.natural_key == key,
+        ).first()
+        if existing:
+            results.append((existing, False))
+            continue
+
+        fields = spec.to_model_fields(item, case_id)
+        fields["natural_key"] = key
+        fields["created_at"] = datetime.utcnow()
+        row = spec.model(**fields)
+        db.add(row)
+        db.flush()  # assign PK without committing the outer transaction
+        results.append((row, True))
+
+    db.commit()
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Convenience wrappers — one per entity type
+# ---------------------------------------------------------------------------
+
+def upsert_litigantes(
+    db: Session, case_id: int, items: list
+) -> list:
+    """Upsert PJUDLitigante objects for a case. Returns [(row, is_new), ...]."""
+    return _sync_entities(db, case_id, items, SPEC_LITIGANTE)
+
+
+def upsert_notificaciones(
+    db: Session, case_id: int, items: list
+) -> list:
+    """Upsert PJUDNotificacion objects for a case. Returns [(row, is_new), ...]."""
+    return _sync_entities(db, case_id, items, SPEC_NOTIFICACION)
+
+
+def upsert_escritos(
+    db: Session, case_id: int, items: list
+) -> list:
+    """Upsert PJUDEscrito objects for a case. Returns [(row, is_new), ...]."""
+    return _sync_entities(db, case_id, items, SPEC_ESCRITO)
+
+
+def upsert_exhortos(
+    db: Session, case_id: int, items: list
+) -> list:
+    """Upsert PJUDExhorto objects for a case. Returns [(row, is_new), ...]."""
+    return _sync_entities(db, case_id, items, SPEC_EXHORTO)
 
 
 class SyncService:
