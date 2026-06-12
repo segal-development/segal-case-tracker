@@ -974,6 +974,20 @@ class CivilScraper(PJUDBaseScraper):
 
         page = await self._get_page(session)
 
+        # The fetch below must run from a page that is ALREADY on the PJUD
+        # origin — a freshly restored page sits at about:blank, so a credentialed
+        # fetch to pjud.cl is cross-origin and fails with "Failed to fetch".
+        # Navigate to indexN.php first so the fetch is same-origin (this mirrors
+        # the live-validated path).
+        try:
+            await page.goto(
+                f"{PJUD_BASE_URL}/indexN.php",
+                wait_until="domcontentloaded",
+                timeout=20000,
+            )
+        except Exception as exc:  # noqa: BLE001 — navigation hiccup must not block the fetch
+            logger.warning("download_document_generic: pre-fetch navigation failed: %s", exc)
+
         # Use the browser's authenticated cookies via credentials:'include'.
         # Returns a plain object so we can detect expiry before reading bytes.
         js = r"""
