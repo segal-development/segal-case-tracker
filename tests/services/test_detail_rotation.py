@@ -534,23 +534,20 @@ class TestMarkDetailCheckedAt:
         assert litigante_count == 0, f"partial litigante rows were committed: {litigante_count} rows found"
 
     @pytest.mark.asyncio
-    async def test_any_exception_advances_timestamp__known_gap_slice2(self, db):
-        """KNOWN GAP (to be fixed in Slice 2): ANY exception advances last_detail_checked_at.
+    async def test_session_error_does_not_advance_timestamp__slice2(self, db):
+        """Slice 2: SessionExpiredError does NOT advance last_detail_checked_at.
 
-        Current behavior: the except block advances last_detail_checked_at unconditionally
-        for ALL exception types, including ones that should be treated as session errors
-        (e.g., authentication timeouts, connection resets).
+        Session failure is not the case's fault — the PJUD session must be
+        refreshed first.  The rotation position is preserved so the case is
+        retried with a fresh session on the next scheduled run.
 
-        Slice 2 will distinguish case-specific errors (should advance) from session-level
-        errors (should NOT advance — the PJUD session must be refreshed first, and the
-        case should be retried with a fresh session rather than silently skipped).
-
-        This test pins the CURRENT behavior as the regression target so Slice 2 has a
-        clear signal to update.  When Slice 2 lands, update or remove this test.
+        Contrast with test_timestamp_advances_on_case_specific_error, where a
+        case-specific (non-session) exception DOES advance the timestamp.
         """
         from app.services.sync_service import detect_and_sync_movements
+        from app.scrapper.pjud.exceptions import SessionExpiredError
 
-        lawyer = Lawyer(rut="10000006-6", name="Lawyer KnownGap", is_active=True)
+        lawyer = Lawyer(rut="10000006-6", name="Lawyer SessionGap", is_active=True)
         db.add(lawyer)
         db.flush()
         court = Court(code="GAP-COURT", name="Gap Court", region="RM", type="civil")
@@ -565,12 +562,11 @@ class TestMarkDetailCheckedAt:
 
         api_case = _make_api_case("C-GAP-1", "token-gap")
         mock_scraper = MagicMock()
-        # Simulate a generic exception that LOOKS like a session error
+        # Raise a real SessionExpiredError (not a generic Exception)
         mock_scraper.get_case_detail = AsyncMock(
-            side_effect=Exception("ConnectionError: PJUD session expired")
+            side_effect=SessionExpiredError("session expired")
         )
 
-        before = datetime.utcnow()
         movements_new, alerts_created, errors = await detect_and_sync_movements(
             db=db,
             scraper=mock_scraper,
@@ -578,16 +574,16 @@ class TestMarkDetailCheckedAt:
             lawyer_id=lawyer.id,
             api_cases=[api_case],
             selected_cases=[api_case],
+            # reauth_callback=None → batch stops gracefully after session error
         )
-        after = datetime.utcnow()
 
         db.refresh(case)
-        # CURRENT behavior: timestamp IS advanced (known gap — should NOT advance for session errors)
-        assert case.last_detail_checked_at is not None, (
-            "KNOWN GAP: session-error should not advance timestamp (fix in Slice 2)"
+        # Slice 2 behavior: session error must NOT advance the timestamp
+        assert case.last_detail_checked_at is None, (
+            "SessionExpiredError must NOT advance last_detail_checked_at "
+            "(session failure is not the case's fault)"
         )
-        assert before <= case.last_detail_checked_at <= after
-        assert len(errors) == 1
+        assert len(errors) == 1, "error should be captured (batch stopped)"
 
     @pytest.mark.asyncio
     async def test_case_specific_error_does_not_starve_next_run(self, db):
@@ -645,3 +641,231 @@ class TestMarkDetailCheckedAt:
         assert before <= case_fail.last_detail_checked_at <= after
         assert before <= case_ok.last_detail_checked_at <= after
         assert len(errors) == 1  # only the failing case
+
+
+# ===========================================================================
+# S2-T1: TestReauthMidBatch — Slice 2 re-auth and session-expiry handling
+# ===========================================================================
+
+class TestReauthMidBatch:
+    """detect_and_sync_movements re-auth callback + SessionExpiredError handling.
+
+    All tests use @pytest.mark.slice2 so they can be run in isolation during
+    Slice 2 development and excluded when verifying Slice 1 regressions.
+    """
+
+    @pytest.mark.slice2
+    @pytest.mark.asyncio
+    async def test_reauth_succeeds_case_is_retried(self, db):
+        """SessionExpiredError triggers reauth_callback; retry succeeds; timestamp advanced."""
+        from app.services.sync_service import detect_and_sync_movements
+        from app.scrapper.pjud.exceptions import SessionExpiredError
+
+        lawyer = Lawyer(rut="20000001-1", name="Lawyer Reauth1", is_active=True)
+        db.add(lawyer)
+        db.flush()
+        court = Court(code="REAUTH-COURT1", name="Reauth Court 1", region="RM", type="civil")
+        db.add(court)
+        db.flush()
+        case = Case(
+            lawyer_id=lawyer.id, court_id=court.id, rol="C-REAUTH-1", competencia="civil",
+            status="active", last_detail_checked_at=None,
+        )
+        db.add(case)
+        db.commit()
+
+        api_case = _make_api_case("C-REAUTH-1", "token-reauth-1")
+
+        # First call raises SessionExpiredError; second succeeds
+        mock_scraper = MagicMock()
+        mock_scraper.get_case_detail = AsyncMock(
+            side_effect=[SessionExpiredError("expired"), _make_detail_empty()]
+        )
+
+        fresh_session = MagicMock()
+        reauth_callback = AsyncMock(return_value=fresh_session)
+
+        before = datetime.utcnow()
+        movements_new, alerts_created, errors = await detect_and_sync_movements(
+            db=db,
+            scraper=mock_scraper,
+            pjud_session=MagicMock(),
+            lawyer_id=lawyer.id,
+            api_cases=[api_case],
+            selected_cases=[api_case],
+            reauth_callback=reauth_callback,
+        )
+        after = datetime.utcnow()
+
+        # Scraper called twice: initial attempt + retry after reauth
+        assert mock_scraper.get_case_detail.await_count == 2, (
+            "expected 2 scraper calls: initial SessionExpiredError + retry after reauth"
+        )
+        # reauth_callback called exactly once
+        reauth_callback.assert_awaited_once()
+        # No unhandled exception; no error entries
+        assert errors == [], f"unexpected errors: {errors}"
+        # Retry succeeded — timestamp advanced
+        db.refresh(case)
+        assert case.last_detail_checked_at is not None, "retry success must advance timestamp"
+        assert before <= case.last_detail_checked_at <= after
+
+    @pytest.mark.slice2
+    @pytest.mark.asyncio
+    async def test_reauth_fails_batch_stops_gracefully(self, db):
+        """reauth_callback raises → batch stops; no unhandled exception; case_b untouched."""
+        from app.services.sync_service import detect_and_sync_movements
+        from app.scrapper.pjud.exceptions import SessionExpiredError
+
+        lawyer = Lawyer(rut="20000002-2", name="Lawyer Reauth2", is_active=True)
+        db.add(lawyer)
+        db.flush()
+        court = Court(code="REAUTH-COURT2", name="Reauth Court 2", region="RM", type="civil")
+        db.add(court)
+        db.flush()
+        case_a = Case(
+            lawyer_id=lawyer.id, court_id=court.id, rol="C-REAUTH-A", competencia="civil",
+            status="active", last_detail_checked_at=None,
+        )
+        case_b = Case(
+            lawyer_id=lawyer.id, court_id=court.id, rol="C-REAUTH-B", competencia="civil",
+            status="active", last_detail_checked_at=None,
+        )
+        db.add_all([case_a, case_b])
+        db.commit()
+
+        api_a = _make_api_case("C-REAUTH-A", "token-a")
+        api_b = _make_api_case("C-REAUTH-B", "token-b")
+
+        mock_scraper = MagicMock()
+        # Always raises SessionExpiredError
+        mock_scraper.get_case_detail = AsyncMock(side_effect=SessionExpiredError("expired"))
+
+        # reauth_callback raises — re-auth failure
+        failing_reauth = AsyncMock(side_effect=RuntimeError("reauth_failed"))
+
+        movements_new, alerts_created, errors = await detect_and_sync_movements(
+            db=db,
+            scraper=mock_scraper,
+            pjud_session=MagicMock(),
+            lawyer_id=lawyer.id,
+            api_cases=[api_a, api_b],
+            selected_cases=[api_a, api_b],
+            reauth_callback=failing_reauth,
+        )
+
+        # No unhandled exception (function returns normally)
+        # Only case_a was attempted (scraper called once, then batch stopped)
+        assert mock_scraper.get_case_detail.await_count == 1, (
+            "batch must stop after first session error + failed reauth"
+        )
+        # case_a timestamp NOT advanced (session failure is not the case's fault)
+        db.refresh(case_a)
+        assert case_a.last_detail_checked_at is None, (
+            "case_a timestamp must NOT be advanced when session error + reauth failure"
+        )
+        # case_b was not processed (batch stopped)
+        db.refresh(case_b)
+        assert case_b.last_detail_checked_at is None, "case_b must be untouched (batch stopped)"
+        # Error captured
+        assert len(errors) == 1, "one error entry for the stopped batch"
+
+    @pytest.mark.slice2
+    @pytest.mark.asyncio
+    async def test_reauth_returns_none_batch_stops_gracefully(self, db):
+        """reauth_callback returns None → batch stops; no unhandled exception."""
+        from app.services.sync_service import detect_and_sync_movements
+        from app.scrapper.pjud.exceptions import SessionExpiredError
+
+        lawyer = Lawyer(rut="20000003-3", name="Lawyer Reauth3", is_active=True)
+        db.add(lawyer)
+        db.flush()
+        court = Court(code="REAUTH-COURT3", name="Reauth Court 3", region="RM", type="civil")
+        db.add(court)
+        db.flush()
+        case_a = Case(
+            lawyer_id=lawyer.id, court_id=court.id, rol="C-RTNONE-A", competencia="civil",
+            status="active", last_detail_checked_at=None,
+        )
+        case_b = Case(
+            lawyer_id=lawyer.id, court_id=court.id, rol="C-RTNONE-B", competencia="civil",
+            status="active", last_detail_checked_at=None,
+        )
+        db.add_all([case_a, case_b])
+        db.commit()
+
+        api_a = _make_api_case("C-RTNONE-A", "token-rtnone-a")
+        api_b = _make_api_case("C-RTNONE-B", "token-rtnone-b")
+
+        mock_scraper = MagicMock()
+        mock_scraper.get_case_detail = AsyncMock(side_effect=SessionExpiredError("expired"))
+
+        # reauth_callback returns None — no new session available
+        none_reauth = AsyncMock(return_value=None)
+
+        movements_new, alerts_created, errors = await detect_and_sync_movements(
+            db=db,
+            scraper=mock_scraper,
+            pjud_session=MagicMock(),
+            lawyer_id=lawyer.id,
+            api_cases=[api_a, api_b],
+            selected_cases=[api_a, api_b],
+            reauth_callback=none_reauth,
+        )
+
+        # Batch stops after case_a — scraper called once
+        assert mock_scraper.get_case_detail.await_count == 1, "batch must stop; only case_a attempted"
+        # No unhandled exception; error captured
+        assert len(errors) == 1, "one error entry for the stopped batch"
+        # case_b not processed
+        db.refresh(case_b)
+        assert case_b.last_detail_checked_at is None, "case_b must not be touched (batch stopped)"
+
+    @pytest.mark.slice2
+    @pytest.mark.asyncio
+    async def test_session_error_does_not_advance_timestamp_with_reauth_failure(self, db):
+        """SessionExpiredError + failing reauth → case timestamp is NOT advanced.
+
+        Session failure is not the case's fault.  Even after a reauth attempt
+        that fails, the rotation position (last_detail_checked_at) must be
+        preserved so the case is retried on the next batch with a fresh session.
+        """
+        from app.services.sync_service import detect_and_sync_movements
+        from app.scrapper.pjud.exceptions import SessionExpiredError
+
+        lawyer = Lawyer(rut="20000004-4", name="Lawyer Reauth4", is_active=True)
+        db.add(lawyer)
+        db.flush()
+        court = Court(code="REAUTH-COURT4", name="Reauth Court 4", region="RM", type="civil")
+        db.add(court)
+        db.flush()
+        case = Case(
+            lawyer_id=lawyer.id, court_id=court.id, rol="C-SESSEXP-1", competencia="civil",
+            status="active", last_detail_checked_at=None,
+        )
+        db.add(case)
+        db.commit()
+
+        api_case = _make_api_case("C-SESSEXP-1", "token-sessexp")
+
+        mock_scraper = MagicMock()
+        mock_scraper.get_case_detail = AsyncMock(side_effect=SessionExpiredError("expired"))
+
+        failing_reauth = AsyncMock(side_effect=RuntimeError("credentials unavailable"))
+
+        movements_new, alerts_created, errors = await detect_and_sync_movements(
+            db=db,
+            scraper=mock_scraper,
+            pjud_session=MagicMock(),
+            lawyer_id=lawyer.id,
+            api_cases=[api_case],
+            selected_cases=[api_case],
+            reauth_callback=failing_reauth,
+        )
+
+        db.refresh(case)
+        # INVARIANT: session error must NOT advance last_detail_checked_at
+        assert case.last_detail_checked_at is None, (
+            "SessionExpiredError with failed reauth must NOT advance last_detail_checked_at; "
+            "session failure is not the case's fault"
+        )
