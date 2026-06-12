@@ -7,6 +7,7 @@ Tests:
 - Exhorto parsing from anonymized rich fixture (S1-T05)
 - Notificacion / Escrito parsing from synthetic fixture (S1-T06)
 - _parse_case_detail_html populates all five entity lists (S1-T07)
+- Static document token extraction — 5 types + dtaCert disambiguation + fa-ban (case-documents Slice 1)
 """
 
 import pathlib
@@ -414,3 +415,218 @@ class TestDocTokenAttributeOrderTolerance:
         assert result[0].doc_token == "TOKEN-REVERSED-XYZ", (
             f"doc_token extraction failed for reversed attribute order; got {result[0].doc_token!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# case-documents Slice 1 — S1-T2: Static Document Token Extraction
+# ---------------------------------------------------------------------------
+
+# Fake JWT used for the cert_envio disambiguation slot in the rich fixture.
+_FAKE_CERT_ENVIO_TOKEN = "eyJhbGciOiJub25lIn0.e30.FAKE_CERT_ENVIO"
+
+
+class TestStaticDocumentTokenExtraction:
+    """Tests for the 5 static document token types and disambiguation logic.
+
+    Depends on:
+    - detail_civil_rich.html: all 5 token types present (cert_envio has the fake JWT)
+    - detail_civil_synthetic.html: cert_envio slot has fa-ban, no form
+    """
+
+    def test_all_five_static_token_types_parsed(
+        self, scraper: CivilScraper, rich_html: str
+    ) -> None:
+        """Rich fixture: texto_demanda, cert_envio, ebook and a docuS movement token all non-null."""
+        detail = scraper._parse_case_detail_html(rich_html, "fake-token")
+
+        texto_demanda_doc = next(
+            (d for d in detail.case_documents if d.doc_type == "texto_demanda"), None
+        )
+        cert_envio_doc = next(
+            (d for d in detail.case_documents if d.doc_type == "cert_envio"), None
+        )
+        ebook_doc = next(
+            (d for d in detail.case_documents if d.doc_type == "ebook"), None
+        )
+
+        assert texto_demanda_doc is not None, "texto_demanda doc must be parsed"
+        assert texto_demanda_doc.token is not None
+        assert cert_envio_doc is not None, "cert_envio doc must be parsed"
+        assert cert_envio_doc.token is not None
+        assert ebook_doc is not None, "ebook doc must be parsed"
+        assert ebook_doc.token is not None
+
+        # At least one movement must have a document token
+        assert any(m.documento_token is not None for m in detail.movements), (
+            "At least one movement must have a document token"
+        )
+
+    def test_dtaCert_disambiguation_by_endpoint(
+        self, scraper: CivilScraper, rich_html: str
+    ) -> None:
+        """escrito_cert (docCertificadoEscrito.php) and cert_envio (docCertificadoDemanda.php)
+        must not be confused: same param name dtaCert, different form action."""
+        detail = scraper._parse_case_detail_html(rich_html, "fake-token")
+
+        # cert_envio comes from case-level docCertificadoDemanda.php form
+        cert_envio_doc = next(
+            (d for d in detail.case_documents if d.doc_type == "cert_envio"), None
+        )
+        assert cert_envio_doc is not None
+        assert cert_envio_doc.token == _FAKE_CERT_ENVIO_TOKEN
+
+        # escrito_cert comes from movement-level docCertificadoEscrito.php form
+        # At least one movement should have an escrito_cert document
+        escrito_cert_docs = [
+            doc
+            for m in detail.movements
+            for doc in m.documentos
+            if doc.doc_type == "escrito_cert"
+        ]
+        assert len(escrito_cert_docs) > 0, (
+            "Rich fixture must have at least one escrito_cert in movements"
+        )
+        # Tokens must differ — different form actions produce different tokens
+        assert escrito_cert_docs[0].token != cert_envio_doc.token
+
+    def test_fa_ban_yields_none_without_exception(
+        self, scraper: CivilScraper, synthetic_html: str
+    ) -> None:
+        """Synthetic fixture: cert_envio has fa-ban → available=False, token=None, no exception."""
+        detail = scraper._parse_case_detail_html(synthetic_html, "fake-token")
+
+        cert_envio_doc = next(
+            (d for d in detail.case_documents if d.doc_type == "cert_envio"), None
+        )
+        assert cert_envio_doc is not None, (
+            "cert_envio must be present even when fa-ban is shown (unavailable doc)"
+        )
+        assert cert_envio_doc.token is None
+        assert cert_envio_doc.available is False
+
+    def test_missing_form_yields_none_without_exception(
+        self, scraper: CivilScraper
+    ) -> None:
+        """HTML with neither form nor fa-ban for cert_envio → no cert_envio doc, no exception."""
+        # Minimal valid HTML with correct ROL but no cert_envio form or icon
+        html = """
+        <div>
+          <strong>ROL:</strong> C-0001-2099
+          <strong>F. Ing.:</strong> 01/01/2026
+          <table class="table table-responsive table-titulos">
+            <tbody>
+              <tr>
+                <td><strong>Texto Demanda:</strong></td>
+                <td><strong>Anexos de la causa:</strong></td>
+                <td><strong>Certificado de Envío:</strong><br><!-- empty slot --></td>
+                <td id="boton"><strong>Ebook:</strong></td>
+              </tr>
+            </tbody>
+          </table>
+          <div id="historiaCiv">
+            <table class="table table-bordered table-striped table-hover">
+              <thead><tr><th>Folio</th><th>Doc.</th><th>Anexo</th><th>Etapa</th><th>Trámite</th>
+              <th>Desc.</th><th>Fecha</th><th>Foja</th><th>Geo</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+        """
+        detail = scraper._parse_case_detail_html(html, "fake-token")
+
+        cert_envio_doc = next(
+            (d for d in detail.case_documents if d.doc_type == "cert_envio"), None
+        )
+        assert cert_envio_doc is None, (
+            "No cert_envio doc expected when neither form nor fa-ban is present"
+        )
+
+    def test_texto_demanda_fa_ban_yields_unavailable(
+        self, scraper: CivilScraper
+    ) -> None:
+        """FIX 6: texto_demanda with fa-ban → PJUDDocument(available=False, token=None).
+
+        Previously texto_demanda with fa-ban yielded None (slot silently absent),
+        making it impossible to distinguish 'never seen' from 'seen-unavailable'.
+        After the fix, both texto_demanda and ebook behave consistently with cert_envio.
+        """
+        html = """
+        <div>
+          <strong>ROL:</strong> C-0001-2099
+          <strong>F. Ing.:</strong> 01/01/2026
+          <table class="table table-responsive table-titulos">
+            <tbody>
+              <tr>
+                <td>
+                  <strong>Texto Demanda:</strong>
+                  <br>
+                  <i class="fas fa-ban fa-lg" aria-hidden="true" style="color:#660000;"></i>
+                </td>
+                <td><strong>Certificado de Envío:</strong></td>
+                <td id="boton"><strong>Ebook:</strong></td>
+              </tr>
+            </tbody>
+          </table>
+          <div id="historiaCiv">
+            <table class="table table-bordered table-striped table-hover">
+              <thead><tr><th>Folio</th><th>Doc.</th><th>Anexo</th><th>Etapa</th><th>Trámite</th>
+              <th>Desc.</th><th>Fecha</th><th>Foja</th><th>Geo</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+        """
+        detail = scraper._parse_case_detail_html(html, "fake-token")
+
+        texto_demanda_doc = next(
+            (d for d in detail.case_documents if d.doc_type == "texto_demanda"), None
+        )
+        assert texto_demanda_doc is not None, (
+            "texto_demanda must be present as unavailable when fa-ban is shown"
+        )
+        assert texto_demanda_doc.token is None
+        assert texto_demanda_doc.available is False
+
+    def test_ebook_fa_ban_yields_unavailable(
+        self, scraper: CivilScraper
+    ) -> None:
+        """FIX 6: ebook with fa-ban → PJUDDocument(available=False, token=None).
+
+        Symmetric with cert_envio and texto_demanda fa-ban handling.
+        """
+        html = """
+        <div>
+          <strong>ROL:</strong> C-0001-2099
+          <strong>F. Ing.:</strong> 01/01/2026
+          <table class="table table-responsive table-titulos">
+            <tbody>
+              <tr>
+                <td><strong>Texto Demanda:</strong></td>
+                <td><strong>Certificado de Envío:</strong></td>
+                <td id="boton">
+                  <strong>Ebook:</strong>
+                  <br>
+                  <i class="fas fa-ban fa-lg" aria-hidden="true" style="color:#660000;"></i>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+          <div id="historiaCiv">
+            <table class="table table-bordered table-striped table-hover">
+              <thead><tr><th>Folio</th><th>Doc.</th><th>Anexo</th><th>Etapa</th><th>Trámite</th>
+              <th>Desc.</th><th>Fecha</th><th>Foja</th><th>Geo</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+        """
+        detail = scraper._parse_case_detail_html(html, "fake-token")
+
+        ebook_doc = next(
+            (d for d in detail.case_documents if d.doc_type == "ebook"), None
+        )
+        assert ebook_doc is not None, (
+            "ebook must be present as unavailable when fa-ban is shown"
+        )
+        assert ebook_doc.token is None
+        assert ebook_doc.available is False

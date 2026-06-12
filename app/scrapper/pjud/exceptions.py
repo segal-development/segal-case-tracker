@@ -74,6 +74,15 @@ class RateLimitError(PJUDError):
         self.wait_time = wait_time
 
 
+class DocumentTokenExpiredError(PJUDError):
+    """Raised when a document JWT token has expired or is no longer valid.
+
+    The API layer maps this to HTTP 410 Gone — caller should re-sync the case
+    to obtain a fresh token.
+    """
+    pass
+
+
 class SessionNotAuthenticatedError(PJUDError):
     """Raised when session restoration did not produce an authenticated PJUD page.
 

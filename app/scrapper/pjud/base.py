@@ -79,11 +79,17 @@ class PJUDCase:
 
 @dataclass
 class PJUDDocument:
-    """Document attached to a movement."""
-    token: str                        # JWT token for download
-    tipo: str                         # "principal", "anexo"
-    url_type: str                     # "docuS" (resolucion), "docuN" (escrito)
+    """Document attached to a movement or case-level slot."""
+    token: Optional[str]              # JWT token for download; None when unavailable (fa-ban)
+    tipo: str                         # "principal", "anexo", "caso", "cert"
+    url_type: str                     # "docuS", "docuN", "texto_demanda", "cert_envio", etc.
     descripcion: Optional[str] = None
+    # Fields added for case-documents Slice 1 (all backward-compatible defaults)
+    doc_type: Optional[str] = None    # Normalized type: "resolution", "escrito_doc", "escrito_cert",
+                                      # "texto_demanda", "cert_envio", "ebook"
+    endpoint: Optional[str] = None   # PHP endpoint, e.g. "documentos/docuS.php"
+    param_name: Optional[str] = None # Query param, e.g. "dtaDoc", "dtaCert", "dtaEbook"
+    available: bool = True           # False when fa-ban icon present (doc not available from PJUD)
 
 
 @dataclass
@@ -167,6 +173,8 @@ class PJUDCaseDetail:
     notificaciones: List[PJUDNotificacion] = field(default_factory=list)
     escritos: List[PJUDEscrito] = field(default_factory=list)
     exhortos: List[PJUDExhorto] = field(default_factory=list)
+    # case-documents Slice 1: case-level static doc tokens (texto_demanda, cert_envio, ebook)
+    case_documents: List[PJUDDocument] = field(default_factory=list)
 
 
 @dataclass

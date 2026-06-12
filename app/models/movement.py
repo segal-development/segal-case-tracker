@@ -24,6 +24,9 @@ class Movement(Base):
     
     # Document link if available
     document_url = Column(String(1024), nullable=True)
+    # Slice 1 bug fix: primary document JWT, denormalized for quick access.
+    # Was silently dropped after parsing; now persisted in sync flow.
+    document_token = Column(Text, nullable=True)
     
     # PJUD specific
     pjud_movement_id = Column(String(100), nullable=True)

@@ -1,0 +1,228 @@
+"""Document endpoints.
+
+GET /api/v1/documents/{document_id}
+    Redirect (307) to a signed URL when the document is stored.
+    Returns 404 if the document does not exist or is not yet stored.
+
+GET /api/v1/documents/{document_id}/download
+    Serve document bytes.
+    - Primary path: if doc.status == "stored", retrieve bytes from StorageService
+      directly — no PJUD call, no session required.
+    - Fallback path: if not stored and an active PJUD session is available,
+      download live from PJUD (pre-Slice-2 behaviour, kept for graceful degradation).
+    - Returns 409 if not stored and no session is available.
+"""
+
+import logging
+from typing import AsyncIterator
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import RedirectResponse, StreamingResponse
+from sqlalchemy.orm import Session
+
+from app.api.deps import get_current_lawyer, get_db
+from app.config import settings
+from app.models.document import Document
+from app.models.case import Case
+from app.scrapper.pjud.civil import CivilScraper
+from app.scrapper.pjud.browser import BrowserFactory
+from app.scrapper.pjud.exceptions import DocumentTokenExpiredError, ScrapingError
+from app.services.session_store import get_session_store
+from app.services.storage_service import StorageService, get_storage_backend
+
+router = APIRouter()
+_logger = logging.getLogger(__name__)
+
+
+def _pdf_stream(data: bytes) -> AsyncIterator[bytes]:
+    """Wrap bytes in a one-shot async iterator for StreamingResponse."""
+    async def _gen():
+        yield data
+    return _gen()
+
+
+def _get_storage_service() -> StorageService:
+    """Dependency: return a StorageService backed by the configured backend."""
+    return StorageService(get_storage_backend(settings))
+
+
+# ---------------------------------------------------------------------------
+# GET /{document_id} — redirect to signed URL
+# ---------------------------------------------------------------------------
+
+@router.get("/{document_id}")
+async def get_document_redirect(
+    document_id: int,
+    current_lawyer: dict = Depends(get_current_lawyer),
+    db: Session = Depends(get_db),
+    storage_svc: StorageService = Depends(_get_storage_service),
+):
+    """Redirect to a signed URL for a stored document.
+
+    Returns:
+        307 Temporary Redirect — ``Location`` header points to the signed URL.
+
+    Raises:
+        404 — document not found, not owned by caller, or not yet stored.
+    """
+    lawyer_id = current_lawyer.get("sub") or current_lawyer.get("lawyer_id")
+
+    doc = (
+        db.query(Document)
+        .join(Case, Case.id == Document.case_id)
+        .filter(
+            Document.id == document_id,
+            Case.lawyer_id == lawyer_id,
+        )
+        .first()
+    )
+    if not doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+    if doc.status != "stored" or not doc.gcs_path:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not yet stored — re-sync to download",
+        )
+
+    url = storage_svc.signed_url(doc, settings.GCS_SIGNED_URL_TTL)
+    if not url:
+        raise HTTPException(status_code=500, detail="Could not generate signed URL")
+
+    return RedirectResponse(url=url, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+
+
+# ---------------------------------------------------------------------------
+# GET /{document_id}/download — storage-first, PJUD fallback
+# ---------------------------------------------------------------------------
+
+@router.get("/{document_id}/download")
+async def download_document(
+    document_id: int,
+    current_lawyer: dict = Depends(get_current_lawyer),
+    db: Session = Depends(get_db),
+    storage_svc: StorageService = Depends(_get_storage_service),
+):
+    """Stream a document PDF to the caller.
+
+    Primary path (no session required):
+        When ``doc.status == "stored"`` and ``doc.gcs_path`` is set, the bytes
+        are retrieved from StorageService and streamed directly.  No PJUD call
+        is made.
+
+    Fallback path (session required):
+        When the document is not yet stored, the endpoint falls back to a live
+        PJUD download using the authenticated browser session stored in Redis.
+        This preserves the pre-Slice-2 behavior for documents that have not
+        been downloaded during sync yet.
+
+    Error codes:
+        404 — document not found or not owned by the authenticated lawyer.
+        409 — document not stored AND no active PJUD session available.
+        410 — document token expired; re-sync the case to refresh tokens.
+        500 — unexpected download failure.
+    """
+    lawyer_id = current_lawyer.get("sub") or current_lawyer.get("lawyer_id")
+    if not lawyer_id:
+        raise HTTPException(status_code=401, detail="Invalid token: no lawyer_id")
+
+    # ── 1. Load document and verify ownership ──────────────────────────────
+    doc = (
+        db.query(Document)
+        .join(Case, Case.id == Document.case_id)
+        .filter(
+            Document.id == document_id,
+            Case.lawyer_id == lawyer_id,
+        )
+        .first()
+    )
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found",
+        )
+
+    # ── 2. Primary path: serve from storage ──────────────────────────────
+    if doc.status == "stored" and doc.gcs_path:
+        try:
+            pdf_bytes = storage_svc.retrieve(doc.gcs_path)
+            safe_name = (doc.filename or f"document_{document_id}").replace(" ", "_")
+            if not safe_name.endswith(".pdf"):
+                safe_name += ".pdf"
+            return StreamingResponse(
+                _pdf_stream(pdf_bytes),
+                media_type="application/pdf",
+                headers={"Content-Disposition": f"inline; filename={safe_name}"},
+            )
+        except Exception as exc:
+            # FIX 5: do NOT fall through to PJUD for a doc marked "stored".
+            # A re-sync cannot restore a file that is missing from storage.
+            # Return 503 so the caller knows the storage layer is unavailable.
+            _logger.error(
+                "doc %s is marked stored but storage retrieval failed (%s): %s",
+                document_id,
+                doc.gcs_path,
+                exc,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Document storage unavailable — contact support",
+            )
+
+    # ── 3. Fallback: live PJUD download ───────────────────────────────────
+    if not doc.pjud_endpoint or not doc.pjud_token:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Document has no PJUD token — re-sync the case first",
+        )
+
+    try:
+        lawyer_id_int = int(lawyer_id)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="Invalid lawyer_id in token")
+
+    pjud_session = await get_session_store().get_session_by_lawyer(lawyer_id_int)
+    if not pjud_session:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="No active PJUD session — login again",
+        )
+
+    try:
+        async with BrowserFactory() as factory:
+            page = await factory.new_page(pjud_session)
+
+            scraper = CivilScraper()
+            scraper._page = page
+            scraper._browser = factory._browser
+            scraper._context = factory._context
+
+            pdf_bytes = await scraper.download_document_generic(
+                session=pjud_session,
+                endpoint=doc.pjud_endpoint,
+                doc_type=doc.doc_type or "resolution",
+                token=doc.pjud_token,
+            )
+
+    except DocumentTokenExpiredError as exc:
+        _logger.warning("Document %s token expired: %s", document_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="Document token expired — re-sync the case",
+        )
+    except ScrapingError as exc:
+        _logger.error("Scraping error for document %s: %s", document_id, exc)
+        raise HTTPException(status_code=500, detail=f"Download failed: {exc}")
+    except Exception as exc:
+        _logger.error("Unexpected error for document %s: %s", document_id, exc)
+        raise HTTPException(status_code=500, detail="Unexpected download error")
+
+    safe_name = (doc.filename or f"document_{document_id}").replace(" ", "_")
+    if not safe_name.endswith(".pdf"):
+        safe_name += ".pdf"
+
+    return StreamingResponse(
+        _pdf_stream(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"inline; filename={safe_name}"},
+    )
