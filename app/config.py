@@ -80,6 +80,13 @@ class Settings(BaseSettings):
     PJUD_METRICS_ENABLED: bool = True       # Enable/disable metrics collection
     PJUD_ALERTS_ENABLED: bool = True        # Enable/disable alert webhooks
 
+    # Document storage (Slice 2)
+    DOC_STORAGE_BACKEND: str = "local"          # "local" or "gcs"
+    DOC_STORAGE_DIR: str = "./storage/documents"  # LocalStorageBackend base dir
+    GCS_BUCKET: str = ""                        # Empty → LocalStorageBackend; set → GCSStorageBackend
+    GCS_SIGNED_URL_TTL: int = 3600              # Signed URL TTL in seconds
+    DOC_DOWNLOAD_ENABLED: bool = False          # Gate: download PDFs during sync
+
     # Notifications
     NOTIFY_MAX_PER_SYNC: int = 25           # Max notifications dispatched per sync_movements call
 
