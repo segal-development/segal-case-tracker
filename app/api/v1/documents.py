@@ -14,7 +14,7 @@ GET /api/v1/documents/{document_id}/download
 """
 
 import logging
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import RedirectResponse, StreamingResponse
@@ -155,13 +155,19 @@ async def download_document(
                 headers={"Content-Disposition": f"inline; filename={safe_name}"},
             )
         except Exception as exc:
-            _logger.warning(
-                "Failed to retrieve doc %s from storage (%s); falling through to PJUD fallback: %s",
+            # FIX 5: do NOT fall through to PJUD for a doc marked "stored".
+            # A re-sync cannot restore a file that is missing from storage.
+            # Return 503 so the caller knows the storage layer is unavailable.
+            _logger.error(
+                "doc %s is marked stored but storage retrieval failed (%s): %s",
                 document_id,
                 doc.gcs_path,
                 exc,
             )
-            # Intentional fall-through to PJUD fallback below
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Document storage unavailable — contact support",
+            )
 
     # ── 3. Fallback: live PJUD download ───────────────────────────────────
     if not doc.pjud_endpoint or not doc.pjud_token:

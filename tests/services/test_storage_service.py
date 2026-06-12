@@ -123,19 +123,23 @@ class TestGCSStorageBackendLazyImport:
 
 class TestStorageService:
     def test_skips_upload_when_backend_exists_is_true(self):
-        """If backend.exists() returns True, backend.upload() must NOT be called."""
+        """If backend.exists() returns True, upload is skipped but doc IS reconciled to stored."""
         from app.services.storage_service import StorageService
 
+        expected_uri = "cases/1/resolution_abc123def456.pdf"
         backend = MagicMock()
         backend.exists.return_value = True
+        backend.uri_for_key.return_value = expected_uri
         svc = StorageService(backend)
 
         doc = _make_doc()
-        doc.gcs_path = "cases/1/resolution_abc123def456.pdf"
 
         svc.upload(doc, b"bytes")
 
         backend.upload.assert_not_called()
+        # FIX 1: doc must be reconciled even when upload was skipped
+        assert doc.status == "stored"
+        assert doc.gcs_path == expected_uri
 
     def test_uploads_and_sets_gcs_path_when_not_exists(self):
         """If backend.exists() returns False, upload bytes and set doc.gcs_path + status."""
@@ -185,23 +189,77 @@ class TestStorageService:
 # ---------------------------------------------------------------------------
 
 class TestGetStorageBackendFactory:
-    def test_returns_local_when_gcs_bucket_empty(self, monkeypatch):
-        """GCS_BUCKET="" → LocalStorageBackend."""
+    def test_returns_local_when_backend_is_local(self, monkeypatch):
+        """DOC_STORAGE_BACKEND='local' → LocalStorageBackend."""
         from app.services.storage_service import LocalStorageBackend, get_storage_backend
 
         settings_mock = MagicMock()
-        settings_mock.GCS_BUCKET = ""
+        settings_mock.DOC_STORAGE_BACKEND = "local"
         settings_mock.DOC_STORAGE_DIR = "./storage/documents"
 
         result = get_storage_backend(settings_mock)
         assert isinstance(result, LocalStorageBackend)
 
-    def test_returns_gcs_when_gcs_bucket_set(self, monkeypatch):
-        """GCS_BUCKET set → GCSStorageBackend (construction must not touch google.cloud)."""
+    def test_returns_gcs_when_backend_is_gcs_and_bucket_set(self, monkeypatch):
+        """DOC_STORAGE_BACKEND='gcs' + GCS_BUCKET set → GCSStorageBackend."""
         from app.services.storage_service import GCSStorageBackend, get_storage_backend
 
         settings_mock = MagicMock()
+        settings_mock.DOC_STORAGE_BACKEND = "gcs"
         settings_mock.GCS_BUCKET = "my-production-bucket"
 
         result = get_storage_backend(settings_mock)
         assert isinstance(result, GCSStorageBackend)
+
+    def test_gcs_backend_without_bucket_raises_config_error(self, monkeypatch):
+        """DOC_STORAGE_BACKEND='gcs' with empty GCS_BUCKET must raise ValueError."""
+        from app.services.storage_service import get_storage_backend
+
+        settings_mock = MagicMock()
+        settings_mock.DOC_STORAGE_BACKEND = "gcs"
+        settings_mock.GCS_BUCKET = ""
+
+        with pytest.raises(ValueError, match="GCS_BUCKET"):
+            get_storage_backend(settings_mock)
+
+    def test_unknown_backend_falls_back_to_local(self, monkeypatch):
+        """Unrecognised DOC_STORAGE_BACKEND value defaults to LocalStorageBackend."""
+        from app.services.storage_service import LocalStorageBackend, get_storage_backend
+
+        settings_mock = MagicMock()
+        settings_mock.DOC_STORAGE_BACKEND = "s3"  # not supported
+        settings_mock.DOC_STORAGE_DIR = "./storage/documents"
+
+        result = get_storage_backend(settings_mock)
+        assert isinstance(result, LocalStorageBackend)
+
+
+# ---------------------------------------------------------------------------
+# LocalStorageBackend — path traversal guard
+# ---------------------------------------------------------------------------
+
+class TestLocalStorageBackendPathTraversalGuard:
+    def test_upload_rejects_key_that_escapes_base_dir(self, tmp_path):
+        """A key with '..' must not be allowed to write outside the storage root."""
+        from app.services.storage_service import LocalStorageBackend
+
+        backend = LocalStorageBackend(str(tmp_path))
+        with pytest.raises(ValueError, match="escape"):
+            backend.upload(b"evil", "../etc/passwd", "application/pdf")
+
+    def test_upload_rejects_absolute_key(self, tmp_path):
+        """An absolute path key must be rejected."""
+        from app.services.storage_service import LocalStorageBackend
+
+        backend = LocalStorageBackend(str(tmp_path))
+        with pytest.raises((ValueError, OSError)):
+            backend.upload(b"evil", "/tmp/evil.pdf", "application/pdf")
+
+    def test_upload_allows_valid_nested_key(self, tmp_path):
+        """A normal nested key must still work."""
+        from app.services.storage_service import LocalStorageBackend
+
+        backend = LocalStorageBackend(str(tmp_path))
+        key = "cases/99/resolution_aabbcc.pdf"
+        uri = backend.upload(b"data", key, "application/pdf")
+        assert uri == key

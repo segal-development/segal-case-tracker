@@ -1244,11 +1244,14 @@ async def detect_and_sync_movements(
                 if settings.DOC_DOWNLOAD_ENABLED and persisted_docs:
                     from app.services.document_downloader import (
                         DocumentDownloader,
-                        _AsyncSleepLimiter,
+                        AsyncSleepLimiter,  # FIX 8: renamed from _AsyncSleepLimiter
                     )
                     from app.services.storage_service import StorageService, get_storage_backend
 
-                    pending_docs = [d for d in persisted_docs if d.status == "pending"]
+                    # FIX 6: include "failed" docs so transient failures are retried
+                    pending_docs = [
+                        d for d in persisted_docs if d.status in ("pending", "failed")
+                    ]
                     if pending_docs:
                         storage_svc = StorageService(get_storage_backend(settings))
                         await DocumentDownloader().download_and_store(
@@ -1257,7 +1260,7 @@ async def detect_and_sync_movements(
                             pjud_session=pjud_session,
                             db=db,
                             storage_service=storage_svc,
-                            limiter=_AsyncSleepLimiter(delay=0.0),
+                            limiter=AsyncSleepLimiter(delay=0.0),
                             enabled=True,
                         )
 

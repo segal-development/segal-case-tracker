@@ -57,7 +57,19 @@ class LocalStorageBackend:
         self._base_dir = Path(base_dir)
 
     def _path(self, key: str) -> Path:
-        return self._base_dir / key
+        """Return the resolved Path for *key*, rejecting traversal outside base_dir."""
+        target = (self._base_dir / key).resolve()
+        base = self._base_dir.resolve()
+        # FIX 8: guard against ../ or absolute-key escapes
+        if not str(target).startswith(str(base) + "/") and target != base:
+            raise ValueError(
+                f"Storage key {key!r} would escape the storage base directory"
+            )
+        return target
+
+    def uri_for_key(self, key: str) -> str:
+        """Return the storage URI for *key* without performing any I/O."""
+        return key  # Local URI = relative key
 
     def upload(self, data: bytes, key: str, content_type: str = "application/pdf") -> str:
         """Write *data* to disk and return the key as the storage URI."""
@@ -109,11 +121,15 @@ class GCSStorageBackend:
     def _get_bucket(self):
         return self._get_client().bucket(self._bucket_name)
 
+    def uri_for_key(self, key: str) -> str:
+        """Return the gs:// URI for *key* without performing any I/O."""
+        return f"gs://{self._bucket_name}/{key}"
+
     def upload(self, data: bytes, key: str, content_type: str = "application/pdf") -> str:
         """Upload *data* to GCS and return a ``gs://`` URI."""
         blob = self._get_bucket().blob(key)
         blob.upload_from_string(data, content_type=content_type)
-        uri = f"gs://{self._bucket_name}/{key}"
+        uri = self.uri_for_key(key)
         logger.info("GCSStorageBackend: uploaded %d bytes → %s", len(data), uri)
         return uri
 
@@ -163,13 +179,18 @@ class StorageService:
         """Store *data* and update ``doc.gcs_path`` + ``doc.status``.
 
         Does NOT commit — the caller owns the surrounding transaction.
-        Skips silently if the key already exists in the backend.
+        When the key already exists in the backend the upload is skipped, but
+        the Document row is still reconciled to status="stored" with the
+        correct URI so it is never left stuck in "pending".  (FIX 1 — idempotency)
         """
         key = document_storage_key(doc)
         if self._backend.exists(key):
-            logger.debug("StorageService: key already exists, skipping (key=%s)", key)
-            return
-        uri = self._backend.upload(data, key, content_type)
+            logger.debug(
+                "StorageService: key already exists, reconciling doc state (key=%s)", key
+            )
+            uri = self._backend.uri_for_key(key)
+        else:
+            uri = self._backend.upload(data, key, content_type)
         doc.gcs_path = uri
         doc.status = "stored"
 
@@ -196,16 +217,23 @@ class StorageService:
 # ---------------------------------------------------------------------------
 
 def get_storage_backend(settings=None) -> "LocalStorageBackend | GCSStorageBackend":
-    """Return the appropriate backend driven by settings.
+    """Return the appropriate backend driven by ``settings.DOC_STORAGE_BACKEND``.
 
-    - ``settings.GCS_BUCKET`` non-empty → ``GCSStorageBackend``
-      (construction does not import google.cloud.storage).
-    - otherwise → ``LocalStorageBackend`` using ``settings.DOC_STORAGE_DIR``.
+    FIX 2: ``DOC_STORAGE_BACKEND`` is the explicit switch:
+    - ``"gcs"``   → ``GCSStorageBackend``; raises ``ValueError`` if ``GCS_BUCKET`` is empty.
+    - ``"local"`` (or any other value) → ``LocalStorageBackend`` using ``DOC_STORAGE_DIR``.
+
+    Construction does NOT import google.cloud.storage — safe in tests.
     """
     if settings is None:
         from app.config import settings as _settings
         settings = _settings
 
-    if settings.GCS_BUCKET:
+    backend_name = (settings.DOC_STORAGE_BACKEND or "local").lower()
+    if backend_name == "gcs":
+        if not settings.GCS_BUCKET:
+            raise ValueError(
+                "DOC_STORAGE_BACKEND='gcs' requires GCS_BUCKET to be configured"
+            )
         return GCSStorageBackend(settings.GCS_BUCKET)
     return LocalStorageBackend(settings.DOC_STORAGE_DIR)

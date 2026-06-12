@@ -70,7 +70,8 @@ class DocumentDownloader:
             return
 
         for doc in pending_docs:
-            if doc.status != "pending":
+            # FIX 6: retry "failed" docs (transient errors); skip "stored" and "unavailable"
+            if doc.status not in ("pending", "failed"):
                 logger.debug(
                     "DocumentDownloader: skipping doc %s (status=%s)", doc.id, doc.status
                 )
@@ -113,13 +114,14 @@ class DocumentDownloader:
                 db.commit()
 
 
-class _AsyncSleepLimiter:
-    """Minimal rate limiter that yields control without delay.
+class AsyncSleepLimiter:
+    """Minimal rate limiter that always yields control via asyncio.sleep.
 
-    Used in production sync when the scraper already applies its own
-    rate limiting (TokenBucketLimiter).  Injecting this avoids a tight
-    zero-sleep loop while still satisfying the protocol expected by
-    DocumentDownloader.
+    FIX 7: ``asyncio.sleep(0)`` is called even when *delay* is zero so that
+    the event loop always gets a chance to run other tasks (no tight loops).
+
+    FIX 8: renamed from ``_AsyncSleepLimiter`` (public name — imported across
+    module boundaries from sync_service).
     """
 
     def __init__(self, delay: float = 0.0) -> None:
@@ -127,5 +129,4 @@ class _AsyncSleepLimiter:
 
     async def wait(self) -> None:
         import asyncio
-        if self._delay > 0:
-            await asyncio.sleep(self._delay)
+        await asyncio.sleep(self._delay)  # FIX 7: always yield, even when delay=0

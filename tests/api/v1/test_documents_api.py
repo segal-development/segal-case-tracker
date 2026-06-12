@@ -120,6 +120,7 @@ def authed_client(client, lawyer):
 
     app.dependency_overrides[get_current_lawyer] = _mock_lawyer
     yield client
+    app.dependency_overrides.pop(get_current_lawyer, None)  # FIX 4: avoid leaking into other tests
 
 
 # ---------------------------------------------------------------------------
@@ -247,3 +248,28 @@ class TestDownloadDocumentFromStorage:
         assert resp.content == _FAKE_PDF
         # Scraper WAS called for the live fallback
         mock_scraper.download_document_generic.assert_called_once()
+
+
+class TestDownloadDocumentStorageFailure:
+    def test_stored_doc_with_storage_error_returns_503_not_pjud(
+        self, authed_client, stored_document
+    ):
+        """FIX 5: a stored doc whose storage retrieve raises must return 503; scraper must NOT run."""
+        with (
+            patch(
+                "app.api.v1.documents.StorageService.retrieve",
+                side_effect=OSError("disk read failed"),
+            ),
+            patch("app.api.v1.documents.get_session_store") as mock_store,
+            patch("app.api.v1.documents.BrowserFactory") as mock_factory,
+            patch("app.api.v1.documents.CivilScraper") as mock_scraper_cls,
+        ):
+            resp = authed_client.get(
+                f"/api/v1/documents/{stored_document.id}/download"
+            )
+
+        assert resp.status_code == 503
+        # PJUD fallback must NOT have been invoked
+        mock_store.assert_not_called()
+        mock_factory.assert_not_called()
+        mock_scraper_cls.assert_not_called()

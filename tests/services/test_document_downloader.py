@@ -134,7 +134,7 @@ class TestDocumentDownloaderRateLimiter:
             enabled=True,
         )
 
-        assert limiter.wait.call_count >= 1
+        assert limiter.wait.call_count == 2  # FIX 3: exactly once per pending doc
 
 
 # ---------------------------------------------------------------------------
@@ -203,3 +203,84 @@ class TestDocumentDownloaderEnabledGate:
         )
 
         scraper.download_document_generic.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Retry failed docs (FIX 6)
+# ---------------------------------------------------------------------------
+
+class TestDocumentDownloaderRetryFailed:
+    @pytest.mark.asyncio
+    async def test_failed_doc_is_retried_on_next_call(self):
+        """A doc with status='failed' must be retried and can become stored."""
+        doc = _make_pending_doc(1)
+        doc.status = "failed"  # simulate a previous failed attempt
+
+        scraper = _make_scraper([b"%PDF retry content"])
+        db = MagicMock()
+        storage_svc = _make_storage_svc()
+        limiter = _make_limiter()
+
+        from app.services.document_downloader import DocumentDownloader
+        await DocumentDownloader().download_and_store(
+            pending_docs=[doc],
+            scraper=scraper,
+            pjud_session=MagicMock(),
+            db=db,
+            storage_service=storage_svc,
+            limiter=limiter,
+            enabled=True,
+        )
+
+        storage_svc.upload.assert_called_once_with(doc, b"%PDF retry content")
+
+    @pytest.mark.asyncio
+    async def test_unavailable_doc_is_never_retried(self):
+        """A doc with status='unavailable' must NOT be retried (terminal state)."""
+        doc = _make_pending_doc(1)
+        doc.status = "unavailable"
+        scraper = MagicMock()
+        scraper.download_document_generic = AsyncMock()
+
+        from app.services.document_downloader import DocumentDownloader
+        await DocumentDownloader().download_and_store(
+            pending_docs=[doc],
+            scraper=scraper,
+            pjud_session=MagicMock(),
+            db=MagicMock(),
+            storage_service=_make_storage_svc(),
+            limiter=_make_limiter(),
+            enabled=True,
+        )
+
+        scraper.download_document_generic.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# AsyncSleepLimiter always yields (FIX 7 + FIX 8 rename)
+# ---------------------------------------------------------------------------
+
+class TestAsyncSleepLimiter:
+    @pytest.mark.asyncio
+    async def test_limiter_always_awaits_even_with_zero_delay(self):
+        """AsyncSleepLimiter must call asyncio.sleep even when delay=0."""
+        from unittest.mock import AsyncMock, patch
+        from app.services.document_downloader import AsyncSleepLimiter
+
+        limiter = AsyncSleepLimiter(delay=0.0)
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            await limiter.wait()
+
+        mock_sleep.assert_called_once_with(0.0)
+
+    @pytest.mark.asyncio
+    async def test_limiter_awaits_with_positive_delay(self):
+        """AsyncSleepLimiter must call asyncio.sleep with the configured delay."""
+        from unittest.mock import AsyncMock, patch
+        from app.services.document_downloader import AsyncSleepLimiter
+
+        limiter = AsyncSleepLimiter(delay=0.5)
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            await limiter.wait()
+
+        mock_sleep.assert_called_once_with(0.5)
