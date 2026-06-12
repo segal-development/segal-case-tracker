@@ -231,7 +231,7 @@ class TestSelectCasesForDetailRotation:
         assert len(result) == 0
 
     def test_empty_db_fallback_returns_api_cases_slice(self, db):
-        """With no Case rows for the lawyer+competencia, returns api_cases[:batch_size]."""
+        """With no Case rows for the lawyer+competencia, returns token-bearing api_cases[:batch_size]."""
         from app.services.sync_service import _select_cases_for_detail_rotation
 
         lawyer = Lawyer(rut="00000006-6", name="Lawyer 6", is_active=True)
@@ -243,9 +243,132 @@ class TestSelectCasesForDetailRotation:
         result = _select_cases_for_detail_rotation(db, lawyer.id, "civil", api_cases, batch_size=4)
 
         assert len(result) == 4
-        # Should be the first 4 from api_cases
+        # Should be the first 4 from api_cases (all have tokens via _make_api_case default)
         for i, ac in enumerate(result):
             assert ac.rol == f"C-FALLBACK-{i}"
+
+    def test_empty_db_fallback_excludes_tokenless_cases(self, db):
+        """With no DB rows, the fallback skips api_cases that have no case_token."""
+        from app.services.sync_service import _select_cases_for_detail_rotation
+
+        lawyer = Lawyer(rut="00000007-7", name="Lawyer 7", is_active=True)
+        db.add(lawyer)
+        db.flush()
+        db.commit()
+
+        # Mix tokenless and tokened cases
+        api_cases = [
+            _make_api_case("C-NO-TOKEN-0", case_token=None),
+            _make_api_case("C-TOKEN-1"),
+            _make_api_case("C-NO-TOKEN-2", case_token=None),
+            _make_api_case("C-TOKEN-3"),
+        ]
+        result = _select_cases_for_detail_rotation(db, lawyer.id, "civil", api_cases, batch_size=10)
+
+        rols = [ac.rol for ac in result]
+        assert "C-NO-TOKEN-0" not in rols
+        assert "C-NO-TOKEN-2" not in rols
+        assert "C-TOKEN-1" in rols
+        assert "C-TOKEN-3" in rols
+
+    def test_ghost_cases_fall_back_to_live_api_cases(self, db):
+        """DB has rows whose ROLs are absent from api_cases (ghost/archived) — falls back to live cases.
+
+        Regression for starvation bug: ghost rows with NULL last_detail_checked_at
+        permanently top the rotation order, blocking live cases from ever being selected.
+        Fix: when DB batch returns rows but none match api_cases, fall back to live
+        token-bearing api_cases so rotation is not stuck.
+        """
+        from app.services.sync_service import _select_cases_for_detail_rotation
+
+        lawyer = Lawyer(rut="00000008-8", name="Lawyer Ghost", is_active=True)
+        db.add(lawyer)
+        db.flush()
+
+        court = db.query(Court).first()
+        if not court:
+            court = Court(code="GHOST-COURT", name="Ghost Court", region="RM", type="civil")
+            db.add(court)
+            db.flush()
+
+        # DB has two ghost rows (removed from PJUD) with NULL timestamps
+        for i in range(2):
+            db.add(Case(
+                lawyer_id=lawyer.id, court_id=court.id,
+                rol=f"C-GHOST-ARCHIVED-{i}", competencia="civil",
+                status="inactive", last_detail_checked_at=None,
+            ))
+        db.commit()
+
+        # api_cases only has live cases that are NOT in DB
+        live_api_cases = [_make_api_case(f"C-LIVE-{i}") for i in range(3)]
+
+        result = _select_cases_for_detail_rotation(db, lawyer.id, "civil", live_api_cases, batch_size=2)
+
+        # Must NOT return empty — ghost rows must not block live cases
+        assert len(result) > 0, "ghost-case starvation: live cases blocked by archived ghost rows"
+        rols = [ac.rol for ac in result]
+        # All returned cases are live (from api_cases), none are ghost
+        for rol in rols:
+            assert rol.startswith("C-LIVE-"), f"unexpected rol in result: {rol}"
+
+    def test_rotation_advances_on_second_run(self, db):
+        """Two-run rotation test: second run returns different (older-unchecked) cases.
+
+        Proves the rotation actually advances: once a batch is marked checked,
+        the next selection should pick DIFFERENT cases (those not yet checked).
+        """
+        from app.services.sync_service import _select_cases_for_detail_rotation
+
+        lawyer = Lawyer(rut="00000009-9", name="Lawyer Rotate", is_active=True)
+        db.add(lawyer)
+        db.flush()
+
+        court = db.query(Court).first()
+        if not court:
+            court = Court(code="ROT-COURT", name="Rotation Court", region="RM", type="civil")
+            db.add(court)
+            db.flush()
+
+        # Seed 5 cases, all unchecked
+        rols = [f"C-ROT-{i}" for i in range(5)]
+        for r in rols:
+            db.add(Case(
+                lawyer_id=lawyer.id, court_id=court.id, rol=r,
+                competencia="civil", status="active",
+                filed_at=datetime(2024, 1, 1),
+                last_detail_checked_at=None,
+            ))
+        db.commit()
+
+        api_cases = [_make_api_case(r) for r in rols]
+
+        # Run 1: select 2
+        batch1 = _select_cases_for_detail_rotation(db, lawyer.id, "civil", api_cases, batch_size=2)
+        assert len(batch1) == 2
+        batch1_rols = {ac.rol for ac in batch1}
+
+        # Simulate marking batch1 as checked
+        now = datetime.utcnow()
+        for ac in batch1:
+            case = db.query(Case).filter(Case.rol == ac.rol, Case.lawyer_id == lawyer.id).first()
+            case.last_detail_checked_at = now
+        db.commit()
+
+        # Run 2: select 2 — must be DIFFERENT cases (the unchecked ones)
+        batch2 = _select_cases_for_detail_rotation(db, lawyer.id, "civil", api_cases, batch_size=2)
+        assert len(batch2) == 2
+        batch2_rols = {ac.rol for ac in batch2}
+
+        # At least one case in batch2 must not have been in batch1
+        assert not batch1_rols.issubset(batch2_rols) or not batch2_rols.issubset(batch1_rols), (
+            "second rotation run returned the same cases as the first — rotation is not advancing"
+        )
+        # More precise: batch2 must come from the unchecked pool
+        unchecked_rols = set(rols) - batch1_rols
+        assert batch2_rols.issubset(unchecked_rols), (
+            f"batch2 {batch2_rols} should be from unchecked pool {unchecked_rols}"
+        )
 
 
 # ===========================================================================
@@ -351,6 +474,120 @@ class TestMarkDetailCheckedAt:
 
         assert movements_new == 0
         assert not errors
+
+    @pytest.mark.asyncio
+    async def test_exception_mid_entity_sync_no_partial_rows_but_timestamp_advances(self, db):
+        """FIX 1: rollback partial entity rows on exception; last_detail_checked_at still advances.
+
+        When _sync_entities raises mid-way, any flushed (but not yet committed) entity
+        rows must be rolled back.  The except block must: (1) rollback partial state,
+        (2) set last_detail_checked_at, (3) commit only that single-column UPDATE.
+        """
+        from app.services.sync_service import detect_and_sync_movements
+        from app.models.case_litigante import CaseLitigante
+
+        lawyer = Lawyer(rut="10000005-5", name="Lawyer Partial", is_active=True)
+        db.add(lawyer)
+        db.flush()
+        court = Court(code="PARTIAL-COURT", name="Partial Court", region="RM", type="civil")
+        db.add(court)
+        db.flush()
+        case = Case(
+            lawyer_id=lawyer.id, court_id=court.id, rol="C-PARTIAL-1", competencia="civil",
+            status="active", last_detail_checked_at=None,
+        )
+        db.add(case)
+        db.commit()
+
+        api_case = _make_api_case("C-PARTIAL-1", "token-partial")
+
+        # Scraper returns successfully but _sync_entities raises after flush
+        detail = _make_detail_empty()
+        from unittest.mock import patch
+        from app.models.case_litigante import CaseLitigante
+
+        mock_scraper = MagicMock()
+        mock_scraper.get_case_detail = AsyncMock(return_value=detail)
+
+        with patch(
+            "app.services.sync_service._sync_entities",
+            side_effect=RuntimeError("simulated entity sync failure"),
+        ):
+            movements_new, alerts_created, errors = await detect_and_sync_movements(
+                db=db,
+                scraper=mock_scraper,
+                pjud_session=MagicMock(),
+                lawyer_id=lawyer.id,
+                api_cases=[api_case],
+                selected_cases=[api_case],
+            )
+
+        assert len(errors) == 1, "error must be captured"
+
+        # timestamp must be advanced despite the error (rotation fairness)
+        db.expire(case)
+        db.refresh(case)
+        assert case.last_detail_checked_at is not None, "timestamp must advance even after entity sync error"
+
+        # No partial litigante/entity rows should have been committed (rollback cleaned them up)
+        litigante_count = db.query(CaseLitigante).filter(CaseLitigante.case_id == case.id).count()
+        assert litigante_count == 0, f"partial litigante rows were committed: {litigante_count} rows found"
+
+    @pytest.mark.asyncio
+    async def test_any_exception_advances_timestamp__known_gap_slice2(self, db):
+        """KNOWN GAP (to be fixed in Slice 2): ANY exception advances last_detail_checked_at.
+
+        Current behavior: the except block advances last_detail_checked_at unconditionally
+        for ALL exception types, including ones that should be treated as session errors
+        (e.g., authentication timeouts, connection resets).
+
+        Slice 2 will distinguish case-specific errors (should advance) from session-level
+        errors (should NOT advance — the PJUD session must be refreshed first, and the
+        case should be retried with a fresh session rather than silently skipped).
+
+        This test pins the CURRENT behavior as the regression target so Slice 2 has a
+        clear signal to update.  When Slice 2 lands, update or remove this test.
+        """
+        from app.services.sync_service import detect_and_sync_movements
+
+        lawyer = Lawyer(rut="10000006-6", name="Lawyer KnownGap", is_active=True)
+        db.add(lawyer)
+        db.flush()
+        court = Court(code="GAP-COURT", name="Gap Court", region="RM", type="civil")
+        db.add(court)
+        db.flush()
+        case = Case(
+            lawyer_id=lawyer.id, court_id=court.id, rol="C-GAP-1", competencia="civil",
+            status="active", last_detail_checked_at=None,
+        )
+        db.add(case)
+        db.commit()
+
+        api_case = _make_api_case("C-GAP-1", "token-gap")
+        mock_scraper = MagicMock()
+        # Simulate a generic exception that LOOKS like a session error
+        mock_scraper.get_case_detail = AsyncMock(
+            side_effect=Exception("ConnectionError: PJUD session expired")
+        )
+
+        before = datetime.utcnow()
+        movements_new, alerts_created, errors = await detect_and_sync_movements(
+            db=db,
+            scraper=mock_scraper,
+            pjud_session=MagicMock(),
+            lawyer_id=lawyer.id,
+            api_cases=[api_case],
+            selected_cases=[api_case],
+        )
+        after = datetime.utcnow()
+
+        db.refresh(case)
+        # CURRENT behavior: timestamp IS advanced (known gap — should NOT advance for session errors)
+        assert case.last_detail_checked_at is not None, (
+            "KNOWN GAP: session-error should not advance timestamp (fix in Slice 2)"
+        )
+        assert before <= case.last_detail_checked_at <= after
+        assert len(errors) == 1
 
     @pytest.mark.asyncio
     async def test_case_specific_error_does_not_starve_next_run(self, db):

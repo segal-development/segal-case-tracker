@@ -735,11 +735,15 @@ class SyncService:
         Returns:
             Tuple of (case, is_new)
         """
+        # Normalize ROL on write so DB values always match the uppercased form used
+        # in rotation queries, preventing starvation from mixed-case PJUD responses.
+        normalized_rol = scraped.rol.strip().upper()
+
         # Find existing case by ROL and lawyer
         existing = self.db.query(Case).filter(
             and_(
                 Case.lawyer_id == lawyer_id,
-                Case.rol == scraped.rol,
+                Case.rol == normalized_rol,
             )
         ).first()
         
@@ -769,7 +773,7 @@ class SyncService:
             case = Case(
                 lawyer_id=lawyer_id,
                 court_id=court.id,
-                rol=scraped.rol,
+                rol=normalized_rol,
                 plaintiff=plaintiff,
                 defendant=defendant,
                 status=self._map_status(scraped.estado_cuaderno),
@@ -1118,9 +1122,10 @@ def _select_cases_for_detail_rotation(
         .all()
     )
 
-    # Empty DB for this lawyer+competencia — fall back to api_cases[:batch_size].
+    # Empty DB for this lawyer+competencia — fall back to live cases that have a
+    # case_token (tokenless cases are skipped downstream anyway).
     if not db_cases:
-        return api_cases[:batch_size]
+        return [ac for ac in api_cases if ac.case_token][:batch_size]
 
     result = []
     for db_case in db_cases:
@@ -1128,6 +1133,13 @@ def _select_cases_for_detail_rotation(
         api_case = api_lookup.get(normalized)
         if api_case is not None:
             result.append(api_case)
+
+    # Ghost-case guard: DB had rows but none matched live api_cases (stale/archived
+    # cases removed from PJUD).  Those rows have NULL last_detail_checked_at so they
+    # sit permanently at the front of the rotation order and starve live cases.
+    # Fall back to live api_cases so rotation is not blocked by ghost rows.
+    if not result and db_cases:
+        return [ac for ac in api_cases if ac.case_token][:batch_size]
 
     return result
 
@@ -1201,12 +1213,19 @@ async def detect_and_sync_movements(
                 "skipping movement detection",
                 rol,
             )
+        elif selected_cases is not None:
+            logger.warning(
+                "detect_and_sync_movements: rotation batch produced 0 live cases "
+                "(lawyer_id=%s) — possible ghost/stale rows",
+                lawyer_id,
+            )
     else:
-        cap_msg = (
-            f"rol={rol}"
-            if rol
-            else f"first {len(cases_for_check)} of {len(api_cases)} cases"
-        )
+        if selected_cases is not None:
+            cap_msg = f"rotation batch of {len(cases_for_check)} cases"
+        elif rol:
+            cap_msg = f"rol={rol}"
+        else:
+            cap_msg = f"first {len(cases_for_check)} of {len(api_cases)} cases"
         logger.info("detect_and_sync_movements: fetching movements for %s", cap_msg)
 
     sync_svc = SyncService(db)
@@ -1327,11 +1346,12 @@ async def detect_and_sync_movements(
                 if settings.DOC_DOWNLOAD_ENABLED and persisted_docs:
                     from app.services.document_downloader import (
                         DocumentDownloader,
-                        AsyncSleepLimiter,  # FIX 8: renamed from _AsyncSleepLimiter
+                        AsyncSleepLimiter,
                     )
                     from app.services.storage_service import StorageService, get_storage_backend
 
-                    # FIX 6: include "failed" docs so transient failures are retried
+                    # Include "failed" docs so transient download failures are retried
+                    # on the next scheduled run.
                     pending_docs = [
                         d for d in persisted_docs if d.status in ("pending", "failed")
                     ]
@@ -1348,6 +1368,11 @@ async def detect_and_sync_movements(
                         )
 
         except Exception as exc:
+            # Rollback any partial entity/alert rows flushed (but not yet committed)
+            # during the try block.  Without this, the except's db.commit() would
+            # silently persist half-written entity state alongside the mark-checked
+            # UPDATE.  sync_movements already committed earlier — unaffected.
+            db.rollback()
             # Case-specific error (detail parse, not-found, etc.) — NOT a session error.
             # Advance last_detail_checked_at so a persistently-failing case rotates to
             # the back and does not block the rotation batch on every scheduled run.
