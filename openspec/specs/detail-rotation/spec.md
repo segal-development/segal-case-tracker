@@ -34,17 +34,29 @@ The system MUST select cases for detail scraping using DB ordering: `last_detail
 
 The system MUST set `last_detail_checked_at` to the current UTC timestamp after each successful case detail fetch, regardless of whether new movements were found.
 
+Additionally, to prevent starvation, `last_detail_checked_at` MUST also be advanced when a case-specific (non-session) error occurs, so persistently-failing cases rotate to the back of the queue instead of blocking all subsequent cases indefinitely.
+
+Session errors (`SessionExpiredError`, `SessionNotAuthenticatedError`) are explicitly excluded from this advancement rule — they indicate a system-level condition, not a case-level failure, and the case must be retried from its current rotation position on the next run.
+
 #### Scenario: Timestamp advances on zero-movement fetch
 
 - GIVEN a case whose detail fetch succeeds with 0 new movements
 - WHEN the fetch completes without error
 - THEN `last_detail_checked_at` is updated to now for that case
 
-#### Scenario: Timestamp is not updated on fetch error
+#### Scenario: Timestamp IS advanced on case-specific fetch error
 
-- GIVEN a case whose detail fetch raises an exception
+- GIVEN a case whose detail fetch raises an exception that is NOT a session error (i.e., not `SessionExpiredError` or `SessionNotAuthenticatedError`)
 - WHEN the exception is handled
+- THEN `last_detail_checked_at` IS updated to now for that case
+- (Rationale: a persistently-failing case must rotate to the back of the queue to prevent queue starvation.)
+
+#### Scenario: Timestamp is NOT advanced on session error
+
+- GIVEN a case whose detail fetch raises `SessionExpiredError` or `SessionNotAuthenticatedError`
+- WHEN the session error is handled
 - THEN `last_detail_checked_at` MUST NOT be updated for that case
+- (Rationale: session expiry is a system-level condition, not a case-level failure. The case retains its rotation position and will be retried on the next scheduled run.)
 
 ---
 
@@ -124,11 +136,13 @@ Documents MUST be downloaded synchronously during the same per-case detail fetch
 
 ## Slice 2 Requirements — Mid-Batch Re-Auth
 
-> Deferred to Slice 2. MUST NOT block Slice 1 delivery. Mark tests with `@pytest.mark.slice2`.
+> Delivered in Slice 2 alongside Slice 1. Both slices shipped on `feat/sync-rotacion`.
 
 ### Requirement: Mid-Batch Session Re-Auth [SLICE 2]
 
-If `SessionExpiredError` is raised during a case's detail fetch, the system MUST invoke a `reauth_callback` (injected at call site), update the active session, and retry that case once. If re-auth fails, the batch MUST stop gracefully without an unhandled exception; remaining cases are deferred to the next scheduled run.
+If `SessionExpiredError` or `SessionNotAuthenticatedError` is raised during a case's detail fetch, the system MUST invoke a `reauth_callback` (injected at call site), update the active session, and retry that case once. If re-auth fails, the batch MUST stop gracefully without an unhandled exception; remaining cases are deferred to the next scheduled run.
+
+The `except (SessionExpiredError, SessionNotAuthenticatedError)` clause MUST appear before the generic `except Exception` clause in the handler chain to ensure session errors are never silently treated as case-specific errors.
 
 #### Scenario: Re-auth succeeds and case is retried [SLICE 2]
 

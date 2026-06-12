@@ -63,11 +63,11 @@ Revert the slice PR(s). The migration is additive (nullable column) — `alembic
 
 ## Success Criteria
 
-- [ ] Every case's `last_detail_checked_at` advances within one configured cycle; no case starved.
-- [ ] Never-checked cases are picked before previously-checked ones (NULLS FIRST).
-- [ ] Timestamp updates even on 0-movement fetches.
-- [ ] Slice 2: session expiry mid-batch triggers reauth and the batch continues.
-- [ ] Batch size and delay are env-configurable.
+- [x] Every case's `last_detail_checked_at` advances within one configured cycle; no case starved.
+- [x] Never-checked cases are picked before previously-checked ones (NULLS FIRST).
+- [x] Timestamp updates even on 0-movement fetches.
+- [x] Slice 2: session expiry mid-batch triggers reauth and the batch continues.
+- [x] Batch size and delay are env-configurable.
 
 ## Suggested First Slice
 

@@ -68,10 +68,10 @@ async def detect_and_sync_movements(
 ```
 
 Slice 2 retry: extract per-case body into an inner coroutine. Loop:
-`except SessionExpiredError:` if callback → `new = await callback()`; if `new`,
+`except (SessionExpiredError, SessionNotAuthenticatedError):` if callback → `new = await callback()`; if `new`,
 reassign local `pjud_session`, retry the case once; on second expiry, log and
 `break` (graceful partial batch). Generic `except Exception` stays for other
-errors. `SessionExpiredError` imported from `app.scrapper.pjud.exceptions`.
+errors. Both exception types imported from `app.scrapper.pjud.exceptions`.
 
 ## Testing Strategy
 
@@ -97,6 +97,7 @@ rotation fn, mark-checked, wiring, tests (rotation behavior). Slice 2 =
 
 ## Open Questions
 
-- [ ] Runtime-observable, not a blocker: is the ~2524 case count per-lawyer or
+- [x] Runtime-observable, not a blocker: is the ~2524 case count per-lawyer or
   total across lawyers? Resolve via the Slice 2 coverage log; tune
   `DETAIL_BATCH_SIZE` after observing real cycle time and PJUD rate behavior.
+  (Accepted as runtime-observable; coverage log now available via _oldest_unchecked_label.)

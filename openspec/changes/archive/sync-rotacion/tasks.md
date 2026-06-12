@@ -391,7 +391,7 @@ Changes to `detect_and_sync_movements`:
    reauth_callback: Optional[Callable[[], Awaitable[Optional["PJUDSession"]]]] = None,
    ```
 
-2. Add import: `from app.scrapper.pjud.exceptions import SessionExpiredError`
+2. Add import: `from app.scrapper.pjud.exceptions import SessionExpiredError, SessionNotAuthenticatedError`
 
 3. Extract per-case detail fetch into an inner coroutine `_do_fetch()` that encapsulates lines from `detail = await scraper.get_case_detail(...)` through the entity sync and document download.  This makes retry-once straightforward.
 
@@ -402,7 +402,7 @@ Changes to `detect_and_sync_movements`:
        if db_case is not None:
            db_case.last_detail_checked_at = datetime.utcnow()
            # (already done before db.commit() in success path)
-   except SessionExpiredError:
+   except (SessionExpiredError, SessionNotAuthenticatedError):
        # Do NOT advance last_detail_checked_at — not the case's fault
        new_session = None
        if reauth_callback is not None:
@@ -420,7 +420,7 @@ Changes to `detect_and_sync_movements`:
            await _do_fetch()
            if db_case is not None:
                db_case.last_detail_checked_at = datetime.utcnow()
-       except SessionExpiredError:
+       except (SessionExpiredError, SessionNotAuthenticatedError):
            logger.error("detect_and_sync_movements: second expiry after reauth; stopping batch")
            errors.append(f"Session expired again on retry for {api_case.rol}; batch stopped")
            break
@@ -444,9 +444,9 @@ Changes to `detect_and_sync_movements`:
        logger.error("detect_and_sync_movements: failed for %s: %s", api_case.rol, exc)
        errors.append(f"Movement fetch failed for {api_case.rol}: {str(exc)}")
    ```
-   The `except SessionExpiredError` block MUST appear BEFORE `except Exception`. Verify this order carefully.
+   The `except (SessionExpiredError, SessionNotAuthenticatedError)` block MUST appear BEFORE `except Exception`. Verify this order carefully.
 
-5. Update the function docstring: document `reauth_callback` and `selected_cases` params; document the no-advance guarantee on `SessionExpiredError`.
+5. Update the function docstring: document `reauth_callback` and `selected_cases` params; document the no-advance guarantee on session errors.
 
 ---
 
@@ -565,21 +565,23 @@ All must pass.
 
 ## Task Summary Table
 
-| ID     | Type  | File(s)                                    | Spec Req                              | Depends on       | Parallel? |
-|--------|-------|--------------------------------------------|---------------------------------------|------------------|-----------|
-| S1-T1  | TEST  | tests/services/test_detail_rotation.py     | Rotation-Aware Selection, Empty DB    | —                | with S1-T2|
-| S1-T2  | IMPL  | alembic/007, models/case.py, config.py     | Column, Config knobs                  | —                | with S1-T1|
-| S1-T3  | IMPL  | app/services/sync_service.py               | Rotation-Aware Selection, Empty DB    | S1-T1, S1-T2     | No        |
-| S1-T4  | TEST  | tests/services/test_detail_rotation.py     | Mark Checked, No Starvation, Robustness| S1-T3           | No        |
-| S1-T5  | IMPL  | app/services/sync_service.py               | Mark Checked, No Starvation, Robustness| S1-T4           | No        |
-| S1-T6  | IMPL  | app/workers/sync_scheduler.py              | Config knobs, Isolation from List     | S1-T5            | No        |
-| S1-T7  | TEST  | tests/workers/test_movement_detection.py   | ROL On-Demand Unchanged, selected_cases| S1-T5           | No        |
-| S1-V1  | VERIFY| —                                          | All Slice 1                           | S1-T7            | No        |
+| ID     | Type  | File(s)                                    | Spec Req                              | Depends on       | Parallel? | Status |
+|--------|-------|--------------------------------------------|---------------------------------------|------------------|-----------|--------|
+| S1-T1  | TEST  | tests/services/test_detail_rotation.py     | Rotation-Aware Selection, Empty DB    | —                | with S1-T2| [x] |
+| S1-T2  | IMPL  | alembic/007, models/case.py, config.py     | Column, Config knobs                  | —                | with S1-T1| [x] |
+| S1-T3  | IMPL  | app/services/sync_service.py               | Rotation-Aware Selection, Empty DB    | S1-T1, S1-T2     | No        | [x] |
+| S1-T4  | TEST  | tests/services/test_detail_rotation.py     | Mark Checked, No Starvation, Robustness| S1-T3           | No        | [x] |
+| S1-T5  | IMPL  | app/services/sync_service.py               | Mark Checked, No Starvation, Robustness| S1-T4           | No        | [x] |
+| S1-T6  | IMPL  | app/workers/sync_scheduler.py              | Config knobs, Isolation from List     | S1-T5            | No        | [x] |
+| S1-T7  | TEST  | tests/workers/test_movement_detection.py   | ROL On-Demand Unchanged, selected_cases| S1-T5           | No        | [x] |
+| S1-V1  | VERIFY| —                                          | All Slice 1                           | S1-T7            | No        | [x] |
 | S2-T1  | TEST  | tests/services/test_detail_rotation.py     | Mid-Batch Re-Auth [SLICE 2]           | S1-V1            | No        | [x] |
 | S2-T2  | IMPL  | app/services/sync_service.py               | Mid-Batch Re-Auth [SLICE 2]           | S2-T1            | No        | [x] |
 | S2-T3  | IMPL  | app/workers/sync_scheduler.py              | Mid-Batch Re-Auth [SLICE 2]           | S2-T2            | with S2-T4| [x] |
 | S2-T4  | IMPL  | app/services/sync_service.py               | Progress observability                | S2-T2            | with S2-T3| [x] |
 | S2-V1  | VERIFY| —                                          | All Slice 2                           | S2-T3, S2-T4     | No        | [x] |
 
-**Total tasks: 13** (7 Slice 1 + 1 verify + 4 Slice 2 + 1 verify)  
+**Total tasks: 13** (7 Slice 1 + 1 verify + 4 Slice 2 + 1 verify) — **All complete.**  
 **Parallel pairs: 2** (S1-T1//S1-T2; S2-T3//S2-T4)
+
+> Archive note: S1-T1 through S1-V1 rows in the original tasks.md summary table lacked `[x]` markers (formatting inconsistency). Reconciled at archive time per sdd-archive stale-checkbox policy: apply-progress and verify-report (646 tests, 0 failures, 0 CRITICAL) confirm all 13 tasks complete.
