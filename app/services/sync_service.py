@@ -1146,16 +1146,29 @@ def _select_cases_for_detail_rotation(
 
 
 def _oldest_unchecked_label(db: Session, lawyer_id: int) -> str:
-    """Return a human-readable age string for the oldest unchecked case, or a summary."""
-    oldest = (
+    """Return a human-readable rotation status label.
+
+    SQL MIN() ignores NULLs, so never-checked cases (NULL last_detail_checked_at)
+    are counted explicitly and reported separately from the oldest checked timestamp.
+    """
+    never_checked = (
+        db.query(func.count(Case.id))
+        .filter(Case.lawyer_id == lawyer_id, Case.last_detail_checked_at.is_(None))
+        .scalar()
+        or 0
+    )
+    oldest_checked = (
         db.query(func.min(Case.last_detail_checked_at))
-        .filter(Case.lawyer_id == lawyer_id)
+        .filter(Case.lawyer_id == lawyer_id, Case.last_detail_checked_at.isnot(None))
         .scalar()
     )
-    if oldest is None:
-        return "never-checked cases exist"
-    age = datetime.utcnow() - oldest
-    return f"{age.days}d {age.seconds // 3600}h ago"
+    if oldest_checked is None:
+        return f"{never_checked} never-checked; oldest-checked: none"
+    age = datetime.utcnow() - oldest_checked
+    return (
+        f"{never_checked} never-checked; "
+        f"oldest-checked: {age.days}d {age.seconds // 3600}h ago"
+    )
 
 
 async def detect_and_sync_movements(
@@ -1419,6 +1432,12 @@ async def detect_and_sync_movements(
             alerts_created += delta_a
 
         except (SessionExpiredError, SessionNotAuthenticatedError) as session_exc:
+            logger.warning(
+                "detect_and_sync_movements: session error for lawyer_id=%s rol=%s: %s",
+                lawyer_id,
+                api_case.rol,
+                session_exc,
+            )
             # Session failure is NOT the case's fault.  Do NOT advance
             # last_detail_checked_at — preserve the rotation position so this
             # case is retried on the next batch with a fresh session.

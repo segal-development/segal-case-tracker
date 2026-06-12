@@ -81,6 +81,8 @@ def _make_detail_empty() -> MagicMock:
     detail.notificaciones = []
     detail.escritos = []
     detail.exhortos = []
+    detail.case = MagicMock()
+    detail.case.rol = "C-FAKE-ROL"
     return detail
 
 
@@ -868,4 +870,150 @@ class TestReauthMidBatch:
         assert case.last_detail_checked_at is None, (
             "SessionExpiredError with failed reauth must NOT advance last_detail_checked_at; "
             "session failure is not the case's fault"
+        )
+
+    @pytest.mark.slice2
+    @pytest.mark.asyncio
+    async def test_reauth_succeeds_retry_generic_error_advances_timestamp_continues(self, db):
+        """Path E: reauth OK, retry raises a generic (non-session) error.
+
+        Per the case-specific-error rule: a generic exception on the retry advance
+        last_detail_checked_at AND the loop continues to the next case (no break).
+        """
+        from app.services.sync_service import detect_and_sync_movements
+        from app.scrapper.pjud.exceptions import SessionExpiredError
+
+        lawyer = Lawyer(rut="20000010-0", name="Lawyer PathE", is_active=True)
+        db.add(lawyer)
+        db.flush()
+        court = Court(code="PATHE-COURT", name="Path E Court", region="RM", type="civil")
+        db.add(court)
+        db.flush()
+        case_a = Case(
+            lawyer_id=lawyer.id, court_id=court.id, rol="C-PATHE-A", competencia="civil",
+            status="active", last_detail_checked_at=None,
+        )
+        case_b = Case(
+            lawyer_id=lawyer.id, court_id=court.id, rol="C-PATHE-B", competencia="civil",
+            status="active", last_detail_checked_at=None,
+        )
+        db.add_all([case_a, case_b])
+        db.commit()
+
+        api_a = _make_api_case("C-PATHE-A", "token-pathe-a")
+        api_b = _make_api_case("C-PATHE-B", "token-pathe-b")
+
+        # call 1: SessionExpiredError (case_a initial)
+        # call 2: RuntimeError (case_a retry after reauth)
+        # call 3: success (case_b)
+        mock_scraper = MagicMock()
+        mock_scraper.get_case_detail = AsyncMock(
+            side_effect=[
+                SessionExpiredError("expired"),
+                RuntimeError("parse failed"),
+                _make_detail_empty(),
+            ]
+        )
+
+        fresh_session = MagicMock()
+        reauth_callback = AsyncMock(return_value=fresh_session)
+
+        before = datetime.utcnow()
+        movements_new, alerts_created, errors = await detect_and_sync_movements(
+            db=db,
+            scraper=mock_scraper,
+            pjud_session=MagicMock(),
+            lawyer_id=lawyer.id,
+            api_cases=[api_a, api_b],
+            selected_cases=[api_a, api_b],
+            reauth_callback=reauth_callback,
+        )
+        after = datetime.utcnow()
+
+        # 3 calls: session-error + retry for case_a, then case_b
+        assert mock_scraper.get_case_detail.await_count == 3, (
+            "expected 3 scraper calls: initial session error + retry (case_a) + case_b"
+        )
+        # Generic retry error → timestamp IS advanced (case-specific-error rule)
+        db.refresh(case_a)
+        assert case_a.last_detail_checked_at is not None, (
+            "generic retry error must advance last_detail_checked_at"
+        )
+        assert before <= case_a.last_detail_checked_at <= after
+        # Exactly 1 error recorded (case_a retry failure)
+        assert len(errors) == 1, f"expected 1 error, got {len(errors)}: {errors}"
+        # Loop continues — case_b processed
+        db.refresh(case_b)
+        assert case_b.last_detail_checked_at is not None, (
+            "case_b must be processed — generic retry error must not stop the loop"
+        )
+
+    @pytest.mark.slice2
+    @pytest.mark.asyncio
+    async def test_reauth_succeeds_retry_session_errors_batch_stops(self, db):
+        """Path D: reauth OK, retry raises SessionExpiredError.
+
+        Double session error: timestamp is NOT advanced; batch stops gracefully
+        (a subsequent case in the batch is NOT processed).
+        """
+        from app.services.sync_service import detect_and_sync_movements
+        from app.scrapper.pjud.exceptions import SessionExpiredError
+
+        lawyer = Lawyer(rut="20000011-1", name="Lawyer PathD", is_active=True)
+        db.add(lawyer)
+        db.flush()
+        court = Court(code="PATHD-COURT", name="Path D Court", region="RM", type="civil")
+        db.add(court)
+        db.flush()
+        case_a = Case(
+            lawyer_id=lawyer.id, court_id=court.id, rol="C-PATHD-A", competencia="civil",
+            status="active", last_detail_checked_at=None,
+        )
+        case_b = Case(
+            lawyer_id=lawyer.id, court_id=court.id, rol="C-PATHD-B", competencia="civil",
+            status="active", last_detail_checked_at=None,
+        )
+        db.add_all([case_a, case_b])
+        db.commit()
+
+        api_a = _make_api_case("C-PATHD-A", "token-pathd-a")
+        api_b = _make_api_case("C-PATHD-B", "token-pathd-b")
+
+        # Both calls for case_a raise SessionExpiredError: initial + retry after reauth
+        mock_scraper = MagicMock()
+        mock_scraper.get_case_detail = AsyncMock(
+            side_effect=[
+                SessionExpiredError("expired"),
+                SessionExpiredError("expired again"),
+            ]
+        )
+
+        fresh_session = MagicMock()
+        reauth_callback = AsyncMock(return_value=fresh_session)
+
+        movements_new, alerts_created, errors = await detect_and_sync_movements(
+            db=db,
+            scraper=mock_scraper,
+            pjud_session=MagicMock(),
+            lawyer_id=lawyer.id,
+            api_cases=[api_a, api_b],
+            selected_cases=[api_a, api_b],
+            reauth_callback=reauth_callback,
+        )
+
+        # Exactly 2 scraper calls: initial + retry for case_a; case_b never reached
+        assert mock_scraper.get_case_detail.await_count == 2, (
+            "expected 2 scraper calls: initial + retry after reauth; case_b must not be attempted"
+        )
+        # Timestamp NOT advanced — double session error is not the case's fault
+        db.refresh(case_a)
+        assert case_a.last_detail_checked_at is None, (
+            "double session error must NOT advance last_detail_checked_at"
+        )
+        # Exactly 1 error recorded
+        assert len(errors) == 1, f"expected 1 error, got {len(errors)}: {errors}"
+        # Batch stopped — case_b untouched
+        db.refresh(case_b)
+        assert case_b.last_detail_checked_at is None, (
+            "case_b must not be processed — batch stops after double session error"
         )

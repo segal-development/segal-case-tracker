@@ -290,6 +290,12 @@ async def sync_lawyer_cases(
         # Slice 2: inject a reauth callback so the service can recover from
         # mid-batch session expiry without coupling to the scheduler auth logic.
         async def _reauth_for_lawyer() -> Optional[PJUDSession]:
+            if lawyer is None:
+                logger.warning(
+                    "sync_lawyer_cases: cannot reauth — lawyer_id=%s not found in DB",
+                    lawyer_id,
+                )
+                return None
             new_session, _reason = await _reauth(lawyer, store)
             return new_session
 
