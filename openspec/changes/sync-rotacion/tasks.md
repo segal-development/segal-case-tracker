@@ -575,11 +575,11 @@ All must pass.
 | S1-T6  | IMPL  | app/workers/sync_scheduler.py              | Config knobs, Isolation from List     | S1-T5            | No        |
 | S1-T7  | TEST  | tests/workers/test_movement_detection.py   | ROL On-Demand Unchanged, selected_cases| S1-T5           | No        |
 | S1-V1  | VERIFY| —                                          | All Slice 1                           | S1-T7            | No        |
-| S2-T1  | TEST  | tests/services/test_detail_rotation.py     | Mid-Batch Re-Auth [SLICE 2]           | S1-V1            | No        |
-| S2-T2  | IMPL  | app/services/sync_service.py               | Mid-Batch Re-Auth [SLICE 2]           | S2-T1            | No        |
-| S2-T3  | IMPL  | app/workers/sync_scheduler.py              | Mid-Batch Re-Auth [SLICE 2]           | S2-T2            | with S2-T4|
-| S2-T4  | IMPL  | app/services/sync_service.py               | Progress observability                | S2-T2            | with S2-T3|
-| S2-V1  | VERIFY| —                                          | All Slice 2                           | S2-T3, S2-T4     | No        |
+| S2-T1  | TEST  | tests/services/test_detail_rotation.py     | Mid-Batch Re-Auth [SLICE 2]           | S1-V1            | No        | [x] |
+| S2-T2  | IMPL  | app/services/sync_service.py               | Mid-Batch Re-Auth [SLICE 2]           | S2-T1            | No        | [x] |
+| S2-T3  | IMPL  | app/workers/sync_scheduler.py              | Mid-Batch Re-Auth [SLICE 2]           | S2-T2            | with S2-T4| [x] |
+| S2-T4  | IMPL  | app/services/sync_service.py               | Progress observability                | S2-T2            | with S2-T3| [x] |
+| S2-V1  | VERIFY| —                                          | All Slice 2                           | S2-T3, S2-T4     | No        | [x] |
 
 **Total tasks: 13** (7 Slice 1 + 1 verify + 4 Slice 2 + 1 verify)  
 **Parallel pairs: 2** (S1-T1//S1-T2; S2-T3//S2-T4)

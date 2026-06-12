@@ -287,6 +287,18 @@ async def sync_lawyer_cases(
             batch_size=settings.DETAIL_BATCH_SIZE,
         )
 
+        # Slice 2: inject a reauth callback so the service can recover from
+        # mid-batch session expiry without coupling to the scheduler auth logic.
+        async def _reauth_for_lawyer() -> Optional[PJUDSession]:
+            if lawyer is None:
+                logger.warning(
+                    "sync_lawyer_cases: cannot reauth — lawyer_id=%s not found in DB",
+                    lawyer_id,
+                )
+                return None
+            new_session, _reason = await _reauth(lawyer, store)
+            return new_session
+
         # S4-T3/S4-T5: movement detection — reuse the shared implementation.
         # selected_cases drives the rotation (replaces the old front-of-list [:5] cap).
         # DETAIL_FETCH_DELAY throttles requests so the worker does not hammer PJUD.
@@ -298,6 +310,7 @@ async def sync_lawyer_cases(
             api_cases=cases,
             selected_cases=rotation_batch,
             delay_between_fetches=settings.DETAIL_FETCH_DELAY,
+            reauth_callback=_reauth_for_lawyer,
         )
 
         if mov_errors:

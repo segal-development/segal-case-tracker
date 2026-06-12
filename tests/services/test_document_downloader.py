@@ -260,6 +260,47 @@ class TestDocumentDownloaderRetryFailed:
 # AsyncSleepLimiter always yields (FIX 7 + FIX 8 rename)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Session error propagation (FIX 5)
+# ---------------------------------------------------------------------------
+
+class TestDocumentDownloaderSessionErrorPropagation:
+    @pytest.mark.asyncio
+    async def test_session_expired_error_propagates_does_not_mark_failed(self):
+        """SessionExpiredError during download must propagate, not mark docs failed.
+
+        Swallowing a session expiry would burn O(N) scraper calls against a dead
+        session and mark all remaining docs failed for a transient auth problem.
+        The caller (detect_and_sync_movements) owns reauth — let it propagate.
+        """
+        from app.scrapper.pjud.exceptions import SessionExpiredError
+        from app.services.document_downloader import DocumentDownloader
+
+        doc1 = _make_pending_doc(1)
+        doc2 = _make_pending_doc(2)
+
+        scraper = _make_scraper([SessionExpiredError("session dead")])
+        db = MagicMock()
+
+        with pytest.raises(SessionExpiredError):
+            await DocumentDownloader().download_and_store(
+                pending_docs=[doc1, doc2],
+                scraper=scraper,
+                pjud_session=MagicMock(),
+                db=db,
+                storage_service=_make_storage_svc(),
+                limiter=_make_limiter(),
+                enabled=True,
+            )
+
+        # doc1 must NOT be marked failed — it was a session error, not a doc error
+        assert doc1.status == "pending", (
+            "SessionExpiredError must not mark the document as failed"
+        )
+        # doc2 must not have been attempted (scraper raises on first call)
+        assert scraper.download_document_generic.await_count == 1
+
+
 class TestAsyncSleepLimiter:
     @pytest.mark.asyncio
     async def test_limiter_always_awaits_even_with_zero_delay(self):

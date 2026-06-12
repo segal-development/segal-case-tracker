@@ -45,6 +45,7 @@ testpaths = ["tests"]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: marks tests requiring live external services such as Redis",
+    "slice2: marks tests added in sync-rotacion Slice 2 (reauth_callback + session-expiry handling)",
 ]
 
 [tool.coverage.run]
