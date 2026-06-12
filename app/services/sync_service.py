@@ -1231,12 +1231,35 @@ async def detect_and_sync_movements(
                 # 3. Persist document tokens (Slice 1 — S1-T13).
                 # Must run after sync_movements so that Movement rows exist for
                 # the folio-based lookup inside persist_from_detail.
-                DocumentPersistenceService().persist_from_detail(
+                persisted_docs = DocumentPersistenceService().persist_from_detail(
                     detail, int(db_case.id), db
                 )
 
                 # Commit entity upserts + document tokens (sync_movements already committed).
                 db.commit()
+
+                # 4. Synchronous document download (Slice 2 — S2-T6).
+                # MUST run in this same sync task while the live browser page and
+                # freshly-parsed JWT tokens are still valid (1-hour expiry window).
+                if settings.DOC_DOWNLOAD_ENABLED and persisted_docs:
+                    from app.services.document_downloader import (
+                        DocumentDownloader,
+                        _AsyncSleepLimiter,
+                    )
+                    from app.services.storage_service import StorageService, get_storage_backend
+
+                    pending_docs = [d for d in persisted_docs if d.status == "pending"]
+                    if pending_docs:
+                        storage_svc = StorageService(get_storage_backend(settings))
+                        await DocumentDownloader().download_and_store(
+                            pending_docs=pending_docs,
+                            scraper=scraper,
+                            pjud_session=pjud_session,
+                            db=db,
+                            storage_service=storage_svc,
+                            limiter=_AsyncSleepLimiter(delay=0.0),
+                            enabled=True,
+                        )
 
         except Exception as exc:
             logger.error(
