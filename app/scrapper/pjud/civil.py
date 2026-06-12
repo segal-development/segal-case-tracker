@@ -25,7 +25,7 @@ from app.scrapper.pjud.base import (
     CompetencyConfig,
     PJUD_BASE_URL,
 )
-from app.scrapper.pjud.exceptions import ScrapingError
+from app.scrapper.pjud.exceptions import DocumentTokenExpiredError, ScrapingError
 from app.scrapper.pjud.selectors import SelectorRegistry
 from app.services.pjud_session import PJUDSession
 
@@ -926,6 +926,88 @@ class CivilScraper(PJUDBaseScraper):
         
         return pdf_bytes
     
+    # param name keyed by doc_type stored in Document.doc_type
+    _DOC_TYPE_PARAM: dict = {
+        "resolution":  "dtaDoc",
+        "escrito_doc": "dtaDoc",
+        "docuS":       "dtaDoc",
+        "docuN":       "dtaDoc",
+        "texto_demanda": "valorEncTxtDmda",
+        "escrito_cert":  "dtaCert",
+        "cert_envio":    "dtaCert",
+        "ebook":         "dtaEbook",
+    }
+
+    async def download_document_generic(
+        self,
+        session: PJUDSession,
+        endpoint: str,
+        doc_type: str,
+        token: str,
+    ) -> bytes:
+        """Download a document using the validated live-download mechanism.
+
+        Builds the URL as:
+            {PJUD_BASE_URL}/misCausas/civil/{endpoint}?{param}={token}
+
+        The ``endpoint`` value is the raw ``Document.pjud_endpoint`` field
+        (Slice-1 parser already stripped the ``misCausas/civil/`` prefix).
+
+        Args:
+            session:  Active PJUDSession (used to restore the browser page).
+            endpoint: e.g. "documentos/docuS.php"
+            doc_type: e.g. "resolution", "cert_envio" — drives the query-param name.
+            token:    Live JWT stored in ``Document.pjud_token``.
+
+        Returns:
+            Raw PDF bytes.
+
+        Raises:
+            DocumentTokenExpiredError: Response was 404 or content-type is text/html
+                                       (token expired / invalid).
+            ScrapingError:             Any other download failure.
+        """
+        param = self._DOC_TYPE_PARAM.get(doc_type, "dtaDoc")
+        url = f"{PJUD_BASE_URL}/misCausas/civil/{endpoint}?{param}={token}"
+
+        logger.info("download_document_generic: fetching %s", url)
+
+        page = await self._get_page(session)
+
+        # Use the browser's authenticated cookies via credentials:'include'.
+        # Returns a plain object so we can detect expiry before reading bytes.
+        js = r"""
+async () => {
+    const r = await fetch(""" + f'"{url}"' + r""", { credentials: 'include' });
+    const ct = (r.headers.get('content-type') || '').toLowerCase();
+    if (r.status === 404 || ct.includes('text/html')) {
+        return { expired: true, status: r.status, ct: ct };
+    }
+    if (!r.ok) {
+        return { error: true, status: r.status };
+    }
+    const buf = await r.arrayBuffer();
+    const arr = Array.from(new Uint8Array(buf));
+    return { expired: false, error: false, data: arr, size: arr.length };
+}
+"""
+        result = await page.evaluate(js)
+
+        if result.get("expired"):
+            raise DocumentTokenExpiredError(
+                f"Document token expired or invalid "
+                f"(status={result.get('status')}, ct={result.get('ct')})"
+            )
+
+        if result.get("error"):
+            raise ScrapingError(
+                f"download_document_generic failed with HTTP {result.get('status')}"
+            )
+
+        pdf_bytes = bytes(result["data"])
+        logger.info("download_document_generic: downloaded %d bytes", result["size"])
+        return pdf_bytes
+
     async def download_movement_documents(
         self,
         session: PJUDSession,
