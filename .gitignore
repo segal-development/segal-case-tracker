@@ -38,7 +38,11 @@ screenshots/
 
 # Manual PJUD debug scripts — contain real credentials, keep local only
 scripts/manual/
-test_captcha.html
+test_captcha*.html
+
+# Locally downloaded case documents (dev disk storage backend)
+storage/
+documents_local/
 
 # OS
 .DS_Store
