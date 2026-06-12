@@ -36,6 +36,7 @@ class Case(Base):
     # Timestamps
     filed_at = Column(DateTime, nullable=True)  # Fecha de ingreso
     last_movement_at = Column(DateTime, nullable=True)
+    last_detail_checked_at = Column(DateTime, nullable=True)  # Rotation tracking
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     

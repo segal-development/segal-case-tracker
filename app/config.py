@@ -87,6 +87,10 @@ class Settings(BaseSettings):
     GCS_SIGNED_URL_TTL: int = 3600              # Signed URL TTL in seconds
     DOC_DOWNLOAD_ENABLED: bool = False          # Gate: download PDFs during sync
 
+    # Detail rotation (sync-rotacion Slice 1)
+    DETAIL_BATCH_SIZE: int = 30    # Cases per scheduled rotation batch
+    DETAIL_FETCH_DELAY: float = 2.0  # Seconds between consecutive detail fetches
+
     # Notifications
     NOTIFY_MAX_PER_SYNC: int = 25           # Max notifications dispatched per sync_movements call
 
