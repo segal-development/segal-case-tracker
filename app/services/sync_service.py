@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, List, Optional, Tuple, Awaitable, TypeVar
 from sqlalchemy.orm import Session
-from sqlalchemy import and_
+from sqlalchemy import and_, func
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,7 @@ from app.models.case_escrito import CaseEscrito
 from app.models.case_exhorto import CaseExhorto
 from app.services.notification_service import NotificationService
 from app.services.document_persistence import DocumentPersistenceService
+from app.scrapper.pjud.exceptions import SessionExpiredError, SessionNotAuthenticatedError
 
 
 @dataclass
@@ -735,11 +736,15 @@ class SyncService:
         Returns:
             Tuple of (case, is_new)
         """
+        # Normalize ROL on write so DB values always match the uppercased form used
+        # in rotation queries, preventing starvation from mixed-case PJUD responses.
+        normalized_rol = scraped.rol.strip().upper()
+
         # Find existing case by ROL and lawyer
         existing = self.db.query(Case).filter(
             and_(
                 Case.lawyer_id == lawyer_id,
-                Case.rol == scraped.rol,
+                Case.rol == normalized_rol,
             )
         ).first()
         
@@ -769,7 +774,7 @@ class SyncService:
             case = Case(
                 lawyer_id=lawyer_id,
                 court_id=court.id,
-                rol=scraped.rol,
+                rol=normalized_rol,
                 plaintiff=plaintiff,
                 defendant=defendant,
                 status=self._map_status(scraped.estado_cuaderno),
@@ -1073,6 +1078,99 @@ def _select_cases_for_movement_check(
     return api_cases[:max_cases]
 
 
+def _select_cases_for_detail_rotation(
+    db: Session,
+    lawyer_id: int,
+    competencia: str,
+    api_cases: list,
+    batch_size: int,
+) -> list:
+    """Select PJUDCase objects for detail scraping via DB-driven rotation.
+
+    Queries Case rows for this lawyer + competencia ordered by
+    ``last_detail_checked_at ASC NULLS FIRST, filed_at DESC`` with a LIMIT of
+    *batch_size*.  Each DB row is matched to *api_cases* by normalized ROL so
+    the returned objects carry the live ``case_token`` required for scraping.
+
+    Args:
+        db: Active SQLAlchemy session.
+        lawyer_id: Filter to this lawyer's cases.
+        competencia: Filter to this competencia (e.g. "civil").
+        api_cases: Live PJUD case list from ``get_my_cases``.
+        batch_size: Maximum number of cases to return.
+
+    Returns:
+        List of PJUDCase objects (subset of *api_cases*) in rotation order,
+        skipping DB cases absent from *api_cases* or without a ``case_token``.
+        If no Case rows exist in DB for this lawyer+competencia, returns
+        ``api_cases[:batch_size]`` so the caller is never starved.
+    """
+    # Build lookup: normalized_rol → api_case (only those with a live token).
+    api_lookup = {
+        ac.rol.strip().upper(): ac
+        for ac in api_cases
+        if ac.case_token
+    }
+
+    db_cases = (
+        db.query(Case)
+        .filter(Case.lawyer_id == lawyer_id, Case.competencia == competencia)
+        .order_by(
+            Case.last_detail_checked_at.asc().nullsfirst(),
+            Case.filed_at.desc(),
+        )
+        .limit(batch_size)
+        .all()
+    )
+
+    # Empty DB for this lawyer+competencia — fall back to live cases that have a
+    # case_token (tokenless cases are skipped downstream anyway).
+    if not db_cases:
+        return [ac for ac in api_cases if ac.case_token][:batch_size]
+
+    result = []
+    for db_case in db_cases:
+        normalized = db_case.rol.strip().upper()
+        api_case = api_lookup.get(normalized)
+        if api_case is not None:
+            result.append(api_case)
+
+    # Ghost-case guard: DB had rows but none matched live api_cases (stale/archived
+    # cases removed from PJUD).  Those rows have NULL last_detail_checked_at so they
+    # sit permanently at the front of the rotation order and starve live cases.
+    # Fall back to live api_cases so rotation is not blocked by ghost rows.
+    if not result and db_cases:
+        return [ac for ac in api_cases if ac.case_token][:batch_size]
+
+    return result
+
+
+def _oldest_unchecked_label(db: Session, lawyer_id: int) -> str:
+    """Return a human-readable rotation status label.
+
+    SQL MIN() ignores NULLs, so never-checked cases (NULL last_detail_checked_at)
+    are counted explicitly and reported separately from the oldest checked timestamp.
+    """
+    never_checked = (
+        db.query(func.count(Case.id))
+        .filter(Case.lawyer_id == lawyer_id, Case.last_detail_checked_at.is_(None))
+        .scalar()
+        or 0
+    )
+    oldest_checked = (
+        db.query(func.min(Case.last_detail_checked_at))
+        .filter(Case.lawyer_id == lawyer_id, Case.last_detail_checked_at.isnot(None))
+        .scalar()
+    )
+    if oldest_checked is None:
+        return f"{never_checked} never-checked; oldest-checked: none"
+    age = datetime.utcnow() - oldest_checked
+    return (
+        f"{never_checked} never-checked; "
+        f"oldest-checked: {age.days}d {age.seconds // 3600}h ago"
+    )
+
+
 async def detect_and_sync_movements(
     db: Session,
     scraper,
@@ -1080,7 +1178,9 @@ async def detect_and_sync_movements(
     lawyer_id: int,
     api_cases: list,
     rol: Optional[str] = None,
+    selected_cases: Optional[list] = None,
     delay_between_fetches: float = 0.0,
+    reauth_callback: Optional[Callable[[], Awaitable[Optional["PJUDSession"]]]] = None,
 ) -> Tuple[int, int, List[str]]:
     """Fetch case details for selected cases and sync new movements to the database.
 
@@ -1088,10 +1188,18 @@ async def detect_and_sync_movements(
     ``POST /sync`` endpoint (on-demand) and the scheduled worker (autonomous).
     Keeping a single implementation ensures one code path to test and maintain.
 
-    Selection is governed by ``_select_cases_for_movement_check``:
-    - If *rol* is given, only that case is fetched (targeted/demo mode).
-    - Otherwise, at most ``MOVEMENT_CHECK_DEFAULT_MAX`` cases from the front of
-      the list are fetched (rate-limit-friendly default).
+    Selection precedence:
+    - If *selected_cases* is provided, it is used directly (scheduler rotation path).
+    - Otherwise selection is governed by ``_select_cases_for_movement_check``:
+      - If *rol* is given, only that case is fetched (targeted/on-demand mode).
+      - Otherwise, at most ``MOVEMENT_CHECK_DEFAULT_MAX`` cases from the front of
+        the list are fetched (rate-limit-friendly default).
+
+    After each successful ``get_case_detail`` call, ``db_case.last_detail_checked_at``
+    is advanced to the current UTC time so the rotation scheduler knows which cases
+    were recently checked.  A case-specific error (non-session) also advances the
+    timestamp so a persistently-failing case rotates to the back and does not block
+    the batch every run.
 
     Notifications are dispatched automatically by ``SyncService.sync_movements``
     via the existing ``NotificationService`` path (email + HMAC webhooks).
@@ -1102,11 +1210,24 @@ async def detect_and_sync_movements(
         pjud_session: Active ``PJUDSession`` used for authenticated scraping.
         lawyer_id: Owner of the cases being checked.
         api_cases: List of PJUDCase objects returned by ``get_my_cases``.
-        rol: Optional ROL filter — when set, only that case is detail-fetched.
+        rol: Optional ROL filter — when set, only that case is detail-fetched
+            (on-demand path; ignored when *selected_cases* is provided).
+        selected_cases: When provided by the scheduler, use this pre-selected
+            list directly and bypass the internal ``_select_cases_for_movement_check``
+            call.  The ROL-targeted on-demand path passes ``None`` here.
         delay_between_fetches: Seconds to sleep between consecutive detail
             fetches.  Use ``0.0`` (default) for on-demand endpoint calls; use
-            a small positive value (e.g. ``1.0``) in scheduled workers to be
+            a positive value (e.g. ``2.0``) in scheduled workers to be
             considerate toward the PJUD infrastructure.
+        reauth_callback: Optional async callable ``() -> Optional[PJUDSession]``
+            injected by the scheduler.  When a ``SessionExpiredError`` or
+            ``SessionNotAuthenticatedError`` is caught, this callback is invoked
+            once to obtain a fresh session.  If it returns ``None`` or raises,
+            the batch stops gracefully (remaining cases deferred to the next
+            run).  If it returns a valid session, the current case is retried
+            once with the new session.  ``last_detail_checked_at`` is NEVER
+            advanced on a session error — session failure is not the case's
+            fault, and the rotation position must be preserved for the retry.
 
     Returns:
         Tuple of ``(movements_new, alerts_created, errors)`` where *errors* is
@@ -1117,7 +1238,10 @@ async def detect_and_sync_movements(
     alerts_created: int = 0
     errors: List[str] = []
 
-    cases_for_check = _select_cases_for_movement_check(api_cases, rol=rol)
+    if selected_cases is not None:
+        cases_for_check = selected_cases
+    else:
+        cases_for_check = _select_cases_for_movement_check(api_cases, rol=rol)
 
     if not cases_for_check:
         if rol:
@@ -1126,13 +1250,29 @@ async def detect_and_sync_movements(
                 "skipping movement detection",
                 rol,
             )
+        elif selected_cases is not None:
+            logger.warning(
+                "detect_and_sync_movements: rotation batch produced 0 live cases "
+                "(lawyer_id=%s) — possible ghost/stale rows",
+                lawyer_id,
+            )
     else:
-        cap_msg = (
-            f"rol={rol}"
-            if rol
-            else f"first {len(cases_for_check)} of {len(api_cases)} cases"
-        )
+        if selected_cases is not None:
+            cap_msg = f"rotation batch of {len(cases_for_check)} cases"
+        elif rol:
+            cap_msg = f"rol={rol}"
+        else:
+            cap_msg = f"first {len(cases_for_check)} of {len(api_cases)} cases"
         logger.info("detect_and_sync_movements: fetching movements for %s", cap_msg)
+
+    # Coverage / progress log — emitted once per batch so operators can gauge
+    # rotation throughput and spot starvation before it becomes a problem.
+    logger.info(
+        "detect_and_sync_movements: batch=%d / total_api=%d; oldest_unchecked=%s",
+        len(cases_for_check),
+        len(api_cases),
+        _oldest_unchecked_label(db, lawyer_id),
+    )
 
     sync_svc = SyncService(db)
 
@@ -1144,7 +1284,24 @@ async def detect_and_sync_movements(
             )
             continue
 
-        try:
+        # Resolve DB case BEFORE the try block so the except branch can reference
+        # it to advance last_detail_checked_at even on failure (rotation fairness).
+        normalized_rol = api_case.rol.strip().upper()
+        db_case = db.query(Case).filter(
+            Case.lawyer_id == lawyer_id,
+            Case.rol == normalized_rol,
+        ).first()
+
+        async def _do_fetch() -> Tuple[int, int]:
+            """Fetch case detail, sync movements/entities/documents for *api_case*.
+
+            Reads ``pjud_session`` from the enclosing scope so that reassigning
+            ``pjud_session = new_session`` in the outer ``except`` block is
+            immediately visible to a subsequent retry call.
+
+            Returns:
+                ``(movements_new_delta, alerts_created_delta)``
+            """
             detail = await scraper.get_case_detail(
                 session=pjud_session,
                 case_token=api_case.case_token,
@@ -1163,12 +1320,6 @@ async def detect_and_sync_movements(
                 for m in detail.movements
             ])
 
-            normalized_rol = api_case.rol.strip().upper()
-            db_case = db.query(Case).filter(
-                Case.lawyer_id == lawyer_id,
-                Case.rol == normalized_rol,
-            ).first()
-
             if not db_case:
                 logger.warning(
                     "detect_and_sync_movements: DB case not found for "
@@ -1176,95 +1327,191 @@ async def detect_and_sync_movements(
                     api_case.rol,
                     lawyer_id,
                 )
-            else:
-                # Hoist lawyer + webhooks once (used by both movements and entities).
-                case_lawyer = db.query(Lawyer).filter(
-                    Lawyer.id == db_case.lawyer_id
-                ).first()
-                case_webhooks: list = []
-                if case_lawyer:
-                    case_webhooks = db.query(Webhook).filter(
-                        Webhook.lawyer_id == case_lawyer.id,
-                        Webhook.is_active == True,  # noqa: E712
-                    ).all()
+                return 0, 0
 
-                # Shared budget across movements + all entity types (ADR-005).
-                shared_budget = NotifyBudget.from_settings()
-                notification_svc = NotificationService(db)
+            # Hoist lawyer + webhooks once (used by both movements and entities).
+            case_lawyer = db.query(Lawyer).filter(
+                Lawyer.id == db_case.lawyer_id
+            ).first()
+            case_webhooks: list = []
+            if case_lawyer:
+                case_webhooks = db.query(Webhook).filter(
+                    Webhook.lawyer_id == case_lawyer.id,
+                    Webhook.is_active == True,  # noqa: E712
+                ).all()
 
-                # 1. Sync movements (with shared budget).
-                if scraped_movements:
-                    new_count, alert_count = sync_svc.sync_movements(
-                        case_id=int(db_case.id),
-                        scraped_movements=scraped_movements,
-                        budget=shared_budget,
-                    )
-                    movements_new += new_count
-                    alerts_created += alert_count
-                    logger.info(
-                        "detect_and_sync_movements: %s → %d new movements, %d alerts",
-                        api_case.rol,
-                        new_count,
-                        alert_count,
-                    )
+            # Shared budget across movements + all entity types (ADR-005).
+            shared_budget = NotifyBudget.from_settings()
+            notification_svc = NotificationService(db)
 
-                # 2. Sync entity types in priority order (S1-T12 + S2-T03).
-                # Litigantes are stored but SILENT (ADR-004); the rest alert + notify.
-                for entity_list, spec in [
-                    (detail.litigantes, SPEC_LITIGANTE),
-                    (detail.notificaciones, SPEC_NOTIFICACION),
-                    (detail.escritos, SPEC_ESCRITO),
-                    (detail.exhortos, SPEC_EXHORTO),
-                ]:
-                    _sync_entities(
-                        db,
-                        int(db_case.id),
-                        entity_list,
-                        spec,
-                        case=db_case,
-                        lawyer=case_lawyer,
-                        webhooks=case_webhooks,
-                        notification_svc=notification_svc,
-                        budget=shared_budget,
-                    )
+            new_count = 0
+            alert_count = 0
 
-                # 3. Persist document tokens (Slice 1 — S1-T13).
-                # Must run after sync_movements so that Movement rows exist for
-                # the folio-based lookup inside persist_from_detail.
-                persisted_docs = DocumentPersistenceService().persist_from_detail(
-                    detail, int(db_case.id), db
+            # 1. Sync movements (with shared budget).
+            if scraped_movements:
+                new_count, alert_count = sync_svc.sync_movements(
+                    case_id=int(db_case.id),
+                    scraped_movements=scraped_movements,
+                    budget=shared_budget,
+                )
+                logger.info(
+                    "detect_and_sync_movements: %s → %d new movements, %d alerts",
+                    api_case.rol,
+                    new_count,
+                    alert_count,
                 )
 
-                # Commit entity upserts + document tokens (sync_movements already committed).
-                db.commit()
+            # 2. Sync entity types in priority order (S1-T12 + S2-T03).
+            # Litigantes are stored but SILENT (ADR-004); the rest alert + notify.
+            for entity_list, spec in [
+                (detail.litigantes, SPEC_LITIGANTE),
+                (detail.notificaciones, SPEC_NOTIFICACION),
+                (detail.escritos, SPEC_ESCRITO),
+                (detail.exhortos, SPEC_EXHORTO),
+            ]:
+                _sync_entities(
+                    db,
+                    int(db_case.id),
+                    entity_list,
+                    spec,
+                    case=db_case,
+                    lawyer=case_lawyer,
+                    webhooks=case_webhooks,
+                    notification_svc=notification_svc,
+                    budget=shared_budget,
+                )
 
-                # 4. Synchronous document download (Slice 2 — S2-T6).
-                # MUST run in this same sync task while the live browser page and
-                # freshly-parsed JWT tokens are still valid (1-hour expiry window).
-                if settings.DOC_DOWNLOAD_ENABLED and persisted_docs:
-                    from app.services.document_downloader import (
-                        DocumentDownloader,
-                        AsyncSleepLimiter,  # FIX 8: renamed from _AsyncSleepLimiter
+            # 3. Persist document tokens (Slice 1 — S1-T13).
+            # Must run after sync_movements so that Movement rows exist for
+            # the folio-based lookup inside persist_from_detail.
+            persisted_docs = DocumentPersistenceService().persist_from_detail(
+                detail, int(db_case.id), db
+            )
+
+            # Mark this case as detail-checked so the rotation scheduler
+            # advances it to the back of the queue for the next run.
+            # Runs even on 0-movement fetches — guarantees full-cycle coverage.
+            db_case.last_detail_checked_at = datetime.utcnow()
+
+            # Commit entity upserts + document tokens + mark-checked.
+            # (sync_movements already committed its own changes.)
+            db.commit()
+
+            # 4. Synchronous document download (Slice 2 — S2-T6).
+            # MUST run in this same sync task while the live browser page and
+            # freshly-parsed JWT tokens are still valid (1-hour expiry window).
+            if settings.DOC_DOWNLOAD_ENABLED and persisted_docs:
+                from app.services.document_downloader import (
+                    DocumentDownloader,
+                    AsyncSleepLimiter,
+                )
+                from app.services.storage_service import StorageService, get_storage_backend
+
+                # Include "failed" docs so transient download failures are retried
+                # on the next scheduled run.
+                pending_docs = [
+                    d for d in persisted_docs if d.status in ("pending", "failed")
+                ]
+                if pending_docs:
+                    storage_svc = StorageService(get_storage_backend(settings))
+                    await DocumentDownloader().download_and_store(
+                        pending_docs=pending_docs,
+                        scraper=scraper,
+                        pjud_session=pjud_session,
+                        db=db,
+                        storage_service=storage_svc,
+                        limiter=AsyncSleepLimiter(delay=0.0),
+                        enabled=True,
                     )
-                    from app.services.storage_service import StorageService, get_storage_backend
 
-                    # FIX 6: include "failed" docs so transient failures are retried
-                    pending_docs = [
-                        d for d in persisted_docs if d.status in ("pending", "failed")
-                    ]
-                    if pending_docs:
-                        storage_svc = StorageService(get_storage_backend(settings))
-                        await DocumentDownloader().download_and_store(
-                            pending_docs=pending_docs,
-                            scraper=scraper,
-                            pjud_session=pjud_session,
-                            db=db,
-                            storage_service=storage_svc,
-                            limiter=AsyncSleepLimiter(delay=0.0),
-                            enabled=True,
-                        )
+            return new_count, alert_count
+
+        try:
+            delta_m, delta_a = await _do_fetch()
+            movements_new += delta_m
+            alerts_created += delta_a
+
+        except (SessionExpiredError, SessionNotAuthenticatedError) as session_exc:
+            logger.warning(
+                "detect_and_sync_movements: session error for lawyer_id=%s rol=%s: %s",
+                lawyer_id,
+                api_case.rol,
+                session_exc,
+            )
+            # Session failure is NOT the case's fault.  Do NOT advance
+            # last_detail_checked_at — preserve the rotation position so this
+            # case is retried on the next batch with a fresh session.
+            new_session = None
+            if reauth_callback is not None:
+                try:
+                    new_session = await reauth_callback()
+                except Exception as reauth_exc:
+                    logger.error(
+                        "detect_and_sync_movements: reauth failed: %s", reauth_exc
+                    )
+
+            if new_session is None:
+                logger.warning(
+                    "detect_and_sync_movements: stopping batch — "
+                    "session expired and no reauth available (lawyer_id=%s, rol=%s)",
+                    lawyer_id,
+                    api_case.rol,
+                )
+                errors.append(
+                    f"Session expired processing {api_case.rol}; batch stopped"
+                )
+                break
+
+            # Reauth succeeded — update the local session reference and retry once.
+            pjud_session = new_session
+            try:
+                delta_m, delta_a = await _do_fetch()
+                movements_new += delta_m
+                alerts_created += delta_a
+            except (SessionExpiredError, SessionNotAuthenticatedError):
+                logger.error(
+                    "detect_and_sync_movements: second session expiry after reauth; "
+                    "stopping batch (lawyer_id=%s, rol=%s)",
+                    lawyer_id,
+                    api_case.rol,
+                )
+                errors.append(
+                    f"Session expired again on retry for {api_case.rol}; batch stopped"
+                )
+                break
+            except Exception as retry_exc:
+                # Non-session error on retry — case-specific; advance timestamp.
+                db.rollback()
+                if db_case is not None:
+                    db_case.last_detail_checked_at = datetime.utcnow()
+                    try:
+                        db.commit()
+                    except Exception:
+                        db.rollback()
+                logger.error(
+                    "detect_and_sync_movements: retry failed for %s: %s",
+                    api_case.rol,
+                    retry_exc,
+                )
+                errors.append(
+                    f"Movement fetch failed on retry for {api_case.rol}: {retry_exc}"
+                )
 
         except Exception as exc:
+            # Rollback any partial entity/alert rows flushed (but not yet committed)
+            # during the try block.  Without this, the except's db.commit() would
+            # silently persist half-written entity state alongside the mark-checked
+            # UPDATE.  sync_movements already committed earlier — unaffected.
+            db.rollback()
+            # Case-specific error (detail parse, not-found, etc.) — NOT a session error.
+            # Advance last_detail_checked_at so a persistently-failing case rotates to
+            # the back and does not block the rotation batch on every scheduled run.
+            if db_case is not None:
+                db_case.last_detail_checked_at = datetime.utcnow()
+                try:
+                    db.commit()
+                except Exception:
+                    db.rollback()
             logger.error(
                 "detect_and_sync_movements: failed to fetch/process for %s: %s",
                 api_case.rol,
@@ -1275,4 +1522,10 @@ async def detect_and_sync_movements(
         if delay_between_fetches > 0:
             await asyncio.sleep(delay_between_fetches)
 
+    logger.info(
+        "detect_and_sync_movements: done — %d new movements, %d alerts, %d errors",
+        movements_new,
+        alerts_created,
+        len(errors),
+    )
     return movements_new, alerts_created, errors

@@ -19,6 +19,8 @@ from __future__ import annotations
 import logging
 from typing import List, TYPE_CHECKING
 
+from app.scrapper.pjud.exceptions import SessionExpiredError, SessionNotAuthenticatedError
+
 if TYPE_CHECKING:
     from app.models.document import Document
     from app.services.storage_service import StorageService
@@ -104,6 +106,10 @@ class DocumentDownloader:
                     len(pdf_bytes),
                     doc.gcs_path,
                 )
+            except (SessionExpiredError, SessionNotAuthenticatedError):
+                # Session expiry must propagate so the caller can trigger reauth.
+                # Swallowing it here would burn O(N) scraper calls against a dead session.
+                raise
             except Exception as exc:  # noqa: BLE001 — failure isolation
                 logger.warning(
                     "DocumentDownloader: failed to download/store doc %s: %s",
