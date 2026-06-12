@@ -14,6 +14,7 @@ from app.models.case_exhorto import CaseExhorto
 from app.models.movement import Movement
 from app.models.court import Court
 from app.models.sync_history import SyncHistory
+from app.models.document import Document
 from app.services.case_service import CaseService
 
 router = APIRouter()
@@ -138,6 +139,20 @@ class CaseEntitiesResponse(BaseModel):
     notificaciones: List[NotificacionResponse]
     escritos: List[EscritoResponse]
     exhortos: List[ExhortoResponse]
+
+
+class DocumentListItem(BaseModel):
+    """Single document row returned by the list endpoint."""
+    id: int
+    doc_type: Optional[str] = None
+    pjud_endpoint: Optional[str] = None
+    filename: Optional[str] = None
+    status: str
+    available: bool
+    download_url: str
+
+    class Config:
+        from_attributes = True
 
 
 class CaseDetailResponse(BaseModel):
@@ -416,6 +431,48 @@ async def get_case_detail_entities(
         escritos=[EscritoResponse.model_validate(r) for r in escritos],
         exhortos=[ExhortoResponse.model_validate(r) for r in exhortos],
     )
+
+
+@router.get("/{case_id}/documents", response_model=List[DocumentListItem])
+async def list_case_documents(
+    case_id: int,
+    current_lawyer: dict = Depends(get_current_lawyer),
+    db: Session = Depends(get_db),
+):
+    """List all documents for a case.
+
+    Returns document rows with a pre-built download URL for each one.
+    ``available`` is ``True`` for every status except ``"unavailable"``.
+    """
+    lawyer_id = current_lawyer.get("sub") or current_lawyer.get("lawyer_id")
+
+    case = db.query(Case).filter(
+        and_(
+            Case.id == case_id,
+            Case.lawyer_id == lawyer_id,
+        )
+    ).first()
+
+    if not case:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Case not found",
+        )
+
+    docs = db.query(Document).filter(Document.case_id == case_id).all()
+
+    return [
+        DocumentListItem(
+            id=doc.id,
+            doc_type=doc.doc_type,
+            pjud_endpoint=doc.pjud_endpoint,
+            filename=doc.filename,
+            status=doc.status,
+            available=(doc.status != "unavailable"),
+            download_url=f"/api/v1/documents/{doc.id}/download",
+        )
+        for doc in docs
+    ]
 
 
 @router.delete("/{case_id}", status_code=status.HTTP_204_NO_CONTENT)
