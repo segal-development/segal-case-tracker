@@ -735,11 +735,15 @@ class SyncService:
         Returns:
             Tuple of (case, is_new)
         """
+        # Normalize ROL on write so DB values always match the uppercased form used
+        # in rotation queries, preventing starvation from mixed-case PJUD responses.
+        normalized_rol = scraped.rol.strip().upper()
+
         # Find existing case by ROL and lawyer
         existing = self.db.query(Case).filter(
             and_(
                 Case.lawyer_id == lawyer_id,
-                Case.rol == scraped.rol,
+                Case.rol == normalized_rol,
             )
         ).first()
         
@@ -769,7 +773,7 @@ class SyncService:
             case = Case(
                 lawyer_id=lawyer_id,
                 court_id=court.id,
-                rol=scraped.rol,
+                rol=normalized_rol,
                 plaintiff=plaintiff,
                 defendant=defendant,
                 status=self._map_status(scraped.estado_cuaderno),
@@ -1073,6 +1077,73 @@ def _select_cases_for_movement_check(
     return api_cases[:max_cases]
 
 
+def _select_cases_for_detail_rotation(
+    db: Session,
+    lawyer_id: int,
+    competencia: str,
+    api_cases: list,
+    batch_size: int,
+) -> list:
+    """Select PJUDCase objects for detail scraping via DB-driven rotation.
+
+    Queries Case rows for this lawyer + competencia ordered by
+    ``last_detail_checked_at ASC NULLS FIRST, filed_at DESC`` with a LIMIT of
+    *batch_size*.  Each DB row is matched to *api_cases* by normalized ROL so
+    the returned objects carry the live ``case_token`` required for scraping.
+
+    Args:
+        db: Active SQLAlchemy session.
+        lawyer_id: Filter to this lawyer's cases.
+        competencia: Filter to this competencia (e.g. "civil").
+        api_cases: Live PJUD case list from ``get_my_cases``.
+        batch_size: Maximum number of cases to return.
+
+    Returns:
+        List of PJUDCase objects (subset of *api_cases*) in rotation order,
+        skipping DB cases absent from *api_cases* or without a ``case_token``.
+        If no Case rows exist in DB for this lawyer+competencia, returns
+        ``api_cases[:batch_size]`` so the caller is never starved.
+    """
+    # Build lookup: normalized_rol → api_case (only those with a live token).
+    api_lookup = {
+        ac.rol.strip().upper(): ac
+        for ac in api_cases
+        if ac.case_token
+    }
+
+    db_cases = (
+        db.query(Case)
+        .filter(Case.lawyer_id == lawyer_id, Case.competencia == competencia)
+        .order_by(
+            Case.last_detail_checked_at.asc().nullsfirst(),
+            Case.filed_at.desc(),
+        )
+        .limit(batch_size)
+        .all()
+    )
+
+    # Empty DB for this lawyer+competencia — fall back to live cases that have a
+    # case_token (tokenless cases are skipped downstream anyway).
+    if not db_cases:
+        return [ac for ac in api_cases if ac.case_token][:batch_size]
+
+    result = []
+    for db_case in db_cases:
+        normalized = db_case.rol.strip().upper()
+        api_case = api_lookup.get(normalized)
+        if api_case is not None:
+            result.append(api_case)
+
+    # Ghost-case guard: DB had rows but none matched live api_cases (stale/archived
+    # cases removed from PJUD).  Those rows have NULL last_detail_checked_at so they
+    # sit permanently at the front of the rotation order and starve live cases.
+    # Fall back to live api_cases so rotation is not blocked by ghost rows.
+    if not result and db_cases:
+        return [ac for ac in api_cases if ac.case_token][:batch_size]
+
+    return result
+
+
 async def detect_and_sync_movements(
     db: Session,
     scraper,
@@ -1080,6 +1151,7 @@ async def detect_and_sync_movements(
     lawyer_id: int,
     api_cases: list,
     rol: Optional[str] = None,
+    selected_cases: Optional[list] = None,
     delay_between_fetches: float = 0.0,
 ) -> Tuple[int, int, List[str]]:
     """Fetch case details for selected cases and sync new movements to the database.
@@ -1088,10 +1160,18 @@ async def detect_and_sync_movements(
     ``POST /sync`` endpoint (on-demand) and the scheduled worker (autonomous).
     Keeping a single implementation ensures one code path to test and maintain.
 
-    Selection is governed by ``_select_cases_for_movement_check``:
-    - If *rol* is given, only that case is fetched (targeted/demo mode).
-    - Otherwise, at most ``MOVEMENT_CHECK_DEFAULT_MAX`` cases from the front of
-      the list are fetched (rate-limit-friendly default).
+    Selection precedence:
+    - If *selected_cases* is provided, it is used directly (scheduler rotation path).
+    - Otherwise selection is governed by ``_select_cases_for_movement_check``:
+      - If *rol* is given, only that case is fetched (targeted/on-demand mode).
+      - Otherwise, at most ``MOVEMENT_CHECK_DEFAULT_MAX`` cases from the front of
+        the list are fetched (rate-limit-friendly default).
+
+    After each successful ``get_case_detail`` call, ``db_case.last_detail_checked_at``
+    is advanced to the current UTC time so the rotation scheduler knows which cases
+    were recently checked.  A case-specific error (non-session) also advances the
+    timestamp so a persistently-failing case rotates to the back and does not block
+    the batch every run.
 
     Notifications are dispatched automatically by ``SyncService.sync_movements``
     via the existing ``NotificationService`` path (email + HMAC webhooks).
@@ -1102,10 +1182,14 @@ async def detect_and_sync_movements(
         pjud_session: Active ``PJUDSession`` used for authenticated scraping.
         lawyer_id: Owner of the cases being checked.
         api_cases: List of PJUDCase objects returned by ``get_my_cases``.
-        rol: Optional ROL filter — when set, only that case is detail-fetched.
+        rol: Optional ROL filter — when set, only that case is detail-fetched
+            (on-demand path; ignored when *selected_cases* is provided).
+        selected_cases: When provided by the scheduler, use this pre-selected
+            list directly and bypass the internal ``_select_cases_for_movement_check``
+            call.  The ROL-targeted on-demand path passes ``None`` here.
         delay_between_fetches: Seconds to sleep between consecutive detail
             fetches.  Use ``0.0`` (default) for on-demand endpoint calls; use
-            a small positive value (e.g. ``1.0``) in scheduled workers to be
+            a positive value (e.g. ``2.0``) in scheduled workers to be
             considerate toward the PJUD infrastructure.
 
     Returns:
@@ -1117,7 +1201,10 @@ async def detect_and_sync_movements(
     alerts_created: int = 0
     errors: List[str] = []
 
-    cases_for_check = _select_cases_for_movement_check(api_cases, rol=rol)
+    if selected_cases is not None:
+        cases_for_check = selected_cases
+    else:
+        cases_for_check = _select_cases_for_movement_check(api_cases, rol=rol)
 
     if not cases_for_check:
         if rol:
@@ -1126,12 +1213,19 @@ async def detect_and_sync_movements(
                 "skipping movement detection",
                 rol,
             )
+        elif selected_cases is not None:
+            logger.warning(
+                "detect_and_sync_movements: rotation batch produced 0 live cases "
+                "(lawyer_id=%s) — possible ghost/stale rows",
+                lawyer_id,
+            )
     else:
-        cap_msg = (
-            f"rol={rol}"
-            if rol
-            else f"first {len(cases_for_check)} of {len(api_cases)} cases"
-        )
+        if selected_cases is not None:
+            cap_msg = f"rotation batch of {len(cases_for_check)} cases"
+        elif rol:
+            cap_msg = f"rol={rol}"
+        else:
+            cap_msg = f"first {len(cases_for_check)} of {len(api_cases)} cases"
         logger.info("detect_and_sync_movements: fetching movements for %s", cap_msg)
 
     sync_svc = SyncService(db)
@@ -1143,6 +1237,14 @@ async def detect_and_sync_movements(
                 api_case.rol,
             )
             continue
+
+        # Resolve DB case BEFORE the try block so the except branch can reference
+        # it to advance last_detail_checked_at even on failure (rotation fairness).
+        normalized_rol = api_case.rol.strip().upper()
+        db_case = db.query(Case).filter(
+            Case.lawyer_id == lawyer_id,
+            Case.rol == normalized_rol,
+        ).first()
 
         try:
             detail = await scraper.get_case_detail(
@@ -1162,12 +1264,6 @@ async def detect_and_sync_movements(
                 }
                 for m in detail.movements
             ])
-
-            normalized_rol = api_case.rol.strip().upper()
-            db_case = db.query(Case).filter(
-                Case.lawyer_id == lawyer_id,
-                Case.rol == normalized_rol,
-            ).first()
 
             if not db_case:
                 logger.warning(
@@ -1235,7 +1331,13 @@ async def detect_and_sync_movements(
                     detail, int(db_case.id), db
                 )
 
-                # Commit entity upserts + document tokens (sync_movements already committed).
+                # Mark this case as detail-checked so the rotation scheduler
+                # advances it to the back of the queue for the next run.
+                # Runs even on 0-movement fetches — guarantees full-cycle coverage.
+                db_case.last_detail_checked_at = datetime.utcnow()
+
+                # Commit entity upserts + document tokens + mark-checked.
+                # (sync_movements already committed its own changes.)
                 db.commit()
 
                 # 4. Synchronous document download (Slice 2 — S2-T6).
@@ -1244,11 +1346,12 @@ async def detect_and_sync_movements(
                 if settings.DOC_DOWNLOAD_ENABLED and persisted_docs:
                     from app.services.document_downloader import (
                         DocumentDownloader,
-                        AsyncSleepLimiter,  # FIX 8: renamed from _AsyncSleepLimiter
+                        AsyncSleepLimiter,
                     )
                     from app.services.storage_service import StorageService, get_storage_backend
 
-                    # FIX 6: include "failed" docs so transient failures are retried
+                    # Include "failed" docs so transient download failures are retried
+                    # on the next scheduled run.
                     pending_docs = [
                         d for d in persisted_docs if d.status in ("pending", "failed")
                     ]
@@ -1265,6 +1368,20 @@ async def detect_and_sync_movements(
                         )
 
         except Exception as exc:
+            # Rollback any partial entity/alert rows flushed (but not yet committed)
+            # during the try block.  Without this, the except's db.commit() would
+            # silently persist half-written entity state alongside the mark-checked
+            # UPDATE.  sync_movements already committed earlier — unaffected.
+            db.rollback()
+            # Case-specific error (detail parse, not-found, etc.) — NOT a session error.
+            # Advance last_detail_checked_at so a persistently-failing case rotates to
+            # the back and does not block the rotation batch on every scheduled run.
+            if db_case is not None:
+                db_case.last_detail_checked_at = datetime.utcnow()
+                try:
+                    db.commit()
+                except Exception:
+                    db.rollback()
             logger.error(
                 "detect_and_sync_movements: failed to fetch/process for %s: %s",
                 api_case.rol,
