@@ -221,6 +221,40 @@ class TestDetectAndSyncMovements:
         assert mock_scraper.get_case_detail.await_count == 1
 
 
+    @pytest.mark.asyncio
+    async def test_selected_cases_bypasses_movement_check_scoping(self, db):
+        """selected_cases overrides the internal MOVEMENT_CHECK_DEFAULT_MAX cap."""
+        from app.services.sync_service import (
+            detect_and_sync_movements,
+            MOVEMENT_CHECK_DEFAULT_MAX,
+        )
+
+        # More api_cases than the default cap
+        total_cases = MOVEMENT_CHECK_DEFAULT_MAX + 3
+        api_cases = [
+            _make_api_case(f"C-SEL-{i}-2024", f"token-sel-{i}") for i in range(total_cases)
+        ]
+        # Pre-select only 2 of them
+        selected = api_cases[:2]
+
+        mock_scraper = MagicMock()
+        mock_scraper.get_case_detail = AsyncMock(
+            return_value=_make_detail_with_movements([])
+        )
+
+        await detect_and_sync_movements(
+            db=db,
+            scraper=mock_scraper,
+            pjud_session=MagicMock(),
+            lawyer_id=1,
+            api_cases=api_cases,
+            selected_cases=selected,
+        )
+
+        # The bypass must be exercised: only 2 fetches, not MOVEMENT_CHECK_DEFAULT_MAX
+        assert mock_scraper.get_case_detail.await_count == 2
+
+
 # ===========================================================================
 # S4-T3: Worker wiring
 # ===========================================================================

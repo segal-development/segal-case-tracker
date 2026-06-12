@@ -30,6 +30,7 @@ from app.services.sync_service import (
     SyncService,
     convert_api_cases_to_scraped,
     detect_and_sync_movements,
+    _select_cases_for_detail_rotation,
 )
 from app.services.session_store import get_session_store, SessionStore
 from app.services.pjud_session import PJUDSession
@@ -275,16 +276,28 @@ async def sync_lawyer_cases(
             triggered_by="scheduled",
         )
 
+        # Select the rotation batch AFTER the full case-list upsert so the DB
+        # reflects the most recent state (new cases will have last_detail_checked_at=NULL
+        # and therefore be at the front of the queue — highest priority).
+        rotation_batch = _select_cases_for_detail_rotation(
+            db=db,
+            lawyer_id=lawyer_id,
+            competencia=competencia,
+            api_cases=cases,
+            batch_size=settings.DETAIL_BATCH_SIZE,
+        )
+
         # S4-T3/S4-T5: movement detection — reuse the shared implementation.
-        # delay_between_fetches=1.0 throttles requests to PJUD so the worker
-        # does not hammer the server on each scheduled run.
+        # selected_cases drives the rotation (replaces the old front-of-list [:5] cap).
+        # DETAIL_FETCH_DELAY throttles requests so the worker does not hammer PJUD.
         movements_new, alerts_created, mov_errors = await detect_and_sync_movements(
             db=db,
             scraper=scraper,
             pjud_session=session,
             lawyer_id=lawyer_id,
             api_cases=cases,
-            delay_between_fetches=1.0,
+            selected_cases=rotation_batch,
+            delay_between_fetches=settings.DETAIL_FETCH_DELAY,
         )
 
         if mov_errors:
