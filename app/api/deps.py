@@ -45,3 +45,23 @@ async def get_current_lawyer(
     # TODO: Fetch lawyer from database using payload["sub"]
     # For now, return the payload
     return payload
+
+
+def _resolve_lawyer_id(db: Session, current_lawyer: dict) -> int:
+    """Resolve the numeric lawyer id from a JWT payload.
+
+    The JWT ``sub`` is the lawyer RUT (e.g. "16021492-9"); legacy/test tokens
+    may carry the numeric id directly. Map the RUT to ``lawyers.id`` via the DB.
+    Raises 401 when no subject is present and 404 when the lawyer is unknown.
+    """
+    sub = current_lawyer.get("sub") or current_lawyer.get("lawyer_id")
+    if not sub:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    if isinstance(sub, int) or (isinstance(sub, str) and sub.isdigit()):
+        return int(sub)
+    from app.models.lawyer import Lawyer
+
+    lawyer = db.query(Lawyer).filter(Lawyer.rut == sub).first()
+    if not lawyer:
+        raise HTTPException(status_code=404, detail="Lawyer not found")
+    return int(lawyer.id)

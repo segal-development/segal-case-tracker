@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import and_
 from pydantic import BaseModel
 
-from app.api.deps import get_db, get_current_lawyer
+from app.api.deps import get_db, get_current_lawyer, _resolve_lawyer_id
 from app.models.sync_history import SyncHistory
 from app.models.lawyer import Lawyer
 from app.services.sync_service import (
@@ -86,25 +86,6 @@ class SyncHistoryResponse(BaseModel):
 # ============================================================================
 # ENDPOINTS
 # ============================================================================
-
-def _resolve_lawyer_id(db: Session, current_lawyer: dict) -> int:
-    """Resolve the numeric lawyer id from the JWT.
-
-    The JWT ``sub`` is the lawyer RUT (e.g. "16021492-9"); legacy/test tokens
-    may carry the numeric id directly. Map the RUT to ``lawyers.id`` via the DB.
-    """
-    sub = current_lawyer.get("sub") or current_lawyer.get("lawyer_id")
-    if not sub:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    if isinstance(sub, int) or (isinstance(sub, str) and sub.isdigit()):
-        return int(sub)
-    from app.models.lawyer import Lawyer
-
-    lawyer = db.query(Lawyer).filter(Lawyer.rut == sub).first()
-    if not lawyer:
-        raise HTTPException(status_code=404, detail="Lawyer not found")
-    return int(lawyer.id)
-
 
 @router.post("", response_model=SyncResponse)
 async def sync_now(
