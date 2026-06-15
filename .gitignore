@@ -2,6 +2,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 .env
+# Real per-environment secret files (keep the *.example templates tracked)
+.env.*
+!.env.*.example
 .venv/
 venv/
 *.egg-info/
