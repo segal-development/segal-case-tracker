@@ -754,19 +754,40 @@ class PJUDBaseScraper(ABC):
                     f"{fn_name} function not found - panel not loaded"
                 )
             
-            # Call the native function
-            await page.evaluate(f"{fn_name}('{case_token}')")
-            await asyncio.sleep(3)
-            
-            # Capture modal content
             modal_id = self.config.modal_id
+
+            # Clear any stale modal content from a previous case — the page (and
+            # thus the modal element) is reused across cases, so we must detect
+            # THIS case's freshly-loaded content, not the prior one.
+            await page.evaluate(
+                f"() => {{ const m = document.querySelector('#{modal_id}'); if (m) m.innerHTML = ''; }}"
+            )
+
+            # Call the native function that opens + AJAX-loads the detail modal.
+            await page.evaluate(f"{fn_name}('{case_token}')")
+
+            # Poll for the modal to actually populate instead of a fixed sleep.
+            # Headless chromium inside Docker is slower than a local browser, and
+            # the previous fixed 3s race produced "Modal content empty" failures.
+            try:
+                await page.wait_for_function(
+                    f"() => {{ const m = document.querySelector('#{modal_id}');"
+                    f" return m && m.innerHTML.length > 100; }}",
+                    timeout=15000,
+                )
+            except Exception:
+                # Fall through to the guard below so we raise the clean,
+                # well-known ScrapingError rather than a Playwright timeout.
+                pass
+
+            # Capture modal content
             detail_html = await page.evaluate(f"""
                 () => {{
                     const modal = document.querySelector('#{modal_id}');
                     return modal ? modal.innerHTML : '';
                 }}
             """)
-            
+
             if not detail_html or len(detail_html) < 100:
                 raise ScrapingError("Modal content empty - detail failed to load")
             
