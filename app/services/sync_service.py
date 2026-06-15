@@ -1528,10 +1528,15 @@ async def detect_and_sync_movements(
             # silently persist half-written entity state alongside the mark-checked
             # UPDATE.  sync_movements already committed earlier — unaffected.
             db.rollback()
-            # Case-specific error (detail parse, not-found, etc.) — NOT a session error.
-            # Advance last_detail_checked_at so a persistently-failing case rotates to
-            # the back and does not block the rotation batch on every scheduled run.
-            if db_case is not None:
+            # Infrastructure errors (e.g. the Mis Causas panel got torn down by a
+            # prior detail navigation) are NOT case-specific — the case has real
+            # detail we simply couldn't reach. Do NOT advance last_detail_checked_at
+            # for these, so the case is retried instead of being falsely marked done.
+            is_infra_error = "panel not loaded" in str(exc).lower()
+            if db_case is not None and not is_infra_error:
+                # Case-specific error (detail parse, not-found, etc.). Advance so a
+                # persistently-failing case rotates to the back and doesn't block
+                # the rotation batch on every scheduled run.
                 db_case.last_detail_checked_at = datetime.utcnow()
                 try:
                     db.commit()
