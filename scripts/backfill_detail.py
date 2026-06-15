@@ -44,21 +44,32 @@ async def main() -> None:
         print("NO live PJUD session — seed one via POST /pjud/login, then re-run.")
         return
 
+    from app.config import settings
+
+    min_year = settings.DETAIL_MIN_YEAR
+
+    def _year_ok(rol: str) -> bool:
+        if min_year <= 0:
+            return True
+        try:
+            last = rol.rsplit("-", 1)[-1]
+        except (AttributeError, IndexError):
+            return True
+        if len(last) != 4 or not last.isdigit():
+            return True
+        return int(last) >= min_year
+
     def coverage() -> tuple[int, int]:
-        total = (
-            db.query(Case)
+        # Count only in-scope cases (ROL year >= DETAIL_MIN_YEAR) so the report
+        # matches what the rotation selection will actually scrape.
+        rows = (
+            db.query(Case.rol, Case.last_detail_checked_at)
             .filter(Case.lawyer_id == lawyer_id, Case.competencia == COMPETENCIA)
-            .count()
+            .all()
         )
-        remaining = (
-            db.query(Case)
-            .filter(
-                Case.lawyer_id == lawyer_id,
-                Case.competencia == COMPETENCIA,
-                Case.last_detail_checked_at.is_(None),
-            )
-            .count()
-        )
+        scoped = [(rol, checked) for rol, checked in rows if _year_ok(rol)]
+        total = len(scoped)
+        remaining = sum(1 for _, checked in scoped if checked is None)
         return total, remaining
 
     total, remaining_before = coverage()

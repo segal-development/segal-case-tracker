@@ -129,6 +129,27 @@ class TestSelectCasesForDetailRotation:
         assert "C-NULL-2" in rols
         assert "C-CHECKED-1" in rols
 
+    def test_year_filter_excludes_pre_min_year_cases(self, db):
+        """Cases whose ROL year < DETAIL_MIN_YEAR (2021) are excluded; >= is kept."""
+        from app.services.sync_service import _select_cases_for_detail_rotation
+
+        lawyer = db.query(Lawyer).first()
+        if not lawyer:
+            lawyer = Lawyer(rut="00000001-1", name="Lawyer 1", is_active=True)
+            db.add(lawyer)
+            db.flush()
+        lid = lawyer.id
+
+        _seed_case(db, lid, "civil", "C-100-2019", filed_at=datetime(2019, 6, 1), last_detail_checked_at=None)
+        _seed_case(db, lid, "civil", "C-200-2024", filed_at=datetime(2024, 6, 1), last_detail_checked_at=None)
+
+        api_cases = [_make_api_case("C-100-2019"), _make_api_case("C-200-2024")]
+        result = _select_cases_for_detail_rotation(db, lid, "civil", api_cases, batch_size=10)
+
+        rols = [c.rol for c in result]
+        assert "C-200-2024" in rols, "2024 case must be included"
+        assert "C-100-2019" not in rols, "pre-2021 case must be excluded"
+
     def test_secondary_sort_filed_at_desc_within_null_group(self, db):
         """Within NULL group, more recent filed_at comes first."""
         from app.services.sync_service import _select_cases_for_detail_rotation
