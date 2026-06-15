@@ -52,10 +52,10 @@ _scheduler: Optional[AsyncIOScheduler] = None
 # ============================================================================
 
 # How often to run sync (in hours)
-SYNC_INTERVAL_HOURS = int(getattr(settings, "SYNC_INTERVAL_HOURS", 4))
+SYNC_INTERVAL_HOURS = settings.SYNC_INTERVAL_HOURS
 
 # Max age before considering data stale (in hours)
-MAX_DATA_AGE_HOURS = int(getattr(settings, "MAX_DATA_AGE_HOURS", 4))
+MAX_DATA_AGE_HOURS = settings.MAX_DATA_AGE_HOURS
 
 # Competencias to sync
 COMPETENCIAS = ["civil", "laboral", "penal"]

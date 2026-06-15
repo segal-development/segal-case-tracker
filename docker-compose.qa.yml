@@ -1,0 +1,80 @@
+# QA — self-contained compose (NOT an overlay).
+#
+# Run:   docker compose -f docker-compose.qa.yml up -d --build
+#
+# Topology: GCE VM, direct connection to Cloud SQL PUBLIC IP (no Auth Proxy —
+# the deploy account lacks roles/cloudsql.client). The VM's static IP is
+# whitelisted on the Cloud SQL instance and the connection uses sslmode=require.
+#
+# All config + secrets come from .env.qa (copy from .env.qa.example, fill in).
+# The Cloud Storage service-account key is mounted read-only from ./sa-key.json
+# (placed next to this file on the VM; gitignored + dockerignored, never baked).
+
+services:
+
+  # --------------------------------------------------------------------------
+  # Redis — sessions + rate-limit
+  # --------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # --------------------------------------------------------------------------
+  # One-shot migration runner — alembic upgrade head, then exits 0
+  # --------------------------------------------------------------------------
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["alembic", "-c", "alembic/alembic.ini", "upgrade", "head"]
+    env_file: .env.qa
+    restart: "no"
+
+  # --------------------------------------------------------------------------
+  # API (FastAPI) — scheduler OFF here (runs in worker)
+  # --------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    shm_size: '2gb'
+    env_file: .env.qa
+    environment:
+      - ENABLE_SCHEDULER=false
+    volumes:
+      - ./sa-key.json:/secrets/sa-key.json:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # Worker — APScheduler ON, larger shm for Chromium, autonomous PJUD re-auth
+  # --------------------------------------------------------------------------
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    shm_size: '2gb'
+    env_file: .env.qa
+    environment:
+      - ENABLE_SCHEDULER=true
+    volumes:
+      - ./sa-key.json:/secrets/sa-key.json:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    command: ["python", "-m", "app.workers.sync_scheduler"]
+    restart: unless-stopped

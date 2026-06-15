@@ -20,7 +20,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import RedirectResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_lawyer, get_db
+from app.api.deps import get_current_lawyer, get_db, _resolve_lawyer_id
 from app.config import settings
 from app.models.document import Document
 from app.models.case import Case
@@ -65,7 +65,7 @@ async def get_document_redirect(
     Raises:
         404 — document not found, not owned by caller, or not yet stored.
     """
-    lawyer_id = current_lawyer.get("sub") or current_lawyer.get("lawyer_id")
+    lawyer_id = _resolve_lawyer_id(db, current_lawyer)
 
     doc = (
         db.query(Document)
@@ -122,7 +122,7 @@ async def download_document(
         410 — document token expired; re-sync the case to refresh tokens.
         500 — unexpected download failure.
     """
-    lawyer_id = current_lawyer.get("sub") or current_lawyer.get("lawyer_id")
+    lawyer_id = _resolve_lawyer_id(db, current_lawyer)
     if not lawyer_id:
         raise HTTPException(status_code=401, detail="Invalid token: no lawyer_id")
 

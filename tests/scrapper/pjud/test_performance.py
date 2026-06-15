@@ -130,6 +130,7 @@ class TestBrowserStartupBenchmark:
     
     @pytest.mark.asyncio
     @pytest.mark.slow
+    @pytest.mark.integration  # launches a REAL browser — excluded from the unit gate / CI
     async def test_real_browser_startup_under_3_seconds(self):
         """Real browser startup should be < 3 seconds.
         

@@ -94,6 +94,10 @@ class Settings(BaseSettings):
     # Notifications
     NOTIFY_MAX_PER_SYNC: int = 25           # Max notifications dispatched per sync_movements call
 
+    # Worker sync
+    SYNC_INTERVAL_HOURS: int = 4            # Hours between scheduled sync runs
+    MAX_DATA_AGE_HOURS: int = 4             # Hours after which cached data is considered stale
+
     # Environment
     ENVIRONMENT: str = "production"
     DEBUG: bool = True

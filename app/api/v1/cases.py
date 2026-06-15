@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
 
-from app.api.deps import get_db, get_current_lawyer
+from app.api.deps import get_db, get_current_lawyer, _resolve_lawyer_id
 from app.models.case import Case
 from app.models.case_litigante import CaseLitigante
 from app.models.case_notificacion import CaseNotificacion
@@ -188,7 +188,7 @@ async def list_cases(
     
     Returns cases from database (fast). Use /sync to refresh from PJUD.
     """
-    lawyer_id = current_lawyer.get("sub") or current_lawyer.get("lawyer_id")
+    lawyer_id = _resolve_lawyer_id(db, current_lawyer)
     if not lawyer_id:
         raise HTTPException(status_code=401, detail="Invalid token: no lawyer_id")
     
@@ -262,7 +262,7 @@ async def get_case(
     db: Session = Depends(get_db),
 ):
     """Get a specific case with its movements."""
-    lawyer_id = current_lawyer.get("sub") or current_lawyer.get("lawyer_id")
+    lawyer_id = _resolve_lawyer_id(db, current_lawyer)
     
     case = db.query(Case).filter(
         and_(
@@ -355,7 +355,7 @@ async def get_case_movements(
     db: Session = Depends(get_db),
 ):
     """Get all movements for a case."""
-    lawyer_id = current_lawyer.get("sub") or current_lawyer.get("lawyer_id")
+    lawyer_id = _resolve_lawyer_id(db, current_lawyer)
     
     # Verify case belongs to lawyer
     case = db.query(Case).filter(
@@ -396,7 +396,7 @@ async def get_case_detail_entities(
     db: Session = Depends(get_db),
 ):
     """Get only the 4 entity lists for a case (litigantes, notificaciones, escritos, exhortos)."""
-    lawyer_id = current_lawyer.get("sub") or current_lawyer.get("lawyer_id")
+    lawyer_id = _resolve_lawyer_id(db, current_lawyer)
 
     # Verify case belongs to lawyer
     case = db.query(Case).filter(
@@ -444,7 +444,7 @@ async def list_case_documents(
     Returns document rows with a pre-built download URL for each one.
     ``available`` is ``True`` for every status except ``"unavailable"``.
     """
-    lawyer_id = current_lawyer.get("sub") or current_lawyer.get("lawyer_id")
+    lawyer_id = _resolve_lawyer_id(db, current_lawyer)
 
     case = db.query(Case).filter(
         and_(
@@ -482,7 +482,7 @@ async def archive_case(
     db: Session = Depends(get_db),
 ):
     """Archive a case (soft delete)."""
-    lawyer_id = current_lawyer.get("sub") or current_lawyer.get("lawyer_id")
+    lawyer_id = _resolve_lawyer_id(db, current_lawyer)
     
     case = db.query(Case).filter(
         and_(

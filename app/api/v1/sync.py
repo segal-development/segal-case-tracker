@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import and_
 from pydantic import BaseModel
 
-from app.api.deps import get_db, get_current_lawyer
+from app.api.deps import get_db, get_current_lawyer, _resolve_lawyer_id
 from app.models.sync_history import SyncHistory
 from app.models.lawyer import Lawyer
 from app.services.sync_service import (
@@ -119,8 +119,12 @@ async def sync_now(
             detail="Invalid or expired PJUD session. Please login again at /pjud/login",
         )
     
+    # The JWT `sub` is the lawyer RUT (e.g. "16021492-9"), NOT the numeric id.
+    # Use the session's bound lawyer_id (set during login) for all DB writes.
+    resolved_lawyer_id = session.lawyer_id
+
     start_time = datetime.utcnow()
-    
+
     try:
         # Get scraper for competencia
         scraper = get_scraper(request.competencia)
@@ -149,7 +153,7 @@ async def sync_now(
         # Sync to database
         sync_service = SyncService(db)
         result = sync_service.sync_cases(
-            lawyer_id=int(lawyer_id),
+            lawyer_id=resolved_lawyer_id,
             scraped_cases=scraped_cases,
             competencia=request.competencia,
             year=request.year,
@@ -166,7 +170,7 @@ async def sync_now(
             db=db,
             scraper=scraper,
             pjud_session=session,
-            lawyer_id=int(lawyer_id),
+            lawyer_id=resolved_lawyer_id,
             api_cases=cases,
             rol=request.rol,
         )
@@ -191,7 +195,7 @@ async def sync_now(
     except Exception as e:
         # Log error in sync history
         sync_record = SyncHistory(
-            lawyer_id=int(lawyer_id),
+            lawyer_id=resolved_lawyer_id,
             competencia=request.competencia,
             year=request.year,
             started_at=start_time,
@@ -217,11 +221,11 @@ async def get_sync_status(
     db: Session = Depends(get_db),
 ):
     """Get status of last sync for a competencia."""
-    lawyer_id = current_lawyer.get("sub") or current_lawyer.get("lawyer_id")
-    
+    lawyer_id = _resolve_lawyer_id(db, current_lawyer)
+
     sync_service = SyncService(db)
-    last_sync = sync_service.get_last_sync(int(lawyer_id), competencia)
-    needs_sync = sync_service.needs_sync(int(lawyer_id), competencia)
+    last_sync = sync_service.get_last_sync(lawyer_id, competencia)
+    needs_sync = sync_service.needs_sync(lawyer_id, competencia)
     
     if not last_sync:
         return SyncStatusResponse(
@@ -249,9 +253,9 @@ async def get_sync_history(
     db: Session = Depends(get_db),
 ):
     """Get sync history for the lawyer."""
-    lawyer_id = current_lawyer.get("sub") or current_lawyer.get("lawyer_id")
-    
-    query = db.query(SyncHistory).filter(SyncHistory.lawyer_id == int(lawyer_id))
+    lawyer_id = _resolve_lawyer_id(db, current_lawyer)
+
+    query = db.query(SyncHistory).filter(SyncHistory.lawyer_id == lawyer_id)
     
     if competencia:
         query = query.filter(SyncHistory.competencia == competencia)

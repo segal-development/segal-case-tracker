@@ -913,13 +913,14 @@ class SyncService:
         words = re.findall(r"[A-Z][a-z]+", name)
         initials = "".join(w[0] for w in words[:3])
         
-        code = f"{number}{initials}"
-        
-        # If code is too short, add hash
-        if len(code) < 3:
-            code = hashlib.md5(name.encode()).hexdigest()[:6].upper()
-        
-        return code
+        # Append a deterministic hash of the full name so that two distinct
+        # courts sharing the same number+initials do NOT collide on the unique
+        # `code` column (e.g. "1º Juzgado Civil de Santiago" and
+        # "1º Juzgado Civil de San Miguel" both reduce to "1JCS").
+        suffix = hashlib.md5(name.encode()).hexdigest()[:8].upper()
+        code = f"{number}{initials}{suffix}"
+
+        return code[:20]
     
     def _extract_region(self, court_name: str) -> str:
         """Extract region from court name."""

@@ -754,19 +754,42 @@ class PJUDBaseScraper(ABC):
                     f"{fn_name} function not found - panel not loaded"
                 )
             
-            # Call the native function
-            await page.evaluate(f"{fn_name}('{case_token}')")
-            await asyncio.sleep(3)
-            
-            # Capture modal content
             modal_id = self.config.modal_id
-            detail_html = await page.evaluate(f"""
-                () => {{
-                    const modal = document.querySelector('#{modal_id}');
-                    return modal ? modal.innerHTML : '';
-                }}
-            """)
-            
+
+            # Clear any stale modal content from a previous case — the page (and
+            # thus the modal element) is reused across cases, so we must detect
+            # THIS case's freshly-loaded content, not the prior one. Best-effort:
+            # a pending navigation can destroy the context here too.
+            try:
+                await page.evaluate(
+                    f"() => {{ const m = document.querySelector('#{modal_id}'); if (m) m.innerHTML = ''; }}"
+                )
+            except Exception:
+                pass
+
+            # Call the native function that opens + loads the detail. This can
+            # trigger a navigation that destroys the JS execution context, so the
+            # poll below tolerates transient evaluate failures and retries until
+            # the page settles and the modal is populated (~15s). A fixed sleep
+            # was too short under headless chromium in Docker.
+            await page.evaluate(f"{fn_name}('{case_token}')")
+
+            detail_html = ""
+            for _ in range(30):
+                await asyncio.sleep(0.5)
+                try:
+                    detail_html = await page.evaluate(f"""
+                        () => {{
+                            const modal = document.querySelector('#{modal_id}');
+                            return modal ? modal.innerHTML : '';
+                        }}
+                    """)
+                except Exception:
+                    # Execution context destroyed mid-navigation — wait + retry.
+                    continue
+                if detail_html and len(detail_html) >= 100:
+                    break
+
             if not detail_html or len(detail_html) < 100:
                 raise ScrapingError("Modal content empty - detail failed to load")
             

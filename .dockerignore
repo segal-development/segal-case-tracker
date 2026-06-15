@@ -1,0 +1,64 @@
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Git
+.git/
+.gitignore
+
+# Test / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Docs and specs (not needed in image)
+openspec/
+*.md
+
+# Local dev secrets and overrides
+.env
+.env.*
+*.env
+*.env.*
+
+# GCP service-account keys (mounted at runtime, NEVER baked into the image)
+sa-key.json
+*-key.json
+*.sa.json
+
+# Scripts not needed at runtime
+scripts/manual/
+
+# Local storage / downloads (mounted at runtime or use GCS)
+storage/
+documents_local/
+
+# Test suite (not needed in production image)
+tests/
+
+# Node (frontend tooling, not used in the Python image)
+node_modules/
+
+# OS artifacts
+.DS_Store
+Thumbs.db
