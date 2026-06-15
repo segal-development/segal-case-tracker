@@ -105,9 +105,12 @@ services:
       - SYNC_INTERVAL_HOURS=${SYNC_INTERVAL_HOURS:-4}
       - MAX_DATA_AGE_HOURS=${MAX_DATA_AGE_HOURS:-4}
     depends_on:
-      - cloud-sql-proxy
-      - migrate
-      - redis
+      cloud-sql-proxy:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
     # Remove dev-only volume mount (no hot-reload in QA)
     volumes: []
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
@@ -147,9 +150,12 @@ services:
       - SYNC_INTERVAL_HOURS=${SYNC_INTERVAL_HOURS:-4}
       - MAX_DATA_AGE_HOURS=${MAX_DATA_AGE_HOURS:-4}
     depends_on:
-      - cloud-sql-proxy
-      - migrate
-      - redis
+      cloud-sql-proxy:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
     shm_size: 2gb
     restart: unless-stopped
 
