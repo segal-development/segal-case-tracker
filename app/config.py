@@ -90,6 +90,7 @@ class Settings(BaseSettings):
     # Detail rotation (sync-rotacion Slice 1)
     DETAIL_BATCH_SIZE: int = 30    # Cases per scheduled rotation batch
     DETAIL_FETCH_DELAY: float = 2.0  # Seconds between consecutive detail fetches
+    DETAIL_MIN_YEAR: int = 2021    # Only detail-scrape cases with ROL year >= this (0 = all)
 
     # Notifications
     NOTIFY_MAX_PER_SYNC: int = 25           # Max notifications dispatched per sync_movements call

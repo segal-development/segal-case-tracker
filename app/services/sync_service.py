@@ -1106,13 +1106,36 @@ def _select_cases_for_detail_rotation(
         If no Case rows exist in DB for this lawyer+competencia, returns
         ``api_cases[:batch_size]`` so the caller is never starved.
     """
-    # Build lookup: normalized_rol → api_case (only those with a live token).
+    # Year scope: only detail-scrape cases whose ROL year (the YYYY in "C-N-YYYY")
+    # is >= settings.DETAIL_MIN_YEAR. 0 disables the filter. Unparseable ROLs are
+    # NOT excluded (fail-open) so a format quirk never silently drops a case.
+    min_year = settings.DETAIL_MIN_YEAR
+
+    def _year_ok(rol: str) -> bool:
+        if min_year <= 0:
+            return True
+        try:
+            last = rol.rsplit("-", 1)[-1]
+        except (AttributeError, IndexError):
+            return True
+        # Only enforce the filter when the suffix is a real 4-digit year (YYYY).
+        # Non-standard ROLs fail open so a format quirk never silently drops a case.
+        if len(last) != 4 or not last.isdigit():
+            return True
+        return int(last) >= min_year
+
+    # Build lookup: normalized_rol → api_case (live token + within the year scope).
     api_lookup = {
         ac.rol.strip().upper(): ac
         for ac in api_cases
-        if ac.case_token
+        if ac.case_token and _year_ok(ac.rol)
     }
 
+    # Year-scoped fallback used when DB rotation can't be applied.
+    fallback = [ac for ac in api_cases if ac.case_token and _year_ok(ac.rol)][:batch_size]
+
+    # Rotation order; the year filter + batch cap are applied in Python below
+    # (parsing the ROL year in SQL is not portable across Postgres/SQLite).
     db_cases = (
         db.query(Case)
         .filter(Case.lawyer_id == lawyer_id, Case.competencia == competencia)
@@ -1120,28 +1143,29 @@ def _select_cases_for_detail_rotation(
             Case.last_detail_checked_at.asc().nullsfirst(),
             Case.filed_at.desc(),
         )
-        .limit(batch_size)
         .all()
     )
 
-    # Empty DB for this lawyer+competencia — fall back to live cases that have a
-    # case_token (tokenless cases are skipped downstream anyway).
+    # Empty DB for this lawyer+competencia — fall back to live cases.
     if not db_cases:
-        return [ac for ac in api_cases if ac.case_token][:batch_size]
+        return fallback
 
     result = []
     for db_case in db_cases:
-        normalized = db_case.rol.strip().upper()
-        api_case = api_lookup.get(normalized)
+        if not _year_ok(db_case.rol):
+            continue
+        api_case = api_lookup.get(db_case.rol.strip().upper())
         if api_case is not None:
             result.append(api_case)
+        if len(result) >= batch_size:
+            break
 
     # Ghost-case guard: DB had rows but none matched live api_cases (stale/archived
     # cases removed from PJUD).  Those rows have NULL last_detail_checked_at so they
     # sit permanently at the front of the rotation order and starve live cases.
     # Fall back to live api_cases so rotation is not blocked by ghost rows.
     if not result and db_cases:
-        return [ac for ac in api_cases if ac.case_token][:batch_size]
+        return fallback
 
     return result
 
