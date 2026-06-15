@@ -1,52 +1,31 @@
-# QA overlay — GCE + Cloud SQL Auth Proxy
+# QA — self-contained compose (NOT an overlay).
 #
-# Usage:
-#   docker compose -f docker-compose.yml -f docker-compose.qa.yml up -d
+# Run:   docker compose -f docker-compose.qa.yml up -d --build
 #
-# Prerequisites:
-#   - .env.qa file present (copy from .env.qa.example and fill in secrets)
-#   - Service account JSON placed at the path set in GOOGLE_APPLICATION_CREDENTIALS_PATH
+# Topology: GCE VM, direct connection to Cloud SQL PUBLIC IP (no Auth Proxy —
+# the deploy account lacks roles/cloudsql.client). The VM's static IP is
+# whitelisted on the Cloud SQL instance and the connection uses sslmode=require.
 #
-# This overlay:
-#   - Disables the local postgres container (replaced by Cloud SQL Auth Proxy)
-#   - Adds cloud-sql-proxy and migrate services
-#   - Overrides api/worker to use Cloud SQL, GCS, and production-grade settings
-
-version: '3.8'
+# All config + secrets come from .env.qa (copy from .env.qa.example, fill in).
+# The Cloud Storage service-account key is mounted read-only from ./sa-key.json
+# (placed next to this file on the VM; gitignored + dockerignored, never baked).
 
 services:
 
   # --------------------------------------------------------------------------
-  # Disable local postgres — Cloud SQL Auth Proxy is the DB gateway in QA
+  # Redis — sessions + rate-limit
   # --------------------------------------------------------------------------
-  postgres:
-    profiles:
-      - dev-only   # never active in QA; postgres container will not start
-
-  # --------------------------------------------------------------------------
-  # Cloud SQL Auth Proxy v2
-  # Listens on 0.0.0.0:5432 so other containers can reach it by service name.
-  # --------------------------------------------------------------------------
-  cloud-sql-proxy:
-    image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2
-    command:
-      - "--address=0.0.0.0"
-      - "--port=5432"
-      - "${CLOUD_SQL_INSTANCE_CONNECTION_NAME}"
-    volumes:
-      - type: bind
-        source: "${GOOGLE_APPLICATION_CREDENTIALS_PATH}"
-        target: /secrets/sa-key.json
-        read_only: true
-    environment:
-      - GOOGLE_APPLICATION_CREDENTIALS=/secrets/sa-key.json
-    env_file: .env.qa
+  redis:
+    image: redis:7-alpine
     restart: unless-stopped
-    networks:
-      - default
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   # --------------------------------------------------------------------------
-  # One-shot migration runner — exits 0 on success, restarts on failure
+  # One-shot migration runner — alembic upgrade head, then exits 0
   # --------------------------------------------------------------------------
   migrate:
     build:
@@ -54,111 +33,48 @@ services:
       dockerfile: Dockerfile
     command: ["alembic", "-c", "alembic/alembic.ini", "upgrade", "head"]
     env_file: .env.qa
-    environment:
-      - DATABASE_URL=postgresql+psycopg2://${DB_USER}:${DB_PASSWORD}@cloud-sql-proxy:5432/${DB_NAME}
-      - ENVIRONMENT=production
-      - SECRET_KEY=${SECRET_KEY}
-      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
-    depends_on:
-      - cloud-sql-proxy
-    restart: on-failure
+    restart: "no"
 
   # --------------------------------------------------------------------------
-  # Redis — same image as dev, explicit here so the overlay is self-contained
-  # --------------------------------------------------------------------------
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    restart: unless-stopped
-
-  # --------------------------------------------------------------------------
-  # API — production settings, GCS storage, Cloud SQL via proxy
+  # API (FastAPI) — scheduler OFF here (runs in worker)
   # --------------------------------------------------------------------------
   api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    shm_size: '2gb'
     env_file: .env.qa
     environment:
-      # Database — points at Cloud SQL Auth Proxy (service DNS name)
-      - DATABASE_URL=postgresql+psycopg2://${DB_USER}:${DB_PASSWORD}@cloud-sql-proxy:5432/${DB_NAME}
-      # Redis
-      - REDIS_URL=redis://redis:6379/0
-      # GCS document storage
-      - DOC_STORAGE_BACKEND=gcs
-      - GCS_BUCKET=${GCS_BUCKET}
-      - DOC_DOWNLOAD_ENABLED=true
-      # Auth / security
-      - SECRET_KEY=${SECRET_KEY}
-      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
-      # CORS
-      - CORS_ORIGINS=${CORS_ORIGINS}
-      # App
-      - APP_URL=${BASE_URL}
-      - ENVIRONMENT=production
-      - DEBUG=false
       - ENABLE_SCHEDULER=false
-      # 2Captcha
-      - CAPTCHA_API_KEY=${CAPTCHA_API_KEY}
-      # Email
-      - SENDGRID_API_KEY=${SENDGRID_API_KEY}
-      - FROM_EMAIL=${SENDGRID_FROM_EMAIL}
-      # Worker tuning (consumed by Settings even from API container)
-      - SYNC_INTERVAL_HOURS=${SYNC_INTERVAL_HOURS:-4}
-      - MAX_DATA_AGE_HOURS=${MAX_DATA_AGE_HOURS:-4}
+    volumes:
+      - ./sa-key.json:/secrets/sa-key.json:ro
     depends_on:
-      cloud-sql-proxy:
-        condition: service_started
       migrate:
         condition: service_completed_successfully
       redis:
         condition: service_started
-    # Remove dev-only volume mount (no hot-reload in QA)
-    volumes: []
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
     restart: unless-stopped
 
   # --------------------------------------------------------------------------
-  # Worker — same env as API plus scheduler enabled, larger shm for Chromium
+  # Worker — APScheduler ON, larger shm for Chromium, autonomous PJUD re-auth
   # --------------------------------------------------------------------------
   worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    shm_size: '2gb'
     env_file: .env.qa
     environment:
-      # Database
-      - DATABASE_URL=postgresql+psycopg2://${DB_USER}:${DB_PASSWORD}@cloud-sql-proxy:5432/${DB_NAME}
-      # Redis
-      - REDIS_URL=redis://redis:6379/0
-      # GCS
-      - DOC_STORAGE_BACKEND=gcs
-      - GCS_BUCKET=${GCS_BUCKET}
-      - DOC_DOWNLOAD_ENABLED=true
-      # Auth / security
-      - SECRET_KEY=${SECRET_KEY}
-      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
-      # CORS (needed for Settings validation in production mode)
-      - CORS_ORIGINS=${CORS_ORIGINS}
-      # App
-      - APP_URL=${BASE_URL}
-      - ENVIRONMENT=production
-      - DEBUG=false
-      # Scheduler ON in worker
       - ENABLE_SCHEDULER=true
-      # 2Captcha
-      - CAPTCHA_API_KEY=${CAPTCHA_API_KEY}
-      # Email
-      - SENDGRID_API_KEY=${SENDGRID_API_KEY}
-      - FROM_EMAIL=${SENDGRID_FROM_EMAIL}
-      # Worker tuning
-      - SYNC_INTERVAL_HOURS=${SYNC_INTERVAL_HOURS:-4}
-      - MAX_DATA_AGE_HOURS=${MAX_DATA_AGE_HOURS:-4}
+    volumes:
+      - ./sa-key.json:/secrets/sa-key.json:ro
     depends_on:
-      cloud-sql-proxy:
-        condition: service_started
       migrate:
         condition: service_completed_successfully
       redis:
         condition: service_started
-    shm_size: 2gb
+    command: ["python", "-m", "app.workers.sync_scheduler"]
     restart: unless-stopped
-
-networks:
-  default:
-    driver: bridge

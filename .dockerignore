@@ -41,6 +41,11 @@ openspec/
 *.env
 *.env.*
 
+# GCP service-account keys (mounted at runtime, NEVER baked into the image)
+sa-key.json
+*-key.json
+*.sa.json
+
 # Scripts not needed at runtime
 scripts/manual/
 
