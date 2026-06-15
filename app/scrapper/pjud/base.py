@@ -510,8 +510,19 @@ class PJUDBaseScraper(ABC):
         detail retrieval only work when this content is loaded.
         """
         if self._panel_loaded:
-            return
-        
+            # A prior detail call can navigate away and break the panel, leaving
+            # the cache stale. Verify the detail function is ACTUALLY present
+            # before trusting the cache; if it's gone, fall through and reload.
+            try:
+                still_ok = await page.evaluate(
+                    f"typeof {self.config.detail_function_name} === 'function'"
+                )
+            except Exception:
+                still_ok = False
+            if still_ok:
+                return
+            self._panel_loaded = False
+
         # Check if we're on indexN.php
         if 'indexN.php' not in page.url:
             await page.goto(PJUD_INDEX_URL, wait_until="domcontentloaded")
