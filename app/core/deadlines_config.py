@@ -33,6 +33,7 @@ class ProceduralState(str, Enum):
     ADMISIBILIDAD = "admisibilidad"
     AUTO_PRUEBA = "auto_prueba"
     CITACION_SENTENCIA = "citacion_sentencia"
+    SENTENCIA = "sentencia"
     TERMINADA = "terminada"
     REBELDE = "rebelde"
     INDETERMINATE = "indeterminate"
@@ -51,6 +52,7 @@ class ProcEvent(str, Enum):
     ADMISIBILIDAD = "admisibilidad"
     AUTO_PRUEBA = "auto_prueba"
     CITACION_SENTENCIA = "citacion_sentencia"
+    SENTENCIA = "sentencia"
     TERMINADA = "terminada"
 
 
@@ -81,7 +83,7 @@ class DeadlineType(str, Enum):
     LISTA_TESTIGOS_2D = ("lista_testigos_2d", 2, "art. 468 CPC")
     OBSERVACIONES_PRUEBA_6D = ("observaciones_prueba_6d", 6, "art. 469 CPC")
     SENTENCIA_10D = ("sentencia_10d", 10, "art. 162/470 CPC")
-    APELACION_5D = ("apelacion_5d", 5, "art. 189/475 CPC")
+    APELACION_5D = ("apelacion_5d", 5, "art. 187/475 CPC")
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +97,10 @@ class ClassifierRule:
     both are set BOTH must match.  Use an empty string or ``None`` to skip
     a field check.
 
+    ``min_state``: when set, the rule only fires when the case's current
+    state is at or beyond the given state in the forward-only ordering.
+    This prevents early-stage rules from firing in medida-prejudicial context.
+
     Priority: higher number wins a tie on the same movement.
     """
 
@@ -104,6 +110,7 @@ class ClassifierRule:
     next_state: ProceduralState
     starts_deadline_type: Optional[DeadlineType]
     priority: int
+    min_state: Optional[ProceduralState] = None
 
     # Compiled regex objects (not part of the frozen hash)
     _desc_re: re.Pattern = field(init=False, repr=False, compare=False, hash=False)
@@ -123,7 +130,7 @@ class ClassifierRule:
         )
 
     def matches(self, description: str, stage: str) -> bool:
-        """Return True when this rule applies to a movement."""
+        """Return True when this rule applies to a movement (text only)."""
         if self._desc_re is not None and not self._desc_re.search(description):
             return False
         if self._stage_re is not None and not self._stage_re.search(stage):
@@ -160,24 +167,33 @@ CLASSIFIER_RULES: list[ClassifierRule] = [
         starts_deadline_type=DeadlineType.EXCEPCIONES_8D,
         priority=6,
     ),
-    # Rule 3 — Excepciones stage → EXCEPCIONES + TRASLADO_EJECUTANTE_4D
+    # Rule 3 — Excepciones stage → EXCEPCIONES (no deadline yet)
     # Real data: stage == "Excepciones"
+    # NOTE: TRASLADO_EJECUTANTE_4D is intentionally NOT triggered here.
+    # Legally the 4-day traslado runs from the court's traslado resolution,
+    # not from the raw excepciones filing.  Triggering from the filing would
+    # be 1-3 days too early and could show a false ROJO before the legal
+    # deadline starts.  The trigger is deferred to Rule 4 (more conservative /
+    # later date).  See also: PR1 review fix #5.
     ClassifierRule(
         description_regex="",
         stage_regex=r"^Excepciones$",
         event=ProcEvent.EXCEPCIONES_OPUESTAS,
         next_state=ProceduralState.EXCEPCIONES,
-        starts_deadline_type=DeadlineType.TRASLADO_EJECUTANTE_4D,
+        starts_deadline_type=None,
         priority=4,
     ),
-    # Rule 4 — Contestación Excepciones stage → TRASLADO_EJECUTANTE (no new deadline)
+    # Rule 4 — Contestación Excepciones stage → TRASLADO_EJECUTANTE + TRASLADO_EJECUTANTE_4D
     # Real data: stage == "Contestación Excepciones"
+    # The 4-day traslado is triggered from the court's traslado resolution
+    # (the first "Contestación Excepciones" stage movement), which is the legally
+    # correct and more conservative (later) trigger date.
     ClassifierRule(
         description_regex="",
         stage_regex=r"Contestaci[oó]n Excepciones",
         event=ProcEvent.TRASLADO_EJECUTANTE,
         next_state=ProceduralState.TRASLADO_EJECUTANTE,
-        starts_deadline_type=None,
+        starts_deadline_type=DeadlineType.TRASLADO_EJECUTANTE_4D,
         priority=5,
     ),
     # Rule 5 — Se pronuncia sobre admisibilidad → ADMISIBILIDAD
@@ -203,6 +219,9 @@ CLASSIFIER_RULES: list[ClassifierRule] = [
     ),
     # Rule 7 — Cita a Audiencia → CITACION_SENTENCIA + SENTENCIA_10D
     # Real data: desc "Cita a Audiencia"
+    # min_state=NOTIFICADO: prevents this rule from firing in a medida-prejudicial
+    # context where "Cita a Audiencia" appears before the demand has been notified
+    # (which would produce a false SENTENCIA_10D deadline).
     ClassifierRule(
         description_regex=r"Cita a Audiencia",
         stage_regex="",
@@ -210,6 +229,7 @@ CLASSIFIER_RULES: list[ClassifierRule] = [
         next_state=ProceduralState.CITACION_SENTENCIA,
         starts_deadline_type=DeadlineType.SENTENCIA_10D,
         priority=8,
+        min_state=ProceduralState.NOTIFICADO,
     ),
     # Rule 8 — Terminada stage → TERMINADA (terminal state)
     ClassifierRule(
@@ -219,5 +239,20 @@ CLASSIFIER_RULES: list[ClassifierRule] = [
         next_state=ProceduralState.TERMINADA,
         starts_deadline_type=None,
         priority=10,
+    ),
+    # Rule 9 — Sentencia definitiva → SENTENCIA + APELACION_5D
+    # Real data: desc contains "Dicta sentencia" or "Sentencia Definitiva"
+    # The 5-day apelación plazo runs from the date the sentencia is issued
+    # (art. 187 CPC, applied by art. 475 for juicio ejecutivo).
+    # min_state=CITACION_SENTENCIA: sentencia can only be issued after
+    # the citación stage has been reached.
+    ClassifierRule(
+        description_regex=r"[Dd]icta [Ss]entencia|[Ss]entencia [Dd]efinitiva",
+        stage_regex="",
+        event=ProcEvent.SENTENCIA,
+        next_state=ProceduralState.SENTENCIA,
+        starts_deadline_type=DeadlineType.APELACION_5D,
+        priority=11,
+        min_state=ProceduralState.CITACION_SENTENCIA,
     ),
 ]

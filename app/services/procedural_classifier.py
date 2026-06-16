@@ -55,9 +55,10 @@ _STATE_ORDER: dict[ProceduralState, int] = {
     ProceduralState.ADMISIBILIDAD: 5,
     ProceduralState.AUTO_PRUEBA: 6,
     ProceduralState.CITACION_SENTENCIA: 7,
-    ProceduralState.TERMINADA: 8,
+    ProceduralState.SENTENCIA: 8,
+    ProceduralState.TERMINADA: 9,
     # REBELDE is handled by the engine, not the classifier
-    ProceduralState.REBELDE: 9,
+    ProceduralState.REBELDE: 10,
 }
 
 
@@ -120,7 +121,7 @@ class MovementClassifier:
             desc = (movement.description or "") if movement.description is not None else ""
             stage = (movement.stage or "") if movement.stage is not None else ""
 
-            best_rule = self._best_matching_rule(desc, stage)
+            best_rule = self._best_matching_rule(desc, stage, state)
 
             if best_rule is None:
                 continue
@@ -128,27 +129,21 @@ class MovementClassifier:
             any_match = True
 
             # Only advance state forward — never regress.
-            # TERMINADA can always be entered (terminal state from any point).
+            # TERMINADA/SENTENCIA can always be entered from their required min_state.
             candidate = best_rule.next_state
-            if (
-                candidate != ProceduralState.TERMINADA
-                and _STATE_ORDER.get(candidate, 0) <= _STATE_ORDER.get(state, 0)
-            ):
-                # Regression attempt: rule matches but doesn't advance state.
-                # Still record deadline triggers if the deadline is new.
-                if best_rule.starts_deadline_type is not None:
-                    pass  # handled below; deadline assignment is still skipped
+            if _STATE_ORDER.get(candidate, 0) <= _STATE_ORDER.get(state, 0):
+                # Regression attempt — skip entirely.
                 continue
 
+            # State advances: clear accumulated triggers from prior state.
+            # This ensures only the CURRENT state's deadlines are active.
+            # Example: EXCEPCIONES_8D is cleared when advancing to EXCEPCIONES,
+            # so a stale past-due EXCEPCIONES_8D never produces a false ROJO.
+            triggers = {}
             state = best_rule.next_state
 
             if best_rule.starts_deadline_type is not None:
                 deadline_type = best_rule.starts_deadline_type
-
-                # LISTA_TESTIGOS_2D deferred to Slice B — skip computation.
-                if deadline_type == DeadlineType.LISTA_TESTIGOS_2D:
-                    continue
-
                 triggers[deadline_type] = movement
 
                 # OBSERVACIONES_PRUEBA_6D is derived from TERMINO_PROBATORIO_10D.
@@ -167,12 +162,20 @@ class MovementClassifier:
     # ------------------------------------------------------------------
 
     def _best_matching_rule(
-        self, description: str, stage: str
+        self, description: str, stage: str, current_state: ProceduralState
     ) -> ClassifierRule | None:
-        """Return the highest-priority rule that matches (desc, stage), or None."""
+        """Return the highest-priority rule that matches (desc, stage, state), or None.
+
+        Rules with a ``min_state`` are skipped when the current state has not
+        yet reached that minimum.  This prevents early-stage rules (e.g.
+        Rule 7 "Cita a Audiencia") from firing in medida-prejudicial context.
+        """
         best: ClassifierRule | None = None
         for rule in CLASSIFIER_RULES:
             if rule.matches(description, stage):
+                if rule.min_state is not None:
+                    if _STATE_ORDER.get(current_state, 0) < _STATE_ORDER.get(rule.min_state, 0):
+                        continue
                 if best is None or rule.priority > best.priority:
                     best = rule
         return best
