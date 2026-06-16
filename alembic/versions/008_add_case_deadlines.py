@@ -51,7 +51,7 @@ def upgrade() -> None:
         sa.Column(
             "case_id",
             sa.Integer,
-            sa.ForeignKey("cases.id"),
+            sa.ForeignKey("cases.id", ondelete="CASCADE"),
             nullable=False,
         ),
         sa.Column("deadline_type", sa.String(50), nullable=False),
