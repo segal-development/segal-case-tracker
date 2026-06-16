@@ -1,6 +1,6 @@
 """CaseDeadline model — procedural deadline rows for civil cases."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import (
     Column,
@@ -54,7 +54,7 @@ class CaseDeadline(Base):
     )
 
     computed_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     # Relationships
     case = relationship("Case", back_populates="deadlines")

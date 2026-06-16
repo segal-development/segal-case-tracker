@@ -28,11 +28,6 @@ import holidays
 # ---------------------------------------------------------------------------
 
 
-def _cl_holidays(year: int) -> holidays.HolidayBase:
-    """Return a HolidayBase instance for the given calendar year (Chile)."""
-    return holidays.country_holidays("CL", years=year)
-
-
 @lru_cache(maxsize=8)
 def _cl_holidays_cached(year: int) -> holidays.HolidayBase:
     """Cached per-year feriado lookup (avoids repeated library calls)."""

@@ -22,10 +22,13 @@ TODO: Slice B — differentiate pagaré (1y prescripción, art. 98 Ley 18.092) v
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import Session
+
+import re as _re
 
 from app.core.deadlines_config import (
     DEADLINE_DISCLAIMER,
@@ -42,19 +45,29 @@ logger = logging.getLogger(__name__)
 
 _CLASSIFIER = MovementClassifier()
 
+_CHILE_TZ = ZoneInfo("America/Santiago")
+
+
+def _today_chile() -> date:
+    """Return today's date in the America/Santiago timezone.
+
+    Using the server's UTC date can produce a 1-day off-by-one during the
+    Chilean evening (UTC-3 / UTC-4 depending on DST), which is legally
+    significant for deadline boundaries.
+    """
+    return datetime.now(_CHILE_TZ).date()
+
 # Semáforo thresholds (in días hábiles)
 _SEMAFORO_ROJO_MAX = 1    # ≤ 1 → ROJO (0 or negative also ROJO)
 _SEMAFORO_AMARILLO_MAX = 5  # 2–5 → AMARILLO; >5 → VERDE
 
-# Abandono risk thresholds (in days)
-_ABANDONO_APPROACHING_DAYS = 135  # 4.5 months
-_ABANDONO_PRESUMIBLE_DAYS = 180   # 6 months (art. 152 CPC)
-_ABANDONO_REBELDE_APPROACHING_DAYS = 912  # ~2.5 years
-_ABANDONO_REBELDE_PRESUMIBLE_DAYS = 1095  # ~3 years (art. 153 inc. 2 CPC)
-
-# Prescripción risk thresholds (in days, art. 2515 CC — acción ejecutiva 3y)
-_PRESCRIPCION_APPROACHING_DAYS = 912  # ~2.5 years
-_PRESCRIPCION_AT_RISK_DAYS = 1095    # ~3 years
+# Abandono / prescripción risk flags — DEFERRED TO PR2 / Slice B.
+# These will be computed and persisted as dedicated Case columns once the
+# GET /deadlines endpoint (PR2) is in place.  Do NOT add dead computation
+# here until the storage layer is ready.
+# Legal references for future implementation:
+#   Abandono:     art. 152 CPC (6 months general), art. 153 inc. 2 (3y post-apremio)
+#   Prescripción: art. 2515 CC (3y acción ejecutiva); pagaré: art. 98 Ley 18.092 (1y)
 
 
 class DeadlineEngine:
@@ -89,7 +102,7 @@ class DeadlineEngine:
 
     @classmethod
     def _recompute_safe(cls, db: Session, case: Case) -> None:
-        today = date.today()
+        today = _today_chile()
 
         # Step 2: competencia guard.
         competencia = (case.competencia or "civil").lower()
@@ -140,31 +153,34 @@ class DeadlineEngine:
                     triggered_at=triggered_at,
                     status="active",
                     source_movement_id=source_movement_id,
-                    computed_at=datetime.utcnow(),
+                    computed_at=datetime.now(timezone.utc),
                 )
                 db.add(row)
             else:
                 existing.due_date = due_date
                 existing.status = "active"
-                existing.computed_at = datetime.utcnow()
+                existing.computed_at = datetime.now(timezone.utc)
 
         db.flush()
 
-        # Step 5: mark superseded — active rows whose triggered_at is no longer current.
-        if new_trigger_keys:
-            all_active = (
-                db.query(CaseDeadline)
-                .filter(
-                    CaseDeadline.case_id == case.id,
-                    CaseDeadline.status == "active",
-                )
-                .all()
+        # Step 5: supersede every active row whose deadline_type is NOT in the
+        # current active set (new_trigger_keys).  This runs unconditionally —
+        # including when new_trigger_keys is empty (TERMINADA, INDETERMINATE, SENTENCIA
+        # after appeal window) — so that no stale "active" rows remain after the
+        # case advances, preventing false ROJO from prior-state past-due deadlines.
+        all_active = (
+            db.query(CaseDeadline)
+            .filter(
+                CaseDeadline.case_id == case.id,
+                CaseDeadline.status == "active",
             )
-            for row in all_active:
-                current_trigger = new_trigger_keys.get(row.deadline_type)
-                if current_trigger is None or row.triggered_at != current_trigger:
-                    row.status = "superseded"
-            db.flush()
+            .all()
+        )
+        for row in all_active:
+            current_trigger = new_trigger_keys.get(row.deadline_type)
+            if current_trigger is None or row.triggered_at != current_trigger:
+                row.status = "superseded"
+        db.flush()
 
         # Step 6: REBELDÍA post-transition.
         # NOTIFICADO + EXCEPCIONES_8D due date elapsed + no EXCEPCIONES movement.
@@ -180,6 +196,11 @@ class DeadlineEngine:
             )
             has_excepciones_movement = any(
                 (mv.stage or "").strip() == "Excepciones"
+                or bool(_re.search(
+                    r"opone\s+excepciones|excepci[oó]n",
+                    (mv.description or ""),
+                    _re.IGNORECASE,
+                ))
                 for mv in movements
             )
             if (
@@ -194,10 +215,8 @@ class DeadlineEngine:
         # Step 7a: compute semáforo from nearest active deadline.
         semaforo = cls._compute_semaforo(db, case.id, proc_state, today)
 
-        # Step 7b: abandono and prescripción risk flags (stored on Case in Slice B;
-        # for now we compute them but only use for semáforo override decision).
-        # The values are not persisted as separate columns in Slice A — they will be
-        # part of the GET /deadlines API response in PR2.
+        # Step 7b: abandono and prescripción risk flags — DEFERRED to PR2 / Slice B.
+        # No computation here.  See module-level comment for legal references.
 
         # Step 8: write denormalized Case columns.
         case.procedural_state = proc_state.value
