@@ -39,7 +39,26 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    """Run migrations in 'online' mode."""
+    """Run migrations in 'online' mode.
+
+    Supports a pre-existing connection injected via ``config.attributes["connection"]``
+    (used in tests to bypass the app DATABASE_URL and run against SQLite).
+    """
+    injected_connection = config.attributes.get("connection", None)
+
+    if injected_connection is not None:
+        # Test path: caller already has an open connection — use it directly.
+        # render_as_batch=True is required for SQLite, which cannot ALTER columns
+        # or constraints in-place; the batch strategy uses copy-and-move instead.
+        context.configure(
+            connection=injected_connection,
+            target_metadata=target_metadata,
+            render_as_batch=True,
+        )
+        with context.begin_transaction():
+            context.run_migrations()
+        return
+
     connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",

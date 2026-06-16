@@ -1,7 +1,7 @@
 """Case model - Civil court cases."""
 
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text
+from sqlalchemy import Column, Date, Integer, String, DateTime, ForeignKey, Text
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
@@ -33,6 +33,11 @@ class Case(Base):
     # PJUD specific
     pjud_causa_id = Column(String(100), nullable=True)  # PJUD internal ID
     
+    # Procedural deadline engine — populated by DeadlineEngine.recompute_case
+    procedural_state = Column(String(30), nullable=True)
+    semaforo = Column(String(10), nullable=True)
+    next_deadline_at = Column(Date, nullable=True)
+
     # Timestamps
     filed_at = Column(DateTime, nullable=True)  # Fecha de ingreso
     last_movement_at = Column(DateTime, nullable=True)
@@ -51,3 +56,8 @@ class Case(Base):
     notificaciones = relationship("CaseNotificacion", back_populates="case")
     escritos = relationship("CaseEscrito", back_populates="case")
     exhortos = relationship("CaseExhorto", back_populates="case")
+    deadlines = relationship(
+        "CaseDeadline",
+        back_populates="case",
+        cascade="all, delete-orphan",
+    )
