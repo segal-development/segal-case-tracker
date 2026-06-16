@@ -27,19 +27,20 @@ modal_close_button:
 
 # Services dropdown button
 services_button:
-  primary: "button[onclick='myFunction()']"
+  primary: "button.dropbtn"
   fallbacks:
-    - "button:has-text('Servicios')"
+    - "button:has-text('Todos los servicios')"
+    - "button[onclick='myFunction()']"
     - ".dropdown-toggle"
-  description: "Services dropdown button on PJUD home"
+  description: "Services dropdown button on PJUD home (the 'Todos los servicios' dropdown)"
 
 # Clave Unica login link
 clave_unica_link:
-  primary: "a:has-text('Clave Única')"
+  primary: "a[onclick='AutenticaCUnica();']"
   fallbacks:
-    - "a[href*='claveunica']"
-    - "//a[contains(text(),'Clave Única')]"
-  description: "Link to Clave Unica login option"
+    - "#myDropdown a:has-text('Clave Única')"
+    - "a:has-text('Clave Única')"
+  description: "Link that triggers Clave Unica auth (onclick=AutenticaCUnica). NOT the external claveunica.gob.cl link."
 
 # Clave Unica portal - RUT input
 rut_input:

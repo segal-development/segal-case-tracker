@@ -136,28 +136,47 @@ class ClaveUnicaAuth:
             raise ClaveUnicaAuthError(f"Login failed: {e}") from e
     
     async def _close_modal_if_present(self, page: Page) -> None:
-        """Close any modal that appears on page load."""
+        """Close any modal that appears on page load (best-effort)."""
         try:
             selector = self._registry.get("clave_unica", "modal_close_button")
-            close_btn = page.locator(selector)
+            close_btn = page.locator(selector).first
             if await close_btn.is_visible(timeout=3000):
                 await close_btn.click()
-                logger.debug("Closed initial modal")
+                logger.debug("Closed initial modal via close button")
         except Exception:
-            # Modal might not be present, continue
+            # Modal might not be present / selector stale, continue.
+            pass
+        # Force-dismiss any lingering modal + backdrop so it cannot intercept
+        # clicks on the page beneath it. The PJUD home "#no-disponible" modal
+        # otherwise blocks the services dropdown (pointer-events interception).
+        try:
+            await page.evaluate(
+                """() => {
+                    document.querySelectorAll('.modal.in, .modal.show, #no-disponible').forEach(m => {
+                        m.classList.remove('in', 'show');
+                        m.style.display = 'none';
+                    });
+                    document.querySelectorAll('.modal-backdrop').forEach(b => b.remove());
+                    document.body.classList.remove('modal-open');
+                    document.body.style.overflow = '';
+                }"""
+            )
+        except Exception:
             pass
     
     async def _click_clave_unica_option(self, page: Page) -> None:
         """Click the Clave Unica login option."""
         # First click on services dropdown
         services_btn_selector = self._registry.get("clave_unica", "services_button")
-        services_btn = page.locator(services_btn_selector)
+        # .first guards against strict-mode violations if the selector ever
+        # resolves to more than one element (the PJUD home has multiple buttons).
+        services_btn = page.locator(services_btn_selector).first
         await services_btn.wait_for(state="visible", timeout=10000)
         await services_btn.click()
         
         # Then click Clave Unica link
         clave_unica_link = self._registry.get("clave_unica", "clave_unica_link")
-        link = page.locator(clave_unica_link)
+        link = page.locator(clave_unica_link).first
         await link.wait_for(state="visible", timeout=5000)
         await link.click()
         
@@ -185,15 +204,43 @@ class ClaveUnicaAuth:
         password_input = page.locator(password_input_selector)
         await password_input.click()
         await password_input.fill(credentials.password)
-        
+
+        # Clave Unica enables the submit button via JS only after it observes
+        # real input/change events on both fields; Locator.fill() may not trigger
+        # its validation, leaving "INGRESA" disabled. Dispatch the events so the
+        # button becomes clickable.
+        try:
+            await page.evaluate(
+                """() => {
+                    for (const sel of ['#uname', '#pword']) {
+                        const el = document.querySelector(sel);
+                        if (el) {
+                            ['input', 'keyup', 'change', 'blur'].forEach(t =>
+                                el.dispatchEvent(new Event(t, { bubbles: true })));
+                        }
+                    }
+                }"""
+            )
+        except Exception:
+            pass
+
         logger.debug("Filled Clave Unica login form")
     
     async def _submit_and_wait_redirect(self, page: Page) -> None:
         """Submit login form and wait for redirect to PJUD."""
         submit_button_selector = self._registry.get("clave_unica", "submit_button")
         submit_btn = page.locator(submit_button_selector)
-        await submit_btn.click()
-        
+        # The button stays disabled until Clave Unica's JS validates the inputs.
+        # Wait for it to become enabled; if it never does, fall back to pressing
+        # Enter on the password field (the form submits via its onSubmit callback).
+        try:
+            await page.wait_for_selector("#login-submit:not([disabled])", timeout=15000)
+            await submit_btn.click()
+        except PlaywrightTimeout:
+            logger.warning("Clave Unica submit stayed disabled — submitting via Enter")
+            pwd_selector = self._registry.get("clave_unica", "password_input")
+            await page.locator(pwd_selector).press("Enter")
+
         # Wait for navigation back to PJUD
         # The redirect goes through Clave Unica -> PJUD
         try:
@@ -228,12 +275,24 @@ class ClaveUnicaAuth:
             pass
     
     async def _verify_logged_in(self, page: Page) -> bool:
-        """Verify that we're logged in to PJUD."""
+        """Verify that we're logged in to PJUD using several robust signals."""
         try:
-            # Look for "Mis Causas" link which only appears when logged in
+            # Strongest signal: we landed on the authenticated area AND the page
+            # exposes the misCausas() function / a logout affordance / the
+            # welcome content. The old single-selector check was too brittle.
+            if "indexN.php" in page.url or "miscausas" in page.url.lower():
+                checks = await page.evaluate(
+                    """() => ({
+                        misCausas: typeof misCausas === 'function',
+                        logout: /cerrar sesi/i.test(document.body.innerText),
+                        welcome: /oficina judicial virtual/i.test(document.body.innerText),
+                    })"""
+                )
+                if checks.get("misCausas") or checks.get("logout") or checks.get("welcome"):
+                    return True
+            # Fallback to the original "Mis Causas" link selector.
             mis_causas_selector = self._registry.get("clave_unica", "my_cases_link")
-            mis_causas = page.locator(mis_causas_selector)
-            return await mis_causas.is_visible(timeout=10000)
+            return await page.locator(mis_causas_selector).first.is_visible(timeout=5000)
         except Exception:
             return False
     
