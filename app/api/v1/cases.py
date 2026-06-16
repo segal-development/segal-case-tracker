@@ -1,9 +1,9 @@
 """Cases endpoints - Read from database."""
 
-from typing import List, Optional
+from typing import List, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import and_
+from sqlalchemy import and_, nullslast
 
 from app.api.deps import get_db, get_current_lawyer, _resolve_lawyer_id
 from app.models.case import Case
@@ -25,7 +25,7 @@ router = APIRouter()
 # ============================================================================
 
 from pydantic import BaseModel
-from datetime import datetime
+from datetime import date, datetime
 
 
 class CourtInfo(BaseModel):
@@ -51,6 +51,10 @@ class CaseResponse(BaseModel):
     last_movement_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    # Procedural deadline engine fields (populated by DeadlineEngine.recompute_case)
+    procedural_state: Optional[str] = None
+    semaforo: Optional[str] = None
+    next_deadline_at: Optional[date] = None
 
     class Config:
         from_attributes = True
@@ -180,31 +184,45 @@ async def list_cases(
     per_page: int = Query(20, ge=1, le=100),
     competencia: Optional[str] = Query(None, description="Filter by competencia: civil, laboral, penal"),
     status_filter: Optional[str] = Query(None, alias="status", description="Filter by status: active, closed"),
+    sort_by: Optional[Literal["criticidad", "updated_at"]] = Query(
+        None,
+        description=(
+            "Sort order. 'criticidad' orders by next_deadline_at ASC NULLS LAST "
+            "(most-urgent first). Default: updated_at DESC."
+        ),
+    ),
     current_lawyer: dict = Depends(get_current_lawyer),
     db: Session = Depends(get_db),
 ):
     """
     List all cases for the authenticated lawyer.
-    
+
     Returns cases from database (fast). Use /sync to refresh from PJUD.
     """
     lawyer_id = _resolve_lawyer_id(db, current_lawyer)
     if not lawyer_id:
         raise HTTPException(status_code=401, detail="Invalid token: no lawyer_id")
-    
+
     # Build query
     query = db.query(Case).filter(Case.lawyer_id == lawyer_id)
-    
+
     if competencia:
         query = query.filter(Case.competencia == competencia)
     if status_filter:
         query = query.filter(Case.status == status_filter)
-    
+
     # Get total count
     total = query.count()
-    
+
+    # Apply sort order
+    if sort_by == "criticidad":
+        # ORDER BY next_deadline_at ASC NULLS LAST — most-critical/soonest first
+        order_clause = nullslast(Case.next_deadline_at.asc())
+    else:
+        order_clause = Case.updated_at.desc()
+
     # Paginate
-    cases = query.order_by(Case.updated_at.desc()).offset((page - 1) * per_page).limit(per_page).all()
+    cases = query.order_by(order_clause).offset((page - 1) * per_page).limit(per_page).all()
     
     # Get last sync time
     last_sync_record = db.query(SyncHistory).filter(
@@ -243,6 +261,9 @@ async def list_cases(
             last_movement_at=case.last_movement_at,
             created_at=case.created_at,
             updated_at=case.updated_at,
+            procedural_state=case.procedural_state,
+            semaforo=case.semaforo,
+            next_deadline_at=case.next_deadline_at,
         ))
     
     return CaseListResponse(
@@ -318,6 +339,9 @@ async def get_case(
         last_movement_at=case.last_movement_at,
         created_at=case.created_at,
         updated_at=case.updated_at,
+        procedural_state=case.procedural_state,
+        semaforo=case.semaforo,
+        next_deadline_at=case.next_deadline_at,
     )
 
     movements_response = [
