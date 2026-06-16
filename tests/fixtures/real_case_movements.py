@@ -86,7 +86,11 @@ def _mvs(*rows: tuple[str, str, str, str]) -> list[FakeMovement]:
 # ---------------------------------------------------------------------------
 
 # C-0001-2026 (source: C-394-2026)
-# Last state: Excepciones stage → EXCEPCIONES, starts TRASLADO_EJECUTANTE_4D
+# Last state: Excepciones stage → EXCEPCIONES.
+# NOTE: TRASLADO_EJECUTANTE_4D is no longer triggered at EXCEPCIONES stage —
+# the trigger was moved to the Contestación Excepciones movement (Rule 4) so
+# the 4-day countdown starts from the court's traslado resolution, not the
+# excepciones filing.  No active deadline while waiting for court to act.
 CASE_0001 = RealCaseFixture(
     case_id="C-0001-2026",
     movements=_mvs(
@@ -99,7 +103,7 @@ CASE_0001 = RealCaseFixture(
         ("2026-05-07", "", "", "Opone excepciones-Traslado"),
     ),
     expected_state=ProceduralState.EXCEPCIONES,
-    expected_deadline=DeadlineType.TRASLADO_EJECUTANTE_4D,
+    expected_deadline=None,
 )
 
 # C-0002-2026 (source: C-2946-2026)
@@ -139,7 +143,8 @@ CASE_0003 = RealCaseFixture(
 
 # C-0004-2025 (source: C-7833-2025)
 # NOTIFICADO → Excepciones → Contestación Excepciones → TRASLADO_EJECUTANTE
-# TRASLADO_EJECUTANTE_4D was started when entering EXCEPCIONES state
+# TRASLADO_EJECUTANTE_4D is now triggered when entering TRASLADO_EJECUTANTE
+# (from the first Contestación Excepciones movement), NOT at EXCEPCIONES stage.
 CASE_0004 = RealCaseFixture(
     case_id="C-0004-2025",
     movements=_mvs(
@@ -172,7 +177,7 @@ CASE_0005 = RealCaseFixture(
 )
 
 # C-0006-2026 (source: C-3462-2026)
-# Still in Excepciones stage → EXCEPCIONES
+# Still in Excepciones stage → EXCEPCIONES (no active deadline — see CASE_0001 note)
 CASE_0006 = RealCaseFixture(
     case_id="C-0006-2026",
     movements=_mvs(
@@ -184,7 +189,7 @@ CASE_0006 = RealCaseFixture(
         ("2026-06-09", "Excepciones", "Resolución", "Recepciona exhorto"),
     ),
     expected_state=ProceduralState.EXCEPCIONES,
-    expected_deadline=DeadlineType.TRASLADO_EJECUTANTE_4D,
+    expected_deadline=None,
 )
 
 # C-0007-2025 (source: C-17143-2025)
@@ -205,7 +210,7 @@ CASE_0007 = RealCaseFixture(
 )
 
 # C-0008-2025 (source: C-4672-2025)
-# Excepciones stage with only Mero trámite movements → EXCEPCIONES
+# Excepciones stage with only Mero trámite movements → EXCEPCIONES (no active deadline)
 CASE_0008 = RealCaseFixture(
     case_id="C-0008-2025",
     movements=_mvs(
@@ -216,11 +221,11 @@ CASE_0008 = RealCaseFixture(
         ("2026-03-24", "Excepciones", "Resolución", "Mero trámite"),
     ),
     expected_state=ProceduralState.EXCEPCIONES,
-    expected_deadline=DeadlineType.TRASLADO_EJECUTANTE_4D,
+    expected_deadline=None,
 )
 
 # C-0009-2026 (source: C-3982-2026)
-# Excepciones stage → EXCEPCIONES
+# Excepciones stage → EXCEPCIONES (no active deadline — see CASE_0001 note)
 CASE_0009 = RealCaseFixture(
     case_id="C-0009-2026",
     movements=_mvs(
@@ -232,7 +237,7 @@ CASE_0009 = RealCaseFixture(
         ("2026-04-20", "Excepciones", "Resolución", "Recepciona exhorto"),
     ),
     expected_state=ProceduralState.EXCEPCIONES,
-    expected_deadline=DeadlineType.TRASLADO_EJECUTANTE_4D,
+    expected_deadline=None,
 )
 
 # C-0010-2025 (source: C-17026-2025)
@@ -254,12 +259,13 @@ CASE_0010 = RealCaseFixture(
 )
 
 # C-0011-2026 (source: C-3997-2026)
-# Medida prejudicial: Cita a Audiencia (→ CITACION_SENTENCIA, order 7) appears BEFORE
-# NOTIFICACIÓN DE DEMANDA Exitosa (→ NOTIFICADO, order 2).
-# With forward-only state transitions, NOTIFICADO (order 2 < 7) is blocked by
-# CITACION_SENTENCIA.  Final state: CITACION_SENTENCIA + SENTENCIA_10D trigger.
-# NOTE: this is a medida prejudicial case — the NOTIFICACIÓN at 2026-04-30 is
-# notification of the judicial decision, not the initial demand notification.
+# Medida prejudicial: "Cita a Audiencia" appears before NOTIFICACIÓN DE DEMANDA.
+# After fix #6 (Rule 7 min_state=NOTIFICADO), "Cita a Audiencia" no longer fires
+# CITACION_SENTENCIA when the case is still INDETERMINATE, preventing the false
+# SENTENCIA_10D ROJO.  The NOTIFICACIÓN DE DEMANDA (Exitosa) then fires NOTIFICADO.
+# NOTE: The NOTIFICACIÓN here is likely notification of the medida prejudicial
+# decision, not the initial demand — full medida-prejudicial classification is
+# deferred to a future PR.  The important fix is that no false SENTENCIA_10D fires.
 CASE_0011 = RealCaseFixture(
     case_id="C-0011-2026",
     movements=_mvs(
@@ -268,12 +274,12 @@ CASE_0011 = RealCaseFixture(
         ("2026-05-18", "Tramitación", "Resolución", "Mero trámite"),
         ("2026-06-05", "Tramitación", "Resolución", "Mero trámite"),
     ),
-    expected_state=ProceduralState.CITACION_SENTENCIA,
-    expected_deadline=DeadlineType.SENTENCIA_10D,
+    expected_state=ProceduralState.NOTIFICADO,
+    expected_deadline=DeadlineType.EXCEPCIONES_8D,
 )
 
 # C-0012-2026 (source: C-3887-2026)
-# MANDAMIENTO (desc) → EXCEPCIONES stage (no Exitosa NOTIFICACIÓN in data)
+# MANDAMIENTO (desc) → EXCEPCIONES stage (no active deadline — see CASE_0001 note)
 CASE_0012 = RealCaseFixture(
     case_id="C-0012-2026",
     movements=_mvs(
@@ -285,7 +291,7 @@ CASE_0012 = RealCaseFixture(
         ("2026-04-21", "Excepciones", "Resolución", "Recepciona exhorto"),
     ),
     expected_state=ProceduralState.EXCEPCIONES,
-    expected_deadline=DeadlineType.TRASLADO_EJECUTANTE_4D,
+    expected_deadline=None,
 )
 
 # C-0013-2026 (source: C-549-2026)
@@ -319,7 +325,7 @@ CASE_0014 = RealCaseFixture(
 )
 
 # C-0015-2026 (source: C-675-2026)
-# Excepciones stage → EXCEPCIONES
+# Excepciones stage → EXCEPCIONES (no active deadline — see CASE_0001 note)
 CASE_0015 = RealCaseFixture(
     case_id="C-0015-2026",
     movements=_mvs(
@@ -331,7 +337,7 @@ CASE_0015 = RealCaseFixture(
         ("2026-04-21", "Excepciones", "Resolución", "Opone excepciones-Traslado"),
     ),
     expected_state=ProceduralState.EXCEPCIONES,
-    expected_deadline=DeadlineType.TRASLADO_EJECUTANTE_4D,
+    expected_deadline=None,
 )
 
 # ---------------------------------------------------------------------------

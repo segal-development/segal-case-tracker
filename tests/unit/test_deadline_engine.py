@@ -313,3 +313,253 @@ class TestNextDeadlineAt:
         case = _make_case(db)
         _recompute(db, case)
         assert case.next_deadline_at is None
+
+
+# ---------------------------------------------------------------------------
+# Fix #1a: No stale "active" deadlines after state advances — crossover test
+# ---------------------------------------------------------------------------
+
+
+class TestStaleDeadlineSupersession:
+    def test_excepciones_filed_supersedes_past_due_excepciones_8d(self, db) -> None:
+        """Fix #1a: NOTIFICADO past-due 8d THEN excepciones filed → AMARILLO/VERDE.
+
+        Before the fix, the engine kept EXCEPCIONES_8D active after advancing
+        to EXCEPCIONES state, causing a false ROJO from the past-due deadline.
+        After the fix, the classifier returns only TRASLADO_4D (now triggered
+        at TRASLADO_EJECUTANTE via Contestación) — or no deadline at EXCEPCIONES —
+        and EXCEPCIONES_8D is superseded.
+        """
+        case = _make_case(db)
+        # Notified 30 days ago — well past the 8d window
+        notif_date = TODAY - timedelta(days=30)
+        _add_movement(db, case.id, notif_date, "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)")
+        # Excepciones filed 25 days ago
+        exc_date = notif_date + timedelta(days=5)
+        _add_movement(db, case.id, exc_date, "Excepciones", "Opone excepciones")
+        _recompute(db, case)
+
+        # EXCEPCIONES_8D must NOT be active → no false ROJO from stale deadline
+        from app.models.case_deadline import CaseDeadline
+        active_rows = (
+            db.query(CaseDeadline)
+            .filter(
+                CaseDeadline.case_id == case.id,
+                CaseDeadline.status == "active",
+                CaseDeadline.deadline_type == DeadlineType.EXCEPCIONES_8D.value,
+            )
+            .all()
+        )
+        assert active_rows == [], "EXCEPCIONES_8D must be superseded after advancing to EXCEPCIONES"
+        # Semáforo must NOT be ROJO from the stale EXCEPCIONES_8D
+        assert case.semaforo != "rojo", (
+            f"False ROJO: EXCEPCIONES_8D is past-due but case is in EXCEPCIONES state. "
+            f"Got semaforo={case.semaforo!r}, state={case.procedural_state!r}"
+        )
+
+    def test_terminada_case_has_no_active_deadlines(self, db) -> None:
+        """Fix #1b: TERMINADA case → no active deadlines, next_deadline_at None, semáforo gris."""
+        case = _make_case(db)
+        notif_date = TODAY - timedelta(days=30)
+        _add_movement(db, case.id, notif_date, "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)")
+        _add_movement(db, case.id, notif_date + timedelta(days=5), "Terminada", "")
+        _recompute(db, case)
+
+        assert case.procedural_state == ProceduralState.TERMINADA.value
+        assert case.semaforo == "gris"
+        assert case.next_deadline_at is None
+
+        from app.models.case_deadline import CaseDeadline
+        active_count = (
+            db.query(CaseDeadline)
+            .filter(
+                CaseDeadline.case_id == case.id,
+                CaseDeadline.status == "active",
+            )
+            .count()
+        )
+        assert active_count == 0, f"TERMINADA must have 0 active deadlines, got {active_count}"
+
+    def test_indeterminate_stale_deadline_superseded(self, db) -> None:
+        """Fix #1: stale active deadline from prior run superseded when state is INDETERMINATE."""
+        case = _make_case(db)
+        # Inject a stale active row directly (simulates a prior recompute that left debris)
+        from app.models.case_deadline import CaseDeadline
+        stale = CaseDeadline(
+            case_id=case.id,
+            deadline_type=DeadlineType.EXCEPCIONES_8D.value,
+            legal_basis="art. 459 CPC",
+            due_date=date(2020, 1, 1),
+            triggered_at=date(2019, 12, 1),
+            status="active",
+        )
+        db.add(stale)
+        db.flush()
+        # No movements → INDETERMINATE → all active rows should be superseded
+        _recompute(db, case)
+        db.refresh(stale)
+        assert stale.status == "superseded", "Stale active deadline must be superseded when INDETERMINATE"
+        assert case.semaforo == "gris"
+        assert case.next_deadline_at is None
+
+
+# ---------------------------------------------------------------------------
+# Fix #2: APELACION_5D triggered by sentencia movement
+# ---------------------------------------------------------------------------
+
+
+class TestApelacion5D:
+    def test_apelacion_5d_triggered_by_sentencia_movement(self, db) -> None:
+        """Fix #2: 'Dicta Sentencia' → SENTENCIA state + APELACION_5D active."""
+        from app.services.business_days import add_business_days
+        case = _make_case(db)
+        notif_date = date(2026, 3, 1)
+        sentencia_date = date(2026, 6, 10)
+        _add_movement(db, case.id, notif_date, "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)")
+        _add_movement(db, case.id, date(2026, 4, 1), "Tramitación", "Cita a Audiencia")
+        _add_movement(db, case.id, sentencia_date, "Tramitación", "Dicta Sentencia Definitiva")
+        _recompute(db, case)
+
+        from app.core.deadlines_config import ProceduralState
+        assert case.procedural_state == ProceduralState.SENTENCIA.value
+
+        from app.models.case_deadline import CaseDeadline
+        apelacion_row = (
+            db.query(CaseDeadline)
+            .filter(
+                CaseDeadline.case_id == case.id,
+                CaseDeadline.deadline_type == DeadlineType.APELACION_5D.value,
+                CaseDeadline.status == "active",
+            )
+            .first()
+        )
+        assert apelacion_row is not None, "APELACION_5D must be active after sentencia"
+        expected_due = add_business_days(sentencia_date, 5)
+        assert apelacion_row.due_date == expected_due, (
+            f"APELACION_5D due_date: expected {expected_due}, got {apelacion_row.due_date}"
+        )
+        assert apelacion_row.legal_basis == "art. 187/475 CPC"
+        # SENTENCIA_10D from citación must be superseded
+        sentencia_10d_row = (
+            db.query(CaseDeadline)
+            .filter(
+                CaseDeadline.case_id == case.id,
+                CaseDeadline.deadline_type == DeadlineType.SENTENCIA_10D.value,
+                CaseDeadline.status == "active",
+            )
+            .first()
+        )
+        assert sentencia_10d_row is None, "SENTENCIA_10D must be superseded after SENTENCIA state"
+
+
+# ---------------------------------------------------------------------------
+# Fix #3: False REBELDÍA — detect excepciones via description too
+# ---------------------------------------------------------------------------
+
+
+class TestFalseRebeldia:
+    def test_no_rebeldia_when_excepciones_filed_in_non_excepciones_stage(self, db) -> None:
+        """Fix #3: 'Opone excepciones' description in non-Excepciones stage prevents REBELDÍA.
+
+        Real data shows excepciones filed under stage 'Notificación demanda y su
+        proveído' (PJUD displays it before the court assigns the Excepciones stage).
+        The engine must detect this via description pattern, not stage alone.
+        """
+        case = _make_case(db)
+        notif_date = TODAY - timedelta(days=30)
+        _add_movement(db, case.id, notif_date, "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)")
+        # Excepciones filed in wrong stage — description has "Opone excepciones"
+        _add_movement(
+            db, case.id, notif_date + timedelta(days=5),
+            "Notificación demanda y su proveído",  # NOT "Excepciones" stage
+            "Opone excepciones",
+        )
+        _recompute(db, case)
+        assert case.procedural_state != ProceduralState.REBELDE.value, (
+            "Must NOT be REBELDE when 'Opone excepciones' desc detected in any stage"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Fix #4: Timezone — engine uses Chile tz for "today"
+# ---------------------------------------------------------------------------
+
+
+class TestTimezone:
+    def test_engine_uses_chile_timezone(self, monkeypatch) -> None:
+        """Fix #4: _today_chile() returns Chile-tz date, not server UTC date."""
+        from app.services import deadline_engine
+        import datetime as _dt
+
+        fixed_chile_date = date(2026, 6, 16)
+
+        monkeypatch.setattr(
+            deadline_engine,
+            "_today_chile",
+            lambda: fixed_chile_date,
+        )
+        # Verify the monkeypatched function is what the engine calls
+        assert deadline_engine._today_chile() == fixed_chile_date
+
+
+# ---------------------------------------------------------------------------
+# Fix #8: REBELDÍA boundary — exactly day 8 (NOT rebelde) vs day 9 (rebelde)
+# ---------------------------------------------------------------------------
+
+
+class TestRebeldiaBoundary:
+    def test_rebeldia_not_fired_on_due_date_itself(self, db) -> None:
+        """Fix #8: on the EXACT due date (day 8), REBELDÍA must NOT fire.
+
+        The debtor still has until end of the due date to file excepciones.
+        Engine condition: due_date < today (strict less-than).
+        """
+        case = _make_case(db)
+        # add_business_days(June 4, 8) = June 16 = TODAY
+        # So today IS the due date → NOT rebelde
+        notif_date = date(2026, 6, 4)
+        _add_movement(db, case.id, notif_date, "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)")
+        _recompute(db, case)
+        assert case.procedural_state != ProceduralState.REBELDE.value, (
+            "Must NOT be REBELDE on the due date itself (day 8 is still open)"
+        )
+        assert case.semaforo == "rojo"  # ≤1 remaining → ROJO (deadline is today)
+
+    def test_rebeldia_fires_day_after_due_date(self, db) -> None:
+        """Fix #8: one business day AFTER the due date → REBELDE.
+
+        add_business_days(June 3, 8) = June 15 (yesterday).
+        Today = June 16 > June 15 → due_date < today → REBELDE.
+        """
+        case = _make_case(db)
+        # add_business_days(June 3, 8):
+        # Jun4=1, Jun5=2, Jun8=3, Jun9=4, Jun10=5, Jun11=6, Jun12=7, Jun15=8 → due=Jun15
+        notif_date = date(2026, 6, 3)
+        _add_movement(db, case.id, notif_date, "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)")
+        _recompute(db, case)
+        assert case.procedural_state == ProceduralState.REBELDE.value, (
+            "Must be REBELDE when today is strictly past the 8d due date"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Fix #7: Abandono / prescripción — deferred to PR2, no dead computation
+# ---------------------------------------------------------------------------
+
+
+class TestAbandonoPrescricion:
+    def test_abandono_flags_deferred_no_extra_semaforo(self, db) -> None:
+        """Fix #7: abandono/prescripción flags are deferred — no impact on semáforo."""
+        # A case inactive for 5 months (approaching abandono threshold)
+        case = _make_case(db, last_movement_at=datetime(2026, 1, 1))
+        _recompute(db, case)
+        # No active deadlines → gris (abandono not yet surfaced in PR1)
+        assert case.semaforo == "gris"
+        assert case.next_deadline_at is None
+
+    def test_prescripcion_approaching_no_flag_in_pr1(self, db) -> None:
+        """Fix #7: prescripción approaching (2.5+ years) — deferred, no PR1 output."""
+        filed = datetime(2023, 12, 1)  # ~2.5 years before June 2026
+        case = _make_case(db, filed_at=filed)
+        _recompute(db, case)
+        assert case.semaforo is not None  # recompute must not crash

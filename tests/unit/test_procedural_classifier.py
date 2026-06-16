@@ -71,8 +71,14 @@ class TestSpecScenarios:
         assert state == ProceduralState.NOTIFICADO
         assert DeadlineType.EXCEPCIONES_8D in triggers
 
-    def test_excepciones_stage_triggers_traslado_4d(self) -> None:
-        """Spec: stage='Excepciones' → EXCEPCIONES + TRASLADO_EJECUTANTE_4D."""
+    def test_excepciones_stage_no_active_deadline(self) -> None:
+        """Spec: stage='Excepciones' → EXCEPCIONES; NO TRASLADO_EJECUTANTE_4D yet.
+
+        TRASLADO_4D is triggered from the court's traslado resolution (the first
+        'Contestación Excepciones' stage movement), NOT from the excepciones filing.
+        While in EXCEPCIONES state the firm waits for the court to act — no
+        running deadline to track.
+        """
         clf = get_classifier()
         movements = [
             _mv("2026-04-09", "Gestión Preparatoria", "NOTIFICACIÓN DE DEMANDA (Exitosa)"),
@@ -80,7 +86,30 @@ class TestSpecScenarios:
         ]
         state, triggers = clf.classify(movements, TODAY)
         assert state == ProceduralState.EXCEPCIONES
+        assert DeadlineType.TRASLADO_EJECUTANTE_4D not in triggers
+        assert DeadlineType.EXCEPCIONES_8D not in triggers
+
+    def test_contestacion_excepciones_triggers_traslado_4d(self) -> None:
+        """Spec: 'Contestación Excepciones' stage → TRASLADO_EJECUTANTE + TRASLADO_4D.
+
+        The 4-day countdown starts from the court's traslado resolution date,
+        which is more conservative (later) than the excepciones filing date.
+        """
+        clf = get_classifier()
+        traslado_date = "2026-05-06"
+        movements = [
+            _mv("2026-04-09", "Gestión Preparatoria", "NOTIFICACIÓN DE DEMANDA (Exitosa)"),
+            _mv("2026-04-13", "Excepciones", "Opone excepciones"),
+            _mv(traslado_date, "Contestación Excepciones", "Evacúa traslado"),
+        ]
+        state, triggers = clf.classify(movements, TODAY)
+        assert state == ProceduralState.TRASLADO_EJECUTANTE
         assert DeadlineType.TRASLADO_EJECUTANTE_4D in triggers
+        # Trigger date must be the Contestación movement, not the Excepciones filing
+        from datetime import datetime
+        trigger = triggers[DeadlineType.TRASLADO_EJECUTANTE_4D]
+        trigger_date = trigger.movement_date.date() if hasattr(trigger.movement_date, "date") else trigger.movement_date
+        assert trigger_date == datetime.strptime(traslado_date, "%Y-%m-%d").date()
 
     def test_auto_prueba_triggers_termino_probatorio_10d(self) -> None:
         """Spec: desc matches auto_prueba rule → AUTO_PRUEBA + TERMINO_PROBATORIO_10D."""
@@ -213,12 +242,70 @@ class TestSafety:
         assert isinstance(triggers[DeadlineType.OBSERVACIONES_PRUEBA_6D], date)
 
     def test_citacion_sentencia_triggers_sentencia_10d(self) -> None:
-        """CITACION_SENTENCIA rule starts SENTENCIA_10D deadline."""
+        """CITACION_SENTENCIA rule starts SENTENCIA_10D deadline.
+
+        'Cita a Audiencia' has min_state=NOTIFICADO, so the case must have
+        been notified first.  A bare 'Cita a Audiencia' before NOTIFICADO
+        (medida prejudicial context) must NOT trigger SENTENCIA_10D.
+        """
         clf = get_classifier()
-        movements = [_mv("2026-04-01", "Tramitación", "Cita a Audiencia")]
+        # Must have NOTIFICADO before Cita a Audiencia fires.
+        movements = [
+            _mv("2026-03-01", "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)"),
+            _mv("2026-04-01", "Tramitación", "Cita a Audiencia"),
+        ]
         state, triggers = clf.classify(movements, TODAY)
         assert state == ProceduralState.CITACION_SENTENCIA
         assert DeadlineType.SENTENCIA_10D in triggers
+
+    def test_cita_a_audiencia_before_notificado_is_ignored(self) -> None:
+        """Fix #6: 'Cita a Audiencia' before NOTIFICADO must NOT fire SENTENCIA_10D.
+
+        In medida-prejudicial context the court may schedule a hearing before
+        the demand is notified.  Rule 7 has min_state=NOTIFICADO to prevent
+        the 10-day deadline from appearing incorrectly.
+        """
+        clf = get_classifier()
+        movements = [_mv("2026-04-01", "Presentación de la Medida Prejudicial", "Cita a Audiencia")]
+        state, triggers = clf.classify(movements, TODAY)
+        assert state == ProceduralState.INDETERMINATE
+        assert DeadlineType.SENTENCIA_10D not in triggers
+
+    def test_apelacion_5d_triggered_by_sentencia(self) -> None:
+        """Fix #2: 'Dicta Sentencia' movement → SENTENCIA state + APELACION_5D deadline."""
+        clf = get_classifier()
+        sentencia_date = "2026-06-10"
+        movements = [
+            _mv("2026-03-01", "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)"),
+            _mv("2026-04-01", "Tramitación", "Cita a Audiencia"),
+            _mv(sentencia_date, "Tramitación", "Dicta Sentencia Definitiva"),
+        ]
+        state, triggers = clf.classify(movements, TODAY)
+        assert state == ProceduralState.SENTENCIA
+        assert DeadlineType.APELACION_5D in triggers
+        from app.core.deadlines_config import DeadlineType as DT
+        assert DT.APELACION_5D.legal_basis == "art. 187/475 CPC"
+        # Trigger date must be the sentencia movement date
+        from datetime import datetime
+        trigger = triggers[DeadlineType.APELACION_5D]
+        trigger_date = trigger.movement_date.date() if hasattr(trigger.movement_date, "date") else trigger.movement_date
+        assert trigger_date == datetime.strptime(sentencia_date, "%Y-%m-%d").date()
+
+    def test_excepciones_8d_not_in_triggers_after_excepciones_state(self) -> None:
+        """Fix #1: once EXCEPCIONES state is reached EXCEPCIONES_8D must be gone.
+
+        The classifier now clears prior-state triggers on every state advance,
+        so a stale past-due EXCEPCIONES_8D never causes a false ROJO after
+        excepciones are filed.
+        """
+        clf = get_classifier()
+        movements = [
+            _mv("2026-01-01", "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)"),
+            _mv("2026-01-10", "Excepciones", "Opone excepciones"),
+        ]
+        state, triggers = clf.classify(movements, TODAY)
+        assert state == ProceduralState.EXCEPCIONES
+        assert DeadlineType.EXCEPCIONES_8D not in triggers
 
 
 # ---------------------------------------------------------------------------

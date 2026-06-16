@@ -6,7 +6,12 @@ All expected dates are manually verified against Chilean feriados.
 Feriados used in these tests (verified for the relevant years):
 - 2026-09-18 Fiestas Patrias (Friday)
 - 2026-09-19 Glorias del Ejército (Saturday → weekend anyway)
-- 2026-09-21 Día de la Unidad Nacional (Monday, Ley 21.169 candidate)
+- 2026-09-21 NOT a feriado in holidays.Chile — Ley 21.169 (Día de la Unidad
+             Nacional) is a conditional/optional feriado that the `holidays`
+             library does NOT include by default.  Sep 21 is therefore counted
+             as a regular business day in all computations.  If the court
+             system ever treats it as a feriado, a Slice B override table will
+             be required (see deferred work note in deadline_engine.py).
 - 2026-04-03 Viernes Santo (Good Friday 2026)
 - 2026-01-01 Año Nuevo
 - 2025-01-01 Año Nuevo
