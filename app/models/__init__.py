@@ -13,6 +13,7 @@ from app.models.case_litigante import CaseLitigante
 from app.models.case_notificacion import CaseNotificacion
 from app.models.case_escrito import CaseEscrito
 from app.models.case_exhorto import CaseExhorto
+from app.models.case_deadline import CaseDeadline
 
 __all__ = [
     "Lawyer",
@@ -28,4 +29,5 @@ __all__ = [
     "CaseNotificacion",
     "CaseEscrito",
     "CaseExhorto",
+    "CaseDeadline",
 ]

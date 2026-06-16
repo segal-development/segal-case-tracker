@@ -44,6 +44,7 @@ from app.models.case_exhorto import CaseExhorto
 from app.services.notification_service import NotificationService
 from app.services.document_persistence import DocumentPersistenceService
 from app.scrapper.pjud.exceptions import SessionExpiredError, SessionNotAuthenticatedError
+from app.services.deadline_engine import DeadlineEngine
 
 
 @dataclass
@@ -1196,6 +1197,30 @@ def _oldest_unchecked_label(db: Session, lawyer_id: int) -> str:
     )
 
 
+def _maybe_recompute_deadlines(db: Session, case: Case) -> None:
+    """Recompute procedural deadlines for *case* after a movement sync.
+
+    Called from inside the _do_fetch closure in detect_and_sync_movements.
+    Only processes civil competencia; silently returns for all others.
+    Never re-raises — a deadline computation failure must NOT abort the
+    surrounding sync transaction.
+
+    Args:
+        db:   Active SQLAlchemy session (shared with the sync transaction).
+        case: Case ORM instance (already flushed, not yet committed).
+    """
+    if (case.competencia or "").lower() != "civil":
+        return
+    try:
+        DeadlineEngine.recompute_case(db, case)
+    except Exception:
+        logger.exception(
+            "_maybe_recompute_deadlines failed for case_id=%s; "
+            "deadline computation skipped — sync continues",
+            getattr(case, "id", "?"),
+        )
+
+
 async def detect_and_sync_movements(
     db: Session,
     scraper,
@@ -1418,7 +1443,10 @@ async def detect_and_sync_movements(
             # Runs even on 0-movement fetches — guarantees full-cycle coverage.
             db_case.last_detail_checked_at = datetime.utcnow()
 
-            # Commit entity upserts + document tokens + mark-checked.
+            # Recompute procedural deadlines (civil only; flush-only; never raises).
+            _maybe_recompute_deadlines(db, db_case)
+
+            # Commit entity upserts + document tokens + mark-checked + deadlines.
             # (sync_movements already committed its own changes.)
             db.commit()
 
