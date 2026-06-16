@@ -62,21 +62,27 @@ class TestClaveUnicaAuthFormFilling:
             {"name": "PHPSESSID", "value": "abc123", "domain": ".pjud.cl"},
             {"name": "other", "value": "value", "domain": ".pjud.cl"},
         ])
-        page.evaluate = AsyncMock(return_value="{}")
-        
+        # _verify_logged_in reads a dict from evaluate; the event-dispatch
+        # evaluate ignores the return value, so a dict works for both.
+        page.evaluate = AsyncMock(return_value={"welcome": True})
+        page.url = "https://oficinajudicialvirtual.pjud.cl/indexN.php"
+        page.wait_for_selector = AsyncMock()
+
         # Mock locators
         locator = AsyncMock()
         locator.is_visible = AsyncMock(return_value=True)
         locator.wait_for = AsyncMock()
         locator.click = AsyncMock()
         locator.fill = AsyncMock()
+        locator.press = AsyncMock()
         locator.text_content = AsyncMock(return_value="")
-        
+        locator.first = locator  # .first returns the same configured locator
+
         page.locator = MagicMock(return_value=locator)
         page.wait_for_load_state = AsyncMock()
         page.wait_for_url = AsyncMock()
         page.goto = AsyncMock()
-        
+
         return page
     
     @pytest.fixture
@@ -234,14 +240,18 @@ class TestClaveUnicaAuthSessionExtraction:
             {"name": "session", "value": "xyz", "domain": "oficinajudicialvirtual.pjud.cl"},
             {"name": "external", "value": "123", "domain": ".google.com"},
         ])
-        mock_page.evaluate = AsyncMock(return_value="{}")
-        
+        mock_page.evaluate = AsyncMock(return_value={"welcome": True})
+        mock_page.url = "https://oficinajudicialvirtual.pjud.cl/indexN.php"
+        mock_page.wait_for_selector = AsyncMock()
+
         # Mock all the other page interactions
         locator = AsyncMock()
         locator.is_visible = AsyncMock(return_value=True)
         locator.wait_for = AsyncMock()
         locator.click = AsyncMock()
         locator.fill = AsyncMock()
+        locator.press = AsyncMock()
+        locator.first = locator
         mock_page.locator = MagicMock(return_value=locator)
         mock_page.wait_for_load_state = AsyncMock()
         mock_page.wait_for_url = AsyncMock()
