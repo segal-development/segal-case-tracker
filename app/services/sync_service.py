@@ -1532,7 +1532,10 @@ async def detect_and_sync_movements(
             # prior detail navigation) are NOT case-specific — the case has real
             # detail we simply couldn't reach. Do NOT advance last_detail_checked_at
             # for these, so the case is retried instead of being falsely marked done.
-            is_infra_error = "panel not loaded" in str(exc).lower()
+            is_infra_error = any(
+                marker in str(exc).lower()
+                for marker in ("panel not loaded", "modal content empty")
+            )
             if db_case is not None and not is_infra_error:
                 # Case-specific error (detail parse, not-found, etc.). Advance so a
                 # persistently-failing case rotates to the back and doesn't block

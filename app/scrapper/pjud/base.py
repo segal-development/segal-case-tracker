@@ -766,44 +766,62 @@ class PJUDBaseScraper(ABC):
                 )
             
             modal_id = self.config.modal_id
-
-            # Clear any stale modal content from a previous case — the page (and
-            # thus the modal element) is reused across cases, so we must detect
-            # THIS case's freshly-loaded content, not the prior one. Best-effort:
-            # a pending navigation can destroy the context here too.
-            try:
-                await page.evaluate(
-                    f"() => {{ const m = document.querySelector('#{modal_id}'); if (m) m.innerHTML = ''; }}"
-                )
-            except Exception:
-                pass
-
-            # Call the native function that opens + loads the detail. This can
-            # trigger a navigation that destroys the JS execution context, so the
-            # poll below tolerates transient evaluate failures and retries until
-            # the page settles and the modal is populated (~15s). A fixed sleep
-            # was too short under headless chromium in Docker.
-            await page.evaluate(f"{fn_name}('{case_token}')")
-
             detail_html = ""
-            for _ in range(30):
-                await asyncio.sleep(0.5)
+
+            # In a rapid backfill loop the modal is frequently still empty after
+            # one open (headless timing + the detail call's own navigation). Retry
+            # the whole open+poll up to 3 times, re-establishing the panel between
+            # attempts, before giving up. Most cases succeed on the first attempt.
+            for attempt in range(3):
+                # Clear stale modal content so we detect THIS case's fresh load,
+                # not the previous one (the page/modal element is reused).
                 try:
-                    detail_html = await page.evaluate(f"""
-                        () => {{
-                            const modal = document.querySelector('#{modal_id}');
-                            return modal ? modal.innerHTML : '';
-                        }}
-                    """)
+                    await page.evaluate(
+                        f"() => {{ const m = document.querySelector('#{modal_id}'); if (m) m.innerHTML = ''; }}"
+                    )
                 except Exception:
-                    # Execution context destroyed mid-navigation — wait + retry.
-                    continue
+                    pass
+
+                # Open + AJAX-load the detail modal. The call can trigger a
+                # navigation that destroys the JS context — the poll tolerates that.
+                try:
+                    await page.evaluate(f"{fn_name}('{case_token}')")
+                except Exception:
+                    pass
+
+                detail_html = ""
+                for _ in range(30):  # ~15s per attempt
+                    await asyncio.sleep(0.5)
+                    try:
+                        detail_html = await page.evaluate(f"""
+                            () => {{
+                                const modal = document.querySelector('#{modal_id}');
+                                return modal ? modal.innerHTML : '';
+                            }}
+                        """)
+                    except Exception:
+                        # Execution context destroyed mid-navigation — wait + retry.
+                        continue
+                    if detail_html and len(detail_html) >= 100:
+                        break
+
                 if detail_html and len(detail_html) >= 100:
-                    break
+                    break  # got the detail — done
+
+                # Empty modal: re-establish the panel and retry the open.
+                logger.warning(
+                    "detail modal empty (attempt %d/3) — reloading panel and retrying",
+                    attempt + 1,
+                )
+                self._panel_loaded = False
+                try:
+                    await self._ensure_panel_loaded(page)
+                except Exception:
+                    pass
 
             if not detail_html or len(detail_html) < 100:
                 raise ScrapingError("Modal content empty - detail failed to load")
-            
+
             logger.info(f"Captured detail modal: {len(detail_html)} chars")
             return self._parse_case_detail_html(detail_html, case_token)
             
