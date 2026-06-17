@@ -124,6 +124,38 @@ def _recompute(db, case: Case) -> None:
     DeadlineEngine.recompute_case(db, case)
 
 
+# Deterministic "today" for color tests (a Monday). Color logic is exercised by
+# passing this explicitly to _compute_semaforo, so it never depends on the clock.
+_FIXED_TODAY = date(2026, 6, 15)
+
+
+def _inject_deadline(db, case_id, dtype, *, biz_days_from_today=None, calendar_due=None, status="active"):
+    """Insert a CaseDeadline whose due_date is positioned relative to _FIXED_TODAY."""
+    from app.services.business_days import add_business_days
+
+    if calendar_due is not None:
+        due = calendar_due
+    else:
+        due = add_business_days(_FIXED_TODAY, biz_days_from_today)
+    row = CaseDeadline(
+        case_id=case_id,
+        deadline_type=dtype.value,
+        legal_basis=getattr(dtype, "legal_basis", ""),
+        due_date=due,
+        triggered_at=due,
+        status=status,
+    )
+    db.add(row)
+    db.flush()
+    return due
+
+
+def _color(db, case_id, state):
+    from app.services.deadline_engine import DeadlineEngine
+
+    return DeadlineEngine._compute_semaforo(db, case_id, state, _FIXED_TODAY)
+
+
 # ---------------------------------------------------------------------------
 # Semáforo threshold tests (REQ-5)
 # ---------------------------------------------------------------------------
@@ -167,61 +199,31 @@ class TestSemaforo:
         assert case.semaforo == "verde"
 
     def test_semaforo_amarillo_3d_remaining(self, db) -> None:
-        """2–5 días hábiles → AMARILLO."""
+        """2–5 días hábiles on an ACTIONABLE deadline → AMARILLO."""
         case = _make_case(db)
-        # Add a notification 5 business days before TODAY so EXCEPCIONES_8D
-        # expires ~3 business days from now (8 - 5 = 3 remaining).
-        # Notify on 2026-06-09 (Mon): biz days until 8d due from June 9:
-        # 10,11,12,[Sat13,Sun14],15,16,17,18,19 → due = June 19 (3d from today June 16)
-        notif_date = date(2026, 6, 9)
-        _add_movement(db, case.id, notif_date, "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)")
-        _recompute(db, case)
-        assert case.semaforo == "amarillo"
+        _inject_deadline(db, case.id, DeadlineType.TRASLADO_EJECUTANTE_4D, biz_days_from_today=3)
+        assert _color(db, case.id, ProceduralState.TRASLADO_EJECUTANTE) == "amarillo"
 
     def test_semaforo_rojo_due_today(self, db) -> None:
-        """Due today (0 remaining) → ROJO."""
+        """Actionable deadline due today (0 remaining) → ROJO."""
         case = _make_case(db)
-        # 8 biz days back from TODAY (June 16) = June 5 (Fri)
-        # From June 5: count June 6(Sat skip), 7(Sun skip), 8(Mon)=1, 9(Tue)=2,
-        #              10(Wed)=3, 11(Thu)=4, 12(Fri)=5, [Sat13,Sun14],
-        #              15(Mon)=6, 16(Tue)=7 ... need 8th
-        # Actually let me compute: add_business_days(June 4, 8) = June 16?
-        # June 4 Thu: Jun5(Fri)=1,[Sat6,Sun7],Jun8(Mon)=2,Jun9(Tue)=3,Jun10(Wed)=4,
-        # Jun11(Thu)=5,Jun12(Fri)=6,[Sat13,Sun14],Jun15(Mon)=7,Jun16(Tue)=8. YES!
-        notif_date = date(2026, 6, 4)
-        _add_movement(db, case.id, notif_date, "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)")
-        _recompute(db, case)
-        assert case.semaforo == "rojo"
+        _inject_deadline(db, case.id, DeadlineType.TRASLADO_EJECUTANTE_4D, calendar_due=_FIXED_TODAY)
+        assert _color(db, case.id, ProceduralState.TRASLADO_EJECUTANTE) == "rojo"
 
-    def test_semaforo_rojo_expired_yesterday(self, db) -> None:
-        """Expired deadline → ROJO."""
+    def test_semaforo_rojo_expired_mandatory(self, db) -> None:
+        """An EXPIRED mandatory-actionable deadline (firm missed it) → ROJO."""
         case = _make_case(db)
-        # Notification 14 days ago, well past 8d deadline
-        notif_date = TODAY - timedelta(days=14)
-        _add_movement(db, case.id, notif_date, "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)")
-        _recompute(db, case)
-        assert case.semaforo == "rojo"
+        _inject_deadline(
+            db, case.id, DeadlineType.TRASLADO_EJECUTANTE_4D,
+            calendar_due=_FIXED_TODAY - timedelta(days=10), status="expired",
+        )
+        assert _color(db, case.id, ProceduralState.TRASLADO_EJECUTANTE) == "rojo"
 
     def test_semaforo_rojo_1d_remaining(self, db) -> None:
-        """1 día hábil remaining → ROJO (≤1 threshold)."""
+        """1 día hábil remaining on an actionable deadline → ROJO (≤1 threshold)."""
         case = _make_case(db)
-        # 7 biz days from June 5: Jun6=1,..Jun12=5,[wknd],Jun15=6,Jun16=7 → due Jun16 (today)
-        # For 1 day remaining, need due date to be tomorrow June 17
-        # add_business_days(June 5, 8) = June 16 (0 remaining, ROJO due today)
-        # add_business_days(June 8, 8) = ? Jun9=1,10=2,11=3,12=4,[wknd],15=5,16=6,17=7,18=8
-        # That's Jun18 → 2 days remaining (AMARILLO). Not right.
-        # For 1 day remaining: need due June 17
-        # add_business_days(June 5, 8) = June 16 (due today, 0 remaining → ROJO)
-        # The ROJO condition is ≤1, so 0 days is ROJO, 1 day is ROJO too.
-        # For 1 day remaining: due = June 17 (tomorrow, 1 biz day away)
-        # add_business_days(start, 8) = June 17 means start=June 5
-        # Let me verify: Jun6(Sat skip), Jun7(Sun skip), Jun8=1, Jun9=2, Jun10=3,
-        # Jun11=4, Jun12=5, [Sat13,Sun14], Jun15=6, Jun16=7, Jun17=8. YES!
-        # So notification on June 5 (Friday): 8d deadline = June 17 (1 day remaining)
-        notif_date = date(2026, 6, 5)  # Friday
-        _add_movement(db, case.id, notif_date, "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)")
-        _recompute(db, case)
-        assert case.semaforo == "rojo"
+        _inject_deadline(db, case.id, DeadlineType.TRASLADO_EJECUTANTE_4D, biz_days_from_today=1)
+        assert _color(db, case.id, ProceduralState.TRASLADO_EJECUTANTE) == "rojo"
 
     def test_non_civil_yields_gris(self, db) -> None:
         """Non-civil competencia → GRIS + INDETERMINATE, no processing."""
@@ -301,11 +303,19 @@ class TestAbandonoPrescricion:
 
 class TestNextDeadlineAt:
     def test_next_deadline_at_set_on_active_deadline(self, db) -> None:
-        """Case.next_deadline_at reflects the nearest active deadline."""
+        """next_deadline_at reflects the firm's nearest active ACTIONABLE deadline."""
+        from app.services.deadline_engine import _today_chile
+
         case = _make_case(db)
-        notif_date = date(2026, 6, 9)  # 3 biz days remaining
-        _add_movement(db, case.id, notif_date, "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)")
+        today = _today_chile()
+        # Notificación then a court traslado resolution → TRASLADO_EJECUTANTE_4D
+        # (an actionable firm deadline), due in the future.
+        _add_movement(db, case.id, today - timedelta(days=10), "Gestión",
+                      "NOTIFICACIÓN DE DEMANDA (Exitosa)")
+        _add_movement(db, case.id, today, "Contestación Excepciones",
+                      "Confiere traslado al ejecutante")
         _recompute(db, case)
+        assert case.procedural_state == ProceduralState.TRASLADO_EJECUTANTE.value
         assert case.next_deadline_at is not None
 
     def test_next_deadline_at_none_when_indeterminate(self, db) -> None:
@@ -453,6 +463,65 @@ class TestApelacion5D:
 
 
 # ---------------------------------------------------------------------------
+# Bug fix: CITACION_SENTENCIA real PJUD texts supersede TERMINO_PROBATORIO_10D
+# ---------------------------------------------------------------------------
+
+
+class TestCitacionSentenciaRealTexts:
+    def test_citacion_a_oir_sentencia_supersedes_termino_probatorio(self, db) -> None:
+        """Bug fix: 'Citación a oír sentencia' advances state and supersedes TERMINO_PROBATORIO_10D.
+
+        Before the fix, Rule 7 regex 'Cita a Audiencia' never matched this real
+        PJUD text, leaving the case at AUTO_PRUEBA with an overdue
+        TERMINO_PROBATORIO_10D causing a false ROJO.  After the fix:
+          - TERMINO_PROBATORIO_10D must be superseded (not active)
+          - SENTENCIA_10D must be active
+        """
+        case = _make_case(db)
+        notif_date = date(2026, 3, 1)
+        auto_prueba_date = date(2026, 4, 1)
+        citacion_date = date(2026, 5, 15)
+        _add_movement(db, case.id, notif_date, "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)")
+        _add_movement(
+            db, case.id, auto_prueba_date,
+            "Contestación Excepciones",
+            "Notificación resolución que recibe la causa a prue (Exitosa)",
+        )
+        _add_movement(db, case.id, citacion_date, "Tramitación", "Citación a oír sentencia")
+        _recompute(db, case)
+
+        assert case.procedural_state == ProceduralState.CITACION_SENTENCIA.value
+
+        from app.models.case_deadline import CaseDeadline
+
+        # TERMINO_PROBATORIO_10D must NOT be active (superseded by citacion)
+        termino_active = (
+            db.query(CaseDeadline)
+            .filter(
+                CaseDeadline.case_id == case.id,
+                CaseDeadline.deadline_type == DeadlineType.TERMINO_PROBATORIO_10D.value,
+                CaseDeadline.status == "active",
+            )
+            .first()
+        )
+        assert termino_active is None, (
+            "TERMINO_PROBATORIO_10D must be superseded after advancing to CITACION_SENTENCIA"
+        )
+
+        # SENTENCIA_10D must be active
+        sentencia_10d_active = (
+            db.query(CaseDeadline)
+            .filter(
+                CaseDeadline.case_id == case.id,
+                CaseDeadline.deadline_type == DeadlineType.SENTENCIA_10D.value,
+                CaseDeadline.status == "active",
+            )
+            .first()
+        )
+        assert sentencia_10d_active is not None, "SENTENCIA_10D must be active after CITACION_SENTENCIA"
+
+
+# ---------------------------------------------------------------------------
 # Fix #3: False REBELDÍA — detect excepciones via description too
 # ---------------------------------------------------------------------------
 
@@ -508,38 +577,114 @@ class TestTimezone:
 
 
 class TestRebeldiaBoundary:
-    def test_rebeldia_not_fired_on_due_date_itself(self, db) -> None:
-        """Fix #8: on the EXACT due date (day 8), REBELDÍA must NOT fire.
+    @staticmethod
+    def _notif_for_excepciones_due(target_due):
+        """Find a notificación date whose EXCEPCIONES_8D (8 biz days) lands on target_due."""
+        from app.services.business_days import add_business_days
 
-        The debtor still has until end of the due date to file excepciones.
-        Engine condition: due_date < today (strict less-than).
+        notif = target_due
+        # walk back until add_business_days(notif, 8) == target_due
+        for _ in range(40):
+            if add_business_days(notif, 8) == target_due:
+                return notif
+            notif -= timedelta(days=1)
+        return notif
+
+    def test_rebeldia_not_fired_on_due_date_itself(self, db) -> None:
+        """On the EXACT due date (day 8), REBELDÍA must NOT fire (window still open).
+
+        New semantics: excepciones is the DEBTOR's window → not the firm's red →
+        semáforo VERDE (nothing pending for the firm) while it is still open.
         """
+        from app.services.deadline_engine import _today_chile
+
         case = _make_case(db)
-        # add_business_days(June 4, 8) = June 16 = TODAY
-        # So today IS the due date → NOT rebelde
-        notif_date = date(2026, 6, 4)
+        today = _today_chile()
+        notif_date = self._notif_for_excepciones_due(today)  # due == today
         _add_movement(db, case.id, notif_date, "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)")
         _recompute(db, case)
         assert case.procedural_state != ProceduralState.REBELDE.value, (
             "Must NOT be REBELDE on the due date itself (day 8 is still open)"
         )
-        assert case.semaforo == "rojo"  # ≤1 remaining → ROJO (deadline is today)
+        assert case.semaforo == "verde"  # debtor's window, not the firm's red
 
     def test_rebeldia_fires_day_after_due_date(self, db) -> None:
-        """Fix #8: one business day AFTER the due date → REBELDE.
+        """One business day AFTER the due date with no opposition → REBELDE.
 
-        add_business_days(June 3, 8) = June 15 (yesterday).
-        Today = June 16 > June 15 → due_date < today → REBELDE.
+        New semantics: rebeldía is FAVOURABLE for the ejecutante (proceed to
+        sentencia) → semáforo VERDE, NOT red.
         """
+        from app.services.deadline_engine import _today_chile
+
         case = _make_case(db)
-        # add_business_days(June 3, 8):
-        # Jun4=1, Jun5=2, Jun8=3, Jun9=4, Jun10=5, Jun11=6, Jun12=7, Jun15=8 → due=Jun15
-        notif_date = date(2026, 6, 3)
+        today = _today_chile()
+        # Notificación well in the past → EXCEPCIONES_8D due strictly before today.
+        notif_date = today - timedelta(days=30)
         _add_movement(db, case.id, notif_date, "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)")
         _recompute(db, case)
         assert case.procedural_state == ProceduralState.REBELDE.value, (
             "Must be REBELDE when today is strictly past the 8d due date"
         )
+        assert case.semaforo == "verde"  # rebeldía is favourable, not red
+
+
+class TestEjecutanteSemantics:
+    """ROJO reflects only the firm's own actionable deadlines (ejecutante)."""
+
+    def test_overdue_court_sentencia_term_not_rojo(self, db) -> None:
+        """SENTENCIA_10D is the COURT's term → past-due is informational, not red."""
+        case = _make_case(db)
+        _inject_deadline(
+            db, case.id, DeadlineType.SENTENCIA_10D,
+            calendar_due=_FIXED_TODAY - timedelta(days=10),
+        )
+        assert _color(db, case.id, ProceduralState.CITACION_SENTENCIA) == "verde"
+
+    def test_expired_optional_apelacion_not_rojo(self, db) -> None:
+        """APELACION_5D is optional → an expired window is closed, not red."""
+        case = _make_case(db)
+        _inject_deadline(
+            db, case.id, DeadlineType.APELACION_5D,
+            calendar_due=_FIXED_TODAY - timedelta(days=10), status="expired",
+        )
+        assert _color(db, case.id, ProceduralState.SENTENCIA) == "verde"
+
+    def test_overdue_active_optional_apelacion_not_rojo(self, db) -> None:
+        """An ACTIVE but past-due optional window (apelación) is closed, not red."""
+        case = _make_case(db)
+        _inject_deadline(
+            db, case.id, DeadlineType.APELACION_5D,
+            calendar_due=_FIXED_TODAY - timedelta(days=10), status="active",
+        )
+        assert _color(db, case.id, ProceduralState.SENTENCIA) == "verde"
+
+    def test_overtaken_overdue_mandatory_not_rojo(self, db) -> None:
+        """A past-due mandatory deadline WITH later court activity is overtaken → not red."""
+        from app.services.deadline_engine import _today_chile
+
+        case = _make_case(db)
+        today = _today_chile()
+        _add_movement(db, case.id, today - timedelta(days=60), "Gestión",
+                      "NOTIFICACIÓN DE DEMANDA (Exitosa)")
+        _add_movement(db, case.id, today - timedelta(days=40), "Contestación Excepciones",
+                      "Confiere traslado al ejecutante")
+        _add_movement(db, case.id, today - timedelta(days=5), "Tramitación", "Mero trámite")
+        _recompute(db, case)
+        assert case.semaforo != "rojo"
+
+    def test_overdue_mandatory_no_activity_is_rojo(self, db) -> None:
+        """A past-due mandatory deadline with NO later activity → firm must act → ROJO."""
+        from app.services.deadline_engine import _today_chile
+
+        case = _make_case(db)
+        today = _today_chile()
+        _add_movement(db, case.id, today - timedelta(days=20), "Gestión",
+                      "NOTIFICACIÓN DE DEMANDA (Exitosa)")
+        _add_movement(db, case.id, today - timedelta(days=10), "Contestación Excepciones",
+                      "Confiere traslado al ejecutante")
+        _recompute(db, case)
+        assert case.procedural_state == ProceduralState.TRASLADO_EJECUTANTE.value
+        assert case.semaforo == "rojo"
 
 
 # ---------------------------------------------------------------------------

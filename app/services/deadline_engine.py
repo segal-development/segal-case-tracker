@@ -31,8 +31,11 @@ from sqlalchemy.orm import Session
 import re as _re
 
 from app.core.deadlines_config import (
+    ACTIONABLE_DEADLINE_VALUES,
     DEADLINE_DISCLAIMER,
     DeadlineType,
+    MANDATORY_ACTIONABLE_VALUES,
+    OPTIONAL_ACTIONABLE_VALUES,
     ProceduralState,
 )
 from app.models.case import Case
@@ -182,6 +185,31 @@ class DeadlineEngine:
                 row.status = "superseded"
         db.flush()
 
+        # Step 5b: OVERTAKEN supersession. An actionable deadline that is past-due
+        # AND has court activity (any movement) dated after its due_date has been
+        # overtaken — the procedure moved on (often via a movement the classifier
+        # doesn't recognise). Mark it superseded so it stops producing a false ROJO.
+        # An overdue deadline with NO later movement stays active → still ROJO,
+        # because the firm genuinely has a pending action.
+        latest_mv_date: Optional[date] = None
+        if movements:
+            last_mv_dt = movements[-1].movement_date  # movements are ASC
+            latest_mv_date = last_mv_dt.date() if hasattr(last_mv_dt, "date") else last_mv_dt
+        if latest_mv_date is not None:
+            still_active = (
+                db.query(CaseDeadline)
+                .filter(
+                    CaseDeadline.case_id == case.id,
+                    CaseDeadline.status == "active",
+                    CaseDeadline.deadline_type.in_(ACTIONABLE_DEADLINE_VALUES),
+                )
+                .all()
+            )
+            for row in still_active:
+                if row.due_date < today and latest_mv_date > row.due_date:
+                    row.status = "superseded"
+            db.flush()
+
         # Step 6: REBELDÍA post-transition.
         # NOTIFICADO + EXCEPCIONES_8D due date elapsed + no EXCEPCIONES movement.
         if proc_state == ProceduralState.NOTIFICADO:
@@ -194,10 +222,18 @@ class DeadlineEngine:
                 )
                 .first()
             )
+            # A REAL opposition only — the previous broad regex (`excepci[oó]n`)
+            # matched any mention ("plazo de excepciones", "admisibilidad de
+            # excep") and wrongly blocked the rebeldía transition.
+            _opposition_stages = {
+                "Excepciones",
+                "Oposición de Excepciones",
+                "Contestación Excepciones",
+            }
             has_excepciones_movement = any(
-                (mv.stage or "").strip() == "Excepciones"
+                (mv.stage or "").strip() in _opposition_stages
                 or bool(_re.search(
-                    r"opone\s+excepciones|excepci[oó]n",
+                    r"opone\s+excepciones",
                     (mv.description or ""),
                     _re.IGNORECASE,
                 ))
@@ -222,12 +258,14 @@ class DeadlineEngine:
         case.procedural_state = proc_state.value
         case.semaforo = semaforo
 
-        # next_deadline_at = earliest active due_date
+        # next_deadline_at = earliest active ACTIONABLE due_date (the firm's next
+        # action). Informational deadlines (debtor/court) are not the headline.
         nearest = (
             db.query(CaseDeadline.due_date)
             .filter(
                 CaseDeadline.case_id == case.id,
                 CaseDeadline.status == "active",
+                CaseDeadline.deadline_type.in_(ACTIONABLE_DEADLINE_VALUES),
             )
             .order_by(CaseDeadline.due_date.asc())
             .first()
@@ -248,31 +286,39 @@ class DeadlineEngine:
         state: ProceduralState,
         today: date,
     ) -> str:
-        """Derive semáforo color from state and active/expired deadlines.
+        """Derive semáforo color from the FIRM's own (actionable) deadlines only.
 
-        Rules (REQ-5):
-          GRIS     → INDETERMINATE state OR TERMINADA OR no deadlines at all.
-          ROJO     → nearest active deadline ≤ 1 día hábil remaining,
-                     OR any 'expired' deadline exists (past-due, action required).
-          AMARILLO → 2–5 días hábiles remaining on nearest active deadline.
-          VERDE    → > 5 días hábiles remaining.
+        Ejecutante perspective (see deadlines_config ownership sets):
+          GRIS     → INDETERMINATE or TERMINADA.
+          ROJO     → nearest active ACTIONABLE deadline ≤ 1 día hábil remaining,
+                     OR a MANDATORY_ACTIONABLE deadline is expired (firm missed it).
+          AMARILLO → 2–5 días hábiles remaining on nearest active actionable.
+          VERDE    → > 5 días hábiles remaining, OR nothing pending for the firm
+                     (rebeldía, awaiting debtor's excepciones, awaiting court
+                     sentencia, or an optional window that already closed).
+        Informational deadlines (EXCEPCIONES_8D, SENTENCIA_10D) and expired
+        OPTIONAL_ACTIONABLE (APELACION_5D) NEVER by themselves produce ROJO.
         """
         if state in (ProceduralState.INDETERMINATE, ProceduralState.TERMINADA):
             return "gris"
 
-        # Check active deadlines first.
-        nearest_active = (
+        # Only the firm's actionable deadlines drive the color. Pick the nearest
+        # one that still "counts": a past-due OPTIONAL window (apelación) is
+        # closed, not red, so skip it.
+        active_actionable = (
             db.query(CaseDeadline)
             .filter(
                 CaseDeadline.case_id == case_id,
                 CaseDeadline.status == "active",
+                CaseDeadline.deadline_type.in_(ACTIONABLE_DEADLINE_VALUES),
             )
             .order_by(CaseDeadline.due_date.asc())
-            .first()
+            .all()
         )
-
-        if nearest_active is not None:
-            remaining = count_business_days_remaining(nearest_active.due_date, today)
+        for row in active_actionable:
+            remaining = count_business_days_remaining(row.due_date, today)
+            if row.deadline_type in OPTIONAL_ACTIONABLE_VALUES and remaining < 0:
+                continue  # optional window already closed → not red
             if remaining <= _SEMAFORO_ROJO_MAX:
                 return "rojo"
             elif remaining <= _SEMAFORO_AMARILLO_MAX:
@@ -280,20 +326,23 @@ class DeadlineEngine:
             else:
                 return "verde"
 
-        # No active deadlines — check if any expired deadline exists.
-        # An expired deadline = past-due action (e.g. REBELDÍA, lawyer missed window).
-        has_expired = (
+        # No active actionable deadline — only a MISSED MANDATORY action is red.
+        # (Expired excepciones = rebeldía/favourable; expired apelación = closed
+        # optional window; expired court sentencia term = waiting — none are red.)
+        has_expired_mandatory = (
             db.query(CaseDeadline)
             .filter(
                 CaseDeadline.case_id == case_id,
                 CaseDeadline.status == "expired",
+                CaseDeadline.deadline_type.in_(MANDATORY_ACTIONABLE_VALUES),
             )
             .first()
         )
-        if has_expired is not None:
+        if has_expired_mandatory is not None:
             return "rojo"
 
-        return "gris"
+        # Nothing pending for the firm → al día.
+        return "verde"
 
     # ------------------------------------------------------------------
     # Helpers
