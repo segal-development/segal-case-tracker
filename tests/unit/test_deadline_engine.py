@@ -801,6 +801,40 @@ class TestSideAware:
         )
         assert _color(db, case.id, ProceduralState.TRASLADO_EJECUTANTE, side="demandado") != "rojo"
 
+    def test_demandado_missed_excepciones_not_overtaken_by_later_movement(self, db) -> None:
+        """Regression (review Bug 2): a missed MANDATORY excepciones (demandado) must
+        stay ROJO even when the court acts after the window — Step 5b must not
+        supersede mandatory deadlines."""
+        from app.services.deadline_engine import _today_chile
+
+        case = _make_case(db)
+        _set_side(db, case, "demandado")
+        today = _today_chile()
+        _add_movement(db, case.id, today - timedelta(days=30), "Gestión",
+                      "NOTIFICACIÓN DE DEMANDA (Exitosa)")
+        # Court activity AFTER the excepciones window would wrongly "overtake" it.
+        _add_movement(db, case.id, today - timedelta(days=3), "Tramitación", "Mero trámite")
+        _recompute(db, case)
+        assert case.semaforo == "rojo", (
+            "missed mandatory excepciones must stay ROJO despite later court activity"
+        )
+
+    def test_firm_side_matches_dotted_litigante_rut(self, db) -> None:
+        """Regression (review Bug 1): a litigante RUT with dots must still match the
+        lawyer's normalized RUT."""
+        from app.models.case_litigante import CaseLitigante
+        from app.services.deadline_engine import _firm_side
+
+        case = _make_case(db)  # lawyer RUT '11111111-1'
+        db.add(
+            CaseLitigante(
+                case_id=case.id, participante="AB.DTE", rut="11.111.111-1",
+                persona_type="NATURAL", nombre="Abg Test", natural_key=f"dot{case.id}",
+            )
+        )
+        db.flush()
+        assert _firm_side(db, case) == "demandante"
+
     def test_demandante_excepciones_informational(self, db) -> None:
         """DEMANDANTE: overdue EXCEPCIONES_8D (debtor's deadline) → NOT rojo."""
         case = _make_case(db)

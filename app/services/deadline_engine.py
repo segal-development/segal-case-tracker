@@ -88,6 +88,7 @@ def _firm_side(db: Session, case: "Case") -> str:
     try:
         from app.models.case_litigante import CaseLitigante
         from app.models.lawyer import Lawyer
+        from app.utils.rut import normalize_rut
 
         # Resolve lawyer RUT: prefer loaded relationship, fall back to DB lookup.
         lawyer = getattr(case, "lawyer", None)
@@ -95,15 +96,20 @@ def _firm_side(db: Session, case: "Case") -> str:
             lawyer = db.get(Lawyer, case.lawyer_id)
         if lawyer is None:
             return "demandado"
-        rut: str = lawyer.rut
+        firm_rut = normalize_rut(lawyer.rut)
 
-        litigantes = db.query(CaseLitigante).filter_by(case_id=case.id).all()
-        for lit in litigantes:
-            if lit.rut == rut:
-                if lit.participante in ("AB.DTE", "AP.DTE"):
-                    return "demandante"
-                if lit.participante in ("AB.DDO", "AP.DDO"):
-                    return "demandado"
+        # Collect ALL roles the firm holds, then apply explicit precedence —
+        # avoids non-deterministic results if the same RUT appears twice.
+        # Normalize both sides: litigante RUTs may carry dots, lawyer RUTs don't.
+        roles = {
+            lit.participante
+            for lit in db.query(CaseLitigante).filter_by(case_id=case.id).all()
+            if normalize_rut(lit.rut) == firm_rut
+        }
+        if roles & {"AB.DTE", "AP.DTE"}:
+            return "demandante"
+        if roles & {"AB.DDO", "AP.DDO"}:
+            return "demandado"
         return "demandado"
     except Exception:
         return "demandado"
@@ -231,17 +237,22 @@ class DeadlineEngine:
         # doesn't recognise). Mark it superseded so it stops producing a false ROJO.
         # An overdue deadline with NO later movement stays active → still ROJO,
         # because the firm genuinely has a pending action.
+        # IMPORTANT: only NON-mandatory deadlines are overtaken this way. A missed
+        # MANDATORY action (e.g. the demandado's excepciones) must stay ROJO even
+        # if the court acts afterwards — it can only be cleared by the classifier
+        # advancing the state (Step 5), never by an "there was later activity" guess.
+        overtakeable = actionable_values - mandatory_values
         latest_mv_date: Optional[date] = None
         if movements:
             last_mv_dt = movements[-1].movement_date  # movements are ASC
             latest_mv_date = last_mv_dt.date() if hasattr(last_mv_dt, "date") else last_mv_dt
-        if latest_mv_date is not None:
+        if latest_mv_date is not None and overtakeable:
             still_active = (
                 db.query(CaseDeadline)
                 .filter(
                     CaseDeadline.case_id == case.id,
                     CaseDeadline.status == "active",
-                    CaseDeadline.deadline_type.in_(actionable_values),
+                    CaseDeadline.deadline_type.in_(overtakeable),
                 )
                 .all()
             )
