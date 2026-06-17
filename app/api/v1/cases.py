@@ -7,6 +7,7 @@ from sqlalchemy import and_, nullslast
 
 from app.api.deps import get_db, get_current_lawyer, _resolve_lawyer_id
 from app.models.case import Case
+from app.models.lawyer import Lawyer
 from app.models.case_litigante import CaseLitigante
 from app.models.case_notificacion import CaseNotificacion
 from app.models.case_escrito import CaseEscrito
@@ -184,6 +185,7 @@ async def list_cases(
     per_page: int = Query(20, ge=1, le=100),
     competencia: Optional[str] = Query(None, description="Filter by competencia: civil, laboral, penal"),
     status_filter: Optional[str] = Query(None, alias="status", description="Filter by status: active, closed"),
+    abogado_rut: Optional[str] = Query(None, description="Filter to cases where this RUT is a firm-side abogado"),
     sort_by: Optional[Literal["criticidad", "updated_at"]] = Query(
         None,
         description=(
@@ -210,6 +212,13 @@ async def list_cases(
         query = query.filter(Case.competencia == competencia)
     if status_filter:
         query = query.filter(Case.status == status_filter)
+
+    if abogado_rut:
+        from app.services.lawyer_roster import case_ids_for_abogado
+        account_lawyer = db.get(Lawyer, lawyer_id)
+        if account_lawyer:
+            allowed_ids = case_ids_for_abogado(db, account_lawyer.rut, abogado_rut)
+            query = query.filter(Case.id.in_(list(allowed_ids)))
 
     # Get total count
     total = query.count()
