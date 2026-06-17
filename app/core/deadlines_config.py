@@ -121,6 +121,36 @@ OPTIONAL_ACTIONABLE_VALUES: frozenset[str] = frozenset(d.value for d in OPTIONAL
 ACTIONABLE_DEADLINE_VALUES: frozenset[str] = frozenset(d.value for d in ACTIONABLE_DEADLINES)
 
 
+def actionable_sets(side: str) -> "tuple[frozenset[str], frozenset[str]]":
+    """Return (mandatory_values, actionable_values) for the firm's side.
+
+    Chilean juicio-ejecutivo logic:
+    - DEMANDADO (debtor, ~73%): must oppose with EXCEPCIONES_8D — that is THE
+      mandatory deadline the firm must not miss.
+    - DEMANDANTE (creditor): replies with TRASLADO_EJECUTANTE_4D after the
+      court grants traslado following the debtor's excepciones.
+    - APELACION_5D stays optional for both sides (it is the firm's right, not
+      an obligation, to appeal the sentencia).
+
+    Returns:
+        (mandatory_values, actionable_values) — both as frozenset[str] of
+        DeadlineType.value strings, suitable for SQL ``in_()`` filters.
+    """
+    base_mandatory = {
+        DeadlineType.TERMINO_PROBATORIO_10D,
+        DeadlineType.OBSERVACIONES_PRUEBA_6D,
+        DeadlineType.LISTA_TESTIGOS_2D,
+    }
+    if side == "demandante":
+        mandatory = base_mandatory | {DeadlineType.TRASLADO_EJECUTANTE_4D}
+    else:  # demandado (default — the firm primarily defends debtors)
+        mandatory = base_mandatory | {DeadlineType.EXCEPCIONES_8D}
+    optional = {DeadlineType.APELACION_5D}
+    mandatory_v = frozenset(d.value for d in mandatory)
+    actionable_v = frozenset(d.value for d in (mandatory | optional))
+    return mandatory_v, actionable_v
+
+
 # ---------------------------------------------------------------------------
 # ClassifierRule — config-driven rule for the movement classifier
 # ---------------------------------------------------------------------------

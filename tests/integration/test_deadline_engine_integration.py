@@ -101,12 +101,28 @@ class TestDeadlineEnginePersistence:
         assert DeadlineType.EXCEPCIONES_8D.value in types
 
     def test_recompute_updates_case_columns(self, db) -> None:
-        """After recompute_case, Case.procedural_state and Case.semaforo are set."""
+        """After recompute_case, Case.procedural_state and Case.semaforo are set.
+
+        Demandante (ejecutante) perspective: EXCEPCIONES_8D is the debtor's window,
+        informational for the firm → VERDE, next_deadline_at None.
+        """
+        from app.models.case_litigante import CaseLitigante
+
         case = _seed_civil_case_with_notification(db)
+        # Declare the firm as ejecutante (demandante) so EXCEPCIONES_8D stays informational.
+        db.add(CaseLitigante(
+            case_id=case.id,
+            participante="AB.DTE",
+            rut="22222222-2",
+            persona_type="NATURAL",
+            nombre="Int Lawyer",
+            natural_key=f"k{case.id}AB.DTE",
+        ))
+        db.flush()
         DeadlineEngine.recompute_case(db, case)
         assert case.procedural_state == ProceduralState.NOTIFICADO.value
-        # NOTIFICADO = awaiting the debtor's excepciones (informational) → no
-        # firm-actionable deadline → VERDE, next_deadline_at None (ejecutante).
+        # NOTIFICADO as demandante: awaiting debtor's excepciones (informational) →
+        # no firm-actionable deadline → VERDE, next_deadline_at None.
         assert case.semaforo == "verde"
         assert case.next_deadline_at is None
 
