@@ -225,10 +225,12 @@ class DeadlineEngine:
             # A REAL opposition only — the previous broad regex (`excepci[oó]n`)
             # matched any mention ("plazo de excepciones", "admisibilidad de
             # excep") and wrongly blocked the rebeldía transition.
+            # Real debtor-opposition stages. ("Contestación Excepciones" is the
+            # court's traslado resolution — the firm's stage — NOT an opposition,
+            # so it is intentionally excluded here.)
             _opposition_stages = {
                 "Excepciones",
                 "Oposición de Excepciones",
-                "Contestación Excepciones",
             }
             has_excepciones_movement = any(
                 (mv.stage or "").strip() in _opposition_stages
@@ -258,19 +260,29 @@ class DeadlineEngine:
         case.procedural_state = proc_state.value
         case.semaforo = semaforo
 
-        # next_deadline_at = earliest active ACTIONABLE due_date (the firm's next
-        # action). Informational deadlines (debtor/court) are not the headline.
-        nearest = (
-            db.query(CaseDeadline.due_date)
+        # next_deadline_at = the firm's next action date. Mirror the semáforo
+        # selection: nearest active ACTIONABLE deadline, skipping a past-due
+        # OPTIONAL window (closed) — otherwise a VERDE case (e.g. SENTENCIA with
+        # the apelación window already closed) would surface a stale past date.
+        active_actionable = (
+            db.query(CaseDeadline)
             .filter(
                 CaseDeadline.case_id == case.id,
                 CaseDeadline.status == "active",
                 CaseDeadline.deadline_type.in_(ACTIONABLE_DEADLINE_VALUES),
             )
             .order_by(CaseDeadline.due_date.asc())
-            .first()
+            .all()
         )
-        case.next_deadline_at = nearest[0] if nearest else None
+        case.next_deadline_at = None
+        for row in active_actionable:
+            if (
+                row.deadline_type in OPTIONAL_ACTIONABLE_VALUES
+                and count_business_days_remaining(row.due_date, today) < 0
+            ):
+                continue  # closed optional window — not a pending firm action
+            case.next_deadline_at = row.due_date
+            break
 
         db.flush()
 

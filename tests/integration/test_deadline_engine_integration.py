@@ -105,8 +105,10 @@ class TestDeadlineEnginePersistence:
         case = _seed_civil_case_with_notification(db)
         DeadlineEngine.recompute_case(db, case)
         assert case.procedural_state == ProceduralState.NOTIFICADO.value
-        assert case.semaforo in {"rojo", "amarillo", "verde"}
-        assert case.next_deadline_at is not None
+        # NOTIFICADO = awaiting the debtor's excepciones (informational) → no
+        # firm-actionable deadline → VERDE, next_deadline_at None (ejecutante).
+        assert case.semaforo == "verde"
+        assert case.next_deadline_at is None
 
     def test_recompute_idempotency_no_duplicate_rows(self, db) -> None:
         """Running recompute_case twice must not create duplicate rows."""
