@@ -37,6 +37,7 @@ from app.core.deadlines_config import (
     MANDATORY_ACTIONABLE_VALUES,
     OPTIONAL_ACTIONABLE_VALUES,
     ProceduralState,
+    actionable_sets,
 )
 from app.models.case import Case
 from app.models.case_deadline import CaseDeadline
@@ -71,6 +72,41 @@ _SEMAFORO_AMARILLO_MAX = 5  # 2–5 → AMARILLO; >5 → VERDE
 # Legal references for future implementation:
 #   Abandono:     art. 152 CPC (6 months general), art. 153 inc. 2 (3y post-apremio)
 #   Prescripción: art. 2515 CC (3y acción ejecutiva); pagaré: art. 98 Ley 18.092 (1y)
+
+
+def _firm_side(db: Session, case: "Case") -> str:
+    """Detect which side the firm represents in this case.
+
+    Looks up the lawyer's RUT via the case.lawyer relationship (or FK),
+    then checks CaseLitigante rows for a matching RUT:
+      - participante "AB.DTE" or "AP.DTE" → firm is demandante (creditor's lawyer)
+      - participante "AB.DDO" or "AP.DDO" → firm is demandado (debtor's lawyer)
+
+    Default: "demandado" (the firm primarily defends debtors, ~73%).
+    Never raises — any exception returns the safe default.
+    """
+    try:
+        from app.models.case_litigante import CaseLitigante
+        from app.models.lawyer import Lawyer
+
+        # Resolve lawyer RUT: prefer loaded relationship, fall back to DB lookup.
+        lawyer = getattr(case, "lawyer", None)
+        if lawyer is None and getattr(case, "lawyer_id", None) is not None:
+            lawyer = db.get(Lawyer, case.lawyer_id)
+        if lawyer is None:
+            return "demandado"
+        rut: str = lawyer.rut
+
+        litigantes = db.query(CaseLitigante).filter_by(case_id=case.id).all()
+        for lit in litigantes:
+            if lit.rut == rut:
+                if lit.participante in ("AB.DTE", "AP.DTE"):
+                    return "demandante"
+                if lit.participante in ("AB.DDO", "AP.DDO"):
+                    return "demandado"
+        return "demandado"
+    except Exception:
+        return "demandado"
 
 
 class DeadlineEngine:
@@ -123,6 +159,10 @@ class DeadlineEngine:
 
         # Step 3: classify.
         proc_state, triggers = _CLASSIFIER.classify(movements, today)
+
+        # Determine the firm's side for this case and derive per-case deadline sets.
+        side = _firm_side(db, case)
+        mandatory_values, actionable_values = actionable_sets(side)
 
         # Step 4: upsert case_deadlines for each active trigger.
         new_trigger_keys: dict[str, date] = {}  # deadline_type → triggered_at
@@ -201,7 +241,7 @@ class DeadlineEngine:
                 .filter(
                     CaseDeadline.case_id == case.id,
                     CaseDeadline.status == "active",
-                    CaseDeadline.deadline_type.in_(ACTIONABLE_DEADLINE_VALUES),
+                    CaseDeadline.deadline_type.in_(actionable_values),
                 )
                 .all()
             )
@@ -211,8 +251,14 @@ class DeadlineEngine:
             db.flush()
 
         # Step 6: REBELDÍA post-transition.
-        # NOTIFICADO + EXCEPCIONES_8D due date elapsed + no EXCEPCIONES movement.
-        if proc_state == ProceduralState.NOTIFICADO:
+        # Only applies when the firm is DEMANDANTE (creditor): the debtor's
+        # failure to oppose (EXCEPCIONES_8D lapsed) is a favourable outcome for
+        # the ejecutante → flip to REBELDE → proceed to sentencia.
+        # For DEMANDADO (debtor's lawyer), EXCEPCIONES_8D is the FIRM's own
+        # mandatory deadline; a lapsed window means the firm MISSED its defense,
+        # not that the counterparty defaulted. Rebeldía must NOT fire → keep the
+        # expired mandatory active so the semáforo stays ROJO.
+        if side == "demandante" and proc_state == ProceduralState.NOTIFICADO:
             exc_row = (
                 db.query(CaseDeadline)
                 .filter(
@@ -251,7 +297,11 @@ class DeadlineEngine:
                 db.flush()
 
         # Step 7a: compute semáforo from nearest active deadline.
-        semaforo = cls._compute_semaforo(db, case.id, proc_state, today)
+        semaforo = cls._compute_semaforo(
+            db, case.id, proc_state, today,
+            actionable_values=actionable_values,
+            mandatory_values=mandatory_values,
+        )
 
         # Step 7b: abandono and prescripción risk flags — DEFERRED to PR2 / Slice B.
         # No computation here.  See module-level comment for legal references.
@@ -261,15 +311,16 @@ class DeadlineEngine:
         case.semaforo = semaforo
 
         # next_deadline_at = the firm's next action date. Mirror the semáforo
-        # selection: nearest active ACTIONABLE deadline, skipping a past-due
-        # OPTIONAL window (closed) — otherwise a VERDE case (e.g. SENTENCIA with
-        # the apelación window already closed) would surface a stale past date.
+        # selection: nearest active ACTIONABLE deadline (per-case side), skipping
+        # a past-due OPTIONAL window (closed) — otherwise a VERDE case (e.g.
+        # SENTENCIA with the apelación window already closed) would surface a
+        # stale past date.
         active_actionable = (
             db.query(CaseDeadline)
             .filter(
                 CaseDeadline.case_id == case.id,
                 CaseDeadline.status == "active",
-                CaseDeadline.deadline_type.in_(ACTIONABLE_DEADLINE_VALUES),
+                CaseDeadline.deadline_type.in_(actionable_values),
             )
             .order_by(CaseDeadline.due_date.asc())
             .all()
@@ -297,18 +348,21 @@ class DeadlineEngine:
         case_id: int,
         state: ProceduralState,
         today: date,
+        *,
+        actionable_values: frozenset[str] = ACTIONABLE_DEADLINE_VALUES,
+        mandatory_values: frozenset[str] = MANDATORY_ACTIONABLE_VALUES,
     ) -> str:
         """Derive semáforo color from the FIRM's own (actionable) deadlines only.
 
-        Ejecutante perspective (see deadlines_config ownership sets):
+        Color rules (side-aware via ``actionable_values`` / ``mandatory_values``):
           GRIS     → INDETERMINATE or TERMINADA.
           ROJO     → nearest active ACTIONABLE deadline ≤ 1 día hábil remaining,
-                     OR a MANDATORY_ACTIONABLE deadline is expired (firm missed it).
+                     OR a MANDATORY deadline is expired (firm missed it).
           AMARILLO → 2–5 días hábiles remaining on nearest active actionable.
           VERDE    → > 5 días hábiles remaining, OR nothing pending for the firm
-                     (rebeldía, awaiting debtor's excepciones, awaiting court
-                     sentencia, or an optional window that already closed).
-        Informational deadlines (EXCEPCIONES_8D, SENTENCIA_10D) and expired
+                     (rebeldía for demandante, awaiting court sentencia, or an
+                     optional window that already closed).
+        Deadlines outside the firm's actionable set for the given side and expired
         OPTIONAL_ACTIONABLE (APELACION_5D) NEVER by themselves produce ROJO.
         """
         if state in (ProceduralState.INDETERMINATE, ProceduralState.TERMINADA):
@@ -322,7 +376,7 @@ class DeadlineEngine:
             .filter(
                 CaseDeadline.case_id == case_id,
                 CaseDeadline.status == "active",
-                CaseDeadline.deadline_type.in_(ACTIONABLE_DEADLINE_VALUES),
+                CaseDeadline.deadline_type.in_(actionable_values),
             )
             .order_by(CaseDeadline.due_date.asc())
             .all()
@@ -339,14 +393,15 @@ class DeadlineEngine:
                 return "verde"
 
         # No active actionable deadline — only a MISSED MANDATORY action is red.
-        # (Expired excepciones = rebeldía/favourable; expired apelación = closed
-        # optional window; expired court sentencia term = waiting — none are red.)
+        # (For demandante: expired traslado_ejecutante = firm missed reply.
+        #  For demandado:  expired excepciones = firm missed the defense window.
+        #  Expired apelación = closed optional window → not red.)
         has_expired_mandatory = (
             db.query(CaseDeadline)
             .filter(
                 CaseDeadline.case_id == case_id,
                 CaseDeadline.status == "expired",
-                CaseDeadline.deadline_type.in_(MANDATORY_ACTIONABLE_VALUES),
+                CaseDeadline.deadline_type.in_(mandatory_values),
             )
             .first()
         )

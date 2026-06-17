@@ -150,9 +150,39 @@ def _inject_deadline(db, case_id, dtype, *, biz_days_from_today=None, calendar_d
     return due
 
 
-def _color(db, case_id, state):
+def _set_side(db, case, side: str) -> None:
+    """Add a CaseLitigante row that tells _firm_side() which side the firm represents.
+
+    The lawyer created by _make_case always uses RUT '11111111-1'.
+    """
+    from app.models.case_litigante import CaseLitigante
+
+    code = "AB.DTE" if side == "demandante" else "AB.DDO"
+    db.add(
+        CaseLitigante(
+            case_id=case.id,
+            participante=code,
+            rut="11111111-1",
+            persona_type="NATURAL",
+            nombre="Test Abogado",
+            natural_key=f"k{case.id}{code}",
+        )
+    )
+    db.flush()
+
+
+def _color(db, case_id, state, *, side: str | None = None):
     from app.services.deadline_engine import DeadlineEngine
 
+    if side is not None:
+        from app.core.deadlines_config import actionable_sets
+
+        mandatory_v, actionable_v = actionable_sets(side)
+        return DeadlineEngine._compute_semaforo(
+            db, case_id, state, _FIXED_TODAY,
+            actionable_values=actionable_v,
+            mandatory_values=mandatory_v,
+        )
     return DeadlineEngine._compute_semaforo(db, case_id, state, _FIXED_TODAY)
 
 
@@ -249,8 +279,9 @@ class TestSemaforo:
 
 class TestRebeldia:
     def test_rebeldia_fires_after_8d_no_excepciones(self, db) -> None:
-        """NOTIFICADO + 8d elapsed + no excepciones movement → REBELDE."""
+        """NOTIFICADO + 8d elapsed + no excepciones movement → REBELDE (demandante only)."""
         case = _make_case(db)
+        _set_side(db, case, "demandante")
         # Notification 30 days ago — well past the 8d deadline
         notif_date = TODAY - timedelta(days=30)
         _add_movement(
@@ -303,10 +334,14 @@ class TestAbandonoPrescricion:
 
 class TestNextDeadlineAt:
     def test_next_deadline_at_set_on_active_deadline(self, db) -> None:
-        """next_deadline_at reflects the firm's nearest active ACTIONABLE deadline."""
+        """next_deadline_at reflects the firm's nearest active ACTIONABLE deadline.
+
+        DEMANDANTE: TRASLADO_EJECUTANTE_4D is the firm's actionable deadline here.
+        """
         from app.services.deadline_engine import _today_chile
 
         case = _make_case(db)
+        _set_side(db, case, "demandante")
         today = _today_chile()
         # Notificación then a court traslado resolution → TRASLADO_EJECUTANTE_4D
         # (an actionable firm deadline), due in the future.
@@ -593,12 +628,13 @@ class TestRebeldiaBoundary:
     def test_rebeldia_not_fired_on_due_date_itself(self, db) -> None:
         """On the EXACT due date (day 8), REBELDÍA must NOT fire (window still open).
 
-        New semantics: excepciones is the DEBTOR's window → not the firm's red →
-        semáforo VERDE (nothing pending for the firm) while it is still open.
+        Demandante perspective: excepciones is the DEBTOR's window → not the firm's
+        red → semáforo VERDE (nothing pending for the firm) while it is still open.
         """
         from app.services.deadline_engine import _today_chile
 
         case = _make_case(db)
+        _set_side(db, case, "demandante")
         today = _today_chile()
         notif_date = self._notif_for_excepciones_due(today)  # due == today
         _add_movement(db, case.id, notif_date, "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)")
@@ -609,14 +645,15 @@ class TestRebeldiaBoundary:
         assert case.semaforo == "verde"  # debtor's window, not the firm's red
 
     def test_rebeldia_fires_day_after_due_date(self, db) -> None:
-        """One business day AFTER the due date with no opposition → REBELDE.
+        """One business day AFTER the due date with no opposition → REBELDE (demandante).
 
-        New semantics: rebeldía is FAVOURABLE for the ejecutante (proceed to
-        sentencia) → semáforo VERDE, NOT red.
+        Rebeldía is FAVOURABLE for the ejecutante (proceed to sentencia) →
+        semáforo VERDE, NOT red.
         """
         from app.services.deadline_engine import _today_chile
 
         case = _make_case(db)
+        _set_side(db, case, "demandante")
         today = _today_chile()
         # Notificación well in the past → EXCEPCIONES_8D due strictly before today.
         notif_date = today - timedelta(days=30)
@@ -673,10 +710,14 @@ class TestEjecutanteSemantics:
         assert case.semaforo != "rojo"
 
     def test_overdue_mandatory_no_activity_is_rojo(self, db) -> None:
-        """A past-due mandatory deadline with NO later activity → firm must act → ROJO."""
+        """A past-due mandatory deadline with NO later activity → firm must act → ROJO.
+
+        DEMANDANTE: TRASLADO_EJECUTANTE_4D is the firm's mandatory deadline here.
+        """
         from app.services.deadline_engine import _today_chile
 
         case = _make_case(db)
+        _set_side(db, case, "demandante")
         today = _today_chile()
         _add_movement(db, case.id, today - timedelta(days=20), "Gestión",
                       "NOTIFICACIÓN DE DEMANDA (Exitosa)")
@@ -708,3 +749,105 @@ class TestAbandonoPrescricion:
         case = _make_case(db, filed_at=filed)
         _recompute(db, case)
         assert case.semaforo is not None  # recompute must not crash
+
+
+# ---------------------------------------------------------------------------
+# Side-aware semáforo — DEMANDADO vs DEMANDANTE deadline ownership
+# ---------------------------------------------------------------------------
+
+
+class TestSideAware:
+    """ROJO reflects the firm's OWN actionable deadlines, which differ by side."""
+
+    def test_demandado_excepciones_urgent_is_rojo(self, db) -> None:
+        """DEMANDADO: EXCEPCIONES_8D active, due today (0 remaining) → ROJO."""
+        case = _make_case(db)
+        _inject_deadline(db, case.id, DeadlineType.EXCEPCIONES_8D, calendar_due=_FIXED_TODAY)
+        assert _color(db, case.id, ProceduralState.NOTIFICADO, side="demandado") == "rojo"
+
+    def test_demandado_excepciones_expired_stays_rojo(self, db) -> None:
+        """DEMANDADO: EXCEPCIONES_8D expired (firm missed defense window) → ROJO.
+
+        Rebeldía must NOT fire for demandado — the lapsed window means the firm
+        failed to act, not that the counterparty defaulted.
+        """
+        from app.services.deadline_engine import _today_chile
+
+        case = _make_case(db)
+        _set_side(db, case, "demandado")
+        today = _today_chile()
+        # Notified 30 days ago → EXCEPCIONES_8D window long since expired; no opposition.
+        _add_movement(
+            db, case.id, today - timedelta(days=30),
+            "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)",
+        )
+        _recompute(db, case)
+        # Rebeldía must NOT flip this to REBELDE for demandado.
+        assert case.procedural_state != ProceduralState.REBELDE.value, (
+            "REBELDÍA must not fire for demandado side"
+        )
+        # Expired EXCEPCIONES_8D is mandatory for demandado → ROJO.
+        assert case.semaforo == "rojo", (
+            "DEMANDADO with expired EXCEPCIONES_8D and no later activity must be ROJO"
+        )
+
+    def test_demandado_traslado_overdue_not_rojo(self, db) -> None:
+        """DEMANDADO: overdue TRASLADO_EJECUTANTE_4D (creditor's deadline) → NOT rojo."""
+        case = _make_case(db)
+        # Inject as expired (firm-side irrelevant — it is not demandado's deadline).
+        _inject_deadline(
+            db, case.id, DeadlineType.TRASLADO_EJECUTANTE_4D,
+            calendar_due=_FIXED_TODAY - timedelta(days=5), status="expired",
+        )
+        assert _color(db, case.id, ProceduralState.TRASLADO_EJECUTANTE, side="demandado") != "rojo"
+
+    def test_demandante_excepciones_informational(self, db) -> None:
+        """DEMANDANTE: overdue EXCEPCIONES_8D (debtor's deadline) → NOT rojo."""
+        case = _make_case(db)
+        # EXCEPCIONES_8D is informational for demandante (debtor's window to oppose).
+        _inject_deadline(
+            db, case.id, DeadlineType.EXCEPCIONES_8D,
+            calendar_due=_FIXED_TODAY - timedelta(days=5),
+        )
+        assert _color(db, case.id, ProceduralState.NOTIFICADO, side="demandante") != "rojo"
+
+    def test_demandante_traslado_mandatory_rojo(self, db) -> None:
+        """DEMANDANTE: expired TRASLADO_EJECUTANTE_4D (firm missed reply) → ROJO."""
+        case = _make_case(db)
+        _inject_deadline(
+            db, case.id, DeadlineType.TRASLADO_EJECUTANTE_4D,
+            calendar_due=_FIXED_TODAY - timedelta(days=5), status="expired",
+        )
+        assert _color(db, case.id, ProceduralState.TRASLADO_EJECUTANTE, side="demandante") == "rojo"
+
+
+# ---------------------------------------------------------------------------
+# _firm_side unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestFirmSide:
+    """_firm_side detects the firm's role from CaseLitigante rows."""
+
+    def test_firm_side_no_litigantes_defaults_demandado(self, db) -> None:
+        """No CaseLitigante rows → defaults to 'demandado'."""
+        from app.services.deadline_engine import _firm_side
+
+        case = _make_case(db)
+        assert _firm_side(db, case) == "demandado"
+
+    def test_firm_side_ab_dte_returns_demandante(self, db) -> None:
+        """CaseLitigante with AB.DTE and lawyer's RUT → 'demandante'."""
+        from app.services.deadline_engine import _firm_side
+
+        case = _make_case(db)
+        _set_side(db, case, "demandante")
+        assert _firm_side(db, case) == "demandante"
+
+    def test_firm_side_ab_ddo_returns_demandado(self, db) -> None:
+        """CaseLitigante with AB.DDO and lawyer's RUT → 'demandado'."""
+        from app.services.deadline_engine import _firm_side
+
+        case = _make_case(db)
+        _set_side(db, case, "demandado")
+        assert _firm_side(db, case) == "demandado"
