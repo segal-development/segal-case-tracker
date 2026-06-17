@@ -24,11 +24,15 @@ LAWYER_RUT = "16021492-9"
 COMPETENCIA = "civil"
 CU_RUT = os.environ.get("CU_RUT", "")
 CU_PASSWORD = os.environ.get("CU_PASSWORD", "")
+# PJUD's F5 Shape blocks headless browsers AND datacenter IPs. This backfill now
+# runs from a RESIDENTIAL machine with a HEADFUL browser (the only combo that
+# passes Shape). Headless is opt-in for legacy/testing only.
+HEADLESS = os.environ.get("BACKFILL_HEADLESS", "false").lower() == "true"
 
 
 async def main() -> None:
     from app.services.session_store import get_session_store
-    from app.api.v1.pjud import get_scraper
+    from app.scrapper.pjud_civil import PJUDCivilScraper
     from app.core.database import SessionLocal
     from app.config import settings
     from app.models.case import Case
@@ -47,7 +51,8 @@ async def main() -> None:
         return
     lawyer_id = int(lawyer.id)
     store = get_session_store()
-    sc = get_scraper(COMPETENCIA)
+    sc = PJUDCivilScraper(headless=HEADLESS)
+    print(f"browser mode: {'HEADLESS' if HEADLESS else 'HEADFUL'} (Shape needs headful+residential)")
 
     min_year = settings.DETAIL_MIN_YEAR
 
@@ -74,7 +79,7 @@ async def main() -> None:
     async def clave_unica_login():
         """Full Clave Única login (no captcha) → fresh PJUDSession, saved + scraper reset."""
         creds = ClaveUnicaCredentials(rut=CU_RUT, password=CU_PASSWORD)
-        async with BrowserFactory(headless=True) as factory:
+        async with BrowserFactory(headless=HEADLESS) as factory:
             page = await factory.new_page()
             new_session = await ClaveUnicaAuth().login(page, creds, lawyer_id)
         await store.asave_session(new_session)

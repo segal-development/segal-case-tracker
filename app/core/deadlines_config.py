@@ -87,6 +87,41 @@ class DeadlineType(str, Enum):
 
 
 # ---------------------------------------------------------------------------
+# Deadline ownership — from the EJECUTANTE's (creditor's) perspective.
+#
+# The semáforo reflects ONLY the firm's own actionable deadlines. Counterparty
+# (debtor) and court deadlines are informational and must NEVER by themselves
+# produce ROJO.
+#   MANDATORY_ACTIONABLE — the firm MUST act; if the window EXPIRES → ROJO.
+#   OPTIONAL_ACTIONABLE  — the firm MAY act; drives the color while active, but
+#                          once EXPIRED it is just a closed window (NOT red).
+#   INFORMATIONAL        — debtor's / court's window; never drives the color.
+#     · EXCEPCIONES_8D — debtor's window to oppose. Lapsing without opposition
+#       = REBELDÍA = favourable for the creditor (proceed to sentencia).
+#     · SENTENCIA_10D  — court's term to rule; the firm only waits.
+# ---------------------------------------------------------------------------
+MANDATORY_ACTIONABLE: frozenset[DeadlineType] = frozenset({
+    DeadlineType.TRASLADO_EJECUTANTE_4D,
+    DeadlineType.TERMINO_PROBATORIO_10D,
+    DeadlineType.LISTA_TESTIGOS_2D,
+    DeadlineType.OBSERVACIONES_PRUEBA_6D,
+})
+OPTIONAL_ACTIONABLE: frozenset[DeadlineType] = frozenset({
+    DeadlineType.APELACION_5D,
+})
+ACTIONABLE_DEADLINES: frozenset[DeadlineType] = MANDATORY_ACTIONABLE | OPTIONAL_ACTIONABLE
+INFORMATIONAL_DEADLINES: frozenset[DeadlineType] = frozenset({
+    DeadlineType.EXCEPCIONES_8D,
+    DeadlineType.SENTENCIA_10D,
+})
+
+# String-value views (CaseDeadline.deadline_type stores the .value string).
+MANDATORY_ACTIONABLE_VALUES: frozenset[str] = frozenset(d.value for d in MANDATORY_ACTIONABLE)
+OPTIONAL_ACTIONABLE_VALUES: frozenset[str] = frozenset(d.value for d in OPTIONAL_ACTIONABLE)
+ACTIONABLE_DEADLINE_VALUES: frozenset[str] = frozenset(d.value for d in ACTIONABLE_DEADLINES)
+
+
+# ---------------------------------------------------------------------------
 # ClassifierRule — config-driven rule for the movement classifier
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
@@ -175,9 +210,11 @@ CLASSIFIER_RULES: list[ClassifierRule] = [
     # be 1-3 days too early and could show a false ROJO before the legal
     # deadline starts.  The trigger is deferred to Rule 4 (more conservative /
     # later date).  See also: PR1 review fix #5.
+    # Real stages where the debtor opposes: "Excepciones" and "Oposición de
+    # Excepciones" (both seen in real PJUD data). Both → EXCEPCIONES state.
     ClassifierRule(
         description_regex="",
-        stage_regex=r"^Excepciones$",
+        stage_regex=r"^Excepciones$|^Oposici[oó]n de Excepciones$",
         event=ProcEvent.EXCEPCIONES_OPUESTAS,
         next_state=ProceduralState.EXCEPCIONES,
         starts_deadline_type=None,
@@ -217,13 +254,14 @@ CLASSIFIER_RULES: list[ClassifierRule] = [
         starts_deadline_type=DeadlineType.TERMINO_PROBATORIO_10D,
         priority=9,
     ),
-    # Rule 7 — Cita a Audiencia → CITACION_SENTENCIA + SENTENCIA_10D
-    # Real data: desc "Cita a Audiencia"
+    # Rule 7 — Citación a oír sentencia → CITACION_SENTENCIA + SENTENCIA_10D
+    # Real data: "Cita a Audiencia", "Citación a oír sentencia" (20 occurrences),
+    #            "Citación para oír sentencia" (17 occurrences).
     # min_state=NOTIFICADO: prevents this rule from firing in a medida-prejudicial
-    # context where "Cita a Audiencia" appears before the demand has been notified
+    # context where a hearing is scheduled before the demand has been notified
     # (which would produce a false SENTENCIA_10D deadline).
     ClassifierRule(
-        description_regex=r"Cita a Audiencia",
+        description_regex=r"Cita a Audiencia|Citaci[óo]n (a|para) o[íi]r sentencia",
         stage_regex="",
         event=ProcEvent.CITACION_SENTENCIA,
         next_state=ProceduralState.CITACION_SENTENCIA,
@@ -241,13 +279,14 @@ CLASSIFIER_RULES: list[ClassifierRule] = [
         priority=10,
     ),
     # Rule 9 — Sentencia definitiva → SENTENCIA + APELACION_5D
-    # Real data: desc contains "Dicta sentencia" or "Sentencia Definitiva"
+    # Real data: "Dicta sentencia", "Sentencia Definitiva", "Sentencia" (exact),
+    #            "Notificación de la sentencia".
     # The 5-day apelación plazo runs from the date the sentencia is issued
     # (art. 187 CPC, applied by art. 475 for juicio ejecutivo).
     # min_state=CITACION_SENTENCIA: sentencia can only be issued after
     # the citación stage has been reached.
     ClassifierRule(
-        description_regex=r"[Dd]icta [Ss]entencia|[Ss]entencia [Dd]efinitiva",
+        description_regex=r"[Dd]icta [Ss]entencia|[Ss]entencia [Dd]efinitiva|^Sentencia$|Notificaci[óo]n de la sentencia",
         stage_regex="",
         event=ProcEvent.SENTENCIA,
         next_state=ProceduralState.SENTENCIA,

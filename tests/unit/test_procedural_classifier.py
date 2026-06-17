@@ -309,6 +309,73 @@ class TestSafety:
 
 
 # ---------------------------------------------------------------------------
+# Real PJUD text variants — Bug fix: Rule 7 and Rule 9 regex expansion
+# ---------------------------------------------------------------------------
+
+
+class TestRealPJUDTexts:
+    def test_citacion_a_oir_sentencia_advances_to_citacion_sentencia(self) -> None:
+        """Bug fix Rule 7: 'Citación a oír sentencia' must fire CITACION_SENTENCIA.
+
+        Real PJUD text seen in 20 occurrences. Previous regex 'Cita a Audiencia'
+        never matched this, leaving the case stuck at AUTO_PRUEBA with a stale
+        overdue TERMINO_PROBATORIO_10D showing false ROJO.
+        """
+        clf = get_classifier()
+        movements = [
+            _mv("2026-03-01", "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)"),
+            _mv("2026-04-01", "Contestación Excepciones", "Notificación resolución que recibe la causa a prue (Exitosa)"),
+            _mv("2026-05-15", "Tramitación", "Citación a oír sentencia"),
+        ]
+        state, triggers = clf.classify(movements, TODAY)
+        assert state == ProceduralState.CITACION_SENTENCIA
+        assert DeadlineType.SENTENCIA_10D in triggers
+
+    def test_citacion_para_oir_sentencia_advances_to_citacion_sentencia(self) -> None:
+        """Bug fix Rule 7: 'Citación para oír sentencia' must fire CITACION_SENTENCIA.
+
+        Real PJUD text seen in 17 occurrences. Same stale-ROJO scenario as above.
+        """
+        clf = get_classifier()
+        movements = [
+            _mv("2026-03-01", "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)"),
+            _mv("2026-04-01", "Contestación Excepciones", "Notificación resolución que recibe la causa a prue (Exitosa)"),
+            _mv("2026-05-15", "Tramitación", "Citación para oír sentencia"),
+        ]
+        state, triggers = clf.classify(movements, TODAY)
+        assert state == ProceduralState.CITACION_SENTENCIA
+        assert DeadlineType.SENTENCIA_10D in triggers
+
+    def test_sentencia_exact_description_advances_to_sentencia(self) -> None:
+        """Bug fix Rule 9: exact text 'Sentencia' must fire SENTENCIA + APELACION_5D.
+
+        min_state=CITACION_SENTENCIA still applies, so sequence must reach that
+        state first.
+        """
+        clf = get_classifier()
+        movements = [
+            _mv("2026-03-01", "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)"),
+            _mv("2026-04-01", "Tramitación", "Citación a oír sentencia"),
+            _mv("2026-06-10", "Tramitación", "Sentencia"),
+        ]
+        state, triggers = clf.classify(movements, TODAY)
+        assert state == ProceduralState.SENTENCIA
+        assert DeadlineType.APELACION_5D in triggers
+
+    def test_notificacion_de_la_sentencia_advances_to_sentencia(self) -> None:
+        """Bug fix Rule 9: 'Notificación de la sentencia' must fire SENTENCIA + APELACION_5D."""
+        clf = get_classifier()
+        movements = [
+            _mv("2026-03-01", "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)"),
+            _mv("2026-04-01", "Tramitación", "Citación a oír sentencia"),
+            _mv("2026-06-10", "Tramitación", "Notificación de la sentencia"),
+        ]
+        state, triggers = clf.classify(movements, TODAY)
+        assert state == ProceduralState.SENTENCIA
+        assert DeadlineType.APELACION_5D in triggers
+
+
+# ---------------------------------------------------------------------------
 # Real-case parametrized tests (REQ-11)
 # ---------------------------------------------------------------------------
 

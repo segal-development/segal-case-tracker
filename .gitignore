@@ -50,3 +50,7 @@ documents_local/
 # OS
 .DS_Store
 Thumbs.db
+
+# Captured PJUD session (sensitive, short-lived)
+pjud_session.json
+.env.backfill
