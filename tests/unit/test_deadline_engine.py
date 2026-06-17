@@ -801,10 +801,11 @@ class TestSideAware:
         )
         assert _color(db, case.id, ProceduralState.TRASLADO_EJECUTANTE, side="demandado") != "rojo"
 
-    def test_demandado_missed_excepciones_not_overtaken_by_later_movement(self, db) -> None:
-        """Regression (review Bug 2): a missed MANDATORY excepciones (demandado) must
-        stay ROJO even when the court acts after the window — Step 5b must not
-        supersede mandatory deadlines."""
+    def test_demandado_overdue_excepciones_with_later_activity_is_overtaken(self, db) -> None:
+        """An overdue excepciones (demandado) WITH later court activity is overtaken
+        → NOT ROJO. Empirically, later activity (exhortos, mere trámites, ongoing
+        notification) means the case is alive/advanced, so the lapsed window is no
+        longer the live actionable deadline. Avoids false-positive ROJO."""
         from app.services.deadline_engine import _today_chile
 
         case = _make_case(db)
@@ -812,11 +813,11 @@ class TestSideAware:
         today = _today_chile()
         _add_movement(db, case.id, today - timedelta(days=30), "Gestión",
                       "NOTIFICACIÓN DE DEMANDA (Exitosa)")
-        # Court activity AFTER the excepciones window would wrongly "overtake" it.
+        # Court activity AFTER the excepciones window → overtaken.
         _add_movement(db, case.id, today - timedelta(days=3), "Tramitación", "Mero trámite")
         _recompute(db, case)
-        assert case.semaforo == "rojo", (
-            "missed mandatory excepciones must stay ROJO despite later court activity"
+        assert case.semaforo != "rojo", (
+            "overdue excepciones with later court activity must be overtaken (not ROJO)"
         )
 
     def test_firm_side_matches_dotted_litigante_rut(self, db) -> None:

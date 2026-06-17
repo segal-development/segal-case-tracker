@@ -237,22 +237,23 @@ class DeadlineEngine:
         # doesn't recognise). Mark it superseded so it stops producing a false ROJO.
         # An overdue deadline with NO later movement stays active → still ROJO,
         # because the firm genuinely has a pending action.
-        # IMPORTANT: only NON-mandatory deadlines are overtaken this way. A missed
-        # MANDATORY action (e.g. the demandado's excepciones) must stay ROJO even
-        # if the court acts afterwards — it can only be cleared by the classifier
-        # advancing the state (Step 5), never by an "there was later activity" guess.
-        overtakeable = actionable_values - mandatory_values
+        #
+        # This applies to MANDATORY deadlines too (incl. the demandado's
+        # excepciones): empirically, later court activity reliably means the case
+        # is alive / advanced (notification-via-exhorto, mere trámites, etc.), so
+        # the lapsed deadline is no longer the live actionable one. A genuinely
+        # abandoned missed window (no later movement) still surfaces as ROJO.
         latest_mv_date: Optional[date] = None
         if movements:
             last_mv_dt = movements[-1].movement_date  # movements are ASC
             latest_mv_date = last_mv_dt.date() if hasattr(last_mv_dt, "date") else last_mv_dt
-        if latest_mv_date is not None and overtakeable:
+        if latest_mv_date is not None and actionable_values:
             still_active = (
                 db.query(CaseDeadline)
                 .filter(
                     CaseDeadline.case_id == case.id,
                     CaseDeadline.status == "active",
-                    CaseDeadline.deadline_type.in_(overtakeable),
+                    CaseDeadline.deadline_type.in_(actionable_values),
                 )
                 .all()
             )
