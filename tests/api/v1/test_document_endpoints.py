@@ -147,6 +147,34 @@ class TestListCaseDocuments:
         assert item["available"] is True
         assert item["download_url"] == f"/api/v1/documents/{document.id}/download"
 
+    def test_movement_linked_doc_exposes_filing_date(self, authed_client, db, case):
+        """A doc linked to a movement exposes that movement's date; a case-level
+        static doc (no movement) has date None."""
+        from app.models.movement import Movement
+
+        mv = Movement(
+            case_id=case.id,
+            description="Resolución",
+            movement_date=datetime(2026, 5, 29),
+        )
+        db.add(mv)
+        db.commit()
+        db.refresh(mv)
+        linked = Document(
+            case_id=case.id, doc_type="resolution", status="stored", movement_id=mv.id
+        )
+        static = Document(case_id=case.id, doc_type="texto_demanda", status="stored")
+        db.add_all([linked, static])
+        db.commit()
+        db.refresh(linked)
+        db.refresh(static)
+
+        resp = authed_client.get(f"/api/v1/cases/{case.id}/documents")
+        assert resp.status_code == 200
+        by_id = {d["id"]: d for d in resp.json()}
+        assert by_id[linked.id]["doc_date"] == "2026-05-29"
+        assert by_id[static.id]["doc_date"] is None
+
     def test_unavailable_document_has_available_false(
         self, authed_client, case, unavailable_document
     ):
