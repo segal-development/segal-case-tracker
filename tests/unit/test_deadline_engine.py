@@ -69,6 +69,16 @@ def db(engine):
 TODAY = date(2026, 6, 16)
 
 
+@pytest.fixture(autouse=True)
+def _freeze_today(monkeypatch):
+    """Pin the engine's clock to TODAY for the whole module so recompute-based
+    assertions are deterministic — independent of the wall clock and feriados.
+    Tests seed dates against TODAY (or via the now-patched _today_chile()), so the
+    engine and the fixtures always agree on "today". TestTimezone re-patches it
+    locally for its own check, which overrides this within that test."""
+    monkeypatch.setattr("app.services.deadline_engine._today_chile", lambda: TODAY)
+
+
 def _make_case(
     db,
     *,
@@ -119,15 +129,9 @@ def _add_movement(
 
 
 def _recompute(db, case: Case) -> None:
-    from unittest.mock import patch
     from app.services.deadline_engine import DeadlineEngine
 
-    # Freeze the engine's "today" to the same fixed date the tests seed against,
-    # so recompute-based assertions never depend on the wall clock (date drift
-    # or feriados shifting business-day counts). Without this, day-precise
-    # semáforo assertions silently rot as the real date moves past TODAY.
-    with patch("app.services.deadline_engine._today_chile", return_value=TODAY):
-        DeadlineEngine.recompute_case(db, case)
+    DeadlineEngine.recompute_case(db, case)
 
 
 # Deterministic "today" for color tests (a Monday). Color logic is exercised by
