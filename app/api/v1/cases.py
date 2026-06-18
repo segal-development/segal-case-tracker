@@ -155,6 +155,11 @@ class DocumentListItem(BaseModel):
     status: str
     available: bool
     download_url: str
+    # Filing date in the expediente = the linked movement's date. None for
+    # case-level static docs (texto_demanda, cert_envio, ebook) which have no
+    # movement and no date in PJUD's data. (Named doc_date, not date, to avoid
+    # shadowing the imported `date` type in the annotation.)
+    doc_date: Optional[date] = None
 
     class Config:
         from_attributes = True
@@ -503,6 +508,20 @@ async def list_case_documents(
 
     docs = db.query(Document).filter(Document.case_id == case_id).all()
 
+    # Map movement_id -> filing date (movement_date) for docs linked to a
+    # movement — the real "when it appeared in the expediente" date. Batched to
+    # avoid N+1. Case-level static docs have no movement_id → date stays None.
+    mv_ids = {doc.movement_id for doc in docs if doc.movement_id}
+    mv_dates: dict[int, date] = {}
+    if mv_ids:
+        for mid, mdate in (
+            db.query(Movement.id, Movement.movement_date)
+            .filter(Movement.id.in_(mv_ids))
+            .all()
+        ):
+            if mdate is not None:
+                mv_dates[mid] = mdate.date()
+
     return [
         DocumentListItem(
             id=doc.id,
@@ -512,6 +531,7 @@ async def list_case_documents(
             status=doc.status,
             available=(doc.status != "unavailable"),
             download_url=f"/api/v1/documents/{doc.id}/download",
+            doc_date=mv_dates.get(doc.movement_id) if doc.movement_id else None,
         )
         for doc in docs
     ]
