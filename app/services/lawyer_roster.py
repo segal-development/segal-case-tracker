@@ -239,7 +239,6 @@ def admin_dashboard_stats(db: Session, account_rut: str) -> dict:
       - documents: GCS download pipeline status breakdown
       - quality: coverage of semaforo / movements / litigantes, and unassigned cases
     """
-    from datetime import datetime, timedelta
     from sqlalchemy import func
     from app.models.movement import Movement
     from app.models.document import Document

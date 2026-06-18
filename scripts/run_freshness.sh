@@ -9,7 +9,7 @@
 # Stop (e.g. before shutting down):
 #   pkill -f run_freshness.sh; pkill -f freshness_sync.py; pkill -f caffeinate; pkill -f ms-playwright/chromium
 
-cd /Users/marcelo/Projects/segal-case-tracker || exit 1
+cd "$(cd "$(dirname "$0")/.." && pwd)" || exit 1
 set -a; source .env.backfill; set +a
 export PYTHONPATH="$(pwd)"
 

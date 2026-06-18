@@ -22,7 +22,7 @@ import os
 
 os.environ.setdefault("ENVIRONMENT", "production")
 
-LAWYER_RUT = "16021492-9"
+LAWYER_RUT = os.environ.get("LAWYER_RUT", "16021492-9")
 COMPETENCIA = "civil"
 CU_RUT = os.environ.get("CU_RUT", "")
 CU_PASSWORD = os.environ.get("CU_PASSWORD", "")
