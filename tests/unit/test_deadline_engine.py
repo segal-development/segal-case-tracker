@@ -69,6 +69,16 @@ def db(engine):
 TODAY = date(2026, 6, 16)
 
 
+@pytest.fixture(autouse=True)
+def _freeze_today(monkeypatch):
+    """Pin the engine's clock to TODAY for the whole module so recompute-based
+    assertions are deterministic — independent of the wall clock and feriados.
+    Tests seed dates against TODAY (or via the now-patched _today_chile()), so the
+    engine and the fixtures always agree on "today". TestTimezone re-patches it
+    locally for its own check, which overrides this within that test."""
+    monkeypatch.setattr("app.services.deadline_engine._today_chile", lambda: TODAY)
+
+
 def _make_case(
     db,
     *,

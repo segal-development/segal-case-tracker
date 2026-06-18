@@ -296,6 +296,20 @@ class PJUDBaseScraper(ABC):
         if not self._browser:
             await self.start()
         
+        # Opt-in context reuse: in HEADFUL mode every new_context() opens a new
+        # OS window, so for the same session reuse the existing page instead of
+        # recreating the context on every call (which pops a window per case).
+        # Off by default — production/headless behavior is unchanged.
+        session_key = id(session) if session is not None else None
+        if (
+            getattr(self, "reuse_context", False)
+            and self._context is not None
+            and self._page is not None
+            and not self._page.is_closed()
+            and getattr(self, "_page_session_key", None) == session_key
+        ):
+            return self._page
+
         # Close existing context if any
         if self._context:
             await self._context.close()
@@ -316,6 +330,7 @@ class PJUDBaseScraper(ABC):
         )
 
         self._page = await self._context.new_page()
+        self._page_session_key = session_key
         return self._page
 
     async def _safe_page_content(self, page: Page, attempts: int = 3) -> str:

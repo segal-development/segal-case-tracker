@@ -2,6 +2,7 @@
 
 import re
 from collections import defaultdict
+from datetime import datetime, timedelta
 from typing import Optional
 from sqlalchemy.orm import Session
 
@@ -83,6 +84,122 @@ def firm_roster(db: Session, account_rut: str) -> list[dict]:
     return result
 
 
+def firm_dashboard_stats(db: Session, account_rut: str) -> dict:
+    """Return firm-wide dashboard stats for the authenticated account.
+
+    Aggregates semaforo distribution, staleness, materia breakdown, and
+    per-lawyer metrics across all civil cases belonging to the account's firm.
+    """
+    _EMPTY = {
+        "totals": {
+            "cases": 0,
+            "semaforo": {"rojo": 0, "amarillo": 0, "verde": 0, "otros": 0},
+            "stale": 0,
+            "by_materia": [],
+        },
+        "by_lawyer": [],
+    }
+
+    account_rut_norm = normalize_rut(account_rut)
+    lawyer = db.query(Lawyer).filter(Lawyer.rut == account_rut_norm).first()
+    if not lawyer:
+        return _EMPTY
+
+    by_case = _abogado_litigantes_by_case(db, lawyer.id)
+
+    # Build abogado_cases and abogado_info (same side-resolution as firm_roster)
+    abogado_cases: dict[str, set[int]] = defaultdict(set)
+    abogado_info: dict[str, dict] = {}
+
+    for case_id, litigantes in by_case.items():
+        account_side: Optional[frozenset] = None
+        for lit in litigantes:
+            if normalize_rut(lit.rut) == account_rut_norm:
+                if lit.participante in DEMANDANTE_ABOGADO:
+                    account_side = DEMANDANTE_ABOGADO
+                elif lit.participante in DEMANDADO_ABOGADO:
+                    account_side = DEMANDADO_ABOGADO
+                break
+        if account_side is None:
+            continue
+        for lit in litigantes:
+            norm = normalize_rut(lit.rut)
+            if lit.participante in account_side:
+                abogado_cases[norm].add(case_id)
+                if norm not in abogado_info:
+                    abogado_info[norm] = {"rut": norm, "nombre": _clean_nombre(lit.nombre)}
+
+    # Load civil cases in one query
+    cases = (
+        db.query(Case.id, Case.semaforo, Case.last_movement_at, Case.matter)
+        .filter(Case.lawyer_id == lawyer.id, Case.competencia == "civil")
+        .all()
+    )
+    case_map = {c.id: c for c in cases}
+
+    stale_cutoff = datetime.utcnow() - timedelta(days=30)
+
+    def _sem_bucket(sem: Optional[str]) -> str:
+        return sem if sem in ("rojo", "amarillo", "verde") else "otros"
+
+    def _is_stale(lma: Optional[datetime]) -> bool:
+        return lma is None or lma < stale_cutoff
+
+    # Aggregate totals across all civil cases
+    sem_totals: dict[str, int] = {"rojo": 0, "amarillo": 0, "verde": 0, "otros": 0}
+    stale_total = 0
+    materia_counts: defaultdict[str, int] = defaultdict(int)
+
+    for c in cases:
+        sem_totals[_sem_bucket(c.semaforo)] += 1
+        if _is_stale(c.last_movement_at):
+            stale_total += 1
+        materia_counts[c.matter or "Sin materia"] += 1
+
+    by_materia = sorted(
+        [{"materia": m, "count": cnt} for m, cnt in materia_counts.items()],
+        key=lambda x: x["count"],
+        reverse=True,
+    )[:12]
+
+    # Aggregate per-lawyer stats restricted to civil cases
+    by_lawyer = []
+    for norm_rut, case_ids in abogado_cases.items():
+        civil_ids = [cid for cid in case_ids if cid in case_map]
+        if not civil_ids:
+            continue
+        lsem: dict[str, int] = {"rojo": 0, "amarillo": 0, "verde": 0, "otros": 0}
+        lstale = 0
+        for cid in civil_ids:
+            c = case_map[cid]
+            lsem[_sem_bucket(c.semaforo)] += 1
+            if _is_stale(c.last_movement_at):
+                lstale += 1
+        info = abogado_info.get(norm_rut, {"rut": norm_rut, "nombre": ""})
+        by_lawyer.append({
+            "rut": info["rut"],
+            "nombre": info["nombre"],
+            "case_count": len(civil_ids),
+            "rojo": lsem["rojo"],
+            "amarillo": lsem["amarillo"],
+            "verde": lsem["verde"],
+            "otros": lsem["otros"],
+            "stale": lstale,
+        })
+
+    by_lawyer.sort(key=lambda x: x["case_count"], reverse=True)
+
+    return {
+        "totals": {
+            "cases": len(cases),
+            "semaforo": sem_totals,
+            "stale": stale_total,
+            "by_materia": by_materia,
+        },
+        "by_lawyer": by_lawyer,
+    }
+
+
 def case_ids_for_abogado(db: Session, account_rut: str, abogado_rut: str) -> set[int]:
     """Return case IDs where abogado_rut is a firm-side abogado (same side as account)."""
     account_rut_norm = normalize_rut(account_rut)
@@ -112,3 +229,115 @@ def case_ids_for_abogado(db: Session, account_rut: str, abogado_rut: str) -> set
                 break
 
     return result
+
+
+def admin_dashboard_stats(db: Session, account_rut: str) -> dict:
+    """Real Admin dashboard aggregates: sync status, document pipeline, data quality.
+
+    All derived from existing data (no fabricated metrics):
+      - sync: freshness of the detail scrape (last/recent checks, pending, stale)
+      - documents: GCS download pipeline status breakdown
+      - quality: coverage of semaforo / movements / litigantes, and unassigned cases
+    """
+    from sqlalchemy import func
+    from app.models.movement import Movement
+    from app.models.document import Document
+
+    empty = {
+        "sync": {"last_checked_at": None, "checked_24h": 0, "pending_detail": 0, "stale_30d": 0},
+        "documents": {"stored": 0, "pending": 0, "failed": 0, "unavailable": 0},
+        "quality": {
+            "total_cases": 0, "with_semaforo": 0, "with_movements": 0,
+            "with_litigantes": 0, "sin_asignar": 0,
+        },
+    }
+
+    account_rut_norm = normalize_rut(account_rut)
+    lawyer = db.query(Lawyer).filter(Lawyer.rut == account_rut_norm).first()
+    if not lawyer:
+        return empty
+
+    now = datetime.utcnow()
+    cutoff_24h = now - timedelta(hours=24)
+    cutoff_30d = now - timedelta(days=30)
+
+    cases = (
+        db.query(Case.id, Case.semaforo, Case.last_detail_checked_at, Case.last_movement_at)
+        .filter(Case.lawyer_id == lawyer.id, Case.competencia == "civil")
+        .all()
+    )
+    case_ids = [c.id for c in cases]
+    total_cases = len(cases)
+
+    last_checked_at: Optional[datetime] = None
+    checked_24h = pending_detail = stale_30d = with_semaforo = 0
+    for c in cases:
+        lc = c.last_detail_checked_at
+        if lc is not None:
+            if last_checked_at is None or lc > last_checked_at:
+                last_checked_at = lc
+            if lc >= cutoff_24h:
+                checked_24h += 1
+            if c.last_movement_at is None or c.last_movement_at < cutoff_30d:
+                stale_30d += 1
+        else:
+            pending_detail += 1
+        if c.semaforo is not None:
+            with_semaforo += 1
+
+    doc_counts = {"stored": 0, "pending": 0, "failed": 0, "unavailable": 0}
+    with_movements = with_litigantes = 0
+    if case_ids:
+        for status, cnt in (
+            db.query(Document.status, func.count())
+            .filter(Document.case_id.in_(case_ids))
+            .group_by(Document.status)
+            .all()
+        ):
+            if status in doc_counts:
+                doc_counts[status] = int(cnt)
+        with_movements = int(
+            db.query(func.count(func.distinct(Movement.case_id)))
+            .filter(Movement.case_id.in_(case_ids))
+            .scalar() or 0
+        )
+        with_litigantes = int(
+            db.query(func.count(func.distinct(CaseLitigante.case_id)))
+            .filter(CaseLitigante.case_id.in_(case_ids))
+            .scalar() or 0
+        )
+
+    # sin_asignar: civil cases with no firm-side abogado resolvable
+    by_case = _abogado_litigantes_by_case(db, lawyer.id)
+    assigned: set[int] = set()
+    for cid, litigantes in by_case.items():
+        account_side: Optional[frozenset] = None
+        for lit in litigantes:
+            if normalize_rut(lit.rut) == account_rut_norm:
+                if lit.participante in DEMANDANTE_ABOGADO:
+                    account_side = DEMANDANTE_ABOGADO
+                elif lit.participante in DEMANDADO_ABOGADO:
+                    account_side = DEMANDADO_ABOGADO
+                break
+        if account_side is not None and any(
+            lit.participante in account_side for lit in litigantes
+        ):
+            assigned.add(cid)
+    sin_asignar = len(set(case_ids) - assigned)
+
+    return {
+        "sync": {
+            "last_checked_at": last_checked_at.isoformat() if last_checked_at else None,
+            "checked_24h": checked_24h,
+            "pending_detail": pending_detail,
+            "stale_30d": stale_30d,
+        },
+        "documents": doc_counts,
+        "quality": {
+            "total_cases": total_cases,
+            "with_semaforo": with_semaforo,
+            "with_movements": with_movements,
+            "with_litigantes": with_litigantes,
+            "sin_asignar": sin_asignar,
+        },
+    }

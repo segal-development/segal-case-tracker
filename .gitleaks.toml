@@ -1,0 +1,24 @@
+title = "Segal case-tracker gitleaks config"
+
+# Use gitleaks' built-in ruleset, then allowlist known NON-secret matches.
+[extend]
+useDefault = true
+
+[allowlist]
+description = """
+Non-secret false positives:
+- test fixtures / fixtures HTML with synthetic PJUD tokens & JWTs (not real),
+- docs with illustrative example tokens,
+- one-off manual dev scripts holding long-expired captured PJUD JWTs (~1h TTL),
+- PUBLIC PJUD portal tokens (TOKEN_MY_CASES, sitekeys, etc.) — identical for all
+  users and present in the public page source, not credentials.
+Real secrets live only in gitignored .env files, which are never committed.
+"""
+paths = [
+  '''tests/''',
+  '''docs/''',
+  '''scripts/manual/''',
+  '''app/scrapper/pjud_civil\.py''',
+  '''app/scrapper/pjud/civil\.py''',
+  '''app/scrapper/captcha_solver\.py''',
+]
