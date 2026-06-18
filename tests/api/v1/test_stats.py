@@ -9,7 +9,9 @@ from app.models.case import Case
 from app.models.case_litigante import CaseLitigante
 from app.models.court import Court
 from app.models.lawyer import Lawyer
-from app.services.lawyer_roster import firm_dashboard_stats
+from app.models.document import Document
+from app.models.movement import Movement
+from app.services.lawyer_roster import firm_dashboard_stats, admin_dashboard_stats
 
 
 # ---------------------------------------------------------------------------
@@ -234,4 +236,99 @@ class TestFirmStatsEndpoint:
 
     def test_endpoint_returns_401_without_auth(self, client):
         response = client.get("/api/v1/stats/firm")
+        assert response.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: admin_dashboard_stats
+# ---------------------------------------------------------------------------
+
+
+class TestAdminDashboardStats:
+    def test_pending_detail_vs_checked(self, db, lawyer, court):
+        checked = _make_case(db, lawyer, court, "C-6001-2025")
+        unchecked = _make_case(db, lawyer, court, "C-6002-2025")
+        _seed_litigantes(db, checked)
+        _seed_litigantes(db, unchecked)
+        checked.last_detail_checked_at = datetime.utcnow()
+        db.commit()
+        sync = admin_dashboard_stats(db, ACCOUNT_RUT)["sync"]
+        assert sync["pending_detail"] == 1
+        assert sync["checked_24h"] == 1
+        assert sync["last_checked_at"] is not None
+
+    def test_with_semaforo_count(self, db, lawyer, court):
+        c1 = _make_case(db, lawyer, court, "C-6003-2025", semaforo="rojo")
+        c2 = _make_case(db, lawyer, court, "C-6004-2025", semaforo=None)
+        _seed_litigantes(db, c1)
+        _seed_litigantes(db, c2)
+        quality = admin_dashboard_stats(db, ACCOUNT_RUT)["quality"]
+        assert quality["total_cases"] == 2
+        assert quality["with_semaforo"] == 1
+
+    def test_documents_breakdown(self, db, lawyer, court):
+        c = _make_case(db, lawyer, court, "C-6005-2025")
+        _seed_litigantes(db, c)
+        db.add_all([
+            Document(case_id=c.id, status="stored"),
+            Document(case_id=c.id, status="stored"),
+            Document(case_id=c.id, status="pending"),
+            Document(case_id=c.id, status="failed"),
+        ])
+        db.commit()
+        docs = admin_dashboard_stats(db, ACCOUNT_RUT)["documents"]
+        assert docs["stored"] == 2
+        assert docs["pending"] == 1
+        assert docs["failed"] == 1
+        assert docs["unavailable"] == 0
+
+    def test_with_movements_and_litigantes(self, db, lawyer, court):
+        c1 = _make_case(db, lawyer, court, "C-6006-2025")
+        c2 = _make_case(db, lawyer, court, "C-6007-2025")
+        _seed_litigantes(db, c1)
+        _seed_litigantes(db, c2)
+        db.add(Movement(case_id=c1.id, description="Resolución", movement_date=datetime.utcnow()))
+        db.commit()
+        quality = admin_dashboard_stats(db, ACCOUNT_RUT)["quality"]
+        assert quality["with_movements"] == 1
+        assert quality["with_litigantes"] == 2
+
+    def test_sin_asignar(self, db, lawyer, court):
+        assigned = _make_case(db, lawyer, court, "C-6008-2025")
+        _seed_litigantes(db, assigned)  # firm-side abogado present
+        _make_case(db, lawyer, court, "C-6009-2025")  # orphan: no litigantes
+        db.commit()
+        quality = admin_dashboard_stats(db, ACCOUNT_RUT)["quality"]
+        assert quality["total_cases"] == 2
+        assert quality["sin_asignar"] == 1
+
+    def test_empty_for_unknown_account(self, db):
+        result = admin_dashboard_stats(db, "99999999-9")
+        assert result["quality"]["total_cases"] == 0
+        assert result["sync"]["pending_detail"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Endpoint tests: GET /api/v1/stats/admin
+# ---------------------------------------------------------------------------
+
+
+class TestAdminStatsEndpoint:
+    def test_endpoint_returns_200_correct_shape(self, authed_client, db, lawyer, court):
+        c = _make_case(db, lawyer, court, "C-6101-2025", semaforo="verde")
+        _seed_litigantes(db, c)
+        response = authed_client.get("/api/v1/stats/admin")
+        assert response.status_code == 200
+        data = response.json()
+        assert set(data.keys()) >= {"sync", "documents", "quality"}
+        assert set(data["sync"].keys()) >= {
+            "last_checked_at", "checked_24h", "pending_detail", "stale_30d"
+        }
+        assert set(data["documents"].keys()) >= {
+            "stored", "pending", "failed", "unavailable"
+        }
+        assert data["quality"]["total_cases"] == 1
+
+    def test_endpoint_returns_401_without_auth(self, client):
+        response = client.get("/api/v1/stats/admin")
         assert response.status_code == 401
