@@ -46,7 +46,8 @@ def court(db):
     return obj
 
 
-def _make_case(db, lawyer, court, rol, semaforo=None, last_movement_at=None, matter=None):
+def _make_case(db, lawyer, court, rol, semaforo=None, last_movement_at=None,
+               matter=None, procedure=None):
     """Create and return a civil Case owned by lawyer."""
     obj = Case(
         lawyer_id=lawyer.id,
@@ -57,6 +58,7 @@ def _make_case(db, lawyer, court, rol, semaforo=None, last_movement_at=None, mat
         semaforo=semaforo,
         last_movement_at=last_movement_at,
         matter=matter,
+        procedure=procedure,
         plaintiff="BANCO DEMANDANTE",
         defendant="DEUDOR DDO",
         created_at=datetime.utcnow(),
@@ -156,13 +158,13 @@ class TestFirmDashboardStats:
 
     def test_by_materia_top12(self, db, lawyer, court):
         for i in range(13):
-            c = _make_case(db, lawyer, court, f"C-52{i:02d}-2025", matter=f"Materia {i}")
+            c = _make_case(db, lawyer, court, f"C-52{i:02d}-2025", procedure=f"Materia {i}")
             _seed_litigantes(db, c)
         result = firm_dashboard_stats(db, ACCOUNT_RUT)
         assert len(result["totals"]["by_materia"]) == 12
 
     def test_none_materia_becomes_sin_materia(self, db, lawyer, court):
-        c = _make_case(db, lawyer, court, "C-5301-2025", matter=None)
+        c = _make_case(db, lawyer, court, "C-5301-2025", procedure=None)
         _seed_litigantes(db, c)
         result = firm_dashboard_stats(db, ACCOUNT_RUT)
         materias = [m["materia"] for m in result["totals"]["by_materia"]]

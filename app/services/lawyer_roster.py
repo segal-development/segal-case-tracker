@@ -131,7 +131,7 @@ def firm_dashboard_stats(db: Session, account_rut: str) -> dict:
 
     # Load civil cases in one query
     cases = (
-        db.query(Case.id, Case.semaforo, Case.last_movement_at, Case.matter)
+        db.query(Case.id, Case.semaforo, Case.last_movement_at, Case.procedure)
         .filter(Case.lawyer_id == lawyer.id, Case.competencia == "civil")
         .all()
     )
@@ -154,7 +154,10 @@ def firm_dashboard_stats(db: Session, account_rut: str) -> dict:
         sem_totals[_sem_bucket(c.semaforo)] += 1
         if _is_stale(c.last_movement_at):
             stale_total += 1
-        materia_counts[c.matter or "Sin materia"] += 1
+        # PJUD populates "Procedimiento" (procedure), not "Materia" (matter is
+        # always null), so the breakdown groups by procedure. Label stays
+        # "materia" for the frontend, which already treats procedure as such.
+        materia_counts[c.procedure or "Sin materia"] += 1
 
     by_materia = sorted(
         [{"materia": m, "count": cnt} for m, cnt in materia_counts.items()],
