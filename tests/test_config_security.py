@@ -70,6 +70,26 @@ class TestSecretsValidation:
         )
         assert settings.ENVIRONMENT == "production"
 
+    def test_weak_nonfernet_key_rejected_in_production(self):
+        """A non-default but non-Fernet key (e.g. a padded 64-char string or
+        'miclave123') must be REJECTED in production — no lenient padding."""
+        with pytest.raises(ValidationError) as exc_info:
+            make_settings(
+                ENVIRONMENT="production",
+                SECRET_KEY="a-totally-different-strong-secret-key-xyz-123",
+                ENCRYPTION_KEY="miclave123-not-a-real-fernet-key-aaaaaaaaaaaaa",
+            )
+        assert "ENCRYPTION_KEY" in str(exc_info.value)
+
+    def test_weak_nonfernet_key_allowed_in_development(self):
+        """In development a non-Fernet key is still accepted (lenient padding)."""
+        settings = make_settings(
+            ENVIRONMENT="development",
+            SECRET_KEY=_DEV_SECRET_KEY,
+            ENCRYPTION_KEY="miclave123-not-a-real-fernet-key",
+        )
+        assert settings.ENVIRONMENT == "development"
+
     def test_environment_check_is_case_insensitive(self):
         """ENVIRONMENT='Production' (mixed case) should also enforce validation."""
         with pytest.raises(ValidationError) as exc_info:

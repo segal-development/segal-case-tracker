@@ -12,11 +12,20 @@ _DEV_SECRET_KEY = "dev-secret-key-change-in-production"
 _DEV_ENCRYPTION_KEY = "dev-32-byte-encryption-key-here!"
 
 
-def _build_fernet(key: str) -> Fernet:
-    """Build a Fernet instance from a key string, using the same derivation as security.py."""
+def _build_fernet(key: str, *, strict: bool = False) -> Fernet:
+    """Build a Fernet instance from a key string.
+
+    strict=True (production): require a real url-safe-base64 32-byte Fernet key;
+    a malformed/weak key raises instead of being silently padded. strict=False
+    (dev/test only): pad an arbitrary string to 32 bytes so local development
+    works without generating a key. NEVER use strict=False in production — it
+    accepts low-entropy junk like "miclave123".
+    """
     try:
         return Fernet(key.encode())
     except Exception:
+        if strict:
+            raise
         key_bytes = key.encode().ljust(32)[:32]
         key_b64 = base64.urlsafe_b64encode(key_bytes)
         return Fernet(key_b64)
@@ -149,12 +158,17 @@ class Settings(BaseSettings):
                 "The current value is the insecure dev default."
             )
 
-        # Verify the key can produce a working Fernet instance.
+        # Outside development, require a REAL Fernet key — no lenient padding.
+        # Padding silently accepts weak keys (e.g. "miclave123"), which is exactly
+        # what we refuse in production. Generate one with:
+        #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
         try:
-            _build_fernet(self.ENCRYPTION_KEY)
+            _build_fernet(self.ENCRYPTION_KEY, strict=True)
         except Exception as exc:
             raise ValueError(
-                f"ENCRYPTION_KEY cannot be used to construct a valid Fernet key: {exc}"
+                "ENCRYPTION_KEY must be a real Fernet key (44-char url-safe base64, "
+                "32 bytes) in non-development environments. The current value is not a "
+                f"valid Fernet key: {exc}"
             ) from exc
 
         # Reject empty CORS in non-development environments.
