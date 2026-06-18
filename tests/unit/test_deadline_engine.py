@@ -119,9 +119,15 @@ def _add_movement(
 
 
 def _recompute(db, case: Case) -> None:
+    from unittest.mock import patch
     from app.services.deadline_engine import DeadlineEngine
 
-    DeadlineEngine.recompute_case(db, case)
+    # Freeze the engine's "today" to the same fixed date the tests seed against,
+    # so recompute-based assertions never depend on the wall clock (date drift
+    # or feriados shifting business-day counts). Without this, day-precise
+    # semáforo assertions silently rot as the real date moves past TODAY.
+    with patch("app.services.deadline_engine._today_chile", return_value=TODAY):
+        DeadlineEngine.recompute_case(db, case)
 
 
 # Deterministic "today" for color tests (a Monday). Color logic is exercised by
