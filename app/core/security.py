@@ -110,19 +110,15 @@ def hash_password(password: str) -> str:
 # =============================================================================
 
 def _get_fernet() -> Fernet:
-    """Get Fernet instance with proper key."""
-    # Encryption key should be 32 url-safe base64-encoded bytes
-    key = settings.ENCRYPTION_KEY
-    
-    # If key is not base64, encode it
-    try:
-        Fernet(key.encode())
-        return Fernet(key.encode())
-    except Exception:
-        # Generate proper key from the provided string
-        key_bytes = key.encode().ljust(32)[:32]
-        key_b64 = base64.urlsafe_b64encode(key_bytes)
-        return Fernet(key_b64)
+    """Get Fernet instance, using the same derivation as config validation.
+
+    Strict (real Fernet key required) outside development; lenient padding is
+    allowed only in dev/test so local work doesn't need a generated key.
+    """
+    from app.config import _build_fernet
+
+    strict = settings.ENVIRONMENT.lower() != "development"
+    return _build_fernet(settings.ENCRYPTION_KEY, strict=strict)
 
 
 def encrypt_pjud_password(password: str) -> str:
