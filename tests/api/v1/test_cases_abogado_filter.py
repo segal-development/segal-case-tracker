@@ -123,3 +123,26 @@ class TestCasesAbogadoFilter:
         assert resp.status_code == 200
         ids = {item["id"] for item in resp.json()["items"]}
         assert case_a.id in ids
+
+
+class TestStablePagination:
+    def test_criticidad_pagination_no_dupes_or_omissions(
+        self, authed_client, db, lawyer, court
+    ):
+        """All cases tie under the criticidad sort (next_deadline_at is NULL), so
+        without a stable id tiebreaker pagination could duplicate or omit rows.
+        Every case must appear exactly once across all pages."""
+        n = 7
+        for i in range(n):
+            _make_case(db, lawyer, court, f"C-93{i:02d}-2025")
+
+        seen: list[int] = []
+        for page in range(1, n + 2):  # per_page=2 → several pages (+ empties)
+            resp = authed_client.get(
+                f"/api/v1/cases?sort_by=criticidad&per_page=2&page={page}"
+            )
+            assert resp.status_code == 200
+            seen.extend(item["id"] for item in resp.json()["items"])
+
+        assert len(seen) == len(set(seen)), "pagination returned duplicate case ids"
+        assert len(set(seen)) == n, "pagination omitted cases"

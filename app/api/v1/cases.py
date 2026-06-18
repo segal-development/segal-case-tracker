@@ -230,8 +230,17 @@ async def list_cases(
     else:
         order_clause = Case.updated_at.desc()
 
+    # Stable secondary sort on the unique id. The primary sort keys
+    # (next_deadline_at / updated_at) are non-unique, so without a deterministic
+    # tiebreaker pagination is unstable: the same case can land on two pages
+    # (duplicates) or fall between pages (omissions) across separate requests.
     # Paginate
-    cases = query.order_by(order_clause).offset((page - 1) * per_page).limit(per_page).all()
+    cases = (
+        query.order_by(order_clause, Case.id.asc())
+        .offset((page - 1) * per_page)
+        .limit(per_page)
+        .all()
+    )
     
     # Get last sync time
     last_sync_record = db.query(SyncHistory).filter(
