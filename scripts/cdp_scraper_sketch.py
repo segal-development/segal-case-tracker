@@ -61,11 +61,12 @@ def normalize_rut(rut: str) -> str:
     return rut if "-" in rut else f"{rut}-{_compute_dv(rut)}"
 
 
-async def scrape_via_cdp(rut: str, max_pages: int = 2) -> list:
+async def scrape_via_cdp(rut: str, max_pages: int = 2, with_detail: bool = True) -> list:
     """Attach to the logged-in real Chrome over CDP and fetch the lawyer's cases
     by INJECTING its authenticated page into CivilScraper — reuses all the proven
-    scraper logic (AJAX + parsing + pagination) inside the real Chrome. Returns the
-    list of cases; raises on attach/scrape failure. Reusable by the launcher.
+    scraper logic (AJAX + parsing + pagination) inside the real Chrome. If
+    with_detail, also fetches get_case_detail for the first case with a token
+    (validates the detail path over CDP). Returns the case list.
     """
     from playwright.async_api import async_playwright
     from app.scrapper.pjud.civil import CivilScraper
@@ -85,7 +86,21 @@ async def scrape_via_cdp(rut: str, max_pages: int = 2) -> list:
         # Cookies/localStorage not needed — the injected page is already authenticated.
         session = PJUDSession.create(rut=rut, cookies=[], local_storage="{}", auth_method="captcha")
         try:
-            return await sc.get_my_cases(session, max_pages=max_pages)
+            cases = await sc.get_my_cases(session, max_pages=max_pages)
+            if with_detail:
+                target = next((c for c in cases if getattr(c, "case_token", None)), None)
+                if target is None:
+                    print("  (no case with a token to fetch detail)")
+                else:
+                    try:
+                        detail = await sc.get_case_detail(session=session, case_token=target.case_token)
+                        print(f"  detail[{target.rol}]: {len(detail.movements)} movimientos · "
+                              f"{len(detail.litigantes)} litigantes · "
+                              f"{len(getattr(detail, 'escritos', []))} escritos · "
+                              f"{len(getattr(detail, 'exhortos', []))} exhortos  ✓")
+                    except Exception as e:
+                        print(f"  get_case_detail over CDP raised: {type(e).__name__}: {str(e)[:140]}")
+            return cases
         finally:
             await browser.close()  # CDP disconnect ONLY — does NOT close the real Chrome
 
