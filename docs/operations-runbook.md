@@ -71,6 +71,12 @@ En falla deja screenshot/HTML redacted en `SMOKE_FAILURE_DIR` (default `/tmp`).
 7. Reanudar scraper.
 Rollback: re-correr reencrypt con OLD/NEW invertidos + restaurar el `.env.qa.bak`.
 
+**Rotación SIN downtime (MultiFernet) — preferido:** no hace falta pausar.
+1. `ENCRYPTION_KEY=<nueva>` + `ENCRYPTION_KEY_FALLBACKS=<vieja>` en `.env.qa`/`.env.backfill` → deploy. La app desencripta con cualquiera de las dos y **escribe con la nueva**.
+2. Re-encriptar con calma (`reencrypt_credentials.py --apply`) — sin ventana.
+3. Cuando todo está re-encriptado, **sacar `ENCRYPTION_KEY_FALLBACKS`** → deploy. La vieja queda muerta.
+`ENCRYPTION_KEY_FALLBACKS` acepta varias keys separadas por coma (todas se prueban al desencriptar; todas deben ser Fernet reales en prod).
+
 ---
 
 ## 6. Rotar contraseña de la DB

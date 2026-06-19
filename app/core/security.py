@@ -8,7 +8,7 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, MultiFernet
 
 from app.config import settings
 
@@ -109,16 +109,20 @@ def hash_password(password: str) -> str:
 # PASSWORD ENCRYPTION (for PJUD passwords - reversible)
 # =============================================================================
 
-def _get_fernet() -> Fernet:
-    """Get Fernet instance, using the same derivation as config validation.
+def _get_fernet() -> MultiFernet:
+    """Get a MultiFernet: encrypts with the primary ENCRYPTION_KEY, decrypts with
+    the primary OR any ENCRYPTION_KEY_FALLBACKS entry (zero-downtime rotation).
 
     Strict (real Fernet key required) outside development; lenient padding is
     allowed only in dev/test so local work doesn't need a generated key.
     """
-    from app.config import _build_fernet
+    from app.config import _build_multifernet
 
     strict = settings.ENVIRONMENT.lower() != "development"
-    return _build_fernet(settings.ENCRYPTION_KEY, strict=strict)
+    fallbacks = [
+        k.strip() for k in (settings.ENCRYPTION_KEY_FALLBACKS or "").split(",") if k.strip()
+    ]
+    return _build_multifernet(settings.ENCRYPTION_KEY, fallbacks, strict=strict)
 
 
 def encrypt_pjud_password(password: str) -> str:
