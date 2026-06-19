@@ -15,6 +15,7 @@ Performance optimizations:
 import asyncio
 import hashlib
 import logging
+import random
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -1581,7 +1582,8 @@ async def detect_and_sync_movements(
             errors.append(f"Movement fetch failed for {api_case.rol}: {str(exc)}")
 
         if delay_between_fetches > 0:
-            await asyncio.sleep(delay_between_fetches)
+            # ±40% jitter so the cadence isn't machine-regular (anti-fingerprint).
+            await asyncio.sleep(delay_between_fetches * random.uniform(0.6, 1.4))
 
     logger.info(
         "detect_and_sync_movements: done — %d new movements, %d alerts, %d errors",
