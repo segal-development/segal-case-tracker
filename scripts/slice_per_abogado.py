@@ -78,6 +78,29 @@ async def _login_headful(rut_username: str, password: str) -> tuple:
         )
         page = await context.new_page()
 
+        # Capture any JS alert/confirm the login shows. Playwright auto-dismisses
+        # dialogs by default (the human only sees a flash), so we print the text
+        # then accept it — that's how we learn WHY the login is rejected.
+        def _on_dialog(dialog):
+            print(f"  ⚠️ PJUD ALERT: {dialog.message!r}", flush=True)
+            asyncio.create_task(dialog.accept())
+        page.on("dialog", _on_dialog)
+
+        # Capture login-related network responses + console errors to learn WHY
+        # the login is rejected (captcha refusal, bad creds, etc.).
+        def _on_response(resp):
+            try:
+                u = resp.url
+                if any(k in u.lower() for k in ("session", "login", "captcha", "recaptcha", "indexn", "autentica")):
+                    print(f"  ↩ RESP {resp.status} {u[:95]}", flush=True)
+            except Exception:
+                pass
+        page.on("response", _on_response)
+        page.on("console", lambda m: (
+            print(f"  ▸ console[{m.type}]: {m.text[:140]}", flush=True)
+            if m.type in ("error", "warning") else None
+        ))
+
         print(f"  Navigating to {PJUD_HOME_URL} ...")
         await page.goto(PJUD_HOME_URL, wait_until="domcontentloaded", timeout=30_000)
 
@@ -145,15 +168,17 @@ async def _login_headful(rut_username: str, password: str) -> tuple:
         # ------------------------------------------------------------------
         # Prompt human
         # ------------------------------------------------------------------
+        login_timeout = int(os.environ.get("SLICE_LOGIN_TIMEOUT", "360"))
         sep = "!" * 62
         print(f"\n{sep}")
-        print("  RESOLVÉ EL CAPTCHA Y APRETÁ INGRESAR EN LA VENTANA")
-        print(f"  Esperando hasta 180 s para que el login complete...")
+        print("  En la ventana: entrá a 'Clave del Poder Judicial', poné el RUT")
+        print("  (sin DV), la clave, RESOLVÉ EL CAPTCHA y apretá Ingresar.")
+        print(f"  Esperando hasta {login_timeout}s para que el login complete...")
         print(f"{sep}\n")
 
         # Wait for the redirect to the authenticated landing page
         try:
-            await page.wait_for_url("**/indexN.php**", timeout=180_000)
+            await page.wait_for_url("**/indexN.php**", timeout=login_timeout * 1000)
         except PlaywrightTimeoutError:
             pass  # Fall through; URL check below decides
 
