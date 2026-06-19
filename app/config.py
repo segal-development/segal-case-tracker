@@ -83,6 +83,17 @@ class Settings(BaseSettings):
     PJUD_RATE_BURST: int = 20               # Rate limiter: burst capacity
     PJUD_HEALTH_CHECK_INTERVAL: int = 300   # Health check: seconds between checks
 
+    # PJUD Per-action rate limits
+    PJUD_RL_LOGIN_RATE: float = 0.033     # ~1 login / 30s
+    PJUD_RL_LOGIN_BURST: int = 3
+    PJUD_RL_LIST_RATE: float = 0.1        # ~1 list / 10s
+    PJUD_RL_LIST_BURST: int = 3
+    PJUD_RL_DETAIL_RATE: float = 0.5      # ~1 detail / 2s
+    PJUD_RL_DETAIL_BURST: int = 10
+    PJUD_RL_DOCUMENT_RATE: float = 0.33   # ~1 document / 3s
+    PJUD_RL_DOCUMENT_BURST: int = 10
+    PJUD_RL_WAIT_TIMEOUT: float = 120.0   # pace up to 2 min before giving up
+
     # PJUD Observability
     PJUD_ALERT_WEBHOOK_URL: str = ""        # Webhook URL for alerts (empty = disabled)
     PJUD_LOG_LEVEL: str = "INFO"            # Log level: DEBUG, INFO, WARNING, ERROR

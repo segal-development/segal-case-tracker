@@ -199,14 +199,43 @@ def rate_limit(
     """
     def decorator(func: Callable) -> Callable:
         limiter = get_rate_limiter(name, config)
-        
+
         @wraps(func)
         async def wrapper(*args, **kwargs):
             await limiter.acquire()
             return await func(*args, **kwargs)
-        
+
         # Expose limiter for inspection
         wrapper.rate_limiter = limiter
         return wrapper
-    
+
     return decorator
+
+
+def pjud_action_limiter(action: str) -> TokenBucketLimiter:
+    """Return (or create) a per-action TokenBucketLimiter for PJUD.
+
+    Import settings inside the function to avoid circular import cycles.
+    Supported actions: "login", "list", "detail", "document".
+    Unknown actions fall back to a conservative 0.1 req/s, burst=1.
+    """
+    from app.config import settings
+
+    action_map = {
+        "login":    (settings.PJUD_RL_LOGIN_RATE,    settings.PJUD_RL_LOGIN_BURST),
+        "list":     (settings.PJUD_RL_LIST_RATE,     settings.PJUD_RL_LIST_BURST),
+        "detail":   (settings.PJUD_RL_DETAIL_RATE,   settings.PJUD_RL_DETAIL_BURST),
+        "document": (settings.PJUD_RL_DOCUMENT_RATE, settings.PJUD_RL_DOCUMENT_BURST),
+    }
+
+    if action in action_map:
+        rate, burst = action_map[action]
+    else:
+        rate, burst = 0.1, 1
+
+    cfg = RateLimiterConfig(
+        rate=rate,
+        burst=burst,
+        wait_timeout=settings.PJUD_RL_WAIT_TIMEOUT,
+    )
+    return get_rate_limiter(f"pjud:{action}", cfg)
