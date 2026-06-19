@@ -25,12 +25,16 @@ echo "[$TS] smoke exit=$CODE $OUT"
 
 if [ "$CODE" -ne 0 ]; then
   MSG="🔴 PJUD smoke FAILED (exit $CODE) at $TS — $OUT"
-  if [ -n "$PJUD_ALERT_WEBHOOK_URL" ]; then
+  if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+    curl -s -m 12 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+      --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" --data-urlencode "text=$MSG" >/dev/null \
+      && echo "alert: telegram sent" || echo "alert: telegram failed"
+  elif [ -n "$PJUD_ALERT_WEBHOOK_URL" ]; then
     curl -s -m 10 -X POST -H 'Content-Type: application/json' \
       --data "$(printf '{"text":%s}' "$(printf '%s' "$MSG" | "$VENV" -c 'import json,sys;print(json.dumps(sys.stdin.read()))')")" \
       "$PJUD_ALERT_WEBHOOK_URL" >/dev/null && echo "alert: webhook sent" || echo "alert: webhook send failed"
   else
-    echo "alert: NO channel configured — set PJUD_ALERT_WEBHOOK_URL to enable alerts. Failure artifacts in ${SMOKE_FAILURE_DIR:-/tmp}/smoke_fail_*"
+    echo "alert: NO channel configured — set TELEGRAM_BOT_TOKEN+TELEGRAM_CHAT_ID (or PJUD_ALERT_WEBHOOK_URL). Failure artifacts in ${SMOKE_FAILURE_DIR:-/tmp}/smoke_fail_*"
   fi
 fi
 

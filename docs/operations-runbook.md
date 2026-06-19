@@ -87,11 +87,16 @@ Rollback: re-correr reencrypt con OLD/NEW invertidos + restaurar el `.env.qa.bak
 ## 7. Backups y restore (Cloud SQL)
 - **Backups automáticos: HABILITADOS** — diarios 07:00 UTC, retención 14, instancia `casetracker-segal-qa-db`.
 - Listar: `gcloud sql backups list --instance=casetracker-segal-qa-db`
-- **Restore** (a la misma o a una instancia separada para drill):
+- **Restore de un backup a una instancia EXISTENTE** (sobrescribe):
   ```
-  gcloud sql backups restore <BACKUP_ID> --restore-instance=<INSTANCIA_DESTINO>
+  gcloud sql backups restore <BACKUP_ID> --restore-instance=<DESTINO> --backup-instance=casetracker-segal-qa-db
   ```
-- ⚠️ **Pendiente:** drill de restore probado + (opcional) PITR (`--enable-point-in-time-recovery`, puede reiniciar la instancia).
+- **Recuperar a una instancia SEPARADA** (drill / recovery sin tocar prod):
+  ```
+  gcloud sql instances clone casetracker-segal-qa-db <NUEVA_INSTANCIA>
+  ```
+- ✅ **Drill probado** (clone → instancia separada): recuperación **~15 min**, data íntegra (2541 causas, igual que prod), instancia drill borrada. Para verificar: conectar y comparar row counts; **borrar la instancia drill al terminar** (`gcloud sql instances delete <NUEVA_INSTANCIA>`) para no dejar costo.
+- ⚠️ Opcional pendiente: PITR (`--enable-point-in-time-recovery`, puede reiniciar la instancia).
 
 ---
 
@@ -122,10 +127,17 @@ Ajustar en `.env.backfill` (local) / `.env.qa` (VM). Más conservador = bajar `*
 - `~/segal_new_encryption_key.txt` — key Fernet actual.
 - `~/segal_new_db_password.txt` — password DB actual.
 - `~/segal_old_pjud_ciphertext.txt` — backup del ciphertext pre-rotación.
-- `.env.backfill` (repo, gitignored) — DATABASE_URL, ENCRYPTION_KEY, CU_RUT/CU_PASSWORD, rate limits.
+- `.env.backfill` (repo, gitignored) — DATABASE_URL, ENCRYPTION_KEY, CU_RUT/CU_PASSWORD, rate limits, TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID.
 ⚠️ Mover a Secret Manager/KMS es follow-up pendiente. **Nunca** pegar secretos en chat/commits (gitleaks corre en CI).
 
 ---
 
-## 12. Alertas (PENDIENTE — falta canal)
-El sistema todavía NO grita solo. Para activarlo: setear `PJUD_ALERT_WEBHOOK_URL` (Slack/Discord) o SendGrid, y wirear un monitor de frescura (`last_checked_at` viejo) + el smoke. Hasta entonces, revisar manualmente (§2, §4).
+## 12. Alertas (Telegram — al ADMIN, no a los abogados)
+Canal: Telegram (`TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` en `.env.backfill`). Las alertas son **operativas** (scraper caído/colgado, smoke fail) → al admin; las alertas de causa de los abogados son in-app (Novedades/semáforo).
+- **Monitor de frescura** (`scripts/freshness_monitor.py` vía `scripts/run_monitor.sh`): alerta 🔴 si no se re-sincronizó ninguna causa en `FRESHNESS_STALE_HOURS` (default 2h) y 🟢 al recuperarse. No usa browser → corre al lado del scraper.
+- **Schedule** (cron en la Mac, cada 30 min):
+  ```
+  */30 * * * * /Users/marcelo/Projects/segal-case-tracker/scripts/run_monitor.sh >> /tmp/segal_monitor.log 2>&1
+  ```
+- **Smoke**: `scripts/run_smoke.sh` alerta a Telegram si el smoke falla (scraper pausado).
+- Probar el canal: `curl -s "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" --data-urlencode "text=test"`
