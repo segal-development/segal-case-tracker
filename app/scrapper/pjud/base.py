@@ -390,6 +390,9 @@ class PJUDBaseScraper(ABC):
         Returns:
             PJUDSession with cookies for scraping
         """
+        from app.scrapper.pjud.resilience.rate_limiter import pjud_action_limiter
+        await pjud_action_limiter("login").acquire()
+
         # Clean RUT - remove dots, hyphens, and verification digit
         rut_clean = rut.replace("-", "").replace(".", "")
         if len(rut_clean) > 8:
@@ -672,6 +675,9 @@ class PJUDBaseScraper(ABC):
         Returns:
             List of cases
         """
+        from app.scrapper.pjud.resilience.rate_limiter import pjud_action_limiter
+        await pjud_action_limiter("list").acquire()
+
         # Extract RUT parts
         rut = session.rut.replace("-", "").replace(".", "")
         rut_num = rut[:-1] if len(rut) > 8 else rut
@@ -762,15 +768,18 @@ class PJUDBaseScraper(ABC):
         Returns:
             Full case detail with movements
         """
+        from app.scrapper.pjud.resilience.rate_limiter import pjud_action_limiter
+        await pjud_action_limiter("detail").acquire()
+
         # Use injected page if valid, otherwise create new one
         if self._page is not None and not self._page.is_closed():
             page = self._page
         else:
             page = await self._get_page(session)
-        
+
         try:
             await self._ensure_panel_loaded(page)
-            
+
             # Check if the detail function exists
             fn_name = self.config.detail_function_name
             fn_exists = await page.evaluate(f"typeof {fn_name} === 'function'")

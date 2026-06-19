@@ -91,6 +91,9 @@ class ClaveUnicaAuth:
         Raises:
             ClaveUnicaAuthError: If login fails
         """
+        from app.scrapper.pjud.resilience.rate_limiter import pjud_action_limiter
+        await pjud_action_limiter("login").acquire()
+
         if not credentials.validate():
             raise ClaveUnicaAuthError("Invalid credentials: RUT and password required")
         

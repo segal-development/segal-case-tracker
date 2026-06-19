@@ -91,6 +91,10 @@ class DocumentDownloader:
             # Rate-limit between downloads.
             await limiter.wait()
 
+            # Token-bucket rate limit (composes with the inter-doc sleep above).
+            from app.scrapper.pjud.resilience.rate_limiter import pjud_action_limiter
+            await pjud_action_limiter("document").acquire()
+
             try:
                 pdf_bytes = await scraper.download_document_generic(
                     session=pjud_session,
