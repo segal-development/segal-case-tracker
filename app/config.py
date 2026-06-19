@@ -1,7 +1,7 @@
 import base64
 from functools import lru_cache
 
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, MultiFernet
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -31,6 +31,19 @@ def _build_fernet(key: str, *, strict: bool = False) -> Fernet:
         return Fernet(key_b64)
 
 
+def _build_multifernet(primary: str, fallbacks=(), *, strict: bool = False) -> MultiFernet:
+    """Build a MultiFernet that ENCRYPTS/rotates with ``primary`` and DECRYPTS with
+    the primary OR any fallback key.
+
+    During a key rotation, set ENCRYPTION_KEY_FALLBACKS to the OLD key(s) so existing
+    ciphertext keeps decrypting with zero downtime while new writes use the new
+    primary; once everything is re-encrypted to the primary, drop the fallbacks.
+    """
+    keys = [_build_fernet(primary, strict=strict)]
+    keys += [_build_fernet(k, strict=strict) for k in fallbacks if k]
+    return MultiFernet(keys)
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -46,6 +59,8 @@ class Settings(BaseSettings):
     # Security
     SECRET_KEY: str = _DEV_SECRET_KEY
     ENCRYPTION_KEY: str = _DEV_ENCRYPTION_KEY
+    # Comma-separated OLD keys, decrypt-only, set during a key rotation window.
+    ENCRYPTION_KEY_FALLBACKS: str = ""
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 24 hours
 
     # 2Captcha
@@ -181,6 +196,16 @@ class Settings(BaseSettings):
                 "32 bytes) in non-development environments. The current value is not a "
                 f"valid Fernet key: {exc}"
             ) from exc
+
+        # Rotation fallbacks (if any) must also be real Fernet keys.
+        for fb in (k.strip() for k in (self.ENCRYPTION_KEY_FALLBACKS or "").split(",") if k.strip()):
+            try:
+                _build_fernet(fb, strict=True)
+            except Exception as exc:
+                raise ValueError(
+                    "ENCRYPTION_KEY_FALLBACKS must contain only real Fernet keys "
+                    f"(comma-separated). Invalid entry: {exc}"
+                ) from exc
 
         # Reject empty CORS in non-development environments.
         if not self.cors_origins_list:
