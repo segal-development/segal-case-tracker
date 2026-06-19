@@ -71,4 +71,7 @@ jobs:
           VM_IP: ${{ secrets.QA_VM_IP }}
         run: |
           sleep 10
-          curl -fsS "http://$VM_IP:8000/health" && echo "" && echo "QA healthy"
+          curl -fsS "http://$VM_IP:8000/health" && echo "" && echo "QA live"
+          # Readiness: fails the deploy if the app can't reach the DB (/health
+          # is liveness only). Catches a broken DB / bad credentials post-deploy.
+          curl -fsS "http://$VM_IP:8000/readyz" && echo "" && echo "QA ready (DB ok)"

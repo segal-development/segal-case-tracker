@@ -1,9 +1,10 @@
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.deps import get_db
 from app.api.v1.router import api_router
 from app.config import settings
 
@@ -55,3 +56,18 @@ async def health_check():
         "status": "healthy",
         "scheduler": "running" if is_scheduler_running() else "disabled",
     }
+
+
+@app.get("/readyz")
+async def readiness_check(db=Depends(get_db)):
+    """Readiness probe: verifies the app can reach the database. Returns 503 if
+    the DB is unreachable, so a deploy (or load balancer) never treats a
+    DB-broken app as healthy — /health is liveness only and never touches the DB.
+    """
+    from sqlalchemy import text
+
+    try:
+        db.execute(text("SELECT 1"))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"db unavailable: {type(exc).__name__}")
+    return {"ready": True, "db": "ok"}
