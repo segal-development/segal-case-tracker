@@ -1,0 +1,110 @@
+"""SKETCH — per-abogado scraper driving a REAL Chrome via CDP.
+
+WHY (validated empirically, see memory per-abogado/validated-architecture):
+- The segunda-clave login reCAPTCHA is v3 (score-based). A real Chrome passes;
+  an automated Playwright browser scores low and is rejected.
+- The session is F5-Shape-bound to the browser that created it — it CANNOT be
+  moved to a separate Playwright browser (PJUD redirects to home / unauth).
+- Therefore the scraper must run IN the real Chrome where the lawyer logged in.
+
+APPROACH:
+- The lawyer logs into PJUD in a real Chrome launched with a debug port.
+- We connect via Playwright connect_over_cdp, grab the already-authenticated page,
+  and INJECT it into the existing CivilScraper (sc._page = page). get_my_cases /
+  get_case_detail then reuse all their proven logic (AJAX + parsing + pagination)
+  ON the real Chrome — no session move, Shape stays happy.
+
+HOW TO RUN (needs a live, logged-in debug Chrome):
+  1. "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+       --remote-debugging-port=9222 --user-data-dir=/tmp/segal_clean_profile \
+       https://oficinajudicialvirtual.pjud.cl/home/index.php
+  2. Lawyer logs in (Clave del Poder Judicial). Leave the tab on Mis Causas.
+  3. set -a; source .env.backfill; set +a   (TEST_ABOGADO_RUT = the lawyer's RUT)
+     PYTHONPATH=. <venv> python scripts/cdp_scraper_sketch.py
+
+STATUS: first draft — wire is in place; needs a live login to validate end to end
+(rut/DV handling, panel load, the AJAX over the injected page may need iteration).
+Production version would add a clean `attach_cdp()` on the scraper + per-lawyer
+rotation + detail/downloads + re-auth signaling.
+"""
+import asyncio
+import os
+
+CDP_URL = os.environ.get("CDP_URL", "http://localhost:9222")
+
+
+def _compute_dv(num: str) -> str:
+    """Chilean RUT check digit (mod 11), so get_my_cases gets a well-formed RUT."""
+    total, factor = 0, 2
+    for digit in reversed(num):
+        total += int(digit) * factor
+        factor = 2 if factor == 7 else factor + 1
+    rem = 11 - (total % 11)
+    return "0" if rem == 11 else "K" if rem == 10 else str(rem)
+
+
+async def attach_authenticated_page(pw):
+    """connect_over_cdp to the real Chrome and return (browser, authenticated page)."""
+    browser = await pw.chromium.connect_over_cdp(CDP_URL)
+    # Prefer the logged-in index page; fall back to any pjud.cl tab.
+    for want in ("indexN.php", "pjud.cl"):
+        for ctx in browser.contexts:
+            for page in ctx.pages:
+                if want in page.url:
+                    return browser, page
+    return browser, None
+
+
+async def main() -> int:
+    rut = os.environ.get("TEST_ABOGADO_RUT", "").strip()
+    if not rut:
+        print("ERROR: TEST_ABOGADO_RUT not set (the lawyer's RUT).")
+        return 2
+    # The scraper needs rut_num + DV; add the check digit if only the body was given.
+    if "-" not in rut:
+        rut = f"{rut}-{_compute_dv(rut)}"
+    print(f"Lawyer RUT (normalized): {rut}")
+
+    from playwright.async_api import async_playwright
+    from app.scrapper.pjud.civil import CivilScraper
+    from app.services.pjud_session import PJUDSession
+
+    async with async_playwright() as pw:
+        browser, page = await attach_authenticated_page(pw)
+        if page is None:
+            print("No authenticated PJUD tab found. Is the lawyer logged in on the "
+                  "debug Chrome (port 9222)?")
+            await browser.close()
+            return 1
+        print(f"Attached to real Chrome tab: {page.url}")
+
+        sc = CivilScraper(headless=False)
+        # INJECT the real Chrome's authenticated page — reuse all scraper logic via CDP.
+        sc._page = page
+        sc.reuse_context = True
+        # Cookies/localStorage are NOT needed: the injected page is already authed.
+        # The session only carries the RUT (used by _fetch_cases_page).
+        session = PJUDSession.create(rut=rut, cookies=[], local_storage="{}", auth_method="captcha")
+
+        try:
+            cases = await sc.get_my_cases(session, max_pages=2)
+        except Exception as e:
+            print(f"get_my_cases over CDP raised: {type(e).__name__}: {str(e)[:160]}")
+            await browser.close()
+            return 1
+
+        print(f"\n{'='*58}")
+        print(f"  get_my_cases via CDP → {len(cases)} cases (max 2 pages)")
+        for c in cases[:10]:
+            print(f"    • {c.rol:<18} {(c.caratulado or '')[:50]}")
+        print("=" * 58)
+        if cases:
+            print("  ✅ SCRAPER-OVER-CDP WORKS — reusing existing logic in the real Chrome.")
+
+        # IMPORTANT: only disconnect (do NOT sc.stop() — that would close the real Chrome).
+        await browser.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(asyncio.run(main()))
