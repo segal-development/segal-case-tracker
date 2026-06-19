@@ -55,54 +55,59 @@ async def attach_authenticated_page(pw):
     return browser, None
 
 
+def normalize_rut(rut: str) -> str:
+    """Ensure the RUT has its check digit (the scraper needs rut_num + DV)."""
+    rut = rut.strip()
+    return rut if "-" in rut else f"{rut}-{_compute_dv(rut)}"
+
+
+async def scrape_via_cdp(rut: str, max_pages: int = 2) -> list:
+    """Attach to the logged-in real Chrome over CDP and fetch the lawyer's cases
+    by INJECTING its authenticated page into CivilScraper — reuses all the proven
+    scraper logic (AJAX + parsing + pagination) inside the real Chrome. Returns the
+    list of cases; raises on attach/scrape failure. Reusable by the launcher.
+    """
+    from playwright.async_api import async_playwright
+    from app.scrapper.pjud.civil import CivilScraper
+    from app.services.pjud_session import PJUDSession
+
+    rut = normalize_rut(rut)
+    print(f"  Lawyer RUT (normalized): {rut}")
+    async with async_playwright() as pw:
+        browser, page = await attach_authenticated_page(pw)
+        if page is None:
+            await browser.close()
+            raise RuntimeError("No authenticated PJUD tab on the debug Chrome (logged in?).")
+        print(f"  Attached to real Chrome tab: {page.url}")
+        sc = CivilScraper(headless=False)
+        sc._page = page            # inject the authenticated page → reuse logic via CDP
+        sc.reuse_context = True
+        # Cookies/localStorage not needed — the injected page is already authenticated.
+        session = PJUDSession.create(rut=rut, cookies=[], local_storage="{}", auth_method="captcha")
+        try:
+            return await sc.get_my_cases(session, max_pages=max_pages)
+        finally:
+            await browser.close()  # CDP disconnect ONLY — does NOT close the real Chrome
+
+
 async def main() -> int:
     rut = os.environ.get("TEST_ABOGADO_RUT", "").strip()
     if not rut:
         print("ERROR: TEST_ABOGADO_RUT not set (the lawyer's RUT).")
         return 2
-    # The scraper needs rut_num + DV; add the check digit if only the body was given.
-    if "-" not in rut:
-        rut = f"{rut}-{_compute_dv(rut)}"
-    print(f"Lawyer RUT (normalized): {rut}")
+    try:
+        cases = await scrape_via_cdp(rut)
+    except Exception as e:
+        print(f"scrape_via_cdp failed: {type(e).__name__}: {str(e)[:160]}")
+        return 1
 
-    from playwright.async_api import async_playwright
-    from app.scrapper.pjud.civil import CivilScraper
-    from app.services.pjud_session import PJUDSession
-
-    async with async_playwright() as pw:
-        browser, page = await attach_authenticated_page(pw)
-        if page is None:
-            print("No authenticated PJUD tab found. Is the lawyer logged in on the "
-                  "debug Chrome (port 9222)?")
-            await browser.close()
-            return 1
-        print(f"Attached to real Chrome tab: {page.url}")
-
-        sc = CivilScraper(headless=False)
-        # INJECT the real Chrome's authenticated page — reuse all scraper logic via CDP.
-        sc._page = page
-        sc.reuse_context = True
-        # Cookies/localStorage are NOT needed: the injected page is already authed.
-        # The session only carries the RUT (used by _fetch_cases_page).
-        session = PJUDSession.create(rut=rut, cookies=[], local_storage="{}", auth_method="captcha")
-
-        try:
-            cases = await sc.get_my_cases(session, max_pages=2)
-        except Exception as e:
-            print(f"get_my_cases over CDP raised: {type(e).__name__}: {str(e)[:160]}")
-            await browser.close()
-            return 1
-
-        print(f"\n{'='*58}")
-        print(f"  get_my_cases via CDP → {len(cases)} cases (max 2 pages)")
-        for c in cases[:10]:
-            print(f"    • {c.rol:<18} {(c.caratulado or '')[:50]}")
-        print("=" * 58)
-        if cases:
-            print("  ✅ SCRAPER-OVER-CDP WORKS — reusing existing logic in the real Chrome.")
-
-        # IMPORTANT: only disconnect (do NOT sc.stop() — that would close the real Chrome).
-        await browser.close()
+    print(f"\n{'='*58}")
+    print(f"  get_my_cases via CDP → {len(cases)} cases")
+    for c in cases[:10]:
+        print(f"    • {c.rol:<18} {(c.caratulado or '')[:50]}")
+    print("=" * 58)
+    if cases:
+        print("  ✅ SCRAPER-OVER-CDP WORKS — reusing existing logic in the real Chrome.")
     return 0
 
 
