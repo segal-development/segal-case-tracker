@@ -134,10 +134,12 @@ Ajustar en `.env.backfill` (local) / `.env.qa` (VM). Más conservador = bajar `*
 
 ## 12. Alertas (Telegram — al ADMIN, no a los abogados)
 Canal: Telegram (`TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` en `.env.backfill`). Las alertas son **operativas** (scraper caído/colgado, smoke fail) → al admin; las alertas de causa de los abogados son in-app (Novedades/semáforo).
-- **Monitor de frescura** (`scripts/freshness_monitor.py` vía `scripts/run_monitor.sh`): alerta 🔴 si no se re-sincronizó ninguna causa en `FRESHNESS_STALE_HOURS` (default 2h) y 🟢 al recuperarse. No usa browser → corre al lado del scraper.
-- **Schedule** (cron en la Mac, cada 30 min):
+- **Monitor de frescura** (`scripts/freshness_monitor.py`): alerta 🔴 si no se re-sincronizó ninguna causa en `FRESHNESS_STALE_HOURS` (default 2h) y 🟢 al recuperarse. No usa browser, mira el `last_detail_checked_at` de la DB compartida.
+- **Schedule: corre en la VM** (siempre prendida — cierra el punto ciego de que la Mac se duerma). Cron de **root** en la VM, cada 30 min:
   ```
-  */30 * * * * /Users/marcelo/Projects/segal-case-tracker/scripts/run_monitor.sh >> /tmp/segal_monitor.log 2>&1
+  */30 * * * * docker exec casetracker-api-1 python scripts/freshness_monitor.py >> /tmp/segal_monitor.log 2>&1
   ```
+  Las creds de Telegram están en `~/casetracker/.env.qa` (env_file del container). Editar: `sudo crontab -e` en la VM.
+  - El runner local `scripts/run_monitor.sh` queda solo para chequeos manuales desde la Mac (NO está en cron — se sacó para no duplicar alertas).
 - **Smoke**: `scripts/run_smoke.sh` alerta a Telegram si el smoke falla (scraper pausado).
 - Probar el canal: `curl -s "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" --data-urlencode "text=test"`
