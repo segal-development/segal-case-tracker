@@ -1353,9 +1353,10 @@ async def detect_and_sync_movements(
             Returns:
                 ``(movements_new_delta, alerts_created_delta)``
             """
-            detail = await scraper.get_case_detail(
-                session=pjud_session,
-                case_token=api_case.case_token,
+            from app.scrapper.pjud.resilience.integration import resilient_call
+            detail = await resilient_call(
+                "detail",
+                lambda: scraper.get_case_detail(session=pjud_session, case_token=api_case.case_token),
             )
 
             scraped_movements = convert_api_movements_to_scraped([

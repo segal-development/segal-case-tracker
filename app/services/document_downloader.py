@@ -96,11 +96,15 @@ class DocumentDownloader:
             await pjud_action_limiter("document").acquire()
 
             try:
-                pdf_bytes = await scraper.download_document_generic(
-                    session=pjud_session,
-                    endpoint=doc.pjud_endpoint,
-                    doc_type=doc.doc_type or "resolution",
-                    token=doc.pjud_token,
+                from app.scrapper.pjud.resilience.integration import resilient_call
+                pdf_bytes = await resilient_call(
+                    "document_download",
+                    lambda: scraper.download_document_generic(
+                        session=pjud_session,
+                        endpoint=doc.pjud_endpoint,
+                        doc_type=doc.doc_type or "resolution",
+                        token=doc.pjud_token,
+                    ),
                 )
                 storage_service.upload(doc, pdf_bytes)
                 db.commit()

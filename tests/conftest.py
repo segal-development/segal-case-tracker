@@ -92,6 +92,26 @@ def sample_session():
     )
 
 
+@pytest.fixture(autouse=True)
+def reset_circuit_breaker_registry():
+    """Clear the global CB registries before each test to prevent state leakage.
+
+    Uses sys.modules to avoid the name shadowing caused by the resilience
+    package __init__.py re-exporting `circuit_breaker` as a function.
+    """
+    import sys
+    # Ensure modules are imported so they appear in sys.modules
+    import app.scrapper.pjud.resilience.circuit_breaker  # noqa: F401
+    import app.scrapper.pjud.resilience.integration  # noqa: F401
+    cb_mod = sys.modules["app.scrapper.pjud.resilience.circuit_breaker"]
+    integ_mod = sys.modules["app.scrapper.pjud.resilience.integration"]
+    cb_mod._circuit_breakers.clear()
+    integ_mod._circuit_breakers.clear()
+    yield
+    cb_mod._circuit_breakers.clear()
+    integ_mod._circuit_breakers.clear()
+
+
 @pytest.fixture
 def mock_scraper():
     """Lightweight scraper mock — avoids Playwright startup in unit tests."""
