@@ -281,8 +281,48 @@ def reset_circuit_sync(competency: str):
     cb._success_count = 0
 
 
+async def resilient_call(operation: str, factory):
+    """
+    CB-outer, retry-inner wrapper for PJUD network operations.
+
+    factory: zero-arg callable returning a fresh coroutine.
+    CircuitOpenError propagates — do NOT swallow it.
+    """
+    import asyncio
+    try:
+        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+        retryable = (PlaywrightTimeoutError, TimeoutError, ConnectionError, asyncio.TimeoutError)
+    except ImportError:
+        retryable = (TimeoutError, ConnectionError, asyncio.TimeoutError)
+
+    from app.config import settings
+    from app.scrapper.pjud.resilience.circuit_breaker import CircuitBreakerConfig, get_circuit_breaker
+    from app.scrapper.pjud.resilience.retry import RetryConfig, retry_async
+
+    cb = get_circuit_breaker(
+        f"pjud-{operation}",
+        CircuitBreakerConfig(
+            failure_threshold=settings.PJUD_CB_FAILURE_THRESHOLD,
+            recovery_timeout=settings.PJUD_CB_RECOVERY_TIMEOUT,
+            half_open_max_calls=3,
+        ),
+    )
+    retry_cfg = RetryConfig(
+        max_retries=settings.PJUD_RETRY_MAX_ATTEMPTS,
+        base_delay=settings.PJUD_RETRY_BASE_DELAY,
+        max_delay=settings.PJUD_RETRY_MAX_DELAY,
+        retryable_exceptions=retryable,
+    )
+
+    async def _inner():
+        return await retry_async(factory, retry_cfg)
+
+    return await cb.call(_inner)
+
+
 __all__ = [
     "resilient_scrape",
+    "resilient_call",
     "get_competency_circuit_breaker",
     "get_competency_rate_limiter",
     "record_scrape_success",
