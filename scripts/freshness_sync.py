@@ -30,6 +30,10 @@ HEADLESS = os.environ.get("BACKFILL_HEADLESS", "false").lower() == "true"
 BATCH = int(os.environ.get("FRESHNESS_BATCH", "40"))
 ROUND_SLEEP = int(os.environ.get("FRESHNESS_ROUND_SLEEP", "45"))
 FETCH_DELAY = float(os.environ.get("FRESHNESS_FETCH_DELAY", "2.5"))
+# Block/challenge back-off: after this many consecutive "bad" rounds (likely
+# PJUD pushing back), cool down instead of hammering — never rotate harder.
+COOLDOWN_THRESHOLD = int(os.environ.get("FRESHNESS_COOLDOWN_THRESHOLD", "3"))
+COOLDOWN_MINUTES = int(os.environ.get("FRESHNESS_COOLDOWN_MINUTES", "20"))
 
 
 async def main() -> None:
@@ -101,39 +105,58 @@ async def main() -> None:
         return s
 
     round_n = 0
+    consecutive_bad = 0
     while True:
         round_n += 1
+        round_bad = False
         try:
             session = await ensure_session()
             if session is None:
-                print("  could not obtain a session; retrying next round")
-                await asyncio.sleep(ROUND_SLEEP)
-                continue
+                print("  could not obtain a session; retrying")
+                round_bad = True
+            else:
+                api_cases = None
+                try:
+                    api_cases = await sc.get_my_cases(session=session, max_pages=0)
+                except Exception as e:
+                    print(f"  list fetch failed ({str(e)[:60]}); re-auth next round")
+                    try:
+                        await clave_unica_login()
+                    except Exception:
+                        pass
+                    round_bad = True
 
-            try:
-                api_cases = await sc.get_my_cases(session=session, max_pages=0)
-            except Exception as e:
-                print(f"  list fetch failed ({str(e)[:60]}); re-auth + retry next round")
-                await clave_unica_login()
-                await asyncio.sleep(ROUND_SLEEP)
-                continue
-
-            batch = _select_cases_for_detail_rotation(
-                db, lawyer_id, COMPETENCIA, api_cases, BATCH
-            )
-            created, updated, errors = await detect_and_sync_movements(
-                db=db, scraper=sc, pjud_session=session, lawyer_id=lawyer_id,
-                api_cases=api_cases, selected_cases=batch,
-                delay_between_fetches=FETCH_DELAY, reauth_callback=reauth_cb,
-            )
-            db.commit()
-            print(f"  round {round_n}: {len(batch)} cases re-synced · "
-                  f"movements+{created} updated={updated} errors={len(errors)}")
+                if api_cases is not None:
+                    batch = _select_cases_for_detail_rotation(
+                        db, lawyer_id, COMPETENCIA, api_cases, BATCH
+                    )
+                    created, updated, errors = await detect_and_sync_movements(
+                        db=db, scraper=sc, pjud_session=session, lawyer_id=lawyer_id,
+                        api_cases=api_cases, selected_cases=batch,
+                        delay_between_fetches=FETCH_DELAY, reauth_callback=reauth_cb,
+                    )
+                    db.commit()
+                    print(f"  round {round_n}: {len(batch)} cases re-synced · "
+                          f"movements+{created} updated={updated} errors={len(errors)}")
+                    # A round that touched cases but EVERY one failed (and nothing
+                    # advanced) looks like PJUD blocking/challenging, not bad data.
+                    if batch and len(errors) >= len(batch) and created == 0 and updated == 0:
+                        round_bad = True
         except Exception as e:
             db.rollback()
             print(f"  round {round_n} error: {str(e)[:120]}")
+            round_bad = True
 
-        await asyncio.sleep(ROUND_SLEEP)
+        # Back-off policy: consecutive bad rounds likely mean PJUD is pushing back
+        # (challenge/block/session trouble). Cool down — never hammer or rotate harder.
+        consecutive_bad = consecutive_bad + 1 if round_bad else 0
+        if consecutive_bad >= COOLDOWN_THRESHOLD:
+            print(f"  ⚠️ {consecutive_bad} bad rounds in a row — possible block/challenge. "
+                  f"Backing off {COOLDOWN_MINUTES} min.")
+            consecutive_bad = 0
+            await asyncio.sleep(COOLDOWN_MINUTES * 60)
+        else:
+            await asyncio.sleep(ROUND_SLEEP)
 
 
 if __name__ == "__main__":
