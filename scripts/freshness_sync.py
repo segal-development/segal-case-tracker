@@ -19,6 +19,9 @@ Run (supervised): scripts/run_freshness.sh
 """
 import asyncio
 import os
+import random
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 os.environ.setdefault("ENVIRONMENT", "production")
 
@@ -34,6 +37,24 @@ FETCH_DELAY = float(os.environ.get("FRESHNESS_FETCH_DELAY", "2.5"))
 # PJUD pushing back), cool down instead of hammering — never rotate harder.
 COOLDOWN_THRESHOLD = int(os.environ.get("FRESHNESS_COOLDOWN_THRESHOLD", "3"))
 COOLDOWN_MINUTES = int(os.environ.get("FRESHNESS_COOLDOWN_MINUTES", "20"))
+# Business-hours guard: courts (and a believable human) act in daytime. Off-hours
+# scraping is both pointless (no new movements at 3am) and suspicious — pause it.
+SCRAPE_HOURS_ENABLED = os.environ.get("SCRAPE_HOURS_ENABLED", "true").lower() == "true"
+SCRAPE_HOURS_START = int(os.environ.get("SCRAPE_HOURS_START", "8"))   # inclusive
+SCRAPE_HOURS_END = int(os.environ.get("SCRAPE_HOURS_END", "21"))      # exclusive
+SCRAPE_SKIP_SUNDAY = os.environ.get("SCRAPE_SKIP_SUNDAY", "true").lower() == "true"
+OFF_HOURS_SLEEP_MIN = int(os.environ.get("OFF_HOURS_SLEEP_MIN", "15"))
+_CHILE_TZ = ZoneInfo("America/Santiago")
+
+
+def _off_hours() -> bool:
+    """True when we should NOT scrape (night, or optionally Sunday) — Chile time."""
+    if not SCRAPE_HOURS_ENABLED:
+        return False
+    now = datetime.now(_CHILE_TZ)
+    if SCRAPE_SKIP_SUNDAY and now.weekday() == 6:  # 6 = Sunday
+        return True
+    return now.hour < SCRAPE_HOURS_START or now.hour >= SCRAPE_HOURS_END
 
 
 async def main() -> None:
@@ -107,6 +128,12 @@ async def main() -> None:
     round_n = 0
     consecutive_bad = 0
     while True:
+        if _off_hours():
+            now = datetime.now(_CHILE_TZ)
+            print(f"  off-hours ({now:%a %H:%M} Chile) — pausing {OFF_HOURS_SLEEP_MIN}min "
+                  f"(courts act in daytime; quieter + more human)")
+            await asyncio.sleep(OFF_HOURS_SLEEP_MIN * 60 * random.uniform(0.8, 1.2))
+            continue
         round_n += 1
         round_bad = False
         try:
@@ -154,9 +181,10 @@ async def main() -> None:
             print(f"  ⚠️ {consecutive_bad} bad rounds in a row — possible block/challenge. "
                   f"Backing off {COOLDOWN_MINUTES} min.")
             consecutive_bad = 0
-            await asyncio.sleep(COOLDOWN_MINUTES * 60)
+            await asyncio.sleep(COOLDOWN_MINUTES * 60 * random.uniform(0.9, 1.3))
         else:
-            await asyncio.sleep(ROUND_SLEEP)
+            # ±jitter so rounds aren't machine-regular (anti-fingerprint).
+            await asyncio.sleep(ROUND_SLEEP * random.uniform(0.7, 1.5))
 
 
 if __name__ == "__main__":
