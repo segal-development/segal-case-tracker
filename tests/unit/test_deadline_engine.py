@@ -13,6 +13,8 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from unittest.mock import MagicMock
 
+from dateutil.relativedelta import relativedelta
+
 import pytest
 from sqlalchemy import create_engine, event as sa_event
 from sqlalchemy.orm import sessionmaker
@@ -896,3 +898,90 @@ class TestFirmSide:
         case = _make_case(db)
         _set_side(db, case, "demandado")
         assert _firm_side(db, case) == "demandado"
+
+
+# ---------------------------------------------------------------------------
+# --- abandono_disponible tests ---
+# Art. 152/153 CPC — abandono del procedimiento advisory signal
+# ---------------------------------------------------------------------------
+
+
+class TestAbandonoDisponible:
+    """abandono_disponible column set by DeadlineEngine.recompute_case."""
+
+    def test_pre_sentencia_7_months_ago_is_true(self, db) -> None:
+        """Pre-sentencia (notificado) + last movement 7 months ago → abandono_disponible = True."""
+        case = _make_case(db)
+        notif_date = TODAY - relativedelta(months=7)
+        _add_movement(db, case.id, notif_date, "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)")
+        _recompute(db, case)
+        assert case.abandono_disponible is True
+
+    def test_pre_sentencia_3_months_ago_is_false(self, db) -> None:
+        """Pre-sentencia (notificado) + last movement 3 months ago → abandono_disponible = False."""
+        case = _make_case(db)
+        notif_date = TODAY - relativedelta(months=3)
+        _add_movement(db, case.id, notif_date, "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)")
+        _recompute(db, case)
+        assert case.abandono_disponible is False
+
+    def test_post_sentencia_1_year_ago_is_false(self, db) -> None:
+        """Post-sentencia (sentencia) + last movement 1 year ago → abandono_disponible = False (needs 3 years)."""
+        case = _make_case(db)
+        notif_date = TODAY - relativedelta(years=2)
+        citacion_date = TODAY - relativedelta(months=14)
+        sentencia_date = TODAY - relativedelta(years=1)
+        _add_movement(db, case.id, notif_date, "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)")
+        _add_movement(db, case.id, citacion_date, "Tramitación", "Citación a oír sentencia")
+        _add_movement(db, case.id, sentencia_date, "Tramitación", "Dicta Sentencia Definitiva")
+        _recompute(db, case)
+        assert case.procedural_state == ProceduralState.SENTENCIA.value
+        assert case.abandono_disponible is False
+
+    def test_post_sentencia_3_5_years_ago_is_true(self, db) -> None:
+        """Post-sentencia (sentencia) + last movement 3.5 years ago → abandono_disponible = True."""
+        case = _make_case(db)
+        notif_date = TODAY - relativedelta(years=5)
+        citacion_date = TODAY - relativedelta(years=4)
+        sentencia_date = TODAY - relativedelta(months=42)
+        _add_movement(db, case.id, notif_date, "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)")
+        _add_movement(db, case.id, citacion_date, "Tramitación", "Citación a oír sentencia")
+        _add_movement(db, case.id, sentencia_date, "Tramitación", "Dicta Sentencia Definitiva")
+        _recompute(db, case)
+        assert case.procedural_state == ProceduralState.SENTENCIA.value
+        assert case.abandono_disponible is True
+
+    def test_post_sentencia_rebelde_3_5_years_ago_is_true(self, db) -> None:
+        """Post-sentencia (rebelde) + last movement 3.5 years ago → abandono_disponible = True (rebelde counts as post-sentencia)."""
+        case = _make_case(db)
+        _set_side(db, case, "demandante")
+        notif_date = TODAY - relativedelta(months=42)
+        _add_movement(db, case.id, notif_date, "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)")
+        _recompute(db, case)
+        assert case.procedural_state == ProceduralState.REBELDE.value
+        assert case.abandono_disponible is True
+
+    def test_indeterminate_1_year_ago_is_false(self, db) -> None:
+        """Indeterminate state + last movement 1 year ago → abandono_disponible = False (excluded)."""
+        case = _make_case(db)
+        _add_movement(db, case.id, TODAY - relativedelta(years=1), "Tramitación", "Mero trámite desconocido")
+        _recompute(db, case)
+        assert case.procedural_state == ProceduralState.INDETERMINATE.value
+        assert case.abandono_disponible is False
+
+    def test_terminada_old_movement_is_false(self, db) -> None:
+        """Terminada + old movement → abandono_disponible = False (excluded)."""
+        case = _make_case(db)
+        notif_date = TODAY - relativedelta(years=3)
+        terminada_date = TODAY - relativedelta(years=2)
+        _add_movement(db, case.id, notif_date, "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)")
+        _add_movement(db, case.id, terminada_date, "Terminada", "")
+        _recompute(db, case)
+        assert case.procedural_state == ProceduralState.TERMINADA.value
+        assert case.abandono_disponible is False
+
+    def test_no_movements_is_false(self, db) -> None:
+        """Case with no movements → abandono_disponible = False."""
+        case = _make_case(db)
+        _recompute(db, case)
+        assert case.abandono_disponible is False

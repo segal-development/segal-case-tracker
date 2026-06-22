@@ -1,7 +1,7 @@
 """Case model - Civil court cases."""
 
 from datetime import datetime
-from sqlalchemy import Column, Date, Integer, String, DateTime, ForeignKey, Text
+from sqlalchemy import Boolean, Column, Date, Integer, String, DateTime, ForeignKey, Text, text
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
@@ -37,6 +37,7 @@ class Case(Base):
     procedural_state = Column(String(30), nullable=True)
     semaforo = Column(String(10), nullable=True)
     next_deadline_at = Column(Date, nullable=True)
+    abandono_disponible = Column(Boolean, nullable=False, server_default=text("false"), default=False)
 
     # Timestamps
     filed_at = Column(DateTime, nullable=True)  # Fecha de ingreso

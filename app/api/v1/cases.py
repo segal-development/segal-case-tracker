@@ -56,6 +56,7 @@ class CaseResponse(BaseModel):
     procedural_state: Optional[str] = None
     semaforo: Optional[str] = None
     next_deadline_at: Optional[date] = None
+    abandono_disponible: bool = False
 
     class Config:
         from_attributes = True
@@ -287,6 +288,7 @@ async def list_cases(
             procedural_state=case.procedural_state,
             semaforo=case.semaforo,
             next_deadline_at=case.next_deadline_at,
+            abandono_disponible=case.abandono_disponible or False,
         ))
     
     return CaseListResponse(
@@ -365,6 +367,7 @@ async def get_case(
         procedural_state=case.procedural_state,
         semaforo=case.semaforo,
         next_deadline_at=case.next_deadline_at,
+        abandono_disponible=case.abandono_disponible or False,
     )
 
     movements_response = [
