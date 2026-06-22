@@ -47,7 +47,7 @@ def court(db):
 
 
 def _make_case(db, lawyer, court, rol, semaforo=None, last_movement_at=None,
-               matter=None, procedure=None):
+               matter=None, procedure=None, procedural_state=None):
     """Create and return a civil Case owned by lawyer."""
     obj = Case(
         lawyer_id=lawyer.id,
@@ -59,6 +59,7 @@ def _make_case(db, lawyer, court, rol, semaforo=None, last_movement_at=None,
         last_movement_at=last_movement_at,
         matter=matter,
         procedure=procedure,
+        procedural_state=procedural_state,
         plaintiff="BANCO DEMANDANTE",
         defendant="DEUDOR DDO",
         created_at=datetime.utcnow(),
@@ -175,6 +176,35 @@ class TestFirmDashboardStats:
         assert result["totals"]["cases"] == 0
         assert result["by_lawyer"] == []
 
+    def test_by_procedural_state_counts_and_order(self, db, lawyer, court):
+        c1 = _make_case(db, lawyer, court, "C-7001-2025", procedural_state="notificado")
+        c2 = _make_case(db, lawyer, court, "C-7002-2025", procedural_state="notificado")
+        c3 = _make_case(db, lawyer, court, "C-7003-2025", procedural_state="excepciones")
+        c4 = _make_case(db, lawyer, court, "C-7004-2025", procedural_state="sentencia")
+        c5 = _make_case(db, lawyer, court, "C-7005-2025", procedural_state=None)
+        for c in (c1, c2, c3, c4, c5):
+            _seed_litigantes(db, c)
+        result = firm_dashboard_stats(db, ACCOUNT_RUT)
+        stages = result["totals"]["by_procedural_state"]
+        assert isinstance(stages, list)
+        stage_map = {s["stage"]: s["count"] for s in stages}
+        assert stage_map["notificado"] == 2
+        assert stage_map["excepciones"] == 1
+        assert stage_map["sentencia"] == 1
+        assert stage_map["sin_clasificar"] == 1
+        stage_names = [s["stage"] for s in stages]
+        assert stage_names.index("notificado") < stage_names.index("excepciones")
+        assert stage_names.index("excepciones") < stage_names.index("sentencia")
+        assert stage_names.index("sentencia") < stage_names.index("sin_clasificar")
+
+    def test_by_procedural_state_omits_empty_stages(self, db, lawyer, court):
+        c = _make_case(db, lawyer, court, "C-7006-2025", procedural_state="mandamiento")
+        _seed_litigantes(db, c)
+        result = firm_dashboard_stats(db, ACCOUNT_RUT)
+        stages = result["totals"]["by_procedural_state"]
+        assert len(stages) == 1
+        assert stages[0] == {"stage": "mandamiento", "count": 1}
+
     def test_by_lawyer_sorted_by_case_count_desc(self, db, lawyer, court):
         """Lawyer on 2 cases ranks above lawyer on 1 case."""
         c1 = _make_case(db, lawyer, court, "C-5401-2025")
@@ -239,6 +269,18 @@ class TestFirmStatsEndpoint:
     def test_endpoint_returns_401_without_auth(self, client):
         response = client.get("/api/v1/stats/firm")
         assert response.status_code == 401
+
+    def test_firm_endpoint_by_procedural_state_in_response(self, authed_client, db, lawyer, court):
+        c = _make_case(db, lawyer, court, "C-7101-2025", procedural_state="notificado")
+        _seed_litigantes(db, c)
+        response = authed_client.get("/api/v1/stats/firm")
+        assert response.status_code == 200
+        data = response.json()
+        stages = data["totals"]["by_procedural_state"]
+        assert isinstance(stages, list)
+        assert len(stages) >= 1
+        assert "stage" in stages[0]
+        assert "count" in stages[0]
 
 
 # ---------------------------------------------------------------------------

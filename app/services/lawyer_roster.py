@@ -96,6 +96,7 @@ def firm_dashboard_stats(db: Session, account_rut: str) -> dict:
             "semaforo": {"rojo": 0, "amarillo": 0, "verde": 0, "otros": 0},
             "stale": 0,
             "by_materia": [],
+            "by_procedural_state": [],
         },
         "by_lawyer": [],
     }
@@ -131,7 +132,7 @@ def firm_dashboard_stats(db: Session, account_rut: str) -> dict:
 
     # Load civil cases in one query
     cases = (
-        db.query(Case.id, Case.semaforo, Case.last_movement_at, Case.procedure)
+        db.query(Case.id, Case.semaforo, Case.last_movement_at, Case.procedure, Case.procedural_state)
         .filter(Case.lawyer_id == lawyer.id, Case.competencia == "civil")
         .all()
     )
@@ -164,6 +165,25 @@ def firm_dashboard_stats(db: Session, account_rut: str) -> dict:
         key=lambda x: x["count"],
         reverse=True,
     )[:12]
+
+    PROCEDURAL_ORDER = [
+        "mandamiento", "notificado", "excepciones", "traslado_ejecutante",
+        "admisibilidad", "auto_prueba", "citacion_sentencia", "sentencia",
+        "rebelde", "terminada", "indeterminate", "sin_clasificar",
+    ]
+    stage_counts: dict[str, int] = defaultdict(int)
+    for c in cases:
+        stage = c.procedural_state if c.procedural_state is not None else "sin_clasificar"
+        stage_counts[stage] += 1
+
+    known = set(PROCEDURAL_ORDER)
+    unknown_stages = sorted(s for s in stage_counts if s not in known)
+    ordered_stages = (
+        [s for s in PROCEDURAL_ORDER[:-1] if s in stage_counts]
+        + unknown_stages
+        + (["sin_clasificar"] if "sin_clasificar" in stage_counts else [])
+    )
+    by_procedural_state = [{"stage": s, "count": stage_counts[s]} for s in ordered_stages]
 
     # Aggregate per-lawyer stats restricted to civil cases
     by_lawyer = []
@@ -198,6 +218,7 @@ def firm_dashboard_stats(db: Session, account_rut: str) -> dict:
             "semaforo": sem_totals,
             "stale": stale_total,
             "by_materia": by_materia,
+            "by_procedural_state": by_procedural_state,
         },
         "by_lawyer": by_lawyer,
     }
