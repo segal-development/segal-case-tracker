@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api.v1 import auth, cases, deadlines, movements, courts, scrapper, webhooks, pjud, sync, documents, lawyers, stats
+from app.api.v1 import auth, cases, deadlines, movements, courts, scrapper, webhooks, pjud, sync, documents, lawyers, stats, goals
 
 api_router = APIRouter()
 
@@ -15,3 +15,4 @@ api_router.include_router(pjud.router, prefix="/pjud", tags=["pjud"])
 api_router.include_router(sync.router, prefix="/sync", tags=["sync"])
 api_router.include_router(lawyers.router, prefix="/lawyers", tags=["lawyers"])
 api_router.include_router(stats.router, prefix="/stats", tags=["stats"])
+api_router.include_router(goals.router, prefix="/goals", tags=["goals"])

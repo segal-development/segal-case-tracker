@@ -14,6 +14,7 @@ from app.models.case_notificacion import CaseNotificacion
 from app.models.case_escrito import CaseEscrito
 from app.models.case_exhorto import CaseExhorto
 from app.models.case_deadline import CaseDeadline
+from app.models.goal import Goal
 
 __all__ = [
     "Lawyer",
@@ -30,4 +31,5 @@ __all__ = [
     "CaseEscrito",
     "CaseExhorto",
     "CaseDeadline",
+    "Goal",
 ]
