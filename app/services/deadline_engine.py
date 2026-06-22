@@ -26,6 +26,8 @@ from datetime import date, datetime, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
+from dateutil.relativedelta import relativedelta
+
 from sqlalchemy.orm import Session
 
 import re as _re
@@ -65,13 +67,49 @@ def _today_chile() -> date:
 _SEMAFORO_ROJO_MAX = 1    # ≤ 1 → ROJO (0 or negative also ROJO)
 _SEMAFORO_AMARILLO_MAX = 5  # 2–5 → AMARILLO; >5 → VERDE
 
-# Abandono / prescripción risk flags — DEFERRED TO PR2 / Slice B.
-# These will be computed and persisted as dedicated Case columns once the
-# GET /deadlines endpoint (PR2) is in place.  Do NOT add dead computation
-# here until the storage layer is ready.
-# Legal references for future implementation:
-#   Abandono:     art. 152 CPC (6 months general), art. 153 inc. 2 (3y post-apremio)
-#   Prescripción: art. 2515 CC (3y acción ejecutiva); pagaré: art. 98 Ley 18.092 (1y)
+# ---------------------------------------------------------------------------
+# Abandono del procedimiento (art. 152/153 CPC) — state classification sets
+# ---------------------------------------------------------------------------
+
+_PRE_SENTENCIA_STATES: frozenset[ProceduralState] = frozenset({
+    ProceduralState.MANDAMIENTO,
+    ProceduralState.NOTIFICADO,
+    ProceduralState.EXCEPCIONES,
+    ProceduralState.TRASLADO_EJECUTANTE,
+    ProceduralState.ADMISIBILIDAD,
+    ProceduralState.AUTO_PRUEBA,
+    ProceduralState.CITACION_SENTENCIA,
+})
+
+_POST_SENTENCIA_STATES: frozenset[ProceduralState] = frozenset({
+    ProceduralState.SENTENCIA,
+    ProceduralState.REBELDE,
+})
+
+
+def _compute_abandono(
+    proc_state: "ProceduralState | None",
+    latest_movement_date: "date | None",
+    today: date,
+) -> bool:
+    """Art. 152/153 CPC abandono del procedimiento advisory signal.
+
+    Pre-sentencia states: 6-month inactivity threshold (art. 152 CPC).
+    Post-sentencia states: 3-year inactivity threshold (art. 153 inc. 2 CPC).
+    TERMINADA, INDETERMINATE, and unrecognised states: always False (excluded).
+    """
+    if proc_state is None:
+        return False
+    if latest_movement_date is None:
+        return False
+    if proc_state in _PRE_SENTENCIA_STATES:
+        threshold = latest_movement_date + relativedelta(months=6)
+        return today >= threshold
+    if proc_state in _POST_SENTENCIA_STATES:
+        threshold = latest_movement_date + relativedelta(years=3)
+        return today >= threshold
+    # TERMINADA, INDETERMINATE, or any unrecognised state
+    return False
 
 
 def _firm_side(db: Session, case: "Case") -> str:
@@ -315,12 +353,13 @@ class DeadlineEngine:
             mandatory_values=mandatory_values,
         )
 
-        # Step 7b: abandono and prescripción risk flags — DEFERRED to PR2 / Slice B.
-        # No computation here.  See module-level comment for legal references.
+        # Step 7b: abandono del procedimiento advisory signal (art. 152/153 CPC).
+        abandono = _compute_abandono(proc_state, latest_mv_date, today)
 
         # Step 8: write denormalized Case columns.
         case.procedural_state = proc_state.value
         case.semaforo = semaforo
+        case.abandono_disponible = abandono
 
         # next_deadline_at = the firm's next action date. Mirror the semáforo
         # selection: nearest active ACTIONABLE deadline (per-case side), skipping
@@ -445,4 +484,5 @@ class DeadlineEngine:
         case.procedural_state = ProceduralState.INDETERMINATE.value
         case.semaforo = "gris"
         case.next_deadline_at = None
+        case.abandono_disponible = False
         db.flush()
