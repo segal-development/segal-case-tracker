@@ -29,6 +29,19 @@ trap 'rm -f "$LOCKDIR/pid"; rmdir "$LOCKDIR" 2>/dev/null' EXIT
 set -a; source .env.backfill; set +a
 export PYTHONPATH="$(pwd)"
 
+# --- Cloud SQL Auth Proxy: reach the DB via IAM, not the IP allowlist ---
+# The Mac's residential IP rotates and breaks Cloud SQL authorized-networks.
+# The proxy authenticates with ADC and tunnels to the instance, so IP changes
+# no longer matter. It encrypts the tunnel itself → the local hop uses
+# sslmode=disable. Start it if it isn't already up, then route DATABASE_URL at it.
+if ! pgrep -f 'cloud-sql-proxy.*casetracker-segal-qa-db' >/dev/null 2>&1; then
+  echo "starting Cloud SQL Auth Proxy on 127.0.0.1:5433..."
+  nohup cloud-sql-proxy grupo-segal:us-central1:casetracker-segal-qa-db --port 5433 \
+    > "${TMPDIR:-/tmp}/csqlproxy.log" 2>&1 &
+  sleep 5
+fi
+export DATABASE_URL="$(python3 -c "import os,re;u=os.environ['DATABASE_URL'];u=re.sub(r'@[^/?]+','@127.0.0.1:5433',u,1);u=re.sub(r'[?&]sslmode=[^&]*','',u);print(u+('&' if '?' in u else '?')+'sslmode=disable')")"
+
 VENV=$(ls -d "$HOME"/Library/Caches/pypoetry/virtualenvs/segal-case-tracker-*-py3.11/bin/python 2>/dev/null | head -1)
 if [ -z "$VENV" ]; then
   echo "ERROR: project venv not found under ~/Library/Caches/pypoetry/virtualenvs/"
