@@ -377,6 +377,7 @@ class DeadlineEngine:
             .all()
         )
         case.next_deadline_at = None
+        case.next_deadline_fatal = False
         for row in active_actionable:
             if (
                 row.deadline_type in OPTIONAL_ACTIONABLE_VALUES
@@ -384,6 +385,10 @@ class DeadlineEngine:
             ):
                 continue  # closed optional window — not a pending firm action
             case.next_deadline_at = row.due_date
+            try:
+                case.next_deadline_fatal = DeadlineType(row.deadline_type).is_fatal
+            except ValueError:
+                case.next_deadline_fatal = False
             break
 
         db.flush()
@@ -485,4 +490,5 @@ class DeadlineEngine:
         case.semaforo = "gris"
         case.next_deadline_at = None
         case.abandono_disponible = False
+        case.next_deadline_fatal = False
         db.flush()

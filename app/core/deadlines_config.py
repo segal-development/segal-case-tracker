@@ -69,21 +69,23 @@ class DeadlineType(str, Enum):
         value: str,
         dias_habiles: int = 0,
         legal_basis: str = "",
+        is_fatal: bool = False,
     ) -> "DeadlineType":
         obj = str.__new__(cls, value)
         obj._value_ = value
         obj.dias_habiles = dias_habiles  # type: ignore[attr-defined]
         obj.legal_basis = legal_basis  # type: ignore[attr-defined]
+        obj.is_fatal = is_fatal  # type: ignore[attr-defined]
         return obj
 
-    EXCEPCIONES_8D = ("excepciones_8d", 8, "art. 459 CPC")
+    EXCEPCIONES_8D = ("excepciones_8d", 8, "art. 459 CPC", True)
     TRASLADO_EJECUTANTE_4D = ("traslado_ejecutante_4d", 4, "art. 466 CPC")
     TERMINO_PROBATORIO_10D = ("termino_probatorio_10d", 10, "art. 468 CPC")
     # Stub — secondary deadline deferred to Slice B
     LISTA_TESTIGOS_2D = ("lista_testigos_2d", 2, "art. 468 CPC")
     OBSERVACIONES_PRUEBA_6D = ("observaciones_prueba_6d", 6, "art. 469 CPC")
     SENTENCIA_10D = ("sentencia_10d", 10, "art. 162/470 CPC")
-    APELACION_5D = ("apelacion_5d", 5, "art. 187/475 CPC")
+    APELACION_5D = ("apelacion_5d", 5, "art. 187/475 CPC", True)
 
 
 # ---------------------------------------------------------------------------

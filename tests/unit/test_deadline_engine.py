@@ -985,3 +985,69 @@ class TestAbandonoDisponible:
         case = _make_case(db)
         _recompute(db, case)
         assert case.abandono_disponible is False
+
+
+# ---------------------------------------------------------------------------
+# --- next_deadline_fatal tests ---
+# Art. 459 CPC / art. 187/475 CPC — fatal (irreversible) deadline flag
+# ---------------------------------------------------------------------------
+
+
+class TestNextDeadlineFatal:
+    """next_deadline_fatal column set by DeadlineEngine.recompute_case.
+
+    True only when the nearest actionable deadline is of a fatal type
+    (EXCEPCIONES_8D or APELACION_5D). False in all other cases.
+    """
+
+    def test_fatal_type_excepciones_8d_is_true(self, db) -> None:
+        """Demandado case with upcoming EXCEPCIONES_8D → next_deadline_fatal = True."""
+        case = _make_case(db)
+        _set_side(db, case, "demandado")
+        # Notify yesterday → EXCEPCIONES_8D window is still open (~8 biz days remaining)
+        notif_date = TODAY - timedelta(days=1)
+        _add_movement(db, case.id, notif_date, "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)")
+        _recompute(db, case)
+        assert case.procedural_state == ProceduralState.NOTIFICADO.value
+        assert case.next_deadline_at is not None
+        assert case.next_deadline_fatal is True
+
+    def test_non_fatal_type_traslado_is_false(self, db) -> None:
+        """Demandante case with upcoming TRASLADO_EJECUTANTE_4D → next_deadline_fatal = False."""
+        case = _make_case(db)
+        _set_side(db, case, "demandante")
+        _add_movement(db, case.id, TODAY - timedelta(days=10), "Gestión",
+                      "NOTIFICACIÓN DE DEMANDA (Exitosa)")
+        _add_movement(db, case.id, TODAY, "Contestación Excepciones",
+                      "Confiere traslado al ejecutante")
+        _recompute(db, case)
+        assert case.procedural_state == ProceduralState.TRASLADO_EJECUTANTE.value
+        assert case.next_deadline_at is not None
+        assert case.next_deadline_fatal is False
+
+    def test_gris_indeterminate_is_false(self, db) -> None:
+        """Non-civil competencia → gris → next_deadline_fatal = False."""
+        case = _make_case(db, competencia="laboral")
+        _add_movement(db, case.id, TODAY, "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)")
+        _recompute(db, case)
+        assert case.semaforo == "gris"
+        assert case.next_deadline_fatal is False
+
+    def test_no_deadline_is_false(self, db) -> None:
+        """Case with no movements → INDETERMINATE → next_deadline_fatal = False."""
+        case = _make_case(db)
+        _recompute(db, case)
+        assert case.next_deadline_at is None
+        assert case.next_deadline_fatal is False
+
+    def test_config_excepciones_8d_is_fatal(self) -> None:
+        """DeadlineType.EXCEPCIONES_8D.is_fatal must be True (art. 459 CPC)."""
+        assert DeadlineType.EXCEPCIONES_8D.is_fatal is True
+
+    def test_config_apelacion_5d_is_fatal(self) -> None:
+        """DeadlineType.APELACION_5D.is_fatal must be True (art. 187/475 CPC)."""
+        assert DeadlineType.APELACION_5D.is_fatal is True
+
+    def test_config_traslado_ejecutante_is_not_fatal(self) -> None:
+        """DeadlineType.TRASLADO_EJECUTANTE_4D.is_fatal must be False."""
+        assert DeadlineType.TRASLADO_EJECUTANTE_4D.is_fatal is False
