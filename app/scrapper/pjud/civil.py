@@ -974,19 +974,22 @@ class CivilScraper(PJUDBaseScraper):
 
         page = await self._get_page(session)
 
-        # The fetch below must run from a page that is ALREADY on the PJUD
-        # origin — a freshly restored page sits at about:blank, so a credentialed
-        # fetch to pjud.cl is cross-origin and fails with "Failed to fetch".
-        # Navigate to indexN.php first so the fetch is same-origin (this mirrors
-        # the live-validated path).
-        try:
-            await page.goto(
-                f"{PJUD_BASE_URL}/indexN.php",
-                wait_until="domcontentloaded",
-                timeout=20000,
-            )
-        except Exception as exc:  # noqa: BLE001 — navigation hiccup must not block the fetch
-            logger.warning("download_document_generic: pre-fetch navigation failed: %s", exc)
+        # The fetch below must run from a page already on the PJUD origin — a
+        # freshly restored page sits at about:blank, so a credentialed fetch to
+        # pjud.cl is cross-origin and fails with "Failed to fetch".
+        # ONLY navigate when NOT already on the PJUD origin: under CDP (per-abogado)
+        # the page is already on indexN.php, and a redundant goto navigates the
+        # shared page mid-flow, destroying the execution context of concurrent
+        # detail/download ops ("Target page ... has been closed").
+        if "pjud.cl" not in (page.url or ""):
+            try:
+                await page.goto(
+                    f"{PJUD_BASE_URL}/indexN.php",
+                    wait_until="domcontentloaded",
+                    timeout=20000,
+                )
+            except Exception as exc:  # noqa: BLE001 — navigation hiccup must not block the fetch
+                logger.warning("download_document_generic: pre-fetch navigation failed: %s", exc)
 
         # Use the browser's authenticated cookies via credentials:'include'.
         # Returns a plain object so we can detect expiry before reading bytes.

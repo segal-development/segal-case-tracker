@@ -270,23 +270,65 @@ class PJUDBaseScraper(ABC):
         logger.info(f"Browser started for {self.config.display_name} scraper")
     
     async def stop(self) -> None:
-        """Stop browser and cleanup."""
-        if self._page:
+        """Stop browser and cleanup.
+
+        When CDP-attached (per-abogado), only DISCONNECT — do NOT close the real
+        Chrome's page/context, which belong to the external, human-driven browser.
+        """
+        cdp = getattr(self, "_cdp_attached", False)
+        if self._page and not cdp:
             await self._page.close()
-        if self._context:
+        if self._context and not cdp:
             await self._context.close()
         if self._browser:
-            await self._browser.close()
+            await self._browser.close()  # CDP connection: disconnects only
         if self._playwright:
             await self._playwright.stop()
-        
+
         self._page = None
         self._context = None
         self._browser = None
         self._playwright = None
         self._panel_loaded = False
+        self._cdp_attached = False
         logger.info(f"Browser stopped for {self.config.display_name} scraper")
-    
+
+    async def attach_cdp(self, cdp_url: str, session: "PJUDSession") -> Page:
+        """Attach to a running, already-logged-in real Chrome over CDP and wire its
+        authenticated page as this scraper's page.
+
+        For per-abogado scraping: the PJUD session is F5-Shape-bound to the real
+        browser and cannot be moved to a Playwright-launched one, so we drive the
+        real Chrome directly. All scraper methods (get_my_cases, get_case_detail,
+        download_document_generic) then work over CDP unchanged. Call stop() when
+        done — it disconnects WITHOUT closing the real Chrome's tab.
+        """
+        if self._browser or self._playwright:
+            await self.stop()
+        self._playwright = await async_playwright().start()
+        self._browser = await self._playwright.chromium.connect_over_cdp(cdp_url)
+
+        page = None
+        for ctx in self._browser.contexts:
+            for p in ctx.pages:
+                if "pjud.cl" in p.url:
+                    page = p
+                    if "indexN.php" in p.url:
+                        break
+            if page is not None and "indexN.php" in page.url:
+                break
+        if page is None:
+            await self.stop()
+            raise ScrapingError("attach_cdp: no authenticated PJUD tab on the CDP target.")
+
+        self._context = page.context
+        self._page = page
+        self.reuse_context = True
+        self._cdp_attached = True
+        self._page_session_key = id(session)
+        logger.info("attach_cdp: wired real-Chrome page %s", page.url)
+        return page
+
     async def close(self) -> None:
         """Alias for stop() for backward compatibility."""
         await self.stop()
