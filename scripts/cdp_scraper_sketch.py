@@ -91,48 +91,36 @@ async def scrape_via_cdp(rut: str, max_pages: int = 2, with_detail: bool = True,
     with_detail / with_download it also validates get_case_detail and a document
     download over CDP. Returns the case list.
     """
-    from playwright.async_api import async_playwright
     from app.scrapper.pjud.civil import CivilScraper
     from app.services.pjud_session import PJUDSession
 
     rut = normalize_rut(rut)
     print(f"  Lawyer RUT (normalized): {rut}")
-    async with async_playwright() as pw:
-        browser, page = await attach_authenticated_page(pw)
-        if page is None:
-            await browser.close()
-            raise RuntimeError("No authenticated PJUD tab on the debug Chrome (logged in?).")
-        print(f"  Attached to real Chrome tab: {page.url}")
-        sc = CivilScraper(headless=False)
-        session = PJUDSession.create(rut=rut, cookies=[], local_storage="{}", auth_method="captcha")
-        # FULL injection so BOTH inline-_page methods (get_my_cases / get_case_detail)
-        # AND _get_page-based ones (download_document_generic) reuse the real Chrome
-        # instead of launching their own Chromium with an empty session.
-        sc._browser = browser
-        sc._context = page.context
-        sc._page = page
-        sc.reuse_context = True
-        sc._page_session_key = id(session)
-        try:
-            cases = await sc.get_my_cases(session, max_pages=max_pages)
-            if with_detail:
-                target = next((c for c in cases if getattr(c, "case_token", None)), None)
-                if target is None:
-                    print("  (no case with a token to fetch detail)")
-                else:
-                    try:
-                        detail = await sc.get_case_detail(session=session, case_token=target.case_token)
-                        print(f"  detail[{target.rol}]: {len(detail.movements)} movimientos · "
-                              f"{len(detail.litigantes)} litigantes · "
-                              f"{len(getattr(detail, 'escritos', []))} escritos · "
-                              f"{len(getattr(detail, 'exhortos', []))} exhortos  ✓")
-                        if with_download:
-                            await _try_download(sc, session, detail)
-                    except Exception as e:
-                        print(f"  get_case_detail over CDP raised: {type(e).__name__}: {str(e)[:140]}")
-            return cases
-        finally:
-            await browser.close()  # CDP disconnect ONLY — does NOT close the real Chrome
+    sc = CivilScraper(headless=False)
+    session = PJUDSession.create(rut=rut, cookies=[], local_storage="{}", auth_method="captcha")
+    # Clean attach: wires the real Chrome's authenticated page into the scraper.
+    await sc.attach_cdp(CDP_URL, session)
+    print(f"  Attached to real Chrome tab: {sc._page.url}")
+    try:
+        cases = await sc.get_my_cases(session, max_pages=max_pages)
+        if with_detail:
+            target = next((c for c in cases if getattr(c, "case_token", None)), None)
+            if target is None:
+                print("  (no case with a token to fetch detail)")
+            else:
+                try:
+                    detail = await sc.get_case_detail(session=session, case_token=target.case_token)
+                    print(f"  detail[{target.rol}]: {len(detail.movements)} movimientos · "
+                          f"{len(detail.litigantes)} litigantes · "
+                          f"{len(getattr(detail, 'escritos', []))} escritos · "
+                          f"{len(getattr(detail, 'exhortos', []))} exhortos  ✓")
+                    if with_download:
+                        await _try_download(sc, session, detail)
+                except Exception as e:
+                    print(f"  get_case_detail over CDP raised: {type(e).__name__}: {str(e)[:140]}")
+        return cases
+    finally:
+        await sc.stop()  # CDP-aware: disconnects, leaves the real Chrome open
 
 
 async def main() -> int:
