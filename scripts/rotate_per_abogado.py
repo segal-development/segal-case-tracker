@@ -26,6 +26,7 @@ from scripts.per_abogado_launcher import (
     _logged_in,
 )
 from scripts.cdp_scraper_sketch import normalize_rut, persist_via_cdp
+from scripts.freshness_monitor import send_telegram  # re-auth/failure alerts
 
 
 def _parse_lawyers() -> list:
@@ -96,6 +97,17 @@ async def main() -> int:
     for label, status in results:
         print(f"    • {label}: {status}")
     print("=" * 62)
+
+    # Re-auth / failure signal: tell the operator which lawyers need to re-login
+    # and be retried (session expired, login timeout, or scrape error).
+    failed = [(lbl, st) for lbl, st in results if st != "ok"]
+    if failed:
+        body = "\n".join(f"• {lbl}: {st}" for lbl, st in failed)
+        send_telegram(
+            f"⚠️ Rotación per-abogado: {len(failed)}/{len(results)} requieren atención "
+            f"(reconectar + reintentar):\n{body}"
+        )
+        print(f"  ⚠️ {len(failed)} abogado(s) requieren re-login/reintento — alerta Telegram enviada.")
     return 0
 
 

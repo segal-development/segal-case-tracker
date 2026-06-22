@@ -295,7 +295,9 @@ async def main() -> int:
     if os.environ.get("PERSIST", "").strip() == "1":
         dry_run = os.environ.get("DRY_RUN", "1").strip() != "0"
         try:
-            await persist_via_cdp(rut=rut, dry_run=dry_run)
+            await persist_via_cdp(
+                rut=rut, name=os.environ.get("TEST_ABOGADO_NAME", ""), dry_run=dry_run
+            )
         except Exception as e:
             print(f"persist_via_cdp failed: {type(e).__name__}: {str(e)[:160]}")
             return 1
