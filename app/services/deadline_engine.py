@@ -168,6 +168,9 @@ class DeadlineEngine:
             db:   Active SQLAlchemy session (shared with the sync transaction).
             case: Case ORM instance to update (modified in-place + flushed).
         """
+        # Apremio detection runs unconditionally so it is set on every code path
+        # (success, GRIS safe-fail, and non-civil guard) without touching _write_gris.
+        case.en_apremio = cls._compute_en_apremio(db, case)
         try:
             cls._recompute_safe(db, case)
         except Exception as exc:
@@ -482,6 +485,37 @@ class DeadlineEngine:
         if hasattr(mv_dt, "date"):
             return mv_dt.date()
         return mv_dt
+
+    @classmethod
+    def _compute_en_apremio(cls, db: Session, case: "Case") -> bool:
+        """Detect whether any movement signals the cuaderno de apremio phase.
+
+        Returns True when ANY movement has:
+          - stage containing 'apremio' or 'remate' (case-insensitive), OR
+          - description containing 'embargo', 'remate', or 'martillero' (case-insensitive)
+
+        Never raises — returns False on any error.
+        """
+        try:
+            # Reuse loaded relationship if already in instance dict; otherwise query.
+            if "movements" in case.__dict__:
+                movements = case.__dict__["movements"]
+            else:
+                movements = (
+                    db.query(Movement)
+                    .filter(Movement.case_id == case.id)
+                    .all()
+                )
+            for mv in movements:
+                stage = (mv.stage or "").lower()
+                desc = (mv.description or "").lower()
+                if "apremio" in stage or "remate" in stage:
+                    return True
+                if "embargo" in desc or "remate" in desc or "martillero" in desc:
+                    return True
+            return False
+        except Exception:
+            return False
 
     @staticmethod
     def _write_gris(case: Case, db: Session) -> None:

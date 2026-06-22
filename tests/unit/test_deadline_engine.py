@@ -1051,3 +1051,51 @@ class TestNextDeadlineFatal:
     def test_config_traslado_ejecutante_is_not_fatal(self) -> None:
         """DeadlineType.TRASLADO_EJECUTANTE_4D.is_fatal must be False."""
         assert DeadlineType.TRASLADO_EJECUTANTE_4D.is_fatal is False
+
+
+# ---------------------------------------------------------------------------
+# --- en_apremio tests ---
+# Cuaderno de apremio phase detection via movement stage/description keywords
+# ---------------------------------------------------------------------------
+
+
+class TestEnApremio:
+    """en_apremio column set by DeadlineEngine.recompute_case.
+
+    True when ANY movement signals the case has entered the enforcement phase
+    (cuaderno de apremio): embargo, remate, or martillero keywords.
+    """
+
+    def test_stage_apremio_returns_true(self, db) -> None:
+        """Movement with stage='Apremio' (mixed case) → en_apremio = True."""
+        case = _make_case(db)
+        _add_movement(db, case.id, TODAY - timedelta(days=1), stage="Apremio", description="Cuaderno de apremio")
+        _recompute(db, case)
+        assert case.en_apremio is True
+
+    def test_description_embargo_returns_true(self, db) -> None:
+        """Movement with description containing 'se decreta embargo' → en_apremio = True."""
+        case = _make_case(db)
+        _add_movement(db, case.id, TODAY - timedelta(days=5), stage="Tramitación", description="se decreta embargo sobre bienes")
+        _recompute(db, case)
+        assert case.en_apremio is True
+
+    def test_description_remate_returns_true(self, db) -> None:
+        """Movement with description 'remate fijado' → en_apremio = True."""
+        case = _make_case(db)
+        _add_movement(db, case.id, TODAY - timedelta(days=2), stage="Tramitación", description="remate fijado para el día 10")
+        _recompute(db, case)
+        assert case.en_apremio is True
+
+    def test_ordinary_movements_returns_false(self, db) -> None:
+        """Movement with stage='Notificación' and description 'notificación demanda' → en_apremio = False."""
+        case = _make_case(db)
+        _add_movement(db, case.id, TODAY - timedelta(days=10), stage="Notificación", description="notificación demanda")
+        _recompute(db, case)
+        assert case.en_apremio is False
+
+    def test_no_movements_returns_false(self, db) -> None:
+        """Case with no movements → en_apremio = False."""
+        case = _make_case(db)
+        _recompute(db, case)
+        assert case.en_apremio is False
