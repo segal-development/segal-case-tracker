@@ -38,6 +38,7 @@ class Case(Base):
     semaforo = Column(String(10), nullable=True)
     next_deadline_at = Column(Date, nullable=True)
     abandono_disponible = Column(Boolean, nullable=False, server_default=text("false"), default=False)
+    next_deadline_fatal = Column(Boolean, nullable=False, server_default=text("false"), default=False)
 
     # Timestamps
     filed_at = Column(DateTime, nullable=True)  # Fecha de ingreso
