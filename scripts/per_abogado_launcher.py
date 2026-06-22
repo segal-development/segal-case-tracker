@@ -76,23 +76,38 @@ async def main() -> int:
         print("  ✗ Timeout esperando login.")
         return 1
 
-    # Logged in → scrape over CDP (reuse the sketch's logic).
-    from scripts.cdp_scraper_sketch import scrape_via_cdp
+    # Logged in → PERSIST=1 runs the full DB sync (dry-run by default); else the
+    # read-only scrape check.
+    if os.environ.get("PERSIST", "").strip() == "1":
+        from scripts.cdp_scraper_sketch import persist_via_cdp
 
-    print("\n[scrape] Trayendo causas vía CDP...")
-    try:
-        cases = await scrape_via_cdp(rut, max_pages=2)
-    except Exception as e:
-        print(f"  scrape_via_cdp failed: {type(e).__name__}: {str(e)[:160]}")
-        return 1
+        dry = os.environ.get("DRY_RUN", "1").strip() != "0"
+        print(f"\n[persist] Sincronizando a la DB (dry_run={dry})...")
+        try:
+            await persist_via_cdp(
+                rut, name=os.environ.get("TEST_ABOGADO_NAME", ""),
+                max_pages=2, batch=20, dry_run=dry,
+            )
+        except Exception as e:
+            print(f"  persist_via_cdp failed: {type(e).__name__}: {str(e)[:160]}")
+            return 1
+    else:
+        from scripts.cdp_scraper_sketch import scrape_via_cdp
 
-    print(f"\n{'='*58}")
-    print(f"  RESULTADO: {len(cases)} causas")
-    for c in cases[:10]:
-        print(f"    • {c.rol:<18} {(c.caratulado or '')[:50]}")
-    print("=" * 58)
-    if cases:
-        print("  ✅ FLUJO PER-ABOGADO END-TO-END OK (launch → login → scrape).")
+        print("\n[scrape] Trayendo causas vía CDP...")
+        try:
+            cases = await scrape_via_cdp(rut, max_pages=2)
+        except Exception as e:
+            print(f"  scrape_via_cdp failed: {type(e).__name__}: {str(e)[:160]}")
+            return 1
+        print(f"\n{'='*58}")
+        print(f"  RESULTADO: {len(cases)} causas")
+        for c in cases[:10]:
+            print(f"    • {c.rol:<18} {(c.caratulado or '')[:50]}")
+        print("=" * 58)
+        if cases:
+            print("  ✅ FLUJO PER-ABOGADO END-TO-END OK (launch → login → scrape).")
+
     print(f"\n(El Chrome de debug sigue abierto — cerralo con: "
           f"pkill -f 'remote-debugging-port={DEBUG_PORT}')")
     return 0

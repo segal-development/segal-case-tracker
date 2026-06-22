@@ -160,8 +160,8 @@ async def persist_via_cdp(
     from app.scrapper.pjud.civil import CivilScraper
     from app.services.pjud_session import PJUDSession
     from app.services.sync_service import (
+        ScrapedCase,
         SyncService,
-        convert_api_cases_to_scraped,
         detect_and_sync_movements,
         _select_cases_for_detail_rotation,
     )
@@ -218,7 +218,20 @@ async def persist_via_cdp(
         # 4. Sync case rows --------------------------------------------------
         # sync_cases calls db.commit() internally; inside begin_nested() that
         # releases the SAVEPOINT and keeps the outer transaction open.
-        scraped = convert_api_cases_to_scraped(api_cases)
+        # get_my_cases returns PJUDCase dataclasses (attributes), NOT dicts, so
+        # build ScrapedCase by attribute (convert_api_cases_to_scraped expects dicts).
+        scraped = [
+            ScrapedCase(
+                rol=c.rol,
+                tribunal=c.tribunal,
+                caratulado=c.caratulado,
+                fecha_ingreso=c.fecha_ingreso,
+                estado_cuaderno=c.estado_cuaderno or "",
+                cuaderno=c.cuaderno or "",
+                institucion=c.institucion,
+            )
+            for c in api_cases
+        ]
         sync = SyncService(db)
         sync_result = sync.sync_cases(lawyer_id, scraped, competencia="civil")
         print(
