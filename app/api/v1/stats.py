@@ -27,11 +27,19 @@ class MateriaCount(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class StageCount(BaseModel):
+    stage: str
+    count: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class FirmTotals(BaseModel):
     cases: int
     semaforo: SemaforoBreakdown
     stale: int
     by_materia: list[MateriaCount]
+    by_procedural_state: list[StageCount]
 
     model_config = ConfigDict(from_attributes=True)
 
