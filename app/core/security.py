@@ -13,8 +13,8 @@ from cryptography.fernet import Fernet, MultiFernet
 from app.config import settings
 
 
-# Password hashing
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# Password hashing (app-level, bcrypt-incompatible with passlib on bcrypt>=4; use pbkdf2_sha256)
+pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 
 # JWT Bearer scheme
 security = HTTPBearer()
