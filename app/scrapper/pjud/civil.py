@@ -1139,7 +1139,86 @@ async () => {
         except Exception as e:
             logger.error(f"Search error: {e}")
             raise
-    
+
+    async def consulta_by_rol(
+        self,
+        session: PJUDSession,
+        rol: str,
+        corte: str,
+        tribunal: str = "0",
+    ) -> Optional["PJUDCaseDetail"]:
+        """Fetch a case's FULL detail from the public Consulta Unificada by ROL.
+
+        Works inside any logged-in session (e.g. the firm's Clave Única) with NO
+        captcha — the consulta does not need the case owner's segunda clave. Returns
+        the parsed detail (movimientos + documentos) or None if the case is not in
+        the consulta (e.g. a RESERVED case — those are only visible via Mis Causas).
+
+        The consulta detail modal (#modalDetalleCivil via causaCivil.php) reuses the
+        same #historiaCiv structure as Mis Causas, so _parse_case_detail_html applies
+        as-is. corte = PJUD Corte de Apelaciones code (Court.pjud_corte); tribunal=0
+        searches all tribunals of that corte (avoids needing the exact tribunal).
+        """
+        from datetime import datetime
+        from app.scrapper.pjud.base import PJUD_INDEX_URL
+
+        if "-" in rol:
+            parts = rol.split("-")
+            tipo_causa = parts[0]
+            numero = parts[1]
+            anio = parts[2] if len(parts) > 2 else str(datetime.now().year)
+        else:
+            tipo_causa, numero, anio = "C", rol, str(datetime.now().year)
+
+        page = await self._get_page(session)
+        if "indexN.php" not in (page.url or ""):
+            await page.goto(PJUD_INDEX_URL, wait_until="domcontentloaded")
+            await asyncio.sleep(1)
+        # Load the consulta form so detalleCausaCivil() is defined.
+        await page.evaluate(
+            "() => { if (typeof consultaUnificada === 'function') consultaUnificada(); }"
+        )
+        await asyncio.sleep(3)
+
+        search_html = await page.evaluate(f"""
+            async () => {{
+                const f = new URLSearchParams();
+                f.append('competencia', '{COMPETENCIA_CIVIL}');
+                f.append('conCorte', '{corte}');
+                f.append('conTribunal', '{tribunal}');
+                f.append('conTipoBus', '1');
+                f.append('conTipoCausa', '{tipo_causa}');
+                f.append('conRolCausa', '{numero}');
+                f.append('conEraCausa', '{anio}');
+                f.append('conCaratulado', '');
+                const r = await fetch('{PJUD_SEARCH_CIVIL_URL}', {{
+                    method: 'POST',
+                    headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+                    body: f.toString(), credentials: 'include'
+                }});
+                return await r.text();
+            }}
+        """)
+        if "No se han encontrado" in search_html:
+            logger.info(f"consulta_by_rol {rol}: not in consulta (reserved or not found)")
+            return None
+
+        m = re.search(r"detalleCausaCivil\('([^']+)'\)", search_html)
+        if not m:
+            logger.warning(f"consulta_by_rol {rol}: no detail token in results")
+            return None
+        jwt = m.group(1)
+
+        await page.evaluate(f"detalleCausaCivil('{jwt}')")
+        await asyncio.sleep(5)
+        detail_html = await page.evaluate(
+            "() => { const e = document.querySelector('#modalDetalleCivil'); return e ? e.innerHTML : ''; }"
+        )
+        if not detail_html:
+            logger.warning(f"consulta_by_rol {rol}: detail modal empty")
+            return None
+        return self._parse_case_detail_html(detail_html, jwt)
+
     def _parse_search_results_html(self, html: str) -> List[PJUDCase]:
         """Parse search results from Consulta Unificada."""
         cases = []
