@@ -127,6 +127,7 @@ async def main() -> None:
 
     round_n = 0
     consecutive_bad = 0
+    cooldowns_total = 0  # cumulative likely-block events this session (metric)
     while True:
         if _off_hours():
             now = datetime.now(_CHILE_TZ)
@@ -178,8 +179,21 @@ async def main() -> None:
         # (challenge/block/session trouble). Cool down — never hammer or rotate harder.
         consecutive_bad = consecutive_bad + 1 if round_bad else 0
         if consecutive_bad >= COOLDOWN_THRESHOLD:
+            cooldowns_total += 1
             print(f"  ⚠️ {consecutive_bad} bad rounds in a row — possible block/challenge. "
-                  f"Backing off {COOLDOWN_MINUTES} min.")
+                  f"Backing off {COOLDOWN_MINUTES} min. (cooldown #{cooldowns_total})")
+            # Early-warning alert: surface a likely PJUD block NOW, before it turns
+            # into a silent stale-data outage (the freshness monitor only catches
+            # staleness after the fact). Telegram failure must never break the loop.
+            try:
+                from scripts.freshness_monitor import send_telegram
+                send_telegram(
+                    f"⚠️ PJUD posible bloqueo/challenge (Carla): {consecutive_bad} rounds "
+                    f"malos seguidos. Enfriando {COOLDOWN_MINUTES} min · evento #{cooldowns_total} "
+                    f"esta sesión. Revisá si nos bloquearon."
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"  (telegram alert failed: {exc})")
             consecutive_bad = 0
             await asyncio.sleep(COOLDOWN_MINUTES * 60 * random.uniform(0.9, 1.3))
         else:
