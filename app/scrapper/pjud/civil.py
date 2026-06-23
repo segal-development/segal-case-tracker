@@ -1217,7 +1217,46 @@ async () => {
         if not detail_html:
             logger.warning(f"consulta_by_rol {rol}: detail modal empty")
             return None
-        return self._parse_case_detail_html(detail_html, jwt)
+        detail = self._parse_case_detail_html(detail_html, jwt)
+        await self._load_other_cuadernos(page, detail)
+        return detail
+
+    async def _load_other_cuadernos(self, page, detail) -> None:
+        """Accumulate movements from the NON-default cuadernos (e.g. Apremio).
+
+        detalleCausaCivil loads only the Principal cuaderno; #selCuaderno lists all
+        cuadernos (option value = a per-cuaderno JWT). For each non-default one we
+        select it (fires the change handler → AJAX reloads #historiaCiv), then parse
+        and merge its movements into ``detail``, deduping by (folio, descripcion).
+        Best-effort: a cuaderno that fails to load is skipped, never fatal.
+        """
+        try:
+            values = await page.evaluate(
+                "() => { const s = document.querySelector('#selCuaderno');"
+                " return s ? [...s.options].map(o => o.value) : []; }"
+            )
+        except Exception:
+            return
+        if len(values) <= 1:
+            return
+        seen = {(m.folio, m.descripcion) for m in detail.movements}
+        for value in values[1:]:
+            try:
+                await page.select_option("#selCuaderno", value)
+                await asyncio.sleep(3)
+                html = await page.evaluate(
+                    "() => { const e = document.querySelector('#modalDetalleCivil');"
+                    " return e ? e.innerHTML : ''; }"
+                )
+                for m in self._parse_movements_table(html):
+                    key = (m.folio, m.descripcion)
+                    if key not in seen:
+                        seen.add(key)
+                        detail.movements.append(m)
+            except Exception as e:
+                logger.warning(
+                    f"cuaderno load failed: {type(e).__name__}: {str(e)[:120]}"
+                )
 
     def _parse_search_results_html(self, html: str) -> List[PJUDCase]:
         """Parse search results from Consulta Unificada."""
