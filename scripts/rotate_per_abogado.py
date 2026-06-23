@@ -84,7 +84,11 @@ async def main() -> int:
             continue
 
         try:
-            await persist_via_cdp(rut, name=name, max_pages=2, batch=20, dry_run=dry)
+            # One human login should sync the lawyer's FULL caseload: the scraping
+            # itself is continuous activity that keeps the PJUD session alive (no idle
+            # timeout while requests flow), so a big batch = fewer human logins.
+            batch = int(os.environ.get("LAWYER_BATCH", "200"))
+            await persist_via_cdp(rut, name=name, max_pages=2, batch=batch, dry_run=dry)
             results.append((label, "ok"))
         except Exception as e:
             print(f"  persist failed for {label}: {type(e).__name__}: {str(e)[:140]}")
