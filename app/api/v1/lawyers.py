@@ -1,15 +1,20 @@
 """Lawyers endpoint — firm roster and admin account management."""
 
+from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
+from sqlalchemy import case, func, or_
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, get_current_lawyer, require_admin, _resolve_lawyer_id
 from app.core.security import hash_password
+from app.models.case import Case
 from app.models.lawyer import Lawyer
 from app.services.lawyer_roster import firm_roster
+
+_STALE_THRESHOLD_DAYS = 7
 
 router = APIRouter()
 
@@ -27,6 +32,80 @@ class AccountUpdateBody(BaseModel):
     email: Optional[str] = None
     role: Optional[str] = None
     new_password: Optional[str] = None
+
+
+class SyncStatusItem(BaseModel):
+    """Per-lawyer civil-case sync status for the operator panel."""
+
+    id: int
+    rut: str
+    name: str
+    email: Optional[str]
+    role: str
+    case_count: int
+    last_synced_at: Optional[datetime]
+    stale_count: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+@router.get("/sync-status", response_model=list[SyncStatusItem], dependencies=[Depends(require_admin)])
+def get_sync_status(db: Session = Depends(get_db)):
+    """Per-lawyer civil-case sync status for the operator panel (admin only).
+
+    Returns one entry per lawyer who has at least one civil case, ordered by
+    last_synced_at ASC, NULLs first (least-recently-synced lawyers appear first).
+
+    - case_count:     total civil cases under this lawyer
+    - last_synced_at: MAX(last_detail_checked_at) across all civil cases (None if all NULL)
+    - stale_count:    cases where last_detail_checked_at IS NULL or older than 7 days
+    """
+    cutoff = datetime.utcnow() - timedelta(days=_STALE_THRESHOLD_DAYS)
+
+    # Subquery: per-lawyer aggregates from civil cases only
+    sub = (
+        db.query(
+            Case.lawyer_id,
+            func.count(Case.id).label("case_count"),
+            func.max(Case.last_detail_checked_at).label("last_synced_at"),
+            func.sum(
+                case(
+                    (
+                        or_(
+                            Case.last_detail_checked_at.is_(None),
+                            Case.last_detail_checked_at < cutoff,
+                        ),
+                        1,
+                    ),
+                    else_=0,
+                )
+            ).label("stale_count"),
+        )
+        .filter(Case.competencia == "civil")
+        .group_by(Case.lawyer_id)
+        .subquery()
+    )
+
+    results = (
+        db.query(Lawyer, sub.c.case_count, sub.c.last_synced_at, sub.c.stale_count)
+        .join(sub, Lawyer.id == sub.c.lawyer_id)
+        .order_by(sub.c.last_synced_at.asc().nulls_first())
+        .all()
+    )
+
+    return [
+        SyncStatusItem(
+            id=lawyer.id,
+            rut=lawyer.rut,
+            name=lawyer.name,
+            email=lawyer.email,
+            role=lawyer.role,
+            case_count=case_count,
+            last_synced_at=last_synced_at,
+            stale_count=int(stale_count) if stale_count is not None else 0,
+        )
+        for lawyer, case_count, last_synced_at, stale_count in results
+    ]
 
 
 @router.get("/accounts", dependencies=[Depends(require_admin)])
