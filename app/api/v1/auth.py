@@ -18,7 +18,15 @@ from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.security import create_access_token, get_current_lawyer, encrypt_pjud_password
+from sqlalchemy import func
+
+from app.core.security import (
+    create_access_token,
+    get_current_lawyer,
+    encrypt_pjud_password,
+    hash_password,
+    verify_password,
+)
 from app.scrapper.pjud_civil import PJUDCivilScraper, LoginError
 from app.scrapper.pjud.browser import BrowserFactory
 from app.scrapper.pjud.clave_unica import (
@@ -85,6 +93,24 @@ class ClaveUnicaLoginResponse(BaseModel):
     session_id: str
     auth_method: str = "clave_unica"
     lawyer: LawyerInfo
+
+
+class WebLoginRequest(BaseModel):
+    """Email+password login request (app-level auth, not PJUD)."""
+    email: str
+    password: str
+
+
+class WebLoginResponse(BaseModel):
+    """Email+password login response."""
+    access_token: str
+    token_type: str = "bearer"
+
+
+class SetPasswordRequest(BaseModel):
+    """Request to set or update a lawyer's app-level password."""
+    email: str
+    new_password: str = Field(..., min_length=8)
 
 
 # ============================================================================
@@ -224,6 +250,48 @@ async def login_clave_unica(
 
 # NOTE: /refresh endpoint is intentionally removed (ADR-4 / AUTH-03).
 # Clients must call /login again to re-authenticate.
+
+
+@router.post("/web-login", response_model=WebLoginResponse)
+def web_login(body: WebLoginRequest, db: Session = Depends(get_db)):
+    """
+    Login with app-level email + password (bcrypt hash).
+
+    Returns a signed JWT on success.  Always returns 401 with a unified error
+    message so the response does not leak which check failed (email unknown vs.
+    wrong password vs. no password set).
+    """
+    lawyer = db.query(Lawyer).filter(
+        func.lower(Lawyer.email) == body.email.lower()
+    ).first()
+    if not lawyer or not lawyer.password_hash or not verify_password(body.password, lawyer.password_hash):
+        raise HTTPException(status_code=401, detail="Credenciales inválidas")
+    token = create_access_token({"sub": lawyer.rut})
+    return WebLoginResponse(access_token=token)
+
+
+@router.put("/password", status_code=200)
+def set_password(
+    body: SetPasswordRequest,
+    db: Session = Depends(get_db),
+    current_rut: str = Depends(get_current_lawyer),
+):
+    """
+    Set or update the app-level password for a lawyer account.
+
+    Requires a valid Bearer JWT.  The caller must supply the target email
+    alongside the new password (min 8 chars) in the request body.
+    """
+    # TODO: restrict to admin role once role-based access control is implemented.
+    # Currently any authenticated lawyer can change any account's password.
+    lawyer = db.query(Lawyer).filter(
+        func.lower(Lawyer.email) == body.email.lower()
+    ).first()
+    if not lawyer:
+        raise HTTPException(status_code=404, detail="Lawyer not found")
+    lawyer.password_hash = hash_password(body.new_password)
+    db.commit()
+    return {"ok": True}
 
 
 @router.get("/session-status", response_model=SessionStatus)
