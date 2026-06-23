@@ -1593,3 +1593,168 @@ async def detect_and_sync_movements(
         len(errors),
     )
     return movements_new, alerts_created, errors
+
+
+async def sync_via_consulta(
+    db: Session,
+    lawyer: Lawyer,
+    scraper,
+    session,
+    cases: list,
+    *,
+    dry_run: bool = False,
+) -> Tuple[int, int, int, int]:
+    """Persist movements for cases sourced from PJUD Consulta Unificada by rol.
+
+    For each Case ORM object in ``cases``:
+
+    - If ``consulta_by_rol`` returns ``None``: the case is reserved (not visible
+      in the public consulta); sets ``case.consulta_reserved = True`` so the
+      runner can route it to the Mis-Causas rotation. Does NOT advance
+      ``last_detail_checked_at``.
+    - If a ``PJUDCaseDetail`` is returned: persists movements, entities, and
+      documents through the same pipeline used by ``detect_and_sync_movements``;
+      clears ``case.consulta_reserved = False`` and advances
+      ``last_detail_checked_at``.
+    - If the court has no ``pjud_corte``: skips with a warning and counts as
+      error. No crash.
+
+    When ``dry_run=True``, no DB mutations or document downloads are performed.
+
+    Returns:
+        Tuple of (created_movements, alerts_created, reserved, errors).
+    """
+    created_movements: int = 0
+    alerts_created: int = 0
+    reserved: int = 0
+    errors: int = 0
+
+    sync_svc = SyncService(db)
+    webhooks: list = (
+        db.query(Webhook)
+        .filter(Webhook.lawyer_id == lawyer.id, Webhook.is_active == True)
+        .all()
+    )
+    notification_svc = NotificationService(db)
+
+    for case in cases:
+        try:
+            corte = case.court.pjud_corte
+            if corte is None:
+                logger.warning(
+                    "sync_via_consulta: case_id=%s rol=%s — court_id=%s has no "
+                    "pjud_corte; skipping",
+                    case.id, case.rol, case.court_id,
+                )
+                errors += 1
+                continue
+
+            detail = await scraper.consulta_by_rol(session, case.rol, str(corte))
+
+            if detail is None:
+                logger.info(
+                    "sync_via_consulta: case_id=%s rol=%s is reserved "
+                    "(not found in consulta)",
+                    case.id, case.rol,
+                )
+                if not dry_run:
+                    case.consulta_reserved = True
+                    db.commit()
+                reserved += 1
+                continue
+
+            # Public case — persist via the existing movement + document pipeline.
+            scraped_movements = convert_api_movements_to_scraped([
+                {
+                    "folio": m.folio,
+                    "fecha": m.fecha,
+                    "tipo_tramite": m.tipo_tramite,
+                    "descripcion": m.descripcion,
+                    "etapa": m.etapa,
+                    "foja": m.foja,
+                    "tiene_documento": m.tiene_documento,
+                }
+                for m in detail.movements
+            ])
+
+            if not dry_run:
+                shared_budget = NotifyBudget.from_settings()
+
+                if scraped_movements:
+                    new_count, alert_count = sync_svc.sync_movements(
+                        case_id=int(case.id),
+                        scraped_movements=scraped_movements,
+                        budget=shared_budget,
+                    )
+                    created_movements += new_count
+                    alerts_created += alert_count
+                    logger.info(
+                        "sync_via_consulta: %s → %d new movements, %d alerts",
+                        case.rol, new_count, alert_count,
+                    )
+
+                for entity_list, spec in [
+                    (detail.litigantes, SPEC_LITIGANTE),
+                    (detail.notificaciones, SPEC_NOTIFICACION),
+                    (detail.escritos, SPEC_ESCRITO),
+                    (detail.exhortos, SPEC_EXHORTO),
+                ]:
+                    _sync_entities(
+                        db, int(case.id), entity_list, spec,
+                        case=case, lawyer=lawyer, webhooks=webhooks,
+                        notification_svc=notification_svc, budget=shared_budget,
+                    )
+
+                persisted_docs = DocumentPersistenceService().persist_from_detail(
+                    detail, int(case.id), db
+                )
+
+                case.consulta_reserved = False
+                case.last_detail_checked_at = datetime.utcnow()
+                _maybe_recompute_deadlines(db, case)
+                db.commit()
+
+                if settings.DOC_DOWNLOAD_ENABLED and persisted_docs:
+                    from app.services.document_downloader import (
+                        DocumentDownloader,
+                        AsyncSleepLimiter,
+                    )
+                    from app.services.storage_service import (
+                        StorageService,
+                        get_storage_backend,
+                    )
+                    pending_docs = [
+                        d for d in persisted_docs if d.status in ("pending", "failed")
+                    ]
+                    if pending_docs:
+                        storage_svc = StorageService(get_storage_backend(settings))
+                        await DocumentDownloader().download_and_store(
+                            pending_docs=pending_docs,
+                            scraper=scraper,
+                            pjud_session=session,
+                            db=db,
+                            storage_service=storage_svc,
+                            limiter=AsyncSleepLimiter(delay=0.0),
+                            enabled=True,
+                        )
+            else:
+                logger.info(
+                    "sync_via_consulta [dry_run]: case_id=%s rol=%s → %d movements "
+                    "in detail (not persisted)",
+                    case.id, case.rol, len(scraped_movements),
+                )
+
+        except Exception as exc:
+            db.rollback()
+            logger.error(
+                "sync_via_consulta: failed for case_id=%s rol=%s: %s",
+                getattr(case, "id", "?"), getattr(case, "rol", "?"), exc,
+            )
+            errors += 1
+            continue
+
+    logger.info(
+        "sync_via_consulta: done — %d new movements, %d alerts, %d reserved, %d errors",
+        created_movements, alerts_created, reserved, errors,
+    )
+    return created_movements, alerts_created, reserved, errors

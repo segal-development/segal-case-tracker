@@ -40,6 +40,7 @@ class Case(Base):
     abandono_disponible = Column(Boolean, nullable=False, server_default=text("false"), default=False)
     next_deadline_fatal = Column(Boolean, nullable=False, server_default=text("false"), default=False)
     en_apremio = Column(Boolean, nullable=False, server_default=text("false"), default=False)
+    consulta_reserved = Column(Boolean, nullable=False, server_default=text("false"), default=False)  # True when consulta_by_rol returns None (case not in public consulta)
 
     # Timestamps
     filed_at = Column(DateTime, nullable=True)  # Fecha de ingreso
