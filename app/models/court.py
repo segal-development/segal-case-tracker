@@ -19,6 +19,7 @@ class Court(Base):
     
     # PJUD internal identifiers
     pjud_competencia = Column(Integer, nullable=True)
+    pjud_corte = Column(Integer, nullable=True)
     pjud_tribunal = Column(Integer, nullable=True)
     
     # Relationships
