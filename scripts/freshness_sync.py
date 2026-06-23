@@ -128,6 +128,18 @@ async def main() -> None:
     round_n = 0
     consecutive_bad = 0
     cooldowns_total = 0  # cumulative likely-block events this session (metric)
+    # Challenge/failure telemetry: classify each failure so we SEE what's going on
+    # (session death = recoverable re-auth; block = likely Shape pushing back).
+    signals = {"session": 0, "block": 0, "transient": 0}
+
+    def classify(exc) -> str:
+        n = type(exc).__name__
+        if "Session" in n or "Login" in n or "Auth" in n:
+            return "session"
+        if "Scraping" in n:
+            return "block"
+        return "transient"
+
     while True:
         if _off_hours():
             now = datetime.now(_CHILE_TZ)
@@ -147,7 +159,8 @@ async def main() -> None:
                 try:
                     api_cases = await sc.get_my_cases(session=session, max_pages=0)
                 except Exception as e:
-                    print(f"  list fetch failed ({str(e)[:60]}); re-auth next round")
+                    signals[classify(e)] += 1
+                    print(f"  list fetch failed [{classify(e)}] ({str(e)[:60]}); re-auth next round")
                     try:
                         await clave_unica_login()
                     except Exception:
@@ -169,28 +182,41 @@ async def main() -> None:
                     # A round that touched cases but EVERY one failed (and nothing
                     # advanced) looks like PJUD blocking/challenging, not bad data.
                     if batch and len(errors) >= len(batch) and created == 0 and updated == 0:
+                        signals["block"] += 1  # touched cases, ALL failed → likely Shape block/challenge
                         round_bad = True
         except Exception as e:
             db.rollback()
-            print(f"  round {round_n} error: {str(e)[:120]}")
+            signals[classify(e)] += 1
+            print(f"  round {round_n} error [{classify(e)}]: {str(e)[:120]}")
             round_bad = True
+
+        # Telemetry summary every 20 rounds — running picture of failure kinds.
+        if round_n % 20 == 0:
+            print(f"  📊 telemetry (round {round_n}): session={signals['session']} "
+                  f"block={signals['block']} transient={signals['transient']} "
+                  f"cooldowns={cooldowns_total}")
 
         # Back-off policy: consecutive bad rounds likely mean PJUD is pushing back
         # (challenge/block/session trouble). Cool down — never hammer or rotate harder.
         consecutive_bad = consecutive_bad + 1 if round_bad else 0
         if consecutive_bad >= COOLDOWN_THRESHOLD:
             cooldowns_total += 1
+            breakdown = (f"sesión {signals['session']} / bloqueo {signals['block']} / "
+                         f"transitorio {signals['transient']}")
+            # When blocks dominate the recent failures it's likely Shape; when session
+            # dominates it's just re-auth churn. Label the alert accordingly.
+            likely = "BLOQUEO (Shape)" if signals["block"] >= signals["session"] else "sesión/re-auth"
             print(f"  ⚠️ {consecutive_bad} bad rounds in a row — possible block/challenge. "
-                  f"Backing off {COOLDOWN_MINUTES} min. (cooldown #{cooldowns_total})")
+                  f"Backing off {COOLDOWN_MINUTES} min. (cooldown #{cooldowns_total}; {breakdown})")
             # Early-warning alert: surface a likely PJUD block NOW, before it turns
             # into a silent stale-data outage (the freshness monitor only catches
             # staleness after the fact). Telegram failure must never break the loop.
             try:
                 from scripts.freshness_monitor import send_telegram
                 send_telegram(
-                    f"⚠️ PJUD posible bloqueo/challenge (Carla): {consecutive_bad} rounds "
-                    f"malos seguidos. Enfriando {COOLDOWN_MINUTES} min · evento #{cooldowns_total} "
-                    f"esta sesión. Revisá si nos bloquearon."
+                    f"⚠️ PJUD — probable {likely} (Carla): {consecutive_bad} rounds malos seguidos. "
+                    f"Señales acumuladas: {breakdown}. Enfriando {COOLDOWN_MINUTES} min · "
+                    f"evento #{cooldowns_total} esta sesión."
                 )
             except Exception as exc:  # noqa: BLE001
                 print(f"  (telegram alert failed: {exc})")
