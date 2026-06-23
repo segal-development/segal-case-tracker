@@ -13,7 +13,8 @@ ACCOUNT_RUT = "11111111-1"
 
 @pytest.fixture
 def lawyer(db):
-    obj = Lawyer(rut=ACCOUNT_RUT, name="Goals Test Lawyer")
+    # role='admin' required: PUT /api/v1/goals/{key} is gated to require_admin.
+    obj = Lawyer(rut=ACCOUNT_RUT, name="Goals Test Lawyer", role="admin")
     db.add(obj)
     db.commit()
     db.refresh(obj)

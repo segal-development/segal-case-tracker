@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_lawyer, get_db
+from app.api.deps import get_current_lawyer, get_db, require_admin
 from app.models.goal import Goal
 
 router = APIRouter()
@@ -26,7 +26,7 @@ async def upsert_goal(
     key: str,
     body: GoalUpdate,
     db: Session = Depends(get_db),
-    current_lawyer: dict = Depends(get_current_lawyer),
+    _admin_rut: str = Depends(require_admin),
 ) -> dict:
     goal = db.query(Goal).filter(Goal.key == key).first()
     if goal is None:
