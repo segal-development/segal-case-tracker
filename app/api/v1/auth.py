@@ -27,6 +27,7 @@ from app.core.security import (
     hash_password,
     verify_password,
 )
+from app.api.deps import require_admin
 from app.scrapper.pjud_civil import PJUDCivilScraper, LoginError
 from app.scrapper.pjud.browser import BrowserFactory
 from app.scrapper.pjud.clave_unica import (
@@ -270,20 +271,36 @@ def web_login(body: WebLoginRequest, db: Session = Depends(get_db)):
     return WebLoginResponse(access_token=token)
 
 
+@router.get("/me")
+def get_me(
+    rut: str = Depends(get_current_lawyer),
+    db: Session = Depends(get_db),
+):
+    """Return the current lawyer's profile: rut, name, email, role."""
+    lawyer = db.query(Lawyer).filter(Lawyer.rut == rut).first()
+    if not lawyer:
+        raise HTTPException(status_code=404, detail="Lawyer not found")
+    return {
+        "rut": lawyer.rut,
+        "name": lawyer.name,
+        "email": lawyer.email,
+        "role": lawyer.role,
+    }
+
+
 @router.put("/password", status_code=200)
 def set_password(
     body: SetPasswordRequest,
     db: Session = Depends(get_db),
-    current_rut: str = Depends(get_current_lawyer),
+    _admin_rut: str = Depends(require_admin),
 ):
     """
     Set or update the app-level password for a lawyer account.
 
-    Requires a valid Bearer JWT.  The caller must supply the target email
-    alongside the new password (min 8 chars) in the request body.
+    Requires a valid Bearer JWT from a lawyer with role='admin'.
+    The caller must supply the target email alongside the new password
+    (min 8 chars) in the request body.
     """
-    # TODO: restrict to admin role once role-based access control is implemented.
-    # Currently any authenticated lawyer can change any account's password.
     lawyer = db.query(Lawyer).filter(
         func.lower(Lawyer.email) == body.email.lower()
     ).first()

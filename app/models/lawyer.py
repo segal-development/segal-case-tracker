@@ -25,6 +25,7 @@ class Lawyer(Base):
     name = Column(String(255), nullable=False)
     email = Column(String(255), unique=True, index=True, nullable=True)
     password_hash = Column(String(255), nullable=True)
+    role = Column(String(20), nullable=False, server_default="lawyer", default="lawyer")
 
     # Encrypted PJUD password for session refresh (captcha method)
     encrypted_pjud_password = Column(String(512), nullable=True)

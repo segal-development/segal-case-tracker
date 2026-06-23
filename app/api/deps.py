@@ -47,6 +47,34 @@ async def get_current_lawyer(
     return payload
 
 
+async def require_admin(
+    current_lawyer: dict = Depends(get_current_lawyer),
+    db: Session = Depends(get_db),
+) -> str:
+    """Allow access only to lawyers with role='admin'.
+
+    Works with real JWT payloads (sub = RUT string) and test mocks
+    (sub = numeric lawyer id string).  Returns the lawyer's RUT string.
+    Raises 403 if the resolved lawyer is missing or not an admin.
+    """
+    from app.models.lawyer import Lawyer
+
+    sub = current_lawyer.get("sub") or current_lawyer.get("lawyer_id")
+    if not sub:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
+    # Handle numeric id (used by test mocks) or RUT string (real JWT)
+    if isinstance(sub, int) or (isinstance(sub, str) and sub.isdigit()):
+        lawyer = db.query(Lawyer).filter(Lawyer.id == int(sub)).first()
+    else:
+        lawyer = db.query(Lawyer).filter(Lawyer.rut == str(sub)).first()
+
+    if lawyer is None or lawyer.role != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Requiere rol admin")
+
+    return str(lawyer.rut)
+
+
 def _resolve_lawyer_id(db: Session, current_lawyer: dict) -> int:
     """Resolve the numeric lawyer id from a JWT payload.
 

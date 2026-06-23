@@ -27,8 +27,12 @@ TEST_PASSWORD = "password123"
 
 @pytest.fixture
 def lawyer_with_password(db):
-    """Create a Lawyer with email and bcrypt password_hash."""
-    lawyer = Lawyer(rut=TEST_RUT, name="Web Auth Lawyer", email=TEST_EMAIL)
+    """Create a Lawyer with email, password_hash, and admin role.
+
+    Role='admin' is required because test_set_password_endpoint exercises
+    PUT /api/v1/auth/password, which is now gated to require_admin.
+    """
+    lawyer = Lawyer(rut=TEST_RUT, name="Web Auth Lawyer", email=TEST_EMAIL, role="admin")
     db.add(lawyer)
     db.commit()
     db.refresh(lawyer)
