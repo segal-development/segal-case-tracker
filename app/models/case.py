@@ -42,6 +42,12 @@ class Case(Base):
     en_apremio = Column(Boolean, nullable=False, server_default=text("false"), default=False)
     consulta_reserved = Column(Boolean, nullable=False, server_default=text("false"), default=False)  # True when consulta_by_rol returns None (case not in public consulta)
 
+    # Prescripción (statute of limitations) — populated by DeadlineEngine.recompute_case
+    titulo_tipo = Column(String(30), nullable=True)   # input: pagare|letra|cheque|escritura_publica|sentencia|otro
+    titulo_fecha = Column(Date, nullable=True)         # input: title's key date
+    prescripcion_cumplida = Column(Boolean, nullable=False, server_default=text("false"), default=False)  # computed
+    prescripcion_fecha = Column(Date, nullable=True)   # computed: titulo_fecha + plazo
+
     # Timestamps
     filed_at = Column(DateTime, nullable=True)  # Fecha de ingreso
     last_movement_at = Column(DateTime, nullable=True)

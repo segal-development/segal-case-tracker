@@ -59,6 +59,11 @@ class CaseResponse(BaseModel):
     abandono_disponible: bool = False
     next_deadline_fatal: bool = False
     en_apremio: bool = False
+    # Prescripción advisory
+    titulo_tipo: Optional[str] = None
+    titulo_fecha: Optional[date] = None
+    prescripcion_cumplida: bool = False
+    prescripcion_fecha: Optional[date] = None
 
     class Config:
         from_attributes = True
