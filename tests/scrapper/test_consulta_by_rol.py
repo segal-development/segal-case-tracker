@@ -79,7 +79,7 @@ async def test_load_other_cuadernos_accumulates_and_dedups(monkeypatch):
     keys = {(m.folio, m.descripcion) for m in detail.movements}
     assert keys == {("1", "A"), ("1", "B")}
     assert len(detail.movements) == 2  # the (1, A) duplicate was not re-added
-    page.select_option.assert_awaited_once_with("#selCuaderno", "cuadB")
+    page.select_option.assert_awaited_once_with("#selCuaderno", "cuadB", timeout=8000)
 
 
 async def test_load_other_cuadernos_single_cuaderno_noop(monkeypatch):
