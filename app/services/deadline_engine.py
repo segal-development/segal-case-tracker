@@ -112,6 +112,39 @@ def _compute_abandono(
     return False
 
 
+def _compute_prescripcion(
+    case: "Case",
+    today: date,
+) -> tuple[bool, "Optional[date]"]:
+    """Statute-of-limitations advisory signal (Chilean law).
+
+    The prescription clock starts from the DEMAND FILING DATE
+    (``Case.filed_at``, "Fecha de ingreso"), NOT the title's vencimiento.
+
+    Prescription ONLY applies to títulos de crédito with a 1-year plazo:
+      {"pagare", "letra", "cheque"} → 1 year
+        (art. 98 Ley 18.092 / art. 34 Ley 18.552)
+      everything else (None, "otro", "escritura_publica", "sentencia") → no
+        prescription at all → (False, None).
+
+    Returns (prescripcion_cumplida, prescripcion_fecha).
+    If titulo_tipo has no prescription, or filed_at is None → (False, None).
+    prescripcion_cumplida = prescripcion_fecha < today (strictly less than).
+    """
+    titulo_tipo = (getattr(case, "titulo_tipo", None) or "").lower().strip()
+    if titulo_tipo not in {"pagare", "letra", "cheque"}:
+        return (False, None)
+
+    filed_at = getattr(case, "filed_at", None)
+    if filed_at is None:
+        return (False, None)
+
+    start = filed_at.date()
+    prescripcion_fecha = start + relativedelta(years=1)
+    prescripcion_cumplida = prescripcion_fecha < today
+    return (prescripcion_cumplida, prescripcion_fecha)
+
+
 def _firm_side(db: Session, case: "Case") -> str:
     """Detect which side the firm represents in this case.
 
@@ -359,10 +392,15 @@ class DeadlineEngine:
         # Step 7b: abandono del procedimiento advisory signal (art. 152/153 CPC).
         abandono = _compute_abandono(proc_state, latest_mv_date, today)
 
+        # Step 7c: prescripción advisory signal (statute of limitations).
+        prescripcion_cumplida, prescripcion_fecha = _compute_prescripcion(case, today)
+
         # Step 8: write denormalized Case columns.
         case.procedural_state = proc_state.value
         case.semaforo = semaforo
         case.abandono_disponible = abandono
+        case.prescripcion_cumplida = prescripcion_cumplida
+        case.prescripcion_fecha = prescripcion_fecha
 
         # next_deadline_at = the firm's next action date. Mirror the semáforo
         # selection: nearest active ACTIONABLE deadline (per-case side), skipping
@@ -525,4 +563,6 @@ class DeadlineEngine:
         case.next_deadline_at = None
         case.abandono_disponible = False
         case.next_deadline_fatal = False
+        case.prescripcion_cumplida = False
+        case.prescripcion_fecha = None
         db.flush()
