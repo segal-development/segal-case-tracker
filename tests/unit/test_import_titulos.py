@@ -211,3 +211,269 @@ class TestImportTitulos:
         assert result["matched"] == 1
         assert result["updated"] == 1
         assert result["not_found"] == []
+
+
+# ---------------------------------------------------------------------------
+# Cascade match tests (rut, nombre, precedence)
+# ---------------------------------------------------------------------------
+
+
+class TestImportTitulosCascade:
+    """Tests for cascade match: rol → rut → nombre."""
+
+    def _write_csv(self, tmp_path, rows: list[dict], fieldnames=None) -> str:
+        """Write rows to a temp CSV file and return path."""
+        if fieldnames is None:
+            fieldnames = list(rows[0].keys()) if rows else ["tipo"]
+        path = str(tmp_path / "titulos_cascade.csv")
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        return path
+
+    def _make_dispatch_mock(self, case_result=None, litigante_result=None):
+        """Build a mock DB that returns different chains for Case vs CaseLitigante."""
+        from app.models.case import Case
+        from app.models.case_litigante import CaseLitigante
+
+        mock_db = MagicMock()
+        mock_db.__enter__ = MagicMock(return_value=mock_db)
+        mock_db.__exit__ = MagicMock(return_value=False)
+
+        mock_case_q = MagicMock()
+        mock_case_q.filter.return_value.all.return_value = case_result or []
+
+        mock_lit_q = MagicMock()
+        mock_lit_q.filter.return_value.all.return_value = litigante_result or []
+
+        def _dispatch(model):
+            return mock_lit_q if model is CaseLitigante else mock_case_q
+
+        mock_db.query.side_effect = _dispatch
+        return mock_db, mock_case_q, mock_lit_q
+
+    # ------------------------------------------------------------------
+    # 1. rol match
+    # ------------------------------------------------------------------
+
+    def test_rol_match_sets_tipo_and_triggers_recompute(self, tmp_path) -> None:
+        """Row with rol finds that civil case, sets tipo, triggers recompute."""
+        from scripts.import_titulos import import_titulos
+
+        mock_case = MagicMock()
+        mock_case.id = 1
+        mock_db, mock_case_q, _ = self._make_dispatch_mock(case_result=[mock_case])
+
+        csv_path = self._write_csv(tmp_path, [{"rol": "C-010-2026", "tipo": "pagare"}])
+        with (
+            patch("scripts.import_titulos.SessionLocal", return_value=mock_db),
+            patch("scripts.import_titulos.DeadlineEngine") as mock_engine,
+        ):
+            result = import_titulos(csv_path)
+
+        assert mock_case.titulo_tipo == "pagare"
+        mock_engine.recompute_case.assert_called_once_with(mock_db, mock_case)
+        assert result["matched_by_rol"] == 1
+        assert result["matched_by_rut"] == 0
+        assert result["matched_by_name"] == 0
+
+    # ------------------------------------------------------------------
+    # 2. rut fan-out: same RUT → two cases, both updated
+    # ------------------------------------------------------------------
+
+    def test_rut_match_applies_to_all_cases_for_that_rut(self, tmp_path) -> None:
+        """Row with no rol but rut applies tipo to ALL cases where that debtor RUT is a litigante."""
+        from scripts.import_titulos import import_titulos
+        from app.models.case import Case
+        from app.models.case_litigante import CaseLitigante
+
+        mock_case1 = MagicMock()
+        mock_case1.id = 10
+        mock_case2 = MagicMock()
+        mock_case2.id = 20
+
+        mock_lit1 = MagicMock()
+        mock_lit1.rut = "12345678-9"
+        mock_lit1.case_id = 10
+        mock_lit2 = MagicMock()
+        mock_lit2.rut = "12345678-9"
+        mock_lit2.case_id = 20
+
+        mock_db, mock_case_q, mock_lit_q = self._make_dispatch_mock(
+            case_result=[mock_case1, mock_case2],
+            litigante_result=[mock_lit1, mock_lit2],
+        )
+
+        csv_path = self._write_csv(tmp_path, [{"tipo": "cheque", "rut": "12345678-9"}])
+        with (
+            patch("scripts.import_titulos.SessionLocal", return_value=mock_db),
+            patch("scripts.import_titulos.DeadlineEngine") as mock_engine,
+        ):
+            result = import_titulos(csv_path)
+
+        assert mock_case1.titulo_tipo == "cheque"
+        assert mock_case2.titulo_tipo == "cheque"
+        assert mock_engine.recompute_case.call_count == 2
+        assert result["matched_by_rut"] == 1
+        assert result["rut_cases_touched"] == 2
+        assert result["matched_by_rol"] == 0
+
+    # ------------------------------------------------------------------
+    # 3. RUT normalization: dotted CSV vs plain stored
+    # ------------------------------------------------------------------
+
+    def test_rut_normalization_dotted_csv_matches_plain_stored(self, tmp_path) -> None:
+        """CSV '12.345.678-9' matches stored '12345678-9' after normalize_rut on both sides."""
+        from scripts.import_titulos import import_titulos, _normalize_rut_for_match
+        from app.models.case import Case
+        from app.models.case_litigante import CaseLitigante
+
+        # Direct normalization unit check
+        assert _normalize_rut_for_match("12.345.678-9") == _normalize_rut_for_match("12345678-9")
+
+        mock_case = MagicMock()
+        mock_case.id = 5
+
+        mock_lit = MagicMock()
+        mock_lit.rut = "12345678-9"  # stored without dots
+        mock_lit.case_id = 5
+
+        mock_db, mock_case_q, mock_lit_q = self._make_dispatch_mock(
+            case_result=[mock_case],
+            litigante_result=[mock_lit],
+        )
+
+        csv_path = self._write_csv(tmp_path, [{"tipo": "letra", "rut": "12.345.678-9"}])
+        with (
+            patch("scripts.import_titulos.SessionLocal", return_value=mock_db),
+            patch("scripts.import_titulos.DeadlineEngine"),
+        ):
+            result = import_titulos(csv_path)
+
+        assert mock_case.titulo_tipo == "letra"
+        assert result["matched_by_rut"] == 1
+
+    # ------------------------------------------------------------------
+    # 4. nombre match via DDO% litigante
+    # ------------------------------------------------------------------
+
+    def test_nombre_match_via_ddo_litigante(self, tmp_path) -> None:
+        """Row with only nombre matches by normalized name against DDO% litigantes."""
+        from scripts.import_titulos import import_titulos
+        from app.models.case import Case
+        from app.models.case_litigante import CaseLitigante
+
+        mock_case = MagicMock()
+        mock_case.id = 7
+        mock_case.defendant = "Juan Pérez López"
+        mock_case.competencia = "civil"
+
+        mock_lit = MagicMock()
+        mock_lit.nombre = "Juan Pérez López"
+        mock_lit.case_id = 7
+        mock_lit.participante = "DDO."
+
+        mock_db, mock_case_q, mock_lit_q = self._make_dispatch_mock(
+            case_result=[mock_case],
+            litigante_result=[mock_lit],
+        )
+
+        csv_path = self._write_csv(tmp_path, [{"tipo": "pagare", "nombre": "Juan Pérez López"}])
+        with (
+            patch("scripts.import_titulos.SessionLocal", return_value=mock_db),
+            patch("scripts.import_titulos.DeadlineEngine") as mock_engine,
+        ):
+            result = import_titulos(csv_path)
+
+        assert mock_case.titulo_tipo == "pagare"
+        mock_engine.recompute_case.assert_called_once_with(mock_db, mock_case)
+        assert result["matched_by_name"] == 1
+        assert result["name_cases_touched"] == 1
+
+    # ------------------------------------------------------------------
+    # 5. unmatched row → counted, no crash
+    # ------------------------------------------------------------------
+
+    def test_unmatched_row_counted_and_no_crash(self, tmp_path) -> None:
+        """Row that matches nothing is counted in unmatched without raising."""
+        from scripts.import_titulos import import_titulos
+
+        mock_db, _, _ = self._make_dispatch_mock(case_result=[], litigante_result=[])
+
+        csv_path = self._write_csv(
+            tmp_path, [{"tipo": "pagare", "rut": "99999999-9", "nombre": "Nobody"}]
+        )
+        with (
+            patch("scripts.import_titulos.SessionLocal", return_value=mock_db),
+            patch("scripts.import_titulos.DeadlineEngine"),
+        ):
+            result = import_titulos(csv_path)
+
+        assert len(result["unmatched"]) == 1
+        assert result["matched_by_rol"] == 0
+        assert result["matched_by_rut"] == 0
+        assert result["matched_by_name"] == 0
+
+    # ------------------------------------------------------------------
+    # 6. precedence: rol wins over rut
+    # ------------------------------------------------------------------
+
+    def test_rol_takes_precedence_over_rut_no_litigante_query(self, tmp_path) -> None:
+        """Row with both rol and rut uses rol (1 case); CaseLitigante is never queried."""
+        from scripts.import_titulos import import_titulos
+        from app.models.case_litigante import CaseLitigante
+
+        mock_case = MagicMock()
+        mock_case.id = 1
+        mock_db, mock_case_q, mock_lit_q = self._make_dispatch_mock(
+            case_result=[mock_case],
+            litigante_result=[],
+        )
+
+        csv_path = self._write_csv(
+            tmp_path,
+            [{"rol": "C-010-2026", "rut": "12345678-9", "tipo": "pagare"}],
+        )
+        with (
+            patch("scripts.import_titulos.SessionLocal", return_value=mock_db),
+            patch("scripts.import_titulos.DeadlineEngine") as mock_engine,
+        ):
+            result = import_titulos(csv_path)
+
+        assert result["matched_by_rol"] == 1
+        assert result["matched_by_rut"] == 0
+        # CaseLitigante should NOT have been queried (rol matched → continue before rut block)
+        assert not any(
+            call.args[0] is CaseLitigante
+            for call in mock_db.query.call_args_list
+        ), "CaseLitigante must not be queried when rol matches"
+
+    # ------------------------------------------------------------------
+    # 7. fecha stored when present
+    # ------------------------------------------------------------------
+
+    def test_fecha_stored_when_present_in_csv(self, tmp_path) -> None:
+        """titulo_fecha is stored when the fecha column is present and parseable."""
+        from scripts.import_titulos import import_titulos
+
+        mock_case = MagicMock()
+        mock_case.id = 1
+
+        mock_db = MagicMock()
+        mock_db.__enter__ = MagicMock(return_value=mock_db)
+        mock_db.__exit__ = MagicMock(return_value=False)
+        mock_db.query.return_value.filter.return_value.all.return_value = [mock_case]
+
+        csv_path = self._write_csv(
+            tmp_path,
+            [{"rol": "C-010-2026", "tipo": "cheque", "fecha": "2024-03-15"}],
+        )
+        with (
+            patch("scripts.import_titulos.SessionLocal", return_value=mock_db),
+            patch("scripts.import_titulos.DeadlineEngine"),
+        ):
+            result = import_titulos(csv_path)
+
+        assert mock_case.titulo_fecha == date(2024, 3, 15)
+        assert mock_case.titulo_tipo == "cheque"
