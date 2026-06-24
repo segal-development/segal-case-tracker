@@ -33,6 +33,13 @@ HEADLESS = os.environ.get("BACKFILL_HEADLESS", "false").lower() == "true"
 BATCH = int(os.environ.get("FRESHNESS_BATCH", "40"))
 ROUND_SLEEP = int(os.environ.get("FRESHNESS_ROUND_SLEEP", "45"))
 FETCH_DELAY = float(os.environ.get("FRESHNESS_FETCH_DELAY", "2.5"))
+# Per-abogado consulta-by-rol, folded into Carla's CU session: every
+# CONSULTA_EVERY rounds, refresh a batch of the LAWYERS' public cases by rol
+# (no captcha, no per-lawyer login). OPT-IN (default off) so it never changes
+# Carla's firm-freshness behaviour unless explicitly enabled.
+CONSULTA_ENABLED = os.environ.get("CONSULTA_ENABLED", "false").lower() == "true"
+CONSULTA_EVERY = int(os.environ.get("CONSULTA_EVERY", "5"))
+CONSULTA_BATCH = int(os.environ.get("CONSULTA_BATCH", "15"))
 # Block/challenge back-off: after this many consecutive "bad" rounds (likely
 # PJUD pushing back), cool down instead of hammering — never rotate harder.
 COOLDOWN_THRESHOLD = int(os.environ.get("FRESHNESS_COOLDOWN_THRESHOLD", "3"))
@@ -57,12 +64,38 @@ def _off_hours() -> bool:
     return now.hour < SCRAPE_HOURS_START or now.hour >= SCRAPE_HOURS_END
 
 
+def _select_consulta_cases(db, firm_lawyer_id: int, limit: int):
+    """The LAWYERS' civil cases to refresh via consulta-by-rol (not the firm's own).
+
+    Excludes the firm account (those are kept fresh by the normal Mis-Causas
+    round), reserved cases (only visible via Mis Causas), and courts with no known
+    PJUD corte. Least-recently-checked first so coverage rotates fairly.
+    """
+    from app.models.case import Case
+    from app.models.court import Court
+
+    return (
+        db.query(Case)
+        .join(Court, Case.court_id == Court.id)
+        .filter(
+            Case.lawyer_id != firm_lawyer_id,
+            Case.competencia == COMPETENCIA,
+            Case.consulta_reserved.is_(False),
+            Court.pjud_corte.isnot(None),
+        )
+        .order_by(Case.last_detail_checked_at.asc().nullsfirst())
+        .limit(limit)
+        .all()
+    )
+
+
 async def main() -> None:
     from app.scrapper.pjud_civil import PJUDCivilScraper
     from app.core.database import SessionLocal
     from app.models.lawyer import Lawyer
     from app.services.sync_service import (
         detect_and_sync_movements,
+        sync_via_consulta,
         _select_cases_for_detail_rotation,
     )
     from app.scrapper.pjud.clave_unica import ClaveUnicaAuth, ClaveUnicaCredentials
@@ -184,6 +217,24 @@ async def main() -> None:
                     if batch and len(errors) >= len(batch) and created == 0 and updated == 0:
                         signals["block"] += 1  # touched cases, ALL failed → likely Shape block/challenge
                         round_bad = True
+
+                    # Per-abogado consulta-by-rol, interleaved into the SAME CU
+                    # session (no captcha, no per-lawyer login). Opt-in + isolated:
+                    # any failure here must NEVER break the firm freshness loop.
+                    if CONSULTA_ENABLED and not round_bad and round_n % CONSULTA_EVERY == 0:
+                        try:
+                            consulta_cases = _select_consulta_cases(db, lawyer_id, CONSULTA_BATCH)
+                            if consulta_cases:
+                                c_created, c_alerts, c_reserved, c_errors = await sync_via_consulta(
+                                    db, lawyer, sc, session, consulta_cases, dry_run=False
+                                )
+                                db.commit()
+                                print(f"  consulta round {round_n}: {len(consulta_cases)} abogado-cases · "
+                                      f"movements+{c_created} reserved={c_reserved} errors={c_errors}")
+                        except Exception as e:
+                            db.rollback()
+                            signals[classify(e)] += 1
+                            print(f"  consulta sync failed [{classify(e)}]: {str(e)[:100]}")
         except Exception as e:
             db.rollback()
             signals[classify(e)] += 1
