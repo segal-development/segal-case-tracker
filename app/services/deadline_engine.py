@@ -118,24 +118,29 @@ def _compute_prescripcion(
 ) -> tuple[bool, "Optional[date]"]:
     """Statute-of-limitations advisory signal (Chilean law).
 
-    Plazo by titulo_tipo:
-      {"pagare", "letra", "cheque"} → 1 year (art. 98 Ley 18.092 / art. 34 Ley 18.552)
-      everything else (incl. None, "otro", "escritura_publica", "sentencia") → 3 years
+    The prescription clock starts from the DEMAND FILING DATE
+    (``Case.filed_at``, "Fecha de ingreso"), NOT the title's vencimiento.
+
+    Prescription ONLY applies to títulos de crédito with a 1-year plazo:
+      {"pagare", "letra", "cheque"} → 1 year
+        (art. 98 Ley 18.092 / art. 34 Ley 18.552)
+      everything else (None, "otro", "escritura_publica", "sentencia") → no
+        prescription at all → (False, None).
 
     Returns (prescripcion_cumplida, prescripcion_fecha).
-    If titulo_fecha is None → (False, None) — not computable.
+    If titulo_tipo has no prescription, or filed_at is None → (False, None).
     prescripcion_cumplida = prescripcion_fecha < today (strictly less than).
     """
-    titulo_fecha = getattr(case, "titulo_fecha", None)
-    if titulo_fecha is None:
+    titulo_tipo = (getattr(case, "titulo_tipo", None) or "").lower().strip()
+    if titulo_tipo not in {"pagare", "letra", "cheque"}:
         return (False, None)
 
-    titulo_tipo = (getattr(case, "titulo_tipo", None) or "").lower().strip()
-    if titulo_tipo in {"pagare", "letra", "cheque"}:
-        prescripcion_fecha = titulo_fecha + relativedelta(years=1)
-    else:
-        prescripcion_fecha = titulo_fecha + relativedelta(years=3)
+    filed_at = getattr(case, "filed_at", None)
+    if filed_at is None:
+        return (False, None)
 
+    start = filed_at.date()
+    prescripcion_fecha = start + relativedelta(years=1)
     prescripcion_cumplida = prescripcion_fecha < today
     return (prescripcion_cumplida, prescripcion_fecha)
 

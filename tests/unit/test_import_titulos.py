@@ -57,14 +57,44 @@ class TestParseFecha:
 class TestImportTitulos:
     """Tests for import_titulos using mocked DB session."""
 
-    def _write_csv(self, tmp_path, rows: list[dict]) -> str:
+    def _write_csv(self, tmp_path, rows: list[dict], fieldnames=None) -> str:
         """Write rows to a temp CSV file and return path."""
         path = str(tmp_path / "titulos.csv")
+        if fieldnames is None:
+            fieldnames = ["rol", "tipo", "fecha"]
         with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=["rol", "tipo", "fecha"])
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(rows)
         return path
+
+    def test_rol_tipo_only_csv_maps_tipo_and_recomputes(self, tmp_path) -> None:
+        """A CSV with only rol,tipo (no fecha column) maps tipo + triggers recompute."""
+        from scripts.import_titulos import import_titulos
+
+        mock_case = MagicMock()
+
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.all.return_value = [mock_case]
+
+        csv_path = self._write_csv(
+            tmp_path,
+            [{"rol": "C-010-2026", "tipo": "pagare"}],
+            fieldnames=["rol", "tipo"],
+        )
+
+        with (
+            patch("scripts.import_titulos.SessionLocal", return_value=mock_db),
+            patch("scripts.import_titulos.DeadlineEngine") as mock_engine,
+        ):
+            mock_db.__enter__ = MagicMock(return_value=mock_db)
+            mock_db.__exit__ = MagicMock(return_value=False)
+            result = import_titulos(csv_path)
+
+        assert mock_case.titulo_tipo == "pagare"
+        assert mock_case.titulo_fecha is None  # no fecha column → None
+        mock_engine.recompute_case.assert_called_once_with(mock_db, mock_case)
+        assert result["updated"] == 1
 
     def test_tipo_stored_lowercased(self, tmp_path) -> None:
         """Unknown tipo stored lowercased: 'PAGARE' → 'pagare'."""

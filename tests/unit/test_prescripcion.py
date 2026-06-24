@@ -107,118 +107,115 @@ def _make_case(
 
 
 class TestComputePrescripcion:
-    """Pure-function tests for _compute_prescripcion (no DB needed)."""
+    """Pure-function tests for _compute_prescripcion (no DB needed).
 
-    def _case(self, titulo_tipo=None, titulo_fecha=None):
-        """Create a minimal mock case with just the two input fields."""
-        return types.SimpleNamespace(titulo_tipo=titulo_tipo, titulo_fecha=titulo_fecha)
+    New rule: the clock starts from Case.filed_at (a DateTime), the plazo is
+    always 1 year, and prescription ONLY applies to pagaré/letra/cheque.
+    """
 
-    def test_pagare_2_years_ago_is_cumplida(self) -> None:
-        """Pagaré with titulo_fecha 2 years ago → cumplida=True (1-year plazo)."""
+    def _case(self, titulo_tipo=None, filed_at=None):
+        """Create a minimal mock case with just the relevant input fields."""
+        return types.SimpleNamespace(titulo_tipo=titulo_tipo, filed_at=filed_at)
+
+    def _filed(self, **delta):
+        """A datetime filed_at relative to TODAY (filed_at is a DateTime)."""
+        d = TODAY - relativedelta(**delta)
+        return datetime(d.year, d.month, d.day)
+
+    def test_pagare_filed_2_years_ago_is_cumplida(self) -> None:
+        """Pagaré filed 2 years ago → cumplida=True, fecha = filed_at + 1yr."""
         from app.services.deadline_engine import _compute_prescripcion
 
-        titulo_fecha = TODAY - relativedelta(years=2)
-        case = self._case(titulo_tipo="pagare", titulo_fecha=titulo_fecha)
+        filed_at = self._filed(years=2)
+        case = self._case(titulo_tipo="pagare", filed_at=filed_at)
         cumplida, prescripcion_fecha = _compute_prescripcion(case, TODAY)
         assert cumplida is True
-        assert prescripcion_fecha == titulo_fecha + relativedelta(years=1)
+        assert prescripcion_fecha == filed_at.date() + relativedelta(years=1)
 
-    def test_pagare_6_months_ago_not_cumplida(self) -> None:
-        """Pagaré 6 months ago → cumplida=False (still within 1-year plazo)."""
+    def test_pagare_filed_6_months_ago_not_cumplida(self) -> None:
+        """Pagaré filed 6 months ago → cumplida=False (within 1-year plazo)."""
         from app.services.deadline_engine import _compute_prescripcion
 
-        titulo_fecha = TODAY - relativedelta(months=6)
-        case = self._case(titulo_tipo="pagare", titulo_fecha=titulo_fecha)
+        filed_at = self._filed(months=6)
+        case = self._case(titulo_tipo="pagare", filed_at=filed_at)
         cumplida, prescripcion_fecha = _compute_prescripcion(case, TODAY)
         assert cumplida is False
+        assert prescripcion_fecha == filed_at.date() + relativedelta(years=1)
 
-    def test_escritura_publica_4_years_ago_is_cumplida(self) -> None:
-        """Escritura pública 4 years ago → cumplida=True (3-year plazo)."""
+    def test_letra_filed_13_months_ago_is_cumplida(self) -> None:
+        """Letra filed 13 months ago → cumplida=True (past 1-year plazo)."""
         from app.services.deadline_engine import _compute_prescripcion
 
-        titulo_fecha = TODAY - relativedelta(years=4)
-        case = self._case(titulo_tipo="escritura_publica", titulo_fecha=titulo_fecha)
+        filed_at = self._filed(months=13)
+        case = self._case(titulo_tipo="letra", filed_at=filed_at)
         cumplida, prescripcion_fecha = _compute_prescripcion(case, TODAY)
         assert cumplida is True
-        assert prescripcion_fecha == titulo_fecha + relativedelta(years=3)
+        assert prescripcion_fecha == filed_at.date() + relativedelta(years=1)
 
-    def test_escritura_publica_2_years_ago_not_cumplida(self) -> None:
-        """Escritura pública 2 years ago → cumplida=False (still within 3-year plazo)."""
+    def test_cheque_filed_13_months_ago_is_cumplida(self) -> None:
+        """Cheque filed 13 months ago → cumplida=True (past 1-year plazo)."""
         from app.services.deadline_engine import _compute_prescripcion
 
-        titulo_fecha = TODAY - relativedelta(years=2)
-        case = self._case(titulo_tipo="escritura_publica", titulo_fecha=titulo_fecha)
+        filed_at = self._filed(months=13)
+        case = self._case(titulo_tipo="cheque", filed_at=filed_at)
         cumplida, prescripcion_fecha = _compute_prescripcion(case, TODAY)
-        assert cumplida is False
+        assert cumplida is True
+        assert prescripcion_fecha == filed_at.date() + relativedelta(years=1)
 
-    def test_titulo_fecha_none_returns_false_none(self) -> None:
-        """titulo_fecha=None → (False, None) — not computable."""
+    def test_escritura_publica_no_prescription(self) -> None:
+        """Escritura pública filed 5 years ago → (False, None): no prescription."""
         from app.services.deadline_engine import _compute_prescripcion
 
-        case = self._case(titulo_tipo="pagare", titulo_fecha=None)
+        case = self._case(titulo_tipo="escritura_publica", filed_at=self._filed(years=5))
         cumplida, prescripcion_fecha = _compute_prescripcion(case, TODAY)
         assert cumplida is False
         assert prescripcion_fecha is None
 
-    def test_cheque_exactly_1_year_1_day_ago_is_cumplida(self) -> None:
-        """Cheque with titulo_fecha exactly 1 year + 1 day ago → cumplida=True."""
+    def test_sentencia_no_prescription(self) -> None:
+        """Sentencia filed 5 years ago → (False, None): no prescription."""
         from app.services.deadline_engine import _compute_prescripcion
 
-        titulo_fecha = TODAY - relativedelta(years=1) - relativedelta(days=1)
-        case = self._case(titulo_tipo="cheque", titulo_fecha=titulo_fecha)
+        case = self._case(titulo_tipo="sentencia", filed_at=self._filed(years=5))
         cumplida, prescripcion_fecha = _compute_prescripcion(case, TODAY)
-        assert cumplida is True
+        assert cumplida is False
+        assert prescripcion_fecha is None
 
-    def test_cheque_exactly_1_year_ago_boundary_not_cumplida(self) -> None:
-        """Cheque with titulo_fecha exactly 1 year ago → prescripcion_fecha == today → cumplida=False (strictly <)."""
+    def test_otro_no_prescription(self) -> None:
+        """Tipo 'otro' filed 5 years ago → (False, None): no prescription."""
         from app.services.deadline_engine import _compute_prescripcion
 
-        titulo_fecha = TODAY - relativedelta(years=1)
-        case = self._case(titulo_tipo="cheque", titulo_fecha=titulo_fecha)
+        case = self._case(titulo_tipo="otro", filed_at=self._filed(years=5))
         cumplida, prescripcion_fecha = _compute_prescripcion(case, TODAY)
-        expected_fecha = titulo_fecha + relativedelta(years=1)
-        assert expected_fecha == TODAY  # boundary check: fecha == today
+        assert cumplida is False
+        assert prescripcion_fecha is None
+
+    def test_none_tipo_no_prescription(self) -> None:
+        """titulo_tipo=None filed 5 years ago → (False, None): no prescription."""
+        from app.services.deadline_engine import _compute_prescripcion
+
+        case = self._case(titulo_tipo=None, filed_at=self._filed(years=5))
+        cumplida, prescripcion_fecha = _compute_prescripcion(case, TODAY)
+        assert cumplida is False
+        assert prescripcion_fecha is None
+
+    def test_pagare_filed_at_none_returns_false_none(self) -> None:
+        """Pagaré but filed_at=None → (False, None) — not computable."""
+        from app.services.deadline_engine import _compute_prescripcion
+
+        case = self._case(titulo_tipo="pagare", filed_at=None)
+        cumplida, prescripcion_fecha = _compute_prescripcion(case, TODAY)
+        assert cumplida is False
+        assert prescripcion_fecha is None
+
+    def test_boundary_exactly_1_year_ago_not_cumplida(self) -> None:
+        """Pagaré filed exactly 1 year ago → prescripcion_fecha == today → cumplida=False (strictly <)."""
+        from app.services.deadline_engine import _compute_prescripcion
+
+        filed_at = self._filed(years=1)
+        case = self._case(titulo_tipo="pagare", filed_at=filed_at)
+        cumplida, prescripcion_fecha = _compute_prescripcion(case, TODAY)
+        assert prescripcion_fecha == TODAY  # boundary check: fecha == today
         assert cumplida is False  # strictly less than, NOT <=
-
-    def test_letra_uses_1_year_plazo(self) -> None:
-        """Letra uses 1-year plazo (same as pagaré)."""
-        from app.services.deadline_engine import _compute_prescripcion
-
-        titulo_fecha = TODAY - relativedelta(years=2)
-        case = self._case(titulo_tipo="letra", titulo_fecha=titulo_fecha)
-        cumplida, prescripcion_fecha = _compute_prescripcion(case, TODAY)
-        assert cumplida is True
-        assert prescripcion_fecha == titulo_fecha + relativedelta(years=1)
-
-    def test_otro_uses_3_year_plazo(self) -> None:
-        """Tipo 'otro' uses 3-year plazo."""
-        from app.services.deadline_engine import _compute_prescripcion
-
-        titulo_fecha = TODAY - relativedelta(years=4)
-        case = self._case(titulo_tipo="otro", titulo_fecha=titulo_fecha)
-        cumplida, prescripcion_fecha = _compute_prescripcion(case, TODAY)
-        assert cumplida is True
-        assert prescripcion_fecha == titulo_fecha + relativedelta(years=3)
-
-    def test_sentencia_uses_3_year_plazo(self) -> None:
-        """Tipo 'sentencia' uses 3-year plazo."""
-        from app.services.deadline_engine import _compute_prescripcion
-
-        titulo_fecha = TODAY - relativedelta(years=4)
-        case = self._case(titulo_tipo="sentencia", titulo_fecha=titulo_fecha)
-        cumplida, prescripcion_fecha = _compute_prescripcion(case, TODAY)
-        assert cumplida is True
-        assert prescripcion_fecha == titulo_fecha + relativedelta(years=3)
-
-    def test_none_tipo_with_fecha_uses_3_year_plazo(self) -> None:
-        """titulo_tipo=None with titulo_fecha set → treated as 'other' → 3-year plazo."""
-        from app.services.deadline_engine import _compute_prescripcion
-
-        titulo_fecha = TODAY - relativedelta(years=4)
-        case = self._case(titulo_tipo=None, titulo_fecha=titulo_fecha)
-        cumplida, prescripcion_fecha = _compute_prescripcion(case, TODAY)
-        assert cumplida is True
-        assert prescripcion_fecha == titulo_fecha + relativedelta(years=3)
 
 
 # ---------------------------------------------------------------------------
@@ -229,22 +226,39 @@ class TestComputePrescripcion:
 class TestPrescripcionRecompute:
     """Integration: recompute_case writes prescripcion_cumplida and prescripcion_fecha."""
 
-    def test_pagare_2_years_ago_sets_cumplida_true(self, db) -> None:
-        """Pagaré titulo_fecha 2 years ago → prescripcion_cumplida=True after recompute."""
+    def _filed(self, **delta):
+        d = TODAY - relativedelta(**delta)
+        return datetime(d.year, d.month, d.day)
+
+    def test_pagare_filed_2_years_ago_sets_cumplida_true(self, db) -> None:
+        """Pagaré filed 2 years ago → prescripcion_cumplida=True, fecha=filed+1yr."""
         from app.services.deadline_engine import DeadlineEngine
 
-        titulo_fecha = TODAY - relativedelta(years=2)
-        case = _make_case(db, titulo_tipo="pagare", titulo_fecha=titulo_fecha)
+        filed_at = self._filed(years=2)
+        case = _make_case(db, titulo_tipo="pagare", filed_at=filed_at)
         DeadlineEngine.recompute_case(db, case)
         assert case.prescripcion_cumplida is True
-        expected_fecha = titulo_fecha + relativedelta(years=1)
-        assert case.prescripcion_fecha == expected_fecha
+        assert case.prescripcion_fecha == filed_at.date() + relativedelta(years=1)
 
-    def test_titulo_fecha_none_sets_cumplida_false(self, db) -> None:
-        """titulo_fecha=None → prescripcion_cumplida=False, prescripcion_fecha=None after recompute."""
+    def test_escritura_no_prescription_after_recompute(self, db) -> None:
+        """Escritura pública filed 5 years ago → (False, None) after recompute."""
         from app.services.deadline_engine import DeadlineEngine
 
-        case = _make_case(db, titulo_tipo=None, titulo_fecha=None)
+        case = _make_case(
+            db, titulo_tipo="escritura_publica", filed_at=self._filed(years=5)
+        )
+        DeadlineEngine.recompute_case(db, case)
+        assert case.prescripcion_cumplida is False
+        assert case.prescripcion_fecha is None
+
+    def test_pagare_filed_at_none_sets_cumplida_false(self, db) -> None:
+        """Pagaré with filed_at=None → prescripcion_cumplida=False, fecha=None."""
+        from app.services.deadline_engine import DeadlineEngine
+
+        case = _make_case(db, titulo_tipo="pagare", filed_at=None)
+        # filed_at default in _make_case is a datetime; force None explicitly.
+        case.filed_at = None
+        db.flush()
         DeadlineEngine.recompute_case(db, case)
         assert case.prescripcion_cumplida is False
         assert case.prescripcion_fecha is None

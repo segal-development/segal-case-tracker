@@ -1,8 +1,14 @@
-"""Import titulo_tipo + titulo_fecha from CSV and recompute prescripción.
+"""Import titulo_tipo (and optional titulo_fecha) from CSV and recompute prescripción.
 
-CSV format: rol,tipo,fecha
-  - fecha: YYYY-MM-DD or DD-MM-YYYY (both accepted)
-  - tipo: pagare|letra|cheque|escritura_publica|sentencia|otro (stored lowercased)
+CSV format: rol,tipo[,fecha]
+  - rol:   required
+  - tipo:  pagare|letra|cheque|escritura_publica|sentencia|otro (stored lowercased)
+  - fecha: OPTIONAL. YYYY-MM-DD or DD-MM-YYYY (both accepted). Stored into
+           titulo_fecha as purely informational metadata.
+
+NOTE: The prescription date is derived from the case's filing date
+(``Case.filed_at``, "Fecha de ingreso"), NOT from the ``fecha`` column.
+A CSV with only ``rol,tipo`` works fine.
 
 Run:
     PYTHONPATH=$(pwd) <venv>/bin/python scripts/import_titulos.py <csv_file>
