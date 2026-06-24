@@ -1252,7 +1252,9 @@ async () => {
         seen = {(m.folio, m.descripcion) for m in detail.movements}
         for value in values[1:]:
             try:
-                await page.select_option("#selCuaderno", value)
+                # Short timeout: a cuaderno whose modal didn't load shouldn't
+                # stall the whole batch for the Playwright default (30s).
+                await page.select_option("#selCuaderno", value, timeout=8000)
                 await asyncio.sleep(3)
                 html = await page.evaluate(
                     "() => { const e = document.querySelector('#modalDetalleCivil');"
