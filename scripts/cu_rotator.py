@@ -69,19 +69,101 @@ def _select_cu_lawyers(db, firm_rut: str | None, only: str | None = None) -> lis
     return q.all()
 
 
-async def main() -> int:
-    from sqlalchemy.orm import Session as SASession
+def _next_cu_index(cursor: int, n: int) -> tuple[int, int]:
+    """Return (pick_index, next_cursor) for a simple round-robin over n items."""
+    return cursor % n, cursor + 1
 
-    from app.core.database import SessionLocal, engine
+
+async def sync_one_cu_lawyer(db, sc, lawyer, *, batch: int = 200) -> tuple[int, int, int]:
+    """Log in AS `lawyer` via their stored Clave Única (fresh context on sc's
+    browser), scrape their full Mis Causas, and persist (sync_cases +
+    detect_and_sync_movements with reserved_first=True). Returns
+    (movements_created, movements_updated, errors). Does NOT commit — the caller
+    owns the transaction. Raises if the CU login itself fails."""
     from app.core.security import decrypt_pjud_password
     from app.scrapper.pjud.clave_unica import ClaveUnicaAuth, ClaveUnicaCredentials
-    from app.scrapper.pjud.civil import CivilScraper
     from app.services.sync_service import (
         ScrapedCase,
         SyncService,
         _select_cases_for_detail_rotation,
         detect_and_sync_movements,
     )
+
+    cu_password = decrypt_pjud_password(lawyer.encrypted_clave_unica_password)
+    clave_rut: str = lawyer.clave_unica_rut or lawyer.rut
+    lawyer_id = int(lawyer.id)
+
+    # Track the active session so the reauth callback can refresh it.
+    held: dict = {"session": None}
+
+    async def cu_login():
+        """Perform a fresh Clave Única login for THIS lawyer and wire it into sc."""
+        if not sc._browser:
+            await sc.start()
+        ctx = await sc._browser.new_context(
+            viewport={"width": 1280, "height": 800},
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+        )
+        page = await ctx.new_page()
+        session = await ClaveUnicaAuth().login(
+            page,
+            ClaveUnicaCredentials(rut=clave_rut, password=cu_password),
+            lawyer_id,
+        )
+        await ctx.close()
+        sc._page = None
+        held["session"] = session
+        return session
+
+    # Initial CU login — raises on failure (caller handles it).
+    session = await cu_login()
+
+    # Fetch full Mis Causas (max_pages=0 → all pages).
+    api_cases = await sc.get_my_cases(session, max_pages=0)
+
+    # Build ScrapedCase list from PJUDCase dataclass attributes.
+    scraped = [
+        ScrapedCase(
+            rol=c.rol,
+            tribunal=c.tribunal,
+            caratulado=c.caratulado,
+            fecha_ingreso=c.fecha_ingreso,
+            estado_cuaderno=c.estado_cuaderno or "",
+            cuaderno=c.cuaderno or "",
+            institucion=c.institucion,
+        )
+        for c in api_cases
+    ]
+    SyncService(db).sync_cases(lawyer_id, scraped, competencia="civil")
+
+    # Detail / movement rotation — reserved cases first.
+    selected = _select_cases_for_detail_rotation(
+        db, lawyer_id, "civil", api_cases, batch, reserved_first=True
+    )
+
+    created, updated, errors = await detect_and_sync_movements(
+        db=db,
+        scraper=sc,
+        pjud_session=session,
+        lawyer_id=lawyer_id,
+        api_cases=api_cases,
+        selected_cases=selected,
+        delay_between_fetches=2.0,
+        reauth_callback=cu_login,
+    )
+
+    return created, updated, len(errors)
+
+
+async def main() -> int:
+    from sqlalchemy.orm import Session as SASession
+
+    from app.core.database import SessionLocal, engine
+    from app.scrapper.pjud.civil import CivilScraper
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
@@ -112,63 +194,9 @@ async def main() -> int:
         sc: CivilScraper | None = None
 
         try:
-            cu_password = decrypt_pjud_password(lawyer.encrypted_clave_unica_password)
-            clave_rut: str = lawyer.clave_unica_rut or lawyer.rut
-            lawyer_id = int(lawyer.id)
-
             sc = CivilScraper(headless=False)
             sc.reuse_context = True
 
-            held: dict = {"session": None}
-
-            async def cu_login(
-                _sc=sc,
-                _clave_rut=clave_rut,
-                _cu_password=cu_password,
-                _lawyer_id=lawyer_id,
-                _held=held,
-            ):
-                """Perform a fresh Clave Única login and wire it into the scraper."""
-                if not _sc._browser:
-                    await _sc.start()
-                ctx = await _sc._browser.new_context(
-                    viewport={"width": 1280, "height": 800},
-                    user_agent=(
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/120.0.0.0 Safari/537.36"
-                    ),
-                )
-                page = await ctx.new_page()
-                session = await ClaveUnicaAuth().login(
-                    page,
-                    ClaveUnicaCredentials(rut=_clave_rut, password=_cu_password),
-                    _lawyer_id,
-                )
-                await ctx.close()
-                _sc._page = None
-                _held["session"] = session
-                return session
-
-            # Initial CU login.
-            try:
-                session = await cu_login()
-            except Exception as exc:
-                msg = (
-                    f"CU login failed for {label}: "
-                    f"{type(exc).__name__}: {str(exc)[:120]}"
-                )
-                print(f"  {msg}")
-                try:
-                    from scripts.freshness_monitor import send_telegram
-                    send_telegram(f"⚠️ CU Rotator — {msg}")
-                except Exception:
-                    pass
-                results.append((label, f"error:{type(exc).__name__}"))
-                continue
-
-            # Per-lawyer DB session with dry-run SAVEPOINT safety
-            # (mirrors persist_via_cdp in cdp_scraper_sketch.py).
             if dry_run:
                 _conn = engine.connect()
                 _outer = _conn.begin()
@@ -178,48 +206,8 @@ async def main() -> int:
                 _conn = _outer = None
 
             try:
-                # Fetch full Mis Causas (max_pages=0 → all pages).
-                api_cases = await sc.get_my_cases(session, max_pages=0)
-                print(f"  get_my_cases → {len(api_cases)} cases")
-
-                # Build ScrapedCase list from PJUDCase dataclass attributes.
-                scraped = [
-                    ScrapedCase(
-                        rol=c.rol,
-                        tribunal=c.tribunal,
-                        caratulado=c.caratulado,
-                        fecha_ingreso=c.fecha_ingreso,
-                        estado_cuaderno=c.estado_cuaderno or "",
-                        cuaderno=c.cuaderno or "",
-                        institucion=c.institucion,
-                    )
-                    for c in api_cases
-                ]
-                sync_result = SyncService(db).sync_cases(
-                    lawyer_id, scraped, competencia="civil"
-                )
-                print(
-                    f"  sync_cases → total={sync_result.cases_total} "
-                    f"new={sync_result.cases_new} "
-                    f"updated={sync_result.cases_updated} "
-                    f"errors={len(sync_result.errors)}"
-                )
-
-                # Detail / movement rotation — reserved cases first.
-                selected = _select_cases_for_detail_rotation(
-                    db, lawyer_id, "civil", api_cases, batch, reserved_first=True
-                )
-                print(f"  selected for detail rotation: {len(selected)} cases")
-
-                created, updated, errors = await detect_and_sync_movements(
-                    db=db,
-                    scraper=sc,
-                    pjud_session=session,
-                    lawyer_id=lawyer_id,
-                    api_cases=api_cases,
-                    selected_cases=selected,
-                    delay_between_fetches=2.0,
-                    reauth_callback=cu_login,
+                created, updated, errors = await sync_one_cu_lawyer(
+                    db, sc, lawyer, batch=batch
                 )
 
                 if dry_run:
@@ -228,7 +216,7 @@ async def main() -> int:
                     db.commit()
                     print("  COMMITTED ✓")
 
-                status = f"ok  movements+{created} updated={updated} errors={len(errors)}"
+                status = f"ok  movements+{created} updated={updated} errors={errors}"
                 results.append((label, status))
                 print(f"  {label}: {status}")
 
@@ -238,7 +226,7 @@ async def main() -> int:
                 except Exception:
                     pass
                 msg = (
-                    f"scrape/persist failed for {label}: "
+                    f"failed for {label}: "
                     f"{type(exc).__name__}: {str(exc)[:120]}"
                 )
                 print(f"  {msg}")
@@ -266,7 +254,6 @@ async def main() -> int:
             results.append((label, f"error:{type(exc).__name__}"))
 
         finally:
-            # Close the browser between lawyers — fresh context per lawyer.
             if sc is not None:
                 try:
                     await sc.stop()
