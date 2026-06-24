@@ -25,7 +25,7 @@ from app.scrapper.pjud.base import (
     CompetencyConfig,
     PJUD_BASE_URL,
 )
-from app.scrapper.pjud.exceptions import DocumentTokenExpiredError, ScrapingError
+from app.scrapper.pjud.exceptions import ConsultaSessionExpired, DocumentTokenExpiredError, ScrapingError
 from app.scrapper.pjud.selectors import SelectorRegistry
 from app.services.pjud_session import PJUDSession
 
@@ -1199,6 +1199,16 @@ async () => {
                 return await r.text();
             }}
         """)
+        # Dead session detection: the server returned a login redirect instead of
+        # search results (parent.window.open("index.php")) — the CU session has expired.
+        if (
+            "parent.window.open" in search_html
+            or re.search(r"<script[^>]*>[^<]*index\.php", search_html, re.DOTALL)
+        ) and "No se han encontrado" not in search_html:
+            raise ConsultaSessionExpired(
+                f"consulta_by_rol {rol}: session redirect detected"
+            )
+
         if "No se han encontrado" in search_html:
             logger.info(f"consulta_by_rol {rol}: not in consulta (reserved or not found)")
             return None

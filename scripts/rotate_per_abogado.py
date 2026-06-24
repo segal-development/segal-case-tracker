@@ -88,7 +88,7 @@ async def main() -> int:
             # itself is continuous activity that keeps the PJUD session alive (no idle
             # timeout while requests flow), so a big batch = fewer human logins.
             batch = int(os.environ.get("LAWYER_BATCH", "200"))
-            await persist_via_cdp(rut, name=name, max_pages=2, batch=batch, dry_run=dry)
+            await persist_via_cdp(rut, name=name, max_pages=2, batch=batch, dry_run=dry, reserved_first=True)
             results.append((label, "ok"))
         except Exception as e:
             print(f"  persist failed for {label}: {type(e).__name__}: {str(e)[:140]}")

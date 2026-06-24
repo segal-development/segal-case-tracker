@@ -5,6 +5,7 @@ logic (reserved/not-found → None, found → parsed via the existing detail par
 and the multi-cuaderno accumulation/dedup, without touching the network.
 asyncio_mode=auto (no marker needed).
 """
+import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 from app.scrapper.pjud.civil import CivilScraper
@@ -93,3 +94,27 @@ async def test_load_other_cuadernos_single_cuaderno_noop(monkeypatch):
 
     assert len(detail.movements) == 1
     page.select_option.assert_not_awaited()
+
+
+async def test_dead_session_redirect_raises_consulta_session_expired(monkeypatch):
+    """A dead CU session causes the search to return a login redirect → ConsultaSessionExpired."""
+    from app.scrapper.pjud.exceptions import ConsultaSessionExpired
+
+    sc = CivilScraper(headless=True)
+    redirect_html = '<script>parent.window.open("index.php", "_self")</script>'
+    page = _mock_page(["", redirect_html])
+    monkeypatch.setattr(sc, "_get_page", AsyncMock(return_value=page))
+    monkeypatch.setattr("app.scrapper.pjud.civil.asyncio.sleep", AsyncMock())
+
+    with pytest.raises(ConsultaSessionExpired):
+        await sc.consulta_by_rol(MagicMock(), "C-7733-2026", corte="90")
+
+
+async def test_reserved_case_still_returns_none_no_false_redirect(monkeypatch):
+    """'No se han encontrado' is NOT mistaken for a session redirect — still returns None."""
+    sc = CivilScraper(headless=True)
+    page = _mock_page(["", "No se han encontrado causas en el sistema"])
+    monkeypatch.setattr(sc, "_get_page", AsyncMock(return_value=page))
+    monkeypatch.setattr("app.scrapper.pjud.civil.asyncio.sleep", AsyncMock())
+
+    assert await sc.consulta_by_rol(MagicMock(), "C-7733-2026", corte="90") is None
