@@ -129,6 +129,7 @@ async def persist_via_cdp(
     max_pages: int = 2,
     batch: int = 20,
     dry_run: bool = True,
+    reserved_first: bool = False,
 ) -> None:
     """Scrape a lawyer's cases over CDP and persist them to the database.
 
@@ -241,7 +242,7 @@ async def persist_via_cdp(
         )
 
         # 5. Detail / movement sync ------------------------------------------
-        selected = _select_cases_for_detail_rotation(db, lawyer_id, "civil", api_cases, batch)
+        selected = _select_cases_for_detail_rotation(db, lawyer_id, "civil", api_cases, batch, reserved_first=reserved_first)
         print(f"  selected for detail rotation: {len(selected)} cases")
         created, updated, errors = await detect_and_sync_movements(
             db=db,

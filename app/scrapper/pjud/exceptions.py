@@ -83,6 +83,10 @@ class DocumentTokenExpiredError(PJUDError):
     pass
 
 
+class ConsultaSessionExpired(PJUDError):
+    """Raised when consulta_by_rol detects a dead session redirect instead of search results."""
+
+
 class SessionNotAuthenticatedError(PJUDError):
     """Raised when session restoration did not produce an authenticated PJUD page.
 

@@ -44,7 +44,7 @@ from app.models.case_escrito import CaseEscrito
 from app.models.case_exhorto import CaseExhorto
 from app.services.notification_service import NotificationService
 from app.services.document_persistence import DocumentPersistenceService
-from app.scrapper.pjud.exceptions import SessionExpiredError, SessionNotAuthenticatedError
+from app.scrapper.pjud.exceptions import ConsultaSessionExpired, SessionExpiredError, SessionNotAuthenticatedError
 from app.services.deadline_engine import DeadlineEngine
 
 
@@ -1087,6 +1087,7 @@ def _select_cases_for_detail_rotation(
     competencia: str,
     api_cases: list,
     batch_size: int,
+    reserved_first: bool = False,
 ) -> list:
     """Select PJUDCase objects for detail scraping via DB-driven rotation.
 
@@ -1138,13 +1139,17 @@ def _select_cases_for_detail_rotation(
 
     # Rotation order; the year filter + batch cap are applied in Python below
     # (parsing the ROL year in SQL is not portable across Postgres/SQLite).
+    order_clauses = []
+    if reserved_first:
+        order_clauses.append(Case.consulta_reserved.desc())
+    order_clauses.extend([
+        Case.last_detail_checked_at.asc().nullsfirst(),
+        Case.filed_at.desc(),
+    ])
     db_cases = (
         db.query(Case)
         .filter(Case.lawyer_id == lawyer_id, Case.competencia == competencia)
-        .order_by(
-            Case.last_detail_checked_at.asc().nullsfirst(),
-            Case.filed_at.desc(),
-        )
+        .order_by(*order_clauses)
         .all()
     )
 
@@ -1603,6 +1608,7 @@ async def sync_via_consulta(
     cases: list,
     *,
     dry_run: bool = False,
+    reauth_callback: Optional[Callable[[], Awaitable[Optional[Any]]]] = None,
 ) -> Tuple[int, int, int, int]:
     """Persist movements for cases sourced from PJUD Consulta Unificada by rol.
 
@@ -1649,7 +1655,43 @@ async def sync_via_consulta(
                 errors += 1
                 continue
 
-            detail = await scraper.consulta_by_rol(session, case.rol, str(corte))
+            try:
+                detail = await scraper.consulta_by_rol(session, case.rol, str(corte))
+            except ConsultaSessionExpired:
+                if reauth_callback is not None:
+                    new_session = await reauth_callback()
+                    if new_session is None:
+                        logger.error(
+                            "sync_via_consulta: reauth returned None for case %s, skipping",
+                            case.rol,
+                        )
+                        errors += 1
+                        continue
+                    session = new_session
+                    try:
+                        detail = await scraper.consulta_by_rol(session, case.rol, str(corte))
+                    except ConsultaSessionExpired:
+                        logger.error(
+                            "sync_via_consulta: session expired again after reauth for case %s",
+                            case.rol,
+                        )
+                        errors += 1
+                        continue
+                    except Exception as exc:
+                        logger.error(
+                            "sync_via_consulta: error on retry for case %s: %s",
+                            case.rol, exc,
+                        )
+                        errors += 1
+                        continue
+                else:
+                    logger.error(
+                        "sync_via_consulta: ConsultaSessionExpired for case %s, "
+                        "no reauth_callback provided",
+                        case.rol,
+                    )
+                    errors += 1
+                    continue
 
             if detail is None:
                 logger.info(

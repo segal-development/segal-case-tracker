@@ -393,6 +393,79 @@ class TestSelectCasesForDetailRotation:
             f"batch2 {batch2_rols} should be from unchecked pool {unchecked_rols}"
         )
 
+    def test_reserved_first_true_sorts_reserved_before_non_reserved(self, db):
+        """reserved_first=True places consulta_reserved=True cases before non-reserved ones."""
+        from app.services.sync_service import _select_cases_for_detail_rotation
+
+        lawyer = Lawyer(rut="00000010-0", name="Lawyer Reserved", is_active=True)
+        db.add(lawyer)
+        db.flush()
+
+        court = db.query(Court).first()
+        if not court:
+            court = Court(code="RES-COURT", name="Reserved Court", region="RM", type="civil")
+            db.add(court)
+            db.flush()
+
+        # Both cases have NULL last_detail_checked_at — only consulta_reserved differs
+        c_public = Case(
+            lawyer_id=lawyer.id, court_id=court.id, rol="C-PUBLIC-1", competencia="civil",
+            status="active", last_detail_checked_at=None, consulta_reserved=False,
+        )
+        c_reserved = Case(
+            lawyer_id=lawyer.id, court_id=court.id, rol="C-RESERV-1", competencia="civil",
+            status="active", last_detail_checked_at=None, consulta_reserved=True,
+        )
+        db.add_all([c_public, c_reserved])
+        db.commit()
+
+        api_cases = [_make_api_case("C-PUBLIC-1"), _make_api_case("C-RESERV-1")]
+        result = _select_cases_for_detail_rotation(
+            db, lawyer.id, "civil", api_cases, batch_size=10, reserved_first=True
+        )
+
+        rols = [ac.rol for ac in result]
+        assert len(rols) == 2
+        assert rols.index("C-RESERV-1") < rols.index("C-PUBLIC-1"), (
+            "reserved case must come before public case when reserved_first=True"
+        )
+
+    def test_reserved_first_false_preserves_existing_order(self, db):
+        """reserved_first=False (default) leaves sort order unchanged — NULL still first."""
+        from app.services.sync_service import _select_cases_for_detail_rotation
+
+        lawyer = Lawyer(rut="00000011-1", name="Lawyer Order", is_active=True)
+        db.add(lawyer)
+        db.flush()
+
+        court = db.query(Court).first()
+        if not court:
+            court = Court(code="ORD-COURT", name="Order Court", region="RM", type="civil")
+            db.add(court)
+            db.flush()
+
+        c_null = Case(
+            lawyer_id=lawyer.id, court_id=court.id, rol="C-ORDER-NULL", competencia="civil",
+            status="active", last_detail_checked_at=None, consulta_reserved=False,
+        )
+        c_checked = Case(
+            lawyer_id=lawyer.id, court_id=court.id, rol="C-ORDER-CHKD", competencia="civil",
+            status="active", last_detail_checked_at=datetime(2025, 1, 1), consulta_reserved=True,
+        )
+        db.add_all([c_null, c_checked])
+        db.commit()
+
+        api_cases = [_make_api_case("C-ORDER-NULL"), _make_api_case("C-ORDER-CHKD")]
+        result = _select_cases_for_detail_rotation(
+            db, lawyer.id, "civil", api_cases, batch_size=10, reserved_first=False
+        )
+
+        rols = [ac.rol for ac in result]
+        # NULL last_detail_checked_at comes first regardless of reserved flag
+        assert rols.index("C-ORDER-NULL") < rols.index("C-ORDER-CHKD"), (
+            "NULL last_detail_checked_at must come before checked case when reserved_first=False"
+        )
+
 
 # ===========================================================================
 # S1-T4: TestMarkDetailCheckedAt

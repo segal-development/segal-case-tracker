@@ -226,7 +226,8 @@ async def main() -> None:
                             consulta_cases = _select_consulta_cases(db, lawyer_id, CONSULTA_BATCH)
                             if consulta_cases:
                                 c_created, c_alerts, c_reserved, c_errors = await sync_via_consulta(
-                                    db, lawyer, sc, session, consulta_cases, dry_run=False
+                                    db, lawyer, sc, session, consulta_cases,
+                                    dry_run=False, reauth_callback=reauth_cb,
                                 )
                                 db.commit()
                                 print(f"  consulta round {round_n}: {len(consulta_cases)} abogado-cases · "

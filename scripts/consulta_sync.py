@@ -98,9 +98,32 @@ async def main() -> int:
     await ctx.close()
     sc._page = None
 
+    async def reauth_cb():
+        """Re-authenticate via Clave Única when the CU session expires mid-run."""
+        try:
+            new_ctx = await sc._browser.new_context(
+                viewport={"width": 1280, "height": 800},
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                ),
+            )
+            new_page = await new_ctx.new_page()
+            new_session = await ClaveUnicaAuth().login(
+                new_page,
+                ClaveUnicaCredentials(rut=CU_RUT, password=CU_PASSWORD),
+                int(lawyer.id),
+            )
+            await new_ctx.close()
+            sc._page = None
+            return new_session
+        except Exception as e:
+            print(f"  reauth failed: {e}")
+            return None
+
     try:
         created, alerts, reserved, errors = await sync_via_consulta(
-            db, lawyer, sc, session, cases, dry_run=dry
+            db, lawyer, sc, session, cases, dry_run=dry, reauth_callback=reauth_cb
         )
         if not dry:
             db.commit()

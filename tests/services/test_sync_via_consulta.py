@@ -253,3 +253,90 @@ async def test_dry_run_no_db_mutations(seeded):
     assert case.consulta_reserved is False, "dry_run must not clear consulta_reserved"
     assert case.last_detail_checked_at is None, "dry_run must not advance last_detail_checked_at"
     mock_sync.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_consulta_session_expired_reauth_succeeds(seeded):
+    """ConsultaSessionExpired → reauth_callback returns a new session → retry succeeds → errors=0, reserved=0."""
+    from app.scrapper.pjud.exceptions import ConsultaSessionExpired
+
+    db = seeded["db"]
+    case = seeded["case"]
+    lawyer = seeded["lawyer"]
+
+    detail = _make_detail()
+    fresh_session = MagicMock()
+
+    scraper = MagicMock()
+    scraper.consulta_by_rol = AsyncMock(
+        side_effect=[ConsultaSessionExpired("session expired"), detail]
+    )
+    reauth_callback = AsyncMock(return_value=fresh_session)
+    pjud_session = MagicMock()
+
+    with (
+        patch("app.services.sync_service.convert_api_movements_to_scraped", return_value=[]),
+        patch("app.services.sync_service._sync_entities"),
+        patch("app.services.sync_service.DocumentPersistenceService") as mock_dp,
+        patch("app.services.sync_service._maybe_recompute_deadlines"),
+    ):
+        mock_dp.return_value.persist_from_detail.return_value = []
+        result = await sync_via_consulta(
+            db, lawyer, scraper, pjud_session, [case], reauth_callback=reauth_callback
+        )
+
+    created_movements, alerts_created, reserved, errors = result
+
+    assert errors == 0
+    assert reserved == 0
+    reauth_callback.assert_awaited_once()
+    assert scraper.consulta_by_rol.await_count == 2
+    db.refresh(case)
+    assert case.consulta_reserved is False
+
+
+@pytest.mark.asyncio
+async def test_consulta_session_expired_no_reauth_counts_as_error(seeded):
+    """ConsultaSessionExpired with no reauth_callback → errors=1, reserved=0, consulta_reserved unchanged."""
+    from app.scrapper.pjud.exceptions import ConsultaSessionExpired
+
+    db = seeded["db"]
+    case = seeded["case"]
+    lawyer = seeded["lawyer"]
+
+    scraper = MagicMock()
+    scraper.consulta_by_rol = AsyncMock(side_effect=ConsultaSessionExpired("session expired"))
+    pjud_session = MagicMock()
+
+    result = await sync_via_consulta(db, lawyer, scraper, pjud_session, [case])
+
+    created_movements, alerts_created, reserved, errors = result
+    assert errors == 1
+    assert reserved == 0
+    db.refresh(case)
+    assert case.consulta_reserved is False, "session expiry must NOT set consulta_reserved"
+
+
+@pytest.mark.asyncio
+async def test_consulta_session_expired_reauth_returns_none_counts_as_error(seeded):
+    """ConsultaSessionExpired + reauth_callback returning None → errors=1, reserved=0."""
+    from app.scrapper.pjud.exceptions import ConsultaSessionExpired
+
+    db = seeded["db"]
+    case = seeded["case"]
+    lawyer = seeded["lawyer"]
+
+    scraper = MagicMock()
+    scraper.consulta_by_rol = AsyncMock(side_effect=ConsultaSessionExpired("session expired"))
+    reauth_callback = AsyncMock(return_value=None)
+    pjud_session = MagicMock()
+
+    result = await sync_via_consulta(
+        db, lawyer, scraper, pjud_session, [case], reauth_callback=reauth_callback
+    )
+
+    created_movements, alerts_created, reserved, errors = result
+    assert errors == 1
+    assert reserved == 0
+    db.refresh(case)
+    assert case.consulta_reserved is False, "session expiry must NOT set consulta_reserved"
