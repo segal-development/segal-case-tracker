@@ -40,6 +40,12 @@ FETCH_DELAY = float(os.environ.get("FRESHNESS_FETCH_DELAY", "2.5"))
 CONSULTA_ENABLED = os.environ.get("CONSULTA_ENABLED", "false").lower() == "true"
 CONSULTA_EVERY = int(os.environ.get("CONSULTA_EVERY", "5"))
 CONSULTA_BATCH = int(os.environ.get("CONSULTA_BATCH", "15"))
+# Per-lawyer CU scrape folded into Carla's loop: every CU_ROTATOR_EVERY rounds,
+# log in as one CU-enrolled lawyer (round-robin) and scrape their full Mis Causas
+# including reserved cases. OPT-IN (default off) — Carla is unchanged unless set.
+CU_ROTATOR_ENABLED = os.environ.get("CU_ROTATOR_ENABLED", "false").lower() == "true"
+CU_ROTATOR_EVERY = int(os.environ.get("CU_ROTATOR_EVERY", "12"))
+CU_ROTATOR_BATCH = int(os.environ.get("CU_ROTATOR_BATCH", "15"))
 # Block/challenge back-off: after this many consecutive "bad" rounds (likely
 # PJUD pushing back), cool down instead of hammering — never rotate harder.
 COOLDOWN_THRESHOLD = int(os.environ.get("FRESHNESS_COOLDOWN_THRESHOLD", "3"))
@@ -99,6 +105,7 @@ async def main() -> None:
         _select_cases_for_detail_rotation,
     )
     from app.scrapper.pjud.clave_unica import ClaveUnicaAuth, ClaveUnicaCredentials
+    from scripts.cu_rotator import _select_cu_lawyers, sync_one_cu_lawyer, _next_cu_index
 
     db = SessionLocal()
     lawyer = db.query(Lawyer).filter(Lawyer.rut == LAWYER_RUT).first()
@@ -157,6 +164,9 @@ async def main() -> None:
             print("  logging in via Clave Única...")
             s = await clave_unica_login()
         return s
+
+    # Round-robin cursor for CU-enrolled lawyers (advances each CU-rotator invocation).
+    cu_cursor = 0
 
     round_n = 0
     consecutive_bad = 0
@@ -236,6 +246,36 @@ async def main() -> None:
                             db.rollback()
                             signals[classify(e)] += 1
                             print(f"  consulta sync failed [{classify(e)}]: {str(e)[:100]}")
+
+                    # Per-lawyer CU scrape (Mis Causas including reserved). Opt-in +
+                    # isolated: any failure here must NEVER break the firm loop.
+                    if CU_ROTATOR_ENABLED and not round_bad and round_n % CU_ROTATOR_EVERY == 0:
+                        cu_lawyers = _select_cu_lawyers(db, LAWYER_RUT)
+                        if cu_lawyers:
+                            pick_idx, cu_cursor = _next_cu_index(cu_cursor, len(cu_lawyers))
+                            cu_lawyer = cu_lawyers[pick_idx]
+                            try:
+                                cu_created, cu_updated, cu_errors = await sync_one_cu_lawyer(
+                                    db, sc, cu_lawyer, batch=CU_ROTATOR_BATCH
+                                )
+                                db.commit()
+                                print(
+                                    f"  cu-rotator round {round_n}: {cu_lawyer.rut} · "
+                                    f"movements+{cu_created} updated={cu_updated} errors={cu_errors}"
+                                )
+                            except Exception as e:
+                                db.rollback()
+                                signals[classify(e)] += 1
+                                print(
+                                    f"  cu-rotator failed [{classify(e)}]: {str(e)[:100]}"
+                                )
+                            finally:
+                                # CRITICAL: logging in AS the lawyer replaces the firm
+                                # session on this IP/browser. Always invalidate so
+                                # ensure_session() re-auths the FIRM CU on the next round.
+                                held["session"] = None
+                                sc._page = None
+                                sc._panel_loaded = False
         except Exception as e:
             db.rollback()
             signals[classify(e)] += 1
