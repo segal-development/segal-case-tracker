@@ -106,7 +106,7 @@ def test_post_manual_deadline_requires_auditor_role_403(client, case_with_deadli
     case, dl = case_with_deadline
     resp = client.post(
         f"/api/v1/cases/{case.id}/deadlines",
-        json={"deadline_type": "apelacion_5d", "due_date": str(date.today() + timedelta(days=3))},
+        json={"deadline_type": "apelacion_5d", "start_date": str(date.today() + timedelta(days=3))},
         headers=lawyer_headers,
     )
     assert resp.status_code == 403
@@ -201,11 +201,13 @@ def test_put_status_404_wrong_case(client, db, auditor, auditor_headers, owning_
 
 
 def test_post_manual_deadline_creates_is_manual_true(client, db, case_with_deadline, auditor, auditor_headers):
+    from app.services.business_days import add_business_days
+
     case, _ = case_with_deadline
-    due = str(date.today() + timedelta(days=10))
+    start = date.today()
     resp = client.post(
         f"/api/v1/cases/{case.id}/deadlines",
-        json={"deadline_type": "apelacion_5d", "due_date": due},
+        json={"deadline_type": "apelacion_5d", "start_date": str(start)},
         headers=auditor_headers,
     )
     assert resp.status_code == 201
@@ -213,6 +215,9 @@ def test_post_manual_deadline_creates_is_manual_true(client, db, case_with_deadl
     assert data["is_manual"] is True
     assert data["deadline_type"] == "apelacion_5d"
     assert data["legal_basis"] == "art. 187/475 CPC"  # from catalog
+    # due_date is derived = start_date + 5 días hábiles (apelacion_5d), NOT sent by the client
+    assert data["due_date"] == str(add_business_days(start, 5))
+    assert data["triggered_at"] == str(start)
 
     # Alert created for case's owning lawyer
     db.expire_all()
@@ -228,7 +233,32 @@ def test_post_manual_deadline_invalid_type_422(client, case_with_deadline, audit
     case, _ = case_with_deadline
     resp = client.post(
         f"/api/v1/cases/{case.id}/deadlines",
-        json={"deadline_type": "not_a_real_type", "due_date": str(date.today())},
+        json={"deadline_type": "not_a_real_type", "start_date": str(date.today())},
+        headers=auditor_headers,
+    )
+    assert resp.status_code == 422
+
+
+def test_compute_due_returns_start_plus_business_days(client, auditor, auditor_headers):
+    from app.services.business_days import add_business_days
+
+    start = date(2026, 6, 25)
+    resp = client.get(
+        "/api/v1/cases/deadlines/compute-due",
+        params={"deadline_type": "excepciones_8d", "start_date": str(start)},
+        headers=auditor_headers,
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["dias_habiles"] == 8
+    assert data["start_date"] == str(start)
+    assert data["due_date"] == str(add_business_days(start, 8))
+
+
+def test_compute_due_invalid_type_422(client, auditor, auditor_headers):
+    resp = client.get(
+        "/api/v1/cases/deadlines/compute-due",
+        params={"deadline_type": "nope", "start_date": "2026-06-25"},
         headers=auditor_headers,
     )
     assert resp.status_code == 422
@@ -237,7 +267,7 @@ def test_post_manual_deadline_invalid_type_422(client, case_with_deadline, audit
 def test_post_manual_deadline_case_not_found_404(client, auditor, auditor_headers):
     resp = client.post(
         "/api/v1/cases/99999/deadlines",
-        json={"deadline_type": "apelacion_5d", "due_date": str(date.today() + timedelta(days=5))},
+        json={"deadline_type": "apelacion_5d", "start_date": str(date.today() + timedelta(days=5))},
         headers=auditor_headers,
     )
     assert resp.status_code == 404

@@ -27,7 +27,7 @@ from app.models.alert import Alert
 from app.models.case import Case
 from app.models.case_deadline import CaseDeadline
 from app.models.lawyer import Lawyer
-from app.services.business_days import count_business_days_remaining
+from app.services.business_days import count_business_days_remaining, add_business_days
 
 from zoneinfo import ZoneInfo
 
@@ -217,7 +217,9 @@ class DeadlineResponse(BaseModel):
 
 class ManualDeadlineBody(BaseModel):
     deadline_type: str
-    due_date: date
+    # The date the deadline starts running. due_date is derived =
+    # start_date + the type's N días hábiles (CL holidays-aware).
+    start_date: date
 
 
 class AuditedDeadlineResponse(BaseModel):
@@ -258,6 +260,41 @@ async def get_deadlines_catalog(
         )
         for dt in DeadlineType
     ]
+
+
+class ComputeDueResponse(BaseModel):
+    deadline_type: str
+    label: str
+    legal_basis: str
+    dias_habiles: int
+    is_fatal: bool
+    start_date: date
+    due_date: date
+
+
+@router.get("/deadlines/compute-due", response_model=ComputeDueResponse)
+async def compute_due_date(
+    deadline_type: str = Query(..., description="Catalog deadline type value"),
+    start_date: date = Query(..., description="Date the deadline starts running"),
+    _current_lawyer: dict = Depends(get_current_lawyer),
+):
+    """Preview a manual deadline's due_date = start_date + N días hábiles (CL holidays-aware)."""
+    valid_values = {dt.value for dt in DeadlineType}
+    if deadline_type not in valid_values:
+        raise HTTPException(
+            status_code=422,
+            detail=f"deadline_type must be one of {sorted(valid_values)}",
+        )
+    dt = DeadlineType(deadline_type)
+    return ComputeDueResponse(
+        deadline_type=dt.value,
+        label=_DEADLINE_LABELS.get(dt.value, dt.value),
+        legal_basis=dt.legal_basis,
+        dias_habiles=dt.dias_habiles,
+        is_fatal=dt.is_fatal,
+        start_date=start_date,
+        due_date=add_business_days(start_date, dt.dias_habiles),
+    )
 
 
 @router.get("/deadlines/audited", response_model=list[AuditedDeadlineResponse])
@@ -403,14 +440,17 @@ async def create_manual_deadline(
         raise HTTPException(status_code=404, detail="Case not found")
 
     dt = DeadlineType(body.deadline_type)
-    today = date.today()
+    # The deadline runs from start_date; due_date = start_date + N días hábiles
+    # (CL holidays-aware) — same arithmetic the engine uses for automatic deadlines.
+    triggered_at = body.start_date
+    due_date = add_business_days(triggered_at, dt.dias_habiles)
 
     new_deadline = CaseDeadline(
         case_id=case_id,
         deadline_type=dt.value,
         legal_basis=dt.legal_basis,
-        due_date=body.due_date,
-        triggered_at=today,
+        due_date=due_date,
+        triggered_at=triggered_at,
         status="active",
         is_manual=True,
         computed_at=None,
@@ -425,8 +465,8 @@ async def create_manual_deadline(
         raise HTTPException(
             status_code=409,
             detail=(
-                f"A deadline of type '{dt.value}' triggered on {today} already exists for this case. "
-                "Change the deadline_type or try again tomorrow."
+                f"A deadline of type '{dt.value}' starting on {triggered_at} already exists for this case. "
+                "Change the deadline_type or the start date."
             ),
         )
 
@@ -436,7 +476,7 @@ async def create_manual_deadline(
         case_id=case.id,
         type="deadline_added",
         title=f"Nuevo plazo · {case.rol}",
-        message=f"El auditor agregó un plazo manual '{dt.value}' con vencimiento {body.due_date}.",
+        message=f"El auditor agregó un plazo manual '{dt.value}' con vencimiento {due_date}.",
         created_at=datetime.utcnow(),
     )
     db.add(alert)
