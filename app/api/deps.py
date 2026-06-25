@@ -75,6 +75,35 @@ async def require_admin(
     return str(lawyer.rut)
 
 
+async def require_auditor(
+    current_lawyer: dict = Depends(get_current_lawyer),
+    db: Session = Depends(get_db),
+) -> str:
+    """Allow access only to lawyers with role in {'auditor', 'admin'}.
+
+    Admins can do everything auditors can.  Returns the lawyer's RUT string.
+    Raises 403 if the resolved lawyer is missing or does not have an allowed role.
+    """
+    from app.models.lawyer import Lawyer
+
+    sub = current_lawyer.get("sub") or current_lawyer.get("lawyer_id")
+    if not sub:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
+    if isinstance(sub, int) or (isinstance(sub, str) and sub.isdigit()):
+        lawyer = db.query(Lawyer).filter(Lawyer.id == int(sub)).first()
+    else:
+        lawyer = db.query(Lawyer).filter(Lawyer.rut == str(sub)).first()
+
+    if lawyer is None or lawyer.role not in {"auditor", "admin"}:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Requiere rol auditor o admin",
+        )
+
+    return str(lawyer.rut)
+
+
 def _resolve_lawyer_id(db: Session, current_lawyer: dict) -> int:
     """Resolve the numeric lawyer id from a JWT payload.
 
