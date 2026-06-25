@@ -141,6 +141,26 @@ class TestSpecScenarios:
         assert state == ProceduralState.INDETERMINATE
         assert triggers == {}
 
+    def test_archivo_expediente_is_terminada(self) -> None:
+        """Real data: 'Archivo del expediente en el tribunal' → TERMINADA (closed)."""
+        clf = get_classifier()
+        movements = [
+            _mv("2024-03-01", "Presentación de la medida prejudicial", "Da curso a la medida prejudicial"),
+            _mv("2025-02-01", "Tramitación", "Archivo del expediente en el tribunal"),
+        ]
+        state, triggers = clf.classify(movements, TODAY)
+        assert state == ProceduralState.TERMINADA
+
+    def test_no_presentada_demanda_is_terminada(self) -> None:
+        """Real data: 'Téngase por no presentada la demanda' → TERMINADA (lapsed)."""
+        clf = get_classifier()
+        movements = [
+            _mv("2024-03-01", "Presentación de la medida prejudicial", "Da curso a la medida prejudicial"),
+            _mv("2024-09-01", "Presentación de la medida prejudicial", "Téngase por no presentada la demanda"),
+        ]
+        state, triggers = clf.classify(movements, TODAY)
+        assert state == ProceduralState.TERMINADA
+
     def test_all_movements_unmatched_is_indeterminate(self) -> None:
         """Spec: movements with no matching rule → INDETERMINATE."""
         clf = get_classifier()
