@@ -66,6 +66,7 @@ _DEADLINE_ACTIONS: dict[str, str] = {
 class DeadlineItemResponse(BaseModel):
     """One procedural deadline in the timeline."""
 
+    id: int
     deadline_type: str
     label: str
     legal_basis: str
@@ -73,6 +74,7 @@ class DeadlineItemResponse(BaseModel):
     triggered_at: date
     dias_habiles_remaining: int
     status: str
+    is_manual: bool = False
     source_movement_id: Optional[int] = None
 
     class Config:
@@ -392,7 +394,9 @@ async def get_case_deadlines(
         db.query(CaseDeadline)
         .filter(
             CaseDeadline.case_id == case_id,
-            CaseDeadline.status == "active",
+            # active + audited (cumplido/no_cumplido) so the lawyer SEES audited
+            # deadlines; only "superseded" rows are hidden.
+            CaseDeadline.status != "superseded",
         )
         .order_by(CaseDeadline.due_date.asc())
         .all()
@@ -400,6 +404,7 @@ async def get_case_deadlines(
 
     active_deadlines: list[DeadlineItemResponse] = [
         DeadlineItemResponse(
+            id=row.id,
             deadline_type=row.deadline_type,
             label=_DEADLINE_LABELS.get(row.deadline_type, row.deadline_type),
             legal_basis=row.legal_basis or "",
@@ -407,6 +412,7 @@ async def get_case_deadlines(
             triggered_at=row.triggered_at,
             dias_habiles_remaining=count_business_days_remaining(row.due_date, today),
             status=row.status,
+            is_manual=row.is_manual,
             source_movement_id=row.source_movement_id,
         )
         for row in deadline_rows
