@@ -44,6 +44,9 @@ class SyncRequest(BaseModel):
 class SyncStatusResponse(BaseModel):
     """Status of last sync."""
     last_sync: Optional[datetime] = None
+    # Most recent moment a case detail was checked against PJUD (Carla's continuous
+    # freshness loop) — the true "last PJUD connection", unlike the formal full-sync.
+    last_activity: Optional[datetime] = None
     status: Optional[str] = None
     cases_found: int = 0
     cases_new: int = 0
@@ -226,16 +229,27 @@ async def get_sync_status(
     sync_service = SyncService(db)
     last_sync = sync_service.get_last_sync(lawyer_id, competencia)
     needs_sync = sync_service.needs_sync(lawyer_id, competencia)
-    
+
+    from sqlalchemy import func
+    from app.models.case import Case
+
+    last_activity = (
+        db.query(func.max(Case.last_detail_checked_at))
+        .filter(Case.lawyer_id == lawyer_id)
+        .scalar()
+    )
+
     if not last_sync:
         return SyncStatusResponse(
             last_sync=None,
+            last_activity=last_activity,
             status=None,
             needs_sync=True,
         )
-    
+
     return SyncStatusResponse(
         last_sync=last_sync.completed_at,
+        last_activity=last_activity,
         status=last_sync.status,
         cases_found=last_sync.cases_found,
         cases_new=last_sync.cases_new,
