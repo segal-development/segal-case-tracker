@@ -326,4 +326,27 @@ CLASSIFIER_RULES: list[ClassifierRule] = [
         priority=11,
         min_state=ProceduralState.CITACION_SENTENCIA,
     ),
+    # Rule 10 — Archivo del expediente → TERMINADA. The file was archived (closed
+    # de facto). Dominant final movement in the 'indeterminate' backlog. No
+    # min_state: a case can be archived from any stage. Priority above non-terminal
+    # rules so it wins on the same movement.
+    ClassifierRule(
+        description_regex=r"[Aa]rchivo del [Ee]xpediente",
+        stage_regex="",
+        event=ProcEvent.TERMINADA,
+        next_state=ProceduralState.TERMINADA,
+        starts_deadline_type=None,
+        priority=12,
+    ),
+    # Rule 11 — "Téngase por no presentada la demanda" → TERMINADA. The demand
+    # lapsed / was never validly filed (común tras una medida prejudicial sin
+    # demanda ejecutiva posterior). The case did not advance — treat as closed.
+    ClassifierRule(
+        description_regex=r"[Tt][ée]ngase por no presentada",
+        stage_regex="",
+        event=ProcEvent.TERMINADA,
+        next_state=ProceduralState.TERMINADA,
+        starts_deadline_type=None,
+        priority=12,
+    ),
 ]
