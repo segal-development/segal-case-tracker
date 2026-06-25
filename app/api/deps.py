@@ -121,4 +121,14 @@ def _resolve_lawyer_id(db: Session, current_lawyer: dict) -> int:
     lawyer = db.query(Lawyer).filter(Lawyer.rut == sub).first()
     if not lawyer:
         raise HTTPException(status_code=404, detail="Lawyer not found")
+    # The auditor is a transversal role: it operates over the firm's full
+    # caseload, not its own (it has no cases of its own). Resolve to the firm
+    # account so the auditor can see/manage every study case and its deadlines.
+    if getattr(lawyer, "role", None) == "auditor":
+        import os
+
+        firm_rut = os.environ.get("FIRM_LAWYER_RUT", "16021492-9")
+        firm = db.query(Lawyer).filter(Lawyer.rut == firm_rut).first()
+        if firm is not None:
+            return int(firm.id)
     return int(lawyer.id)
