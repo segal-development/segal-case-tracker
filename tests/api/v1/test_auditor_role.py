@@ -1,7 +1,7 @@
 """Tests for the auditor role — deadline audit and manual deadline management."""
 
 import pytest
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from app.core.security import create_access_token
 from app.models.lawyer import Lawyer
@@ -341,6 +341,122 @@ def test_recompute_does_not_touch_cumplido_deadline(db, owning_lawyer):
 
     db.refresh(audited_dl)
     assert audited_dl.status == "cumplido", "Cumplido deadline must not be touched by the engine"
+
+
+# ---------------------------------------------------------------------------
+# GET /deadlines/audited — audited deadline list
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def case_with_audited_deadlines(db, owning_lawyer):
+    """A case owned by owning_lawyer with cumplido + no_cumplido + active + superseded rows."""
+    case = Case(
+        rol="C-300-2026",
+        lawyer_id=owning_lawyer.id,
+        court_id=1,
+        plaintiff="Banco X",
+        defendant="Juan Pérez",
+    )
+    db.add(case)
+    db.commit()
+    db.refresh(case)
+
+    rows = [
+        CaseDeadline(
+            case_id=case.id, deadline_type="excepciones_8d", legal_basis="art. 459 CPC",
+            due_date=date.today() + timedelta(days=2), triggered_at=date.today(),
+            status="cumplido", marked_by=owning_lawyer.id, marked_at=datetime(2026, 6, 1, 12, 0),
+        ),
+        CaseDeadline(
+            case_id=case.id, deadline_type="apelacion_5d", legal_basis="art. 187/475 CPC",
+            due_date=date.today() + timedelta(days=4), triggered_at=date.today(),
+            status="no_cumplido", marked_by=owning_lawyer.id, marked_at=datetime(2026, 6, 2, 12, 0),
+        ),
+        CaseDeadline(
+            case_id=case.id, deadline_type="sentencia_10d", legal_basis="art. 162/470 CPC",
+            due_date=date.today() + timedelta(days=6), triggered_at=date.today(), status="active",
+        ),
+        CaseDeadline(
+            case_id=case.id, deadline_type="termino_probatorio_10d", legal_basis="art. 468 CPC",
+            due_date=date.today() + timedelta(days=8), triggered_at=date.today(), status="superseded",
+        ),
+    ]
+    db.add_all(rows)
+    db.commit()
+    return case
+
+
+def test_audited_deadlines_returns_both_statuses_with_shape(
+    client, case_with_audited_deadlines, owning_lawyer, lawyer_headers
+):
+    from datetime import datetime as _dt  # noqa: F401
+    resp = client.get("/api/v1/cases/deadlines/audited", headers=lawyer_headers)
+    assert resp.status_code == 200
+    data = resp.json()
+    statuses = {row["status"] for row in data}
+    assert statuses == {"cumplido", "no_cumplido"}
+    assert len(data) == 2
+
+    row = next(r for r in data if r["status"] == "cumplido")
+    for key in (
+        "id", "case_id", "rol", "caratula", "deadline_type", "label", "legal_basis",
+        "due_date", "triggered_at", "status", "is_manual", "marked_at", "abogado_nombre",
+    ):
+        assert key in row, f"missing key {key}"
+    assert row["rol"] == "C-300-2026"
+    assert row["caratula"] == "Banco X/Juan Pérez"
+    assert row["label"] == "Plazo para oponer excepciones"
+    assert row["abogado_nombre"] == "Case Lawyer"
+
+
+def test_audited_deadlines_status_filter_narrows(
+    client, case_with_audited_deadlines, owning_lawyer, lawyer_headers
+):
+    resp = client.get("/api/v1/cases/deadlines/audited?status=cumplido", headers=lawyer_headers)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) == 1
+    assert data[0]["status"] == "cumplido"
+
+    resp2 = client.get("/api/v1/cases/deadlines/audited?status=no_cumplido", headers=lawyer_headers)
+    assert resp2.status_code == 200
+    assert {r["status"] for r in resp2.json()} == {"no_cumplido"}
+
+
+def test_audited_deadlines_excludes_active_and_superseded(
+    client, case_with_audited_deadlines, owning_lawyer, lawyer_headers
+):
+    resp = client.get("/api/v1/cases/deadlines/audited", headers=lawyer_headers)
+    data = resp.json()
+    assert all(r["status"] in {"cumplido", "no_cumplido"} for r in data)
+
+
+def test_audited_deadlines_scoped_to_owner(
+    client, db, case_with_audited_deadlines, owning_lawyer, lawyer_headers, admin_lawyer
+):
+    # A case owned by a DIFFERENT lawyer with an audited deadline must not leak.
+    other = Case(rol="C-777-2026", lawyer_id=admin_lawyer.id, court_id=1)
+    db.add(other)
+    db.commit()
+    db.refresh(other)
+    db.add(CaseDeadline(
+        case_id=other.id, deadline_type="apelacion_5d", legal_basis="art. 187/475 CPC",
+        due_date=date.today(), triggered_at=date.today(), status="cumplido",
+    ))
+    db.commit()
+
+    resp = client.get("/api/v1/cases/deadlines/audited", headers=lawyer_headers)
+    rols = {r["rol"] for r in resp.json()}
+    assert "C-777-2026" not in rols
+    assert rols == {"C-300-2026"}
+
+
+def test_audited_deadlines_invalid_status_422(
+    client, case_with_audited_deadlines, owning_lawyer, lawyer_headers
+):
+    resp = client.get("/api/v1/cases/deadlines/audited?status=active", headers=lawyer_headers)
+    assert resp.status_code == 422
 
 
 # ---------------------------------------------------------------------------
