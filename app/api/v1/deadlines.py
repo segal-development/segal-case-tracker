@@ -14,17 +14,19 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy import and_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy.sql import nullslast
 
 from app.api.deps import get_current_lawyer, get_db, _resolve_lawyer_id, require_auditor
 from app.core.deadlines_config import DEADLINE_DISCLAIMER, DeadlineType
 from app.models.alert import Alert
 from app.models.case import Case
 from app.models.case_deadline import CaseDeadline
+from app.models.lawyer import Lawyer
 from app.services.business_days import count_business_days_remaining
 
 from zoneinfo import ZoneInfo
@@ -218,6 +220,24 @@ class ManualDeadlineBody(BaseModel):
     due_date: date
 
 
+class AuditedDeadlineResponse(BaseModel):
+    """One audited (cumplido / no_cumplido) deadline, enriched with case info."""
+
+    id: int
+    case_id: int
+    rol: str
+    caratula: str
+    deadline_type: str
+    label: str
+    legal_basis: Optional[str]
+    due_date: date
+    triggered_at: date
+    status: str
+    is_manual: bool
+    marked_at: Optional[datetime]
+    abogado_nombre: Optional[str]
+
+
 # ---------------------------------------------------------------------------
 # Auditor endpoints
 # ---------------------------------------------------------------------------
@@ -237,6 +257,75 @@ async def get_deadlines_catalog(
             is_fatal=dt.is_fatal,
         )
         for dt in DeadlineType
+    ]
+
+
+@router.get("/deadlines/audited", response_model=list[AuditedDeadlineResponse])
+async def list_audited_deadlines(
+    status: Optional[str] = Query(
+        default=None,
+        description="Filter by audited status. Omitted → both cumplido and no_cumplido.",
+    ),
+    current_lawyer: dict = Depends(get_current_lawyer),
+    db: Session = Depends(get_db),
+):
+    """List audited deadlines (cumplido / no_cumplido) for the caller's cases.
+
+    Scoped via ``_resolve_lawyer_id`` so an auditor sees the whole firm's
+    caseload. Optional ``status`` narrows to a single audited status.
+    """
+    audited_statuses = {"cumplido", "no_cumplido"}
+    if status is not None and status not in audited_statuses:
+        raise HTTPException(
+            status_code=422,
+            detail=f"status must be one of {sorted(audited_statuses)}",
+        )
+
+    lawyer_id = _resolve_lawyer_id(db, current_lawyer)
+    status_filter = {status} if status is not None else audited_statuses
+
+    rows = (
+        db.query(CaseDeadline, Case)
+        .join(Case, CaseDeadline.case_id == Case.id)
+        .filter(
+            Case.lawyer_id == lawyer_id,
+            CaseDeadline.status.in_(status_filter),
+        )
+        .order_by(
+            nullslast(CaseDeadline.marked_at.desc()),
+            CaseDeadline.due_date.desc(),
+        )
+        .all()
+    )
+
+    # Resolve lawyer names once (small cache) for abogado_nombre.
+    name_cache: dict[int, Optional[str]] = {}
+
+    def _lawyer_name(lid: Optional[int]) -> Optional[str]:
+        if lid is None:
+            return None
+        if lid not in name_cache:
+            lw = db.get(Lawyer, lid)
+            name_cache[lid] = lw.name if lw else None
+        return name_cache[lid]
+
+    return [
+        AuditedDeadlineResponse(
+            id=dl.id,
+            case_id=case.id,
+            rol=case.rol or "",
+            caratula=f"{case.plaintiff or ''}/{case.defendant or ''}",
+            deadline_type=dl.deadline_type,
+            label=_DEADLINE_LABELS.get(dl.deadline_type, dl.deadline_type),
+            legal_basis=dl.legal_basis,
+            due_date=dl.due_date,
+            triggered_at=dl.triggered_at,
+            status=dl.status,
+            is_manual=dl.is_manual,
+            marked_at=dl.marked_at,
+            abogado_nombre=_lawyer_name(case.lawyer_id),
+        )
+        for dl, case in rows
     ]
 
 
