@@ -136,7 +136,8 @@ async def test_detail_returned_syncs_and_clears_flag(seeded):
     case.consulta_reserved = True
     db.commit()
 
-    detail = _make_detail()
+    # Detail WITH movements → the consulta brought the cuaderno → advance the cursor.
+    detail = _make_detail(movements=[MagicMock()])
     scraper = _make_scraper(detail)
     pjud_session = MagicMock()
 
@@ -165,6 +166,41 @@ async def test_detail_returned_syncs_and_clears_flag(seeded):
     assert reserved == 0
     assert errors == 0
     mock_sync.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_zero_movement_consulta_does_not_advance_timestamp(seeded):
+    """A consulta that returns a detail with NO movements (cuaderno not public) must
+    clear reserved but NOT advance last_detail_checked_at — so the detail rotation
+    (Mis Causas) still picks the case up and brings the real movements. Regression
+    guard for the 'indeterminate forever' bug."""
+    db = seeded["db"]
+    case = seeded["case"]
+    lawyer = seeded["lawyer"]
+
+    assert case.last_detail_checked_at is None
+
+    detail = _make_detail(movements=[])  # case found in consulta, but cuaderno empty/public-hidden
+    scraper = _make_scraper(detail)
+    pjud_session = MagicMock()
+
+    with (
+        patch("app.services.sync_service.convert_api_movements_to_scraped", return_value=[]),
+        patch("app.services.sync_service._sync_entities"),
+        patch("app.services.sync_service.DocumentPersistenceService") as mock_dp,
+        patch("app.services.sync_service._maybe_recompute_deadlines"),
+    ):
+        mock_dp.return_value.persist_from_detail.return_value = []
+        result = await sync_via_consulta(db, lawyer, scraper, pjud_session, [case])
+
+    created_movements, alerts_created, reserved, errors = result
+    db.refresh(case)
+    assert case.consulta_reserved is False, "case IS in the consulta → not reserved"
+    assert case.last_detail_checked_at is None, (
+        "0-movement consulta must NOT advance the detail-rotation cursor"
+    )
+    assert reserved == 0
+    assert errors == 0
 
 
 @pytest.mark.asyncio

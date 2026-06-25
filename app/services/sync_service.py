@@ -1752,7 +1752,15 @@ async def sync_via_consulta(
                 )
 
                 case.consulta_reserved = False
-                case.last_detail_checked_at = datetime.utcnow()
+                # Only advance the detail-rotation cursor when the consulta actually
+                # returned movements. A 0-movement consulta means the cuaderno is NOT
+                # public (the movimientos are only visible via Mis Causas / the owner's
+                # session). Leaving last_detail_checked_at untouched keeps the case at
+                # the front of the detail-rotation queue (NULLS FIRST) so the owner-side
+                # rotation brings the real movements — instead of being wrongly marked
+                # "checked" with an empty cuaderno and stuck as 'indeterminate' forever.
+                if detail.movements:
+                    case.last_detail_checked_at = datetime.utcnow()
                 _maybe_recompute_deadlines(db, case)
                 db.commit()
 
