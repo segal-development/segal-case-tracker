@@ -17,10 +17,12 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import and_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_lawyer, get_db, _resolve_lawyer_id
-from app.core.deadlines_config import DEADLINE_DISCLAIMER
+from app.api.deps import get_current_lawyer, get_db, _resolve_lawyer_id, require_auditor
+from app.core.deadlines_config import DEADLINE_DISCLAIMER, DeadlineType
+from app.models.alert import Alert
 from app.models.case import Case
 from app.models.case_deadline import CaseDeadline
 from app.services.business_days import count_business_days_remaining
@@ -171,6 +173,185 @@ def _as_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=_CHILE_TZ)
     return dt.astimezone(_CHILE_TZ)
+
+
+# ---------------------------------------------------------------------------
+# Auditor schemas
+# ---------------------------------------------------------------------------
+
+
+class CatalogItemResponse(BaseModel):
+    value: str
+    label: str
+    dias: int
+    legal_basis: str
+    is_fatal: bool
+
+
+class DeadlineStatusUpdateBody(BaseModel):
+    status: str  # "cumplido" | "no_cumplido" | "active"
+
+
+class DeadlineResponse(BaseModel):
+    id: int
+    case_id: int
+    deadline_type: str
+    legal_basis: Optional[str]
+    due_date: date
+    triggered_at: date
+    status: str
+    is_manual: bool
+    marked_by: Optional[int] = None
+    marked_at: Optional[datetime] = None
+    source_movement_id: Optional[int] = None
+    computed_at: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ManualDeadlineBody(BaseModel):
+    deadline_type: str
+    due_date: date
+
+
+# ---------------------------------------------------------------------------
+# Auditor endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.get("/deadlines/catalog", response_model=list[CatalogItemResponse])
+async def get_deadlines_catalog(
+    _current_lawyer: dict = Depends(get_current_lawyer),
+):
+    """Return the full DeadlineType catalog for the auditor manual-deadline modal."""
+    return [
+        CatalogItemResponse(
+            value=dt.value,
+            label=_DEADLINE_LABELS.get(dt.value, dt.value),
+            dias=dt.dias_habiles,
+            legal_basis=dt.legal_basis,
+            is_fatal=dt.is_fatal,
+        )
+        for dt in DeadlineType
+    ]
+
+
+@router.put("/{case_id}/deadlines/{deadline_id}/status", response_model=DeadlineResponse)
+async def update_deadline_status(
+    case_id: int,
+    deadline_id: int,
+    body: DeadlineStatusUpdateBody,
+    auditor_rut: str = Depends(require_auditor),
+    db: Session = Depends(get_db),
+):
+    """Mark a deadline as cumplido / no_cumplido / active (auditor or admin only)."""
+    allowed_statuses = {"cumplido", "no_cumplido", "active"}
+    if body.status not in allowed_statuses:
+        raise HTTPException(status_code=422, detail=f"status must be one of {allowed_statuses}")
+
+    deadline = (
+        db.query(CaseDeadline)
+        .filter(
+            CaseDeadline.id == deadline_id,
+            CaseDeadline.case_id == case_id,
+        )
+        .first()
+    )
+    if not deadline:
+        raise HTTPException(status_code=404, detail="Deadline not found")
+
+    case = db.query(Case).filter(Case.id == case_id).first()
+    if not case:
+        raise HTTPException(status_code=404, detail="Case not found")
+
+    # Resolve auditor's lawyer id from the RUT returned by require_auditor
+    from app.models.lawyer import Lawyer
+
+    auditor = db.query(Lawyer).filter(Lawyer.rut == auditor_rut).first()
+    auditor_id = auditor.id if auditor else None
+
+    deadline.status = body.status
+    deadline.marked_by = auditor_id
+    deadline.marked_at = datetime.utcnow()
+
+    # Notify the case's owning lawyer
+    alert = Alert(
+        lawyer_id=case.lawyer_id,
+        case_id=case.id,
+        type="deadline_audit",
+        title=f"Plazo {body.status} · {case.rol}",
+        message=f"El auditor marcó '{deadline.deadline_type}' como {body.status}.",
+        created_at=datetime.utcnow(),
+    )
+    db.add(alert)
+    db.commit()
+    db.refresh(deadline)
+    return deadline
+
+
+@router.post("/{case_id}/deadlines", response_model=DeadlineResponse, status_code=201)
+async def create_manual_deadline(
+    case_id: int,
+    body: ManualDeadlineBody,
+    auditor_rut: str = Depends(require_auditor),
+    db: Session = Depends(get_db),
+):
+    """Add a manual deadline to a case from the catalog (auditor or admin only)."""
+    # Validate deadline_type is a known catalog value
+    valid_values = {dt.value for dt in DeadlineType}
+    if body.deadline_type not in valid_values:
+        raise HTTPException(
+            status_code=422,
+            detail=f"deadline_type must be one of {sorted(valid_values)}",
+        )
+
+    case = db.query(Case).filter(Case.id == case_id).first()
+    if not case:
+        raise HTTPException(status_code=404, detail="Case not found")
+
+    dt = DeadlineType(body.deadline_type)
+    today = date.today()
+
+    new_deadline = CaseDeadline(
+        case_id=case_id,
+        deadline_type=dt.value,
+        legal_basis=dt.legal_basis,
+        due_date=body.due_date,
+        triggered_at=today,
+        status="active",
+        is_manual=True,
+        computed_at=None,
+    )
+    db.add(new_deadline)
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        # Unique constraint clash: (case_id, deadline_type, triggered_at=today).
+        # Strategy: return 409 — auditor must pick a different type or wait until tomorrow.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"A deadline of type '{dt.value}' triggered on {today} already exists for this case. "
+                "Change the deadline_type or try again tomorrow."
+            ),
+        )
+
+    # Notify the case's owning lawyer
+    alert = Alert(
+        lawyer_id=case.lawyer_id,
+        case_id=case.id,
+        type="deadline_added",
+        title=f"Nuevo plazo · {case.rol}",
+        message=f"El auditor agregó un plazo manual '{dt.value}' con vencimiento {body.due_date}.",
+        created_at=datetime.utcnow(),
+    )
+    db.add(alert)
+    db.commit()
+    db.refresh(new_deadline)
+    return new_deadline
 
 
 # ---------------------------------------------------------------------------

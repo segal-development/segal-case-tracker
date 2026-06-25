@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 
 from sqlalchemy import (
+    Boolean,
     Column,
     DateTime,
     Date,
@@ -10,6 +11,7 @@ from sqlalchemy import (
     Integer,
     String,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import relationship
 
@@ -56,6 +58,12 @@ class CaseDeadline(Base):
     computed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
+    # Auditor fields (migration 018)
+    is_manual = Column(Boolean, nullable=False, server_default=text("false"), default=False)
+    marked_by = Column(Integer, ForeignKey("lawyers.id"), nullable=True)
+    marked_at = Column(DateTime, nullable=True)
+
     # Relationships
     case = relationship("Case", back_populates="deadlines")
     source_movement = relationship("Movement")
+    marked_by_lawyer = relationship("Lawyer", foreign_keys=[marked_by])

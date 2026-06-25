@@ -267,6 +267,12 @@ class DeadlineEngine:
             if not isinstance(trigger, date):
                 source_movement_id = getattr(trigger, "id", None)
 
+            # Skip rows that are manually managed or already audited
+            if existing is not None and (
+                existing.is_manual or existing.status in ("cumplido", "no_cumplido")
+            ):
+                continue
+
             if existing is None:
                 row = CaseDeadline(
                     case_id=case.id,
@@ -296,6 +302,7 @@ class DeadlineEngine:
             .filter(
                 CaseDeadline.case_id == case.id,
                 CaseDeadline.status == "active",
+                CaseDeadline.is_manual == False,  # noqa: E712
             )
             .all()
         )
@@ -328,6 +335,7 @@ class DeadlineEngine:
                     CaseDeadline.case_id == case.id,
                     CaseDeadline.status == "active",
                     CaseDeadline.deadline_type.in_(actionable_values),
+                    CaseDeadline.is_manual == False,  # noqa: E712
                 )
                 .all()
             )

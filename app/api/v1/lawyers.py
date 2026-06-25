@@ -138,8 +138,8 @@ def update_account(
         raise HTTPException(status_code=404, detail="Lawyer not found")
 
     if body.role is not None:
-        if body.role not in {"admin", "lawyer"}:
-            raise HTTPException(status_code=422, detail="Invalid role; must be 'admin' or 'lawyer'")
+        if body.role not in {"admin", "lawyer", "auditor"}:
+            raise HTTPException(status_code=422, detail="Invalid role; must be 'admin', 'lawyer', or 'auditor'")
         lawyer.role = body.role
 
     if body.email is not None:
