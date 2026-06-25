@@ -99,6 +99,51 @@ async def get_firm_stats(
     return firm_dashboard_stats(db, lawyer.rut)
 
 
+class PublicOverview(BaseModel):
+    """Aggregated firm semaforo counts for the (pre-auth) login screen — counts only."""
+    rojo: int
+    amarillo: int
+    verde: int
+
+
+@router.get("/public-overview", response_model=PublicOverview)
+async def get_public_overview(db: Session = Depends(get_db)):
+    """PUBLIC (no auth): firm semáforo counts for the login screen marquee.
+
+    Exposes ONLY aggregated counts (no case data, no names, no personal info).
+    The firm account is the one configured via FIRM_LAWYER_RUT (default the study
+    account); falls back to the lawyer with the most civil cases.
+    """
+    import os
+    from sqlalchemy import func
+
+    firm_rut = os.environ.get("FIRM_LAWYER_RUT", "16021492-9")
+    lawyer = db.query(Lawyer).filter(Lawyer.rut == firm_rut).first()
+    if lawyer is None:
+        row = (
+            db.query(Case.lawyer_id, func.count(Case.id).label("c"))
+            .filter(Case.competencia == "civil")
+            .group_by(Case.lawyer_id)
+            .order_by(func.count(Case.id).desc())
+            .first()
+        )
+        lawyer = db.get(Lawyer, row.lawyer_id) if row else None
+    if lawyer is None:
+        return PublicOverview(rojo=0, amarillo=0, verde=0)
+
+    counts = dict(
+        db.query(Case.semaforo, func.count(Case.id))
+        .filter(Case.lawyer_id == lawyer.id, Case.competencia == "civil")
+        .group_by(Case.semaforo)
+        .all()
+    )
+    return PublicOverview(
+        rojo=counts.get("rojo", 0),
+        amarillo=counts.get("amarillo", 0),
+        verde=counts.get("verde", 0),
+    )
+
+
 @router.get("/me", response_model=MyStatsResponse)
 async def get_my_stats(
     db: Session = Depends(get_db),
