@@ -12,10 +12,11 @@ Architecture:
 """
 
 import time
+from datetime import datetime, timedelta, timezone
+from typing import Any, List, Optional
+
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
-from pydantic import BaseModel, Field
-from typing import List, Optional
-from datetime import datetime, timedelta
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -30,7 +31,7 @@ from app.scrapper.pjud.exceptions import CircuitOpenError
 from app.scrapper.pjud.browser import BrowserFactory
 from app.services.session_store import get_session_store
 from app.services.pjud_session import PJUDSession
-from app.api.deps import get_db
+from app.api.deps import get_db, get_current_lawyer
 from app.api.v1.auth import _get_or_create_lawyer
 
 router = APIRouter()
@@ -124,6 +125,59 @@ class CountResponse(BaseModel):
 
 
 # ============================================================================
+# Connect schemas
+# ============================================================================
+
+
+class ConnectRequest(BaseModel):
+    """Request body for POST /pjud/connect."""
+
+    lawyer_id: int = Field(..., description="DB primary key of the lawyer to connect")
+    rut: str = Field(..., description="Lawyer RUT in normalized form (e.g. 12345678-9)")
+    auth_method: str = Field(
+        ..., description='Authentication method: "segunda_clave" or "clave_unica"'
+    )
+    captcha_token: Optional[str] = Field(
+        None, description="reCAPTCHA v3 token — required when auth_method is segunda_clave"
+    )
+
+    @model_validator(mode="after")
+    def captcha_required_for_segunda_clave(self) -> "ConnectRequest":
+        if self.auth_method == "segunda_clave" and not self.captcha_token:
+            raise ValueError("captcha_token is required when auth_method is segunda_clave")
+        return self
+
+
+class ConnectResponse(BaseModel):
+    """Response body for POST /pjud/connect."""
+
+    connection_id: str
+    status: str  # always "pending" on creation
+
+
+# ============================================================================
+# Redis dependency (overridable in tests)
+# ============================================================================
+
+
+async def get_redis_dep() -> Any:
+    """Async Redis client dependency.
+
+    Returns the singleton async Redis client.
+    Override this in tests with a FakeRedis instance.
+
+    Raises:
+        HTTPException 503: if Redis is not available.
+    """
+    from app.core.redis import get_async_redis_client
+
+    redis = await get_async_redis_client()
+    if redis is None:
+        raise HTTPException(status_code=503, detail="Redis unavailable")
+    return redis
+
+
+# ============================================================================
 # Session helpers
 # ============================================================================
 
@@ -158,6 +212,113 @@ def get_scraper(competency: str = "civil"):
 # ============================================================================
 # ENDPOINTS
 # ============================================================================
+
+# ============================================================================
+# PJUD ONE-CLICK CONNECT ENDPOINTS
+# ============================================================================
+
+
+@router.post("/connect", response_model=ConnectResponse)
+async def pjud_connect(
+    request: ConnectRequest,
+    current_lawyer: dict = Depends(get_current_lawyer),
+    db: Session = Depends(get_db),
+    redis: Any = Depends(get_redis_dep),
+):
+    """Enqueue a PJUD one-click connection request.
+
+    Validates the lawyer and their stored credential, pushes a credential-free
+    job onto the Redis queue, sets the status key to "pending", and returns the
+    new connection_id for polling.
+
+    Errors:
+      422 — missing captcha_token for segunda_clave (Pydantic validation)
+      404 — lawyer_id not found in the database
+      409 — no stored credential for the requested auth_method
+    """
+    from app.models.lawyer import Lawyer as LawyerModel
+    from app.services.connection_queue import enqueue_connection, set_status
+
+    # Validate auth_method domain
+    if request.auth_method not in {"segunda_clave", "clave_unica"}:
+        raise HTTPException(
+            status_code=422,
+            detail="auth_method must be 'segunda_clave' or 'clave_unica'",
+        )
+
+    # Look up lawyer by the id supplied in the body
+    lawyer = db.query(LawyerModel).filter(LawyerModel.id == request.lawyer_id).first()
+    if lawyer is None:
+        raise HTTPException(status_code=404, detail="Lawyer not found")
+
+    # Verify that the required encrypted credential is present
+    if request.auth_method == "segunda_clave" and not lawyer.encrypted_pjud_password:
+        raise HTTPException(
+            status_code=409,
+            detail="No stored credential for segunda_clave — enroll your PJUD password first",
+        )
+    if request.auth_method == "clave_unica" and not lawyer.encrypted_clave_unica_password:
+        raise HTTPException(
+            status_code=409,
+            detail="No stored credential for clave_unica — enroll your CU password first",
+        )
+
+    # Push credential-free job onto queue and initialize lifecycle status
+    connection_id = await enqueue_connection(
+        redis,
+        lawyer_id=lawyer.id,
+        rut=request.rut,
+        auth_method=request.auth_method,
+        captcha_token=request.captcha_token,
+    )
+    await set_status(
+        redis,
+        connection_id,
+        {
+            "status": "pending",
+            "updated_at": datetime.now(tz=timezone.utc).isoformat(),
+        },
+    )
+
+    _logger.info(
+        "Connection enqueued: %s for lawyer %d (method=%s)",
+        connection_id,
+        lawyer.id,
+        request.auth_method,
+    )
+    return ConnectResponse(connection_id=connection_id, status="pending")
+
+
+@router.get("/connect/{connection_id}/status")
+async def pjud_connect_status(
+    connection_id: str,
+    redis: Any = Depends(get_redis_dep),
+):
+    """Poll the lifecycle status of a PJUD connection request.
+
+    Returns the current status blob written by the connection_watcher:
+      pending     — job queued, not yet picked up
+      connecting  — watcher is logging in
+      connected   — login succeeded; includes cases_synced count
+      failed      — login failed; includes reason string
+
+    Raises 404 when the connection_id is unknown or the key has expired (300s TTL).
+    """
+    from app.services.connection_queue import get_status
+
+    status_data = await get_status(redis, connection_id)
+    if status_data is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Connection '{connection_id}' not found or expired",
+        )
+    return status_data
+
+
+# ============================================================================
+# LEGACY STATEFUL LOGIN ENDPOINT
+# ============================================================================
+
 
 @router.post("/login", response_model=LoginResponse)
 async def login(
