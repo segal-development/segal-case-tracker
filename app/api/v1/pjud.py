@@ -156,28 +156,6 @@ class ConnectResponse(BaseModel):
 
 
 # ============================================================================
-# Redis dependency (overridable in tests)
-# ============================================================================
-
-
-async def get_redis_dep() -> Any:
-    """Async Redis client dependency.
-
-    Returns the singleton async Redis client.
-    Override this in tests with a FakeRedis instance.
-
-    Raises:
-        HTTPException 503: if Redis is not available.
-    """
-    from app.core.redis import get_async_redis_client
-
-    redis = await get_async_redis_client()
-    if redis is None:
-        raise HTTPException(status_code=503, detail="Redis unavailable")
-    return redis
-
-
-# ============================================================================
 # Session helpers
 # ============================================================================
 
@@ -223,13 +201,12 @@ async def pjud_connect(
     request: ConnectRequest,
     current_lawyer: dict = Depends(get_current_lawyer),
     db: Session = Depends(get_db),
-    redis: Any = Depends(get_redis_dep),
 ):
     """Enqueue a PJUD one-click connection request.
 
-    Validates the lawyer and their stored credential, pushes a credential-free
-    job onto the Redis queue, sets the status key to "pending", and returns the
-    new connection_id for polling.
+    Validates the lawyer and their stored credential, inserts a credential-free
+    row into pending_connections with status='pending', and returns the new
+    connection_id for polling.
 
     Errors:
       422 — missing captcha_token for segunda_clave (Pydantic validation)
@@ -237,7 +214,7 @@ async def pjud_connect(
       409 — no stored credential for the requested auth_method
     """
     from app.models.lawyer import Lawyer as LawyerModel
-    from app.services.connection_queue import enqueue_connection, set_status
+    from app.services.connection_queue import enqueue_connection
 
     # Validate auth_method domain
     if request.auth_method not in {"segunda_clave", "clave_unica"}:
@@ -263,21 +240,13 @@ async def pjud_connect(
             detail="No stored credential for clave_unica — enroll your CU password first",
         )
 
-    # Push credential-free job onto queue and initialize lifecycle status
-    connection_id = await enqueue_connection(
-        redis,
+    # Insert credential-free row (status='pending' set by enqueue_connection)
+    connection_id = enqueue_connection(
+        db,
         lawyer_id=lawyer.id,
         rut=request.rut,
         auth_method=request.auth_method,
         captcha_token=request.captcha_token,
-    )
-    await set_status(
-        redis,
-        connection_id,
-        {
-            "status": "pending",
-            "updated_at": datetime.now(tz=timezone.utc).isoformat(),
-        },
     )
 
     _logger.info(
@@ -292,25 +261,25 @@ async def pjud_connect(
 @router.get("/connect/{connection_id}/status")
 async def pjud_connect_status(
     connection_id: str,
-    redis: Any = Depends(get_redis_dep),
+    db: Session = Depends(get_db),
 ):
     """Poll the lifecycle status of a PJUD connection request.
 
-    Returns the current status blob written by the connection_watcher:
+    Returns the current status from the pending_connections table:
       pending     — job queued, not yet picked up
       connecting  — watcher is logging in
       connected   — login succeeded; includes cases_synced count
-      failed      — login failed; includes reason string
+      failed      — login failed; includes error string
 
-    Raises 404 when the connection_id is unknown or the key has expired (300s TTL).
+    Raises 404 when the connection_id is unknown.
     """
     from app.services.connection_queue import get_status
 
-    status_data = await get_status(redis, connection_id)
+    status_data = get_status(db, connection_id)
     if status_data is None:
         raise HTTPException(
             status_code=404,
-            detail=f"Connection '{connection_id}' not found or expired",
+            detail=f"Connection '{connection_id}' not found",
         )
     return status_data
 
