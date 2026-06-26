@@ -23,6 +23,7 @@ from playwright.async_api import (
 
 from app.services.pjud_session import PJUDSession
 from app.scrapper.pjud.exceptions import (
+    InvalidCredentialsError,
     LoginError,
     ScrapingError,
     SessionExpiredError,
@@ -41,6 +42,36 @@ PJUD_BASE_URL = "https://oficinajudicialvirtual.pjud.cl"
 PJUD_HOME_URL = f"{PJUD_BASE_URL}/home/index.php"
 PJUD_SESSION_URL = f"{PJUD_BASE_URL}/sessionN.php"
 PJUD_INDEX_URL = f"{PJUD_BASE_URL}/indexN.php"
+
+
+# Matches PJUD's "wrong password / wrong user" messages on the login page, so a
+# stuck-on-login can be classified as bad credentials (the lawyer must update
+# their clave) vs. a rejected captcha token or a transient error (retry-able).
+# Pattern is broad on purpose; the captured snippet lets us refine on real cases.
+_LOGIN_CRED_ERROR_RE = re.compile(
+    r"(clave|contraseña|usuario|credencial(?:es)?|rut)"
+    r"[^<>{}]{0,40}"
+    r"(incorrect\w*|erróne\w*|inválid\w*|no\s+coincide\w*|no\s+válid\w*|bloquead\w*)",
+    re.IGNORECASE,
+)
+
+
+def classify_login_failure(page_content: str) -> tuple:
+    """Inspect a stuck-on-login page; return (is_invalid_credentials, short_msg).
+
+    ``is_invalid_credentials`` is True when the page shows a wrong-password /
+    wrong-user style message — meaning a retry is pointless and the lawyer must
+    update their clave. ``short_msg`` is a cleaned snippet for logging/reporting.
+    """
+    if not page_content:
+        return False, ""
+    text = re.sub(r"<[^>]+>", " ", page_content)
+    text = re.sub(r"\s+", " ", text).strip()
+    m = _LOGIN_CRED_ERROR_RE.search(text)
+    if m:
+        start = max(0, m.start() - 30)
+        return True, text[start:m.end() + 50].strip()
+    return False, ""
 
 
 # ============================================================================
@@ -515,7 +546,20 @@ class PJUDBaseScraper(ABC):
             
             # 5. Check we're logged in (should be at indexN.php)
             if "home/index.php" in current_url:
-                raise LoginError("Session not established - still on login page")
+                # Still on login → distinguish wrong credentials (the lawyer must
+                # update their clave — retry is pointless) from a rejected captcha
+                # token or a transient error (retry-able).
+                stuck_content = await self._safe_page_content(page)
+                invalid, snippet = classify_login_failure(stuck_content)
+                if invalid:
+                    raise InvalidCredentialsError(
+                        f"PJUD rejected credentials for RUT {rut_clean}"
+                        + (f": {snippet}" if snippet else "")
+                    )
+                raise LoginError(
+                    "Session not established - still on login page"
+                    + (f" ({snippet})" if snippet else "")
+                )
             
             # 6. Verify session by checking page content (retry-safe against mid-navigation reads)
             page_content = await self._safe_page_content(page)

@@ -19,6 +19,18 @@ class LoginError(PJUDError):
     pass
 
 
+class InvalidCredentialsError(LoginError):
+    """Raised when PJUD rejects the login because the credentials are wrong.
+
+    Distinct from a generic LoginError (e.g. a rejected captcha token or a
+    network hiccup): this one means the stored 2ª clave / Clave Única is
+    incorrect or was changed, so the lawyer must update their password —
+    retrying will never succeed. The rotator surfaces these so the firm can
+    ask that specific lawyer to re-enter their clave.
+    """
+    pass
+
+
 class SessionExpiredError(PJUDError):
     """Raised when PJUD session has expired."""
     pass
