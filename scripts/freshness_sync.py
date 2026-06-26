@@ -20,7 +20,7 @@ Run (supervised): scripts/run_freshness.sh
 import asyncio
 import os
 import random
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 os.environ.setdefault("ENVIRONMENT", "production")
@@ -95,6 +95,162 @@ def _select_consulta_cases(db, firm_lawyer_id: int, limit: int):
     )
 
 
+async def _sync_after_login(db, sc, session, lawyer_id: int) -> int:
+    """Run get_my_cases + sync_cases + detect_and_sync_movements for one lawyer.
+
+    Intended as the immediate-sync step executed right after a successful
+    login in handle_connection.  Returns the number of API cases found
+    (used as ``cases_synced`` in the connected-status payload).
+
+    Does NOT commit — the caller owns the transaction.
+    """
+    from app.services.sync_service import (
+        ScrapedCase,
+        SyncService,
+        _select_cases_for_detail_rotation,
+        detect_and_sync_movements,
+    )
+
+    api_cases = await sc.get_my_cases(session=session, max_pages=0)
+    scraped = [
+        ScrapedCase(
+            rol=c.rol,
+            tribunal=c.tribunal,
+            caratulado=c.caratulado,
+            fecha_ingreso=c.fecha_ingreso,
+            estado_cuaderno=c.estado_cuaderno or "",
+            cuaderno=c.cuaderno or "",
+            institucion=c.institucion,
+        )
+        for c in api_cases
+    ]
+    SyncService(db).sync_cases(lawyer_id, scraped, competencia="civil")
+    selected = _select_cases_for_detail_rotation(db, lawyer_id, "civil", api_cases, BATCH)
+    await detect_and_sync_movements(
+        db=db,
+        scraper=sc,
+        pjud_session=session,
+        lawyer_id=lawyer_id,
+        api_cases=api_cases,
+        selected_cases=selected,
+        delay_between_fetches=FETCH_DELAY,
+    )
+    return len(api_cases)
+
+
+async def handle_connection(job: dict, redis, db, sc, lock: asyncio.Lock) -> None:
+    """Process one PJUD connection job from the Redis queue.
+
+    Lifecycle states written to Redis:
+      pending (set by the API) -> connecting -> connected | failed
+
+    The browser lock is held around the entire login + save + sync section so
+    only one live PJUD browser session is active at a time on this machine.
+
+    Security: the decrypted password is NEVER passed to any logger (INV-2).
+    """
+    from app.models.lawyer import Lawyer
+    from app.core.security import decrypt_pjud_password
+    from app.services.connection_queue import set_status
+    from app.services.session_store import SessionStore
+
+    connection_id = job["connection_id"]
+    lawyer_id = int(job["lawyer_id"])
+    rut = job["rut"]
+    auth_method = job["auth_method"]
+    captcha_token = job.get("captcha_token")
+
+    def _now() -> str:
+        return datetime.now(tz=timezone.utc).isoformat()
+
+    await set_status(redis, connection_id, {"status": "connecting", "updated_at": _now()})
+
+    try:
+        lawyer = db.query(Lawyer).filter(Lawyer.id == lawyer_id).first()
+        if lawyer is None:
+            raise ValueError(f"Lawyer {lawyer_id} not found in DB")
+
+        if auth_method == "segunda_clave":
+            if not lawyer.encrypted_pjud_password:
+                raise ValueError("No segunda_clave credential stored for this lawyer")
+            # Decrypt locally — NEVER log or propagate the plaintext (INV-2).
+            password = decrypt_pjud_password(lawyer.encrypted_pjud_password)
+
+            async with lock:
+                session = await sc.login_with_token(rut, password, captcha_token)
+                store = SessionStore(redis)
+                await store.asave_session(session)
+                cases_synced = await _sync_after_login(db, sc, session, lawyer_id)
+        else:
+            # CU path — follow-on slice; stub raises so callers surface intent.
+            raise NotImplementedError(
+                f"auth_method {auth_method!r} is not implemented in this slice; "
+                "the CU login path is a follow-on task."
+            )
+
+        db.commit()
+        await set_status(redis, connection_id, {
+            "status": "connected",
+            "session_id": session.session_id,
+            "cases_synced": cases_synced,
+            "updated_at": _now(),
+        })
+
+    except Exception as exc:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        reason = str(exc) if str(exc) else type(exc).__name__
+        await set_status(redis, connection_id, {
+            "status": "failed",
+            "reason": reason,
+            "updated_at": _now(),
+        })
+
+
+async def connection_watcher(
+    redis,
+    db,
+    sc,
+    lock: asyncio.Lock,
+    pending: dict,
+) -> None:
+    """Background Task: BLPOP connection jobs from Redis and dispatch each as a Task.
+
+    Each job is dispatched via ``asyncio.create_task`` so the handler runs
+    independently of this watcher loop — long-running login + sync does not
+    stall the watcher from picking up the next job.
+
+    *pending* is a shared ``{"count": int}`` mutable dict.  The counter is
+    incremented when a job is popped and decremented when its task finishes
+    (including on error), so the main loop can check it before acquiring
+    ``pjud_browser_lock`` and yield priority to connection tasks.
+    """
+    from app.services.connection_queue import blpop_connection
+
+    while True:
+        try:
+            job = await blpop_connection(redis, timeout=5)
+            if job is None:
+                continue
+
+            pending["count"] += 1
+
+            async def _handle_and_decrement(j: dict = job) -> None:
+                try:
+                    await handle_connection(j, redis, db, sc, lock)
+                finally:
+                    pending["count"] -= 1
+
+            asyncio.create_task(_handle_and_decrement())
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"  connection_watcher error: {exc}")
+
+
 async def main() -> None:
     from app.scrapper.pjud_civil import PJUDCivilScraper
     from app.core.database import SessionLocal
@@ -106,6 +262,7 @@ async def main() -> None:
     )
     from app.scrapper.pjud.clave_unica import ClaveUnicaAuth, ClaveUnicaCredentials
     from scripts.cu_rotator import _select_cu_lawyers, sync_one_cu_lawyer, _next_cu_index
+    from app.core.redis import get_async_redis_client
 
     db = SessionLocal()
     lawyer = db.query(Lawyer).filter(Lawyer.rut == LAWYER_RUT).first()
@@ -117,6 +274,25 @@ async def main() -> None:
     sc.reuse_context = True  # headful: reuse one window across cases (no pop per case)
     print(f"freshness sync · browser={'HEADLESS' if HEADLESS else 'HEADFUL'} · "
           f"batch={BATCH} · round_sleep={ROUND_SLEEP}s")
+
+    # Concurrent-browser safety: one lock serializes both the freshness round
+    # and any on-demand connection tasks so only one live PJUD session is
+    # active at a time (mirrors the "one session per residential IP" invariant).
+    pjud_browser_lock = asyncio.Lock()
+    # Shared counter: incremented by connection_watcher on BLPOP, decremented
+    # when the dispatched task completes. The main loop checks it before
+    # acquiring the lock to yield priority to connection jobs (shorter captcha
+    # window than a full freshness batch).
+    pending_connections: dict = {"count": 0}
+
+    redis_client = await get_async_redis_client()
+    if redis_client is not None:
+        asyncio.create_task(
+            connection_watcher(redis_client, db, sc, pjud_browser_lock, pending_connections)
+        )
+        print("  connection_watcher started")
+    else:
+        print("  Redis not available — connection_watcher disabled")
 
     # In-process session — no Redis dependency (robust for the always-on box).
     held: dict = {"session": None}
@@ -192,6 +368,13 @@ async def main() -> None:
             continue
         round_n += 1
         round_bad = False
+
+        # Connection tasks have a shorter captcha validity window — yield so
+        # they can acquire pjud_browser_lock before we start a new batch.
+        if pending_connections["count"] > 0:
+            await asyncio.sleep(0)
+
+        await pjud_browser_lock.acquire()
         try:
             session = await ensure_session()
             if session is None:
@@ -281,6 +464,8 @@ async def main() -> None:
             signals[classify(e)] += 1
             print(f"  round {round_n} error [{classify(e)}]: {str(e)[:120]}")
             round_bad = True
+        finally:
+            pjud_browser_lock.release()
 
         # Telemetry summary every 20 rounds — running picture of failure kinds.
         if round_n % 20 == 0:
