@@ -22,3 +22,10 @@ paths = [
   '''app/scrapper/pjud/civil\.py''',
   '''app/scrapper/captcha_solver\.py''',
 ]
+
+regexes = [
+  # PUBLIC reCAPTCHA v3 site key for the PJUD 2ª clave flow — ships in PJUD's
+  # own page source, identical for everyone, NOT a credential. Used by the
+  # segunda_clave_rotator + spikes + recaptcha_token.html.
+  '''6LelLWkUAAAAANPDMkBxllo_QJe5RQVpg6V2pIDt''',
+]
