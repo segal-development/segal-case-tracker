@@ -1,12 +1,12 @@
 """Tests for connection_watcher + handle_connection in freshness_sync.py.
 
-TDD RED -> GREEN cycle (Task 3.1 / 3.2).
+TDD RED → GREEN (migrated from Redis BLPOP to DB polling).
 
-All tests use FakeRedis + mocked scraper — no live PJUD, no Playwright.
+All tests use a real SQLite DB (conftest ``db`` fixture) + mocked scraper.
+No live PJUD, no Playwright, no Redis required.
 
 Security invariant tested:
-  INV-2 — decrypted password MUST NOT appear in any log statement during the
-           handle_connection flow.
+  INV-2 — decrypted password MUST NOT appear in any log during handle_connection.
 """
 
 import asyncio
@@ -14,10 +14,6 @@ import logging
 import pytest
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
-
-import fakeredis.aioredis
-
-from app.services.connection_queue import enqueue_connection, get_status
 
 
 # ---------------------------------------------------------------------------
@@ -27,19 +23,18 @@ from app.services.connection_queue import enqueue_connection, get_status
 
 def _make_pjud_session(session_id: str = "sess-abc", lawyer_id: int = 1) -> MagicMock:
     """Return a minimal PJUDSession-like mock."""
+    from datetime import timedelta
+
     s = MagicMock()
     s.session_id = session_id
     s.lawyer_id = lawyer_id
     s.rut = "12345678-9"
     s.is_expired.return_value = False
-    # time_until_expiry returns a timedelta for asave_session TTL computation
-    from datetime import timedelta
     s.time_until_expiry.return_value = timedelta(minutes=90)
     return s
 
 
 def _make_pjud_case(rol: str = "C-0001-2026") -> MagicMock:
-    """Return a minimal PJUDCase-like mock (attributes accessed by _sync_after_login)."""
     c = MagicMock()
     c.rol = rol
     c.tribunal = "Juzgado Civil de Santiago"
@@ -51,37 +46,19 @@ def _make_pjud_case(rol: str = "C-0001-2026") -> MagicMock:
     return c
 
 
-def _make_job(
-    connection_id: str = "cid-001",
-    lawyer_id: int = 42,
-    rut: str = "12345678-9",
-    auth_method: str = "segunda_clave",
-    captcha_token: str = "tok-abc",
-) -> dict:
-    return {
-        "connection_id": connection_id,
-        "lawyer_id": lawyer_id,
-        "rut": rut,
-        "auth_method": auth_method,
-        "captcha_token": captcha_token,
-    }
+def _make_lawyer_in_db(db, lawyer_id_hint: int = 42):
+    """Create a lawyer with credentials in the SQLite test DB."""
+    from app.models.lawyer import Lawyer
+    from app.core.security import encrypt_pjud_password
 
-
-def _make_db_with_lawyer(
-    lawyer_id: int = 42,
-    encrypted_pjud_password: str = "ENCRYPTED",
-    rut: str = "12345678-9",
-) -> MagicMock:
-    """Return a mock DB session whose query returns a lawyer with the given attrs."""
-    lawyer = MagicMock()
-    lawyer.id = lawyer_id
-    lawyer.rut = rut
-    lawyer.encrypted_pjud_password = encrypted_pjud_password
-    lawyer.encrypted_clave_unica_password = None
-
-    mock_db = MagicMock()
-    mock_db.query.return_value.filter.return_value.first.return_value = lawyer
-    return mock_db
+    lawyer = Lawyer(
+        rut="12345678-9",
+        name="Test Lawyer",
+        encrypted_pjud_password=encrypt_pjud_password("plain-password"),
+    )
+    db.add(lawyer)
+    db.flush()
+    return lawyer
 
 
 # ---------------------------------------------------------------------------
@@ -90,33 +67,38 @@ def _make_db_with_lawyer(
 
 
 class TestHandleConnectionSuccess:
-    """Segunda_clave happy path: session saved, status -> connected, cases_synced set."""
+    """segunda_clave happy path: DB status transitions to 'connected'."""
 
     @pytest.mark.asyncio
-    async def test_segunda_clave_success_writes_connected_status(self):
-        """handle_connection writes 'connected' status with session_id + cases_synced."""
+    async def test_segunda_clave_success_writes_connected_status(self, db):
+        """handle_connection sets status='connected' with session_id + cases_synced."""
         from scripts.freshness_sync import handle_connection
+        from app.services.connection_queue import enqueue_connection, get_status
 
-        fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+        lawyer = _make_lawyer_in_db(db)
+        cid = enqueue_connection(
+            db, lawyer_id=lawyer.id, rut="12345678-9",
+            auth_method="segunda_clave", captcha_token="tok",
+        )
         lock = asyncio.Lock()
-        mock_db = _make_db_with_lawyer(lawyer_id=42, encrypted_pjud_password="ENC")
-
-        session = _make_pjud_session(session_id="sess-xyz", lawyer_id=42)
         cases = [_make_pjud_case(f"C-{i:04d}-2026") for i in range(5)]
+        session = _make_pjud_session(session_id="sess-xyz", lawyer_id=lawyer.id)
 
         mock_sc = MagicMock()
         mock_sc.login_with_token = AsyncMock(return_value=session)
         mock_sc.get_my_cases = AsyncMock(return_value=cases)
 
-        job = _make_job(connection_id="cid-success", lawyer_id=42, captcha_token="token123")
-
-        # Pre-set the pending status so the key exists (mirrors real enqueue flow)
-        from app.services.connection_queue import set_status as _set
-        await _set(fake_redis, "cid-success", {"status": "pending", "updated_at": "t"})
+        job = {
+            "connection_id": cid,
+            "lawyer_id": lawyer.id,
+            "rut": "12345678-9",
+            "auth_method": "segunda_clave",
+            "captcha_token": "tok",
+        }
 
         with (
             patch("app.core.security.decrypt_pjud_password", return_value="plain-password"),
-            patch("app.services.session_store.SessionStore.asave_session", new_callable=AsyncMock, return_value=True),
+            patch("app.core.redis.get_async_redis_client", new_callable=AsyncMock, return_value=None),
             patch("app.services.sync_service.SyncService.sync_cases"),
             patch("app.services.sync_service._select_cases_for_detail_rotation", return_value=cases),
             patch(
@@ -125,38 +107,48 @@ class TestHandleConnectionSuccess:
                 return_value=(3, 2, []),
             ),
         ):
-            await handle_connection(job, fake_redis, mock_db, mock_sc, lock)
+            await handle_connection(job, db, mock_sc, lock)
 
-        status = await get_status(fake_redis, "cid-success")
-        assert status is not None, "Status key must exist after handle_connection"
+        status = get_status(db, cid)
+        assert status is not None, "Status row must exist after handle_connection"
         assert status["status"] == "connected", f"Expected 'connected', got {status['status']!r}"
         assert status["session_id"] == "sess-xyz"
-        assert isinstance(status["cases_synced"], int)
         assert status["cases_synced"] == 5  # len(api_cases)
 
     @pytest.mark.asyncio
-    async def test_asave_session_is_called_on_success(self):
-        """asave_session must be called to persist the session after login."""
+    async def test_session_store_failure_does_not_crash_connect(self, db):
+        """A Redis error during SessionStore.asave_session must NOT abort the flow."""
         from scripts.freshness_sync import handle_connection
+        from app.services.connection_queue import enqueue_connection, get_status
 
-        fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+        lawyer = _make_lawyer_in_db(db)
+        cid = enqueue_connection(
+            db, lawyer_id=lawyer.id, rut="12345678-9", auth_method="segunda_clave", captcha_token="tok"
+        )
         lock = asyncio.Lock()
-        mock_db = _make_db_with_lawyer(lawyer_id=7, encrypted_pjud_password="ENC")
-
-        session = _make_pjud_session(session_id="sess-save", lawyer_id=7)
         cases = [_make_pjud_case()]
+        session = _make_pjud_session(session_id="sess-optional", lawyer_id=lawyer.id)
 
         mock_sc = MagicMock()
         mock_sc.login_with_token = AsyncMock(return_value=session)
         mock_sc.get_my_cases = AsyncMock(return_value=cases)
 
-        job = _make_job(connection_id="cid-save", lawyer_id=7)
+        job = {
+            "connection_id": cid,
+            "lawyer_id": lawyer.id,
+            "rut": "12345678-9",
+            "auth_method": "segunda_clave",
+            "captcha_token": "tok",
+        }
 
-        mock_asave = AsyncMock(return_value=True)
-
+        # Simulate Redis blowing up
         with (
-            patch("app.core.security.decrypt_pjud_password", return_value="plain-pw"),
-            patch("app.services.session_store.SessionStore.asave_session", mock_asave),
+            patch("app.core.security.decrypt_pjud_password", return_value="plain"),
+            patch(
+                "app.core.redis.get_async_redis_client",
+                new_callable=AsyncMock,
+                side_effect=Exception("Redis connection refused"),
+            ),
             patch("app.services.sync_service.SyncService.sync_cases"),
             patch("app.services.sync_service._select_cases_for_detail_rotation", return_value=cases),
             patch(
@@ -165,41 +157,51 @@ class TestHandleConnectionSuccess:
                 return_value=(1, 0, []),
             ),
         ):
-            await handle_connection(job, fake_redis, mock_db, mock_sc, lock)
+            await handle_connection(job, db, mock_sc, lock)
 
-        mock_asave.assert_called_once()
+        status = get_status(db, cid)
+        # Must still reach 'connected' — Redis failure is non-fatal
+        assert status["status"] == "connected"
 
 
 # ---------------------------------------------------------------------------
-# Test 2 — expired / invalid captcha token -> status: failed
+# Test 2 — login failure → status: failed
 # ---------------------------------------------------------------------------
 
 
 class TestHandleConnectionLoginFailure:
-    """When login raises, status must be written as 'failed' with a reason."""
+    """When login raises, DB status must be written as 'failed'."""
 
     @pytest.mark.asyncio
-    async def test_login_raises_writes_failed_status(self):
-        """A login exception produces a 'failed' status with the exception message as reason."""
+    async def test_login_raises_writes_failed_status(self, db):
+        """A login exception produces a 'failed' status with an error message."""
         from scripts.freshness_sync import handle_connection
+        from app.services.connection_queue import enqueue_connection, get_status
 
-        fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+        lawyer = _make_lawyer_in_db(db)
+        cid = enqueue_connection(
+            db, lawyer_id=lawyer.id, rut="12345678-9", auth_method="segunda_clave", captcha_token="tok"
+        )
         lock = asyncio.Lock()
-        mock_db = _make_db_with_lawyer(lawyer_id=99, encrypted_pjud_password="ENC")
 
         mock_sc = MagicMock()
         mock_sc.login_with_token = AsyncMock(side_effect=Exception("token_expired"))
 
-        job = _make_job(connection_id="cid-fail", lawyer_id=99)
+        job = {
+            "connection_id": cid,
+            "lawyer_id": lawyer.id,
+            "rut": "12345678-9",
+            "auth_method": "segunda_clave",
+            "captcha_token": "tok",
+        }
 
         with patch("app.core.security.decrypt_pjud_password", return_value="plain-pass"):
-            await handle_connection(job, fake_redis, mock_db, mock_sc, lock)
+            await handle_connection(job, db, mock_sc, lock)
 
-        status = await get_status(fake_redis, "cid-fail")
+        status = get_status(db, cid)
         assert status is not None
-        assert status["status"] == "failed", f"Expected 'failed', got {status['status']!r}"
-        assert "reason" in status
-        assert status["reason"], "reason must be non-empty"
+        assert status["status"] == "failed"
+        assert status["error"], "error field must be non-empty"
 
 
 # ---------------------------------------------------------------------------
@@ -211,29 +213,37 @@ class TestPasswordNotLeakedToLogs:
     """INV-2: the plaintext password MUST NOT appear in any log output."""
 
     @pytest.mark.asyncio
-    async def test_decrypted_password_not_in_caplog(self, caplog):
+    async def test_decrypted_password_not_in_caplog(self, db, caplog):
         """caplog must not contain the plaintext password at any log level."""
         from scripts.freshness_sync import handle_connection
+        from app.services.connection_queue import enqueue_connection
 
         PLAINTEXT_PASSWORD = "super-secret-pjud-pass-12345"
 
-        fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+        lawyer = _make_lawyer_in_db(db)
+        cid = enqueue_connection(
+            db, lawyer_id=lawyer.id, rut="12345678-9", auth_method="segunda_clave", captcha_token="tok"
+        )
         lock = asyncio.Lock()
-        mock_db = _make_db_with_lawyer(lawyer_id=5, encrypted_pjud_password="ENC")
-
-        session = _make_pjud_session(session_id="sess-inv2", lawyer_id=5)
         cases = [_make_pjud_case()]
+        session = _make_pjud_session(session_id="sess-inv2", lawyer_id=lawyer.id)
 
         mock_sc = MagicMock()
         mock_sc.login_with_token = AsyncMock(return_value=session)
         mock_sc.get_my_cases = AsyncMock(return_value=cases)
 
-        job = _make_job(connection_id="cid-inv2", lawyer_id=5)
+        job = {
+            "connection_id": cid,
+            "lawyer_id": lawyer.id,
+            "rut": "12345678-9",
+            "auth_method": "segunda_clave",
+            "captcha_token": "tok",
+        }
 
         with caplog.at_level(logging.DEBUG):
             with (
                 patch("app.core.security.decrypt_pjud_password", return_value=PLAINTEXT_PASSWORD),
-                patch("app.services.session_store.SessionStore.asave_session", new_callable=AsyncMock, return_value=True),
+                patch("app.core.redis.get_async_redis_client", new_callable=AsyncMock, return_value=None),
                 patch("app.services.sync_service.SyncService.sync_cases"),
                 patch("app.services.sync_service._select_cases_for_detail_rotation", return_value=cases),
                 patch(
@@ -242,11 +252,10 @@ class TestPasswordNotLeakedToLogs:
                     return_value=(0, 0, []),
                 ),
             ):
-                await handle_connection(job, fake_redis, mock_db, mock_sc, lock)
+                await handle_connection(job, db, mock_sc, lock)
 
         assert PLAINTEXT_PASSWORD not in caplog.text, (
-            f"Plaintext password was found in log output! "
-            f"This is a security invariant (INV-2) violation."
+            "Plaintext password found in log output — INV-2 violation!"
         )
 
 
@@ -259,20 +268,29 @@ class TestConnectionWatcherDispatch:
     """Watcher must dispatch each job as an asyncio.Task, not await it inline."""
 
     @pytest.mark.asyncio
-    async def test_watcher_calls_create_task_not_await(self):
-        """connection_watcher must call asyncio.create_task for each job, not await inline."""
+    async def test_watcher_dispatches_job_as_task(self):
+        """connection_watcher calls asyncio.create_task for a pending job."""
         from scripts.freshness_sync import connection_watcher
 
-        fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
         lock = asyncio.Lock()
-        mock_db = MagicMock()
         mock_sc = MagicMock()
         pending = {"count": 0}
 
-        # Pre-seed one job so the watcher picks it up
-        job = _make_job(connection_id="cid-dispatch", lawyer_id=11)
-        import json
-        await fake_redis.lpush("pjud:connect:queue", json.dumps(job))
+        job = {
+            "connection_id": "cid-watcher-1",
+            "lawyer_id": 11,
+            "rut": "1-1",
+            "auth_method": "segunda_clave",
+            "captcha_token": "tok",
+        }
+
+        call_count = {"n": 0}
+
+        def mock_dequeue(db_session):
+            call_count["n"] += 1
+            return job if call_count["n"] == 1 else None
+
+        mock_db = MagicMock()
 
         tasks_created = []
         original_create_task = asyncio.create_task
@@ -282,13 +300,15 @@ class TestConnectionWatcherDispatch:
             tasks_created.append(t)
             return t
 
-        with patch("asyncio.create_task", side_effect=tracking_create_task):
-            # Run watcher for a short window: it should pick up the seeded job,
-            # dispatch a task, then we cancel it.
+        with (
+            patch("app.core.database.SessionLocal", return_value=mock_db),
+            patch("app.services.connection_queue.dequeue_connection", side_effect=mock_dequeue),
+            patch("scripts.freshness_sync.CONNECTION_POLL_INTERVAL", 0),
+            patch("asyncio.create_task", side_effect=tracking_create_task),
+        ):
             watcher_task = asyncio.create_task(
-                connection_watcher(fake_redis, mock_db, mock_sc, lock, pending)
+                connection_watcher(mock_sc, lock, pending)
             )
-            # Give it enough time to BLPOP + create_task
             await asyncio.sleep(0.15)
             watcher_task.cancel()
             try:
@@ -300,7 +320,7 @@ class TestConnectionWatcherDispatch:
             "connection_watcher must dispatch handle_connection via asyncio.create_task"
         )
 
-        # Cleanup any dispatched tasks
+        # Cleanup dispatched tasks
         for t in tasks_created:
             if not t.done():
                 t.cancel()
@@ -319,39 +339,36 @@ class TestLockSerialization:
     """pjud_browser_lock must prevent two concurrent browser operations."""
 
     @pytest.mark.asyncio
-    async def test_two_concurrent_handle_connections_are_serialized(self):
-        """Concurrent handle_connection calls must not overlap inside the lock.
-
-        We track 'current' concurrent executions inside the mocked login;
-        the max must never exceed 1 when both share the same Lock.
-        """
+    async def test_two_concurrent_handle_connections_are_serialized(self, db):
+        """Two concurrent handle_connection calls must not overlap inside the lock."""
         from scripts.freshness_sync import handle_connection
+        from app.services.connection_queue import enqueue_connection
 
-        fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+        lawyer = _make_lawyer_in_db(db)
         lock = asyncio.Lock()
-
         concurrency = {"current": 0, "max_seen": 0}
 
         async def slow_login(rut, password, captcha_token):
             concurrency["current"] += 1
             concurrency["max_seen"] = max(concurrency["max_seen"], concurrency["current"])
-            await asyncio.sleep(0.05)  # simulate browser latency
+            await asyncio.sleep(0.05)
             concurrency["current"] -= 1
-            return _make_pjud_session(session_id="sess-lock", lawyer_id=1)
+            return _make_pjud_session(session_id="sess-lock", lawyer_id=lawyer.id)
 
+        cases = [_make_pjud_case()]
         mock_sc = MagicMock()
         mock_sc.login_with_token = slow_login
-        mock_sc.get_my_cases = AsyncMock(return_value=[_make_pjud_case()])
+        mock_sc.get_my_cases = AsyncMock(return_value=cases)
 
-        job1 = _make_job(connection_id="cid-lock-1", lawyer_id=1)
-        job2 = _make_job(connection_id="cid-lock-2", lawyer_id=2)
+        cid1 = enqueue_connection(db, lawyer_id=lawyer.id, rut="12345678-9", auth_method="segunda_clave", captcha_token="t1")
+        cid2 = enqueue_connection(db, lawyer_id=lawyer.id, rut="12345678-9", auth_method="segunda_clave", captcha_token="t2")
 
-        mock_db1 = _make_db_with_lawyer(lawyer_id=1, encrypted_pjud_password="ENC")
-        mock_db2 = _make_db_with_lawyer(lawyer_id=2, encrypted_pjud_password="ENC")
+        job1 = {"connection_id": cid1, "lawyer_id": lawyer.id, "rut": "12345678-9", "auth_method": "segunda_clave", "captcha_token": "t1"}
+        job2 = {"connection_id": cid2, "lawyer_id": lawyer.id, "rut": "12345678-9", "auth_method": "segunda_clave", "captcha_token": "t2"}
 
         with (
             patch("app.core.security.decrypt_pjud_password", return_value="plain"),
-            patch("app.services.session_store.SessionStore.asave_session", new_callable=AsyncMock, return_value=True),
+            patch("app.core.redis.get_async_redis_client", new_callable=AsyncMock, return_value=None),
             patch("app.services.sync_service.SyncService.sync_cases"),
             patch("app.services.sync_service._select_cases_for_detail_rotation", return_value=[]),
             patch(
@@ -361,11 +378,10 @@ class TestLockSerialization:
             ),
         ):
             await asyncio.gather(
-                handle_connection(job1, fake_redis, mock_db1, mock_sc, lock),
-                handle_connection(job2, fake_redis, mock_db2, mock_sc, lock),
+                handle_connection(job1, db, mock_sc, lock),
+                handle_connection(job2, db, mock_sc, lock),
             )
 
         assert concurrency["max_seen"] == 1, (
-            f"Expected max 1 concurrent browser section (serialized by lock), "
-            f"got {concurrency['max_seen']}. The lock is not being acquired correctly."
+            f"Expected max 1 concurrent browser section, got {concurrency['max_seen']}."
         )

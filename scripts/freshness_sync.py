@@ -59,6 +59,9 @@ SCRAPE_SKIP_SUNDAY = os.environ.get("SCRAPE_SKIP_SUNDAY", "true").lower() == "tr
 OFF_HOURS_SLEEP_MIN = int(os.environ.get("OFF_HOURS_SLEEP_MIN", "15"))
 _CHILE_TZ = ZoneInfo("America/Santiago")
 
+# Polling interval for the DB-backed connection watcher (seconds)
+CONNECTION_POLL_INTERVAL = int(os.environ.get("CONNECTION_POLL_INTERVAL", "4"))
+
 
 def _off_hours() -> bool:
     """True when we should NOT scrape (night, or optionally Sunday) — Chile time."""
@@ -138,21 +141,24 @@ async def _sync_after_login(db, sc, session, lawyer_id: int) -> int:
     return len(api_cases)
 
 
-async def handle_connection(job: dict, redis, db, sc, lock: asyncio.Lock) -> None:
-    """Process one PJUD connection job from the Redis queue.
+async def handle_connection(job: dict, db, sc, lock: asyncio.Lock) -> None:
+    """Process one PJUD connection job from the DB queue.
 
-    Lifecycle states written to Redis:
+    Lifecycle states written to pending_connections:
       pending (set by the API) -> connecting -> connected | failed
 
-    The browser lock is held around the entire login + save + sync section so
+    The browser lock is held around the entire login + sync section so
     only one live PJUD browser session is active at a time on this machine.
+
+    SessionStore (Redis) save is attempted but OPTIONAL — a missing or
+    unavailable Redis does NOT block the connect flow.  The in-memory
+    session returned by login is used for the immediate sync regardless.
 
     Security: the decrypted password is NEVER passed to any logger (INV-2).
     """
     from app.models.lawyer import Lawyer
     from app.core.security import decrypt_pjud_password
     from app.services.connection_queue import set_status
-    from app.services.session_store import SessionStore
 
     connection_id = job["connection_id"]
     lawyer_id = int(job["lawyer_id"])
@@ -160,10 +166,7 @@ async def handle_connection(job: dict, redis, db, sc, lock: asyncio.Lock) -> Non
     auth_method = job["auth_method"]
     captcha_token = job.get("captcha_token")
 
-    def _now() -> str:
-        return datetime.now(tz=timezone.utc).isoformat()
-
-    await set_status(redis, connection_id, {"status": "connecting", "updated_at": _now()})
+    set_status(db, connection_id, status="connecting")
 
     try:
         lawyer = db.query(Lawyer).filter(Lawyer.id == lawyer_id).first()
@@ -178,8 +181,17 @@ async def handle_connection(job: dict, redis, db, sc, lock: asyncio.Lock) -> Non
 
             async with lock:
                 session = await sc.login_with_token(rut, password, captcha_token)
-                store = SessionStore(redis)
-                await store.asave_session(session)
+                # SessionStore (Redis) save is optional — Carla and cloud may not
+                # share Redis.  Wrap so a missing Redis does NOT break this flow.
+                try:
+                    from app.core.redis import get_async_redis_client
+                    redis_client = await get_async_redis_client()
+                    if redis_client is not None:
+                        from app.services.session_store import SessionStore
+                        store = SessionStore(redis_client)
+                        await store.asave_session(session)
+                except Exception as _redis_err:
+                    print(f"  SessionStore save skipped (Redis unavailable): {_redis_err}")
                 cases_synced = await _sync_after_login(db, sc, session, lawyer_id)
         else:
             # CU path — follow-on slice; stub raises so callers surface intent.
@@ -189,12 +201,8 @@ async def handle_connection(job: dict, redis, db, sc, lock: asyncio.Lock) -> Non
             )
 
         db.commit()
-        await set_status(redis, connection_id, {
-            "status": "connected",
-            "session_id": session.session_id,
-            "cases_synced": cases_synced,
-            "updated_at": _now(),
-        })
+        set_status(db, connection_id, status="connected",
+                   session_id=session.session_id, cases_synced=cases_synced)
 
     except Exception as exc:
         try:
@@ -202,53 +210,60 @@ async def handle_connection(job: dict, redis, db, sc, lock: asyncio.Lock) -> Non
         except Exception:
             pass
         reason = str(exc) if str(exc) else type(exc).__name__
-        await set_status(redis, connection_id, {
-            "status": "failed",
-            "reason": reason,
-            "updated_at": _now(),
-        })
+        set_status(db, connection_id, status="failed", error=reason)
 
 
 async def connection_watcher(
-    redis,
-    db,
     sc,
     lock: asyncio.Lock,
     pending: dict,
 ) -> None:
-    """Background Task: BLPOP connection jobs from Redis and dispatch each as a Task.
+    """Background Task: poll DB for pending connections and dispatch each as a Task.
 
-    Each job is dispatched via ``asyncio.create_task`` so the handler runs
-    independently of this watcher loop — long-running login + sync does not
-    stall the watcher from picking up the next job.
+    Polls pending_connections every CONNECTION_POLL_INTERVAL seconds using
+    SELECT … FOR UPDATE SKIP LOCKED (Postgres) so multiple processes cannot
+    double-pick the same row.  No Redis dependency.
 
     *pending* is a shared ``{"count": int}`` mutable dict.  The counter is
-    incremented when a job is popped and decremented when its task finishes
-    (including on error), so the main loop can check it before acquiring
-    ``pjud_browser_lock`` and yield priority to connection tasks.
+    incremented when a job is dequeued and decremented when its task finishes,
+    so the main loop can check it before acquiring pjud_browser_lock.
     """
-    from app.services.connection_queue import blpop_connection
+    from app.core.database import SessionLocal
+    from app.services.connection_queue import dequeue_connection
 
     while True:
         try:
-            job = await blpop_connection(redis, timeout=5)
-            if job is None:
-                continue
+            poll_db = SessionLocal()
+            try:
+                job = dequeue_connection(poll_db)
+            finally:
+                poll_db.close()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"  connection_watcher DB error: {exc}")
+            await asyncio.sleep(CONNECTION_POLL_INTERVAL)
+            continue
 
+        if job is not None:
+            handle_db = SessionLocal()
             pending["count"] += 1
 
-            async def _handle_and_decrement(j: dict = job) -> None:
+            async def _handle_and_decrement(j: dict = job, _db=handle_db) -> None:
                 try:
-                    await handle_connection(j, redis, db, sc, lock)
+                    await handle_connection(j, _db, sc, lock)
+                except Exception as exc:
+                    print(f"  handle_connection error: {exc}")
                 finally:
+                    try:
+                        _db.close()
+                    except Exception:
+                        pass
                     pending["count"] -= 1
 
             asyncio.create_task(_handle_and_decrement())
 
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            print(f"  connection_watcher error: {exc}")
+        await asyncio.sleep(CONNECTION_POLL_INTERVAL)
 
 
 async def main() -> None:
@@ -262,7 +277,6 @@ async def main() -> None:
     )
     from app.scrapper.pjud.clave_unica import ClaveUnicaAuth, ClaveUnicaCredentials
     from scripts.cu_rotator import _select_cu_lawyers, sync_one_cu_lawyer, _next_cu_index
-    from app.core.redis import get_async_redis_client
 
     db = SessionLocal()
     lawyer = db.query(Lawyer).filter(Lawyer.rut == LAWYER_RUT).first()
@@ -285,14 +299,10 @@ async def main() -> None:
     # window than a full freshness batch).
     pending_connections: dict = {"count": 0}
 
-    redis_client = await get_async_redis_client()
-    if redis_client is not None:
-        asyncio.create_task(
-            connection_watcher(redis_client, db, sc, pjud_browser_lock, pending_connections)
-        )
-        print("  connection_watcher started")
-    else:
-        print("  Redis not available — connection_watcher disabled")
+    asyncio.create_task(
+        connection_watcher(sc, pjud_browser_lock, pending_connections)
+    )
+    print("  connection_watcher started (DB-backed polling)")
 
     # In-process session — no Redis dependency (robust for the always-on box).
     held: dict = {"session": None}
