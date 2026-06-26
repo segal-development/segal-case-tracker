@@ -29,12 +29,15 @@ def get_redis_client() -> Optional[redis.Redis]:
         return None
     
     try:
-        _redis_client = redis.from_url(
+        client = redis.from_url(
             settings.REDIS_URL,
             decode_responses=True,
         )
-        # Test connection
-        _redis_client.ping()
+        # Test connection — only cache the client if ping succeeds so that a
+        # failed connection attempt does not poison the global singleton with a
+        # stale object (which would prevent subsequent tests from skipping).
+        client.ping()
+        _redis_client = client
         return _redis_client
     except redis.ConnectionError:
         return None

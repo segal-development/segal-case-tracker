@@ -11,10 +11,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
+from app.config import settings
+
 
 logger = logging.getLogger(__name__)
 
-SESSION_EXPIRY_MINUTES = 25
+# Backward-compat constant exported for existing tests; value reflects the
+# current default from settings at module-import time.
+SESSION_EXPIRY_MINUTES = settings.PJUD_SESSION_EXPIRY_MINUTES
 
 
 def _utcnow() -> datetime:
@@ -72,7 +76,9 @@ class PJUDSession:
             rut=rut,
             cookies=cookies,
             created_at=now,
-            expires_at=now + timedelta(minutes=SESSION_EXPIRY_MINUTES),
+            # Read from settings at call time so PJUD_SESSION_EXPIRY_MINUTES
+            # can be patched in tests without reloading the module.
+            expires_at=now + timedelta(minutes=settings.PJUD_SESSION_EXPIRY_MINUTES),
             local_storage=local_storage,
             auth_method=auth_method,
         )

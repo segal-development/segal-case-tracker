@@ -15,8 +15,10 @@ for backward compatibility with existing callers; they use the sync
 """
 
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+from app.config import settings as _settings
 from app.core.redis import get_redis_client, get_async_redis_client
 from app.services.pjud_session import PJUDSession  # canonical model; re-exported below
 from app.utils.rut import normalize_rut
@@ -95,9 +97,14 @@ class SessionStore:
     # ------------------------------------------------------------------
 
     async def asave_session(self, session: PJUDSession) -> bool:
-        """Persist a session under all three keys.
+        """Persist a session under all three keys, applying sliding expiry.
 
-        Returns True on success, False on error or expired session.
+        Sliding TTL: ``last_used_at`` is set to now and ``expires_at`` is
+        recomputed as ``now + PJUD_SESSION_EXPIRY_MINUTES``.  This means every
+        call to ``asave_session`` resets the 300-s window from the current
+        moment, regardless of the session's original ``expires_at``.
+
+        Returns True on success, False on error.
         """
         redis = await self._redis()
         if redis is None:
@@ -105,6 +112,13 @@ class SessionStore:
             return False
 
         try:
+            # Sliding expiry: refresh last_used_at and recompute expires_at from now.
+            now = datetime.now(tz=timezone.utc)
+            session.last_used_at = now
+            session.expires_at = now + timedelta(
+                minutes=_settings.PJUD_SESSION_EXPIRY_MINUTES
+            )
+
             ttl = int(session.time_until_expiry().total_seconds())
             if ttl <= 0:
                 logger.warning("Session %s is already expired, not saving", session.session_id)
