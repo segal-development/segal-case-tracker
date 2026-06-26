@@ -15,6 +15,7 @@ class Case(Base):
     id = Column(Integer, primary_key=True, index=True)
     lawyer_id = Column(Integer, ForeignKey("lawyers.id"), nullable=False)
     court_id = Column(Integer, ForeignKey("courts.id"), nullable=False)
+    client_id = Column(Integer, ForeignKey("clients.id"), nullable=True, index=True)
     
     # Case identification
     rol = Column(String(50), nullable=False, index=True)  # C-1234-2024
@@ -57,6 +58,7 @@ class Case(Base):
     
     # Relationships
     lawyer = relationship("Lawyer", back_populates="cases")
+    client = relationship("Client", back_populates="cases")
     court = relationship("Court", back_populates="cases")
     movements = relationship("Movement", back_populates="case", order_by="desc(Movement.movement_date)")
     documents = relationship("Document", back_populates="case")
