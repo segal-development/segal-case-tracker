@@ -58,7 +58,9 @@ def db(engine):
 # Helpers
 # ---------------------------------------------------------------------------
 
-TODAY_DT = datetime(2026, 6, 16)
+# Relative to today (real) so the 8-business-day excepciones plazo is always still
+# running → NOTIFICADO. A fixed date silently rots into REBELDE as time passes.
+TODAY_DT = datetime.now()
 TODAY_NOTIF = TODAY_DT - timedelta(days=1)  # yesterday → NOTIFICADO case
 
 

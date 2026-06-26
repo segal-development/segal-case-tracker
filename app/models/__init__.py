@@ -2,6 +2,7 @@
 
 from app.models.lawyer import Lawyer
 from app.models.court import Court
+from app.models.client import Client
 from app.models.case import Case
 from app.models.movement import Movement
 from app.models.document import Document
@@ -19,6 +20,7 @@ from app.models.goal import Goal
 __all__ = [
     "Lawyer",
     "Court",
+    "Client",
     "Case",
     "Movement",
     "Document",
