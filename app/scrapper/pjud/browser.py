@@ -25,6 +25,13 @@ from app.config import settings
 # Copied here to keep browser.py self-contained (no circular-import risk).
 _PJUD_BASE_URL = "https://oficinajudicialvirtual.pjud.cl"
 
+# User-agent matching the real system Chrome installed on this Mac (v149).
+_CHROME_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/149.0.0.0 Safari/537.36"
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -143,10 +150,28 @@ class BrowserFactory:
         await self._stop()
     
     async def _start(self) -> None:
-        """Start playwright and browser with timing instrumentation."""
+        """Start playwright and browser with timing instrumentation.
+
+        Uses system Chrome when ``PJUD_CHROME_PATH`` is set — same fingerprint
+        humans use, less likely to trigger F5 Shape.
+        """
         if self._browser is not None:
             logger.debug("Browser already started")
             return
+        
+        chrome_path = settings.PJUD_CHROME_PATH or None
+        launch_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+        ]
+        if chrome_path:
+            launch_args += [
+                "--disable-sync",
+                "--no-first-run",
+                "--hide-scrollbars",
+                "--mute-audio",
+            ]
+            logger.info("BrowserFactory using system Chrome: %s", chrome_path)
         
         start_time = time.perf_counter()
         logger.info("Starting fresh browser instance")
@@ -154,10 +179,8 @@ class BrowserFactory:
         self._playwright = await async_playwright().start()
         self._browser = await self._playwright.chromium.launch(
             headless=self.headless,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-            ]
+            executable_path=chrome_path,
+            args=launch_args,
         )
         
         startup_ms = (time.perf_counter() - start_time) * 1000
@@ -238,11 +261,27 @@ class BrowserFactory:
                 f"Restoring {len(storage_state['cookies'])} cookies via storage_state"
             )
 
-        # Create new browser context with storage_state pre-loaded
-        self._context = await self._browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            storage_state=storage_state,
+        # Create new browser context with stealth-friendly options:
+        #   - Chrome 149 UA (matches system Chrome)
+        #   - Full-HD viewport (configurable)
+        #   - Chilean locale + timezone for PJUD
+        #   - navigator.webdriver overridden via init script
+        context_options = {
+            "viewport": {
+                "width": settings.PJUD_VIEWPORT_WIDTH,
+                "height": settings.PJUD_VIEWPORT_HEIGHT,
+            },
+            "user_agent": _CHROME_UA,
+            "locale": "es-CL",
+            "timezone_id": "America/Santiago",
+            "storage_state": storage_state,
+        }
+
+        self._context = await self._browser.new_context(**context_options)
+
+        # Patch navigator.webdriver — the #1 fingerprint Shape checks
+        await self._context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
         )
 
         # Create new page

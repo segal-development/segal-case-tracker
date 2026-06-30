@@ -113,6 +113,9 @@ class Settings(BaseSettings):
     PJUD_ALERT_WEBHOOK_URL: str = ""        # Webhook URL for alerts (empty = disabled)
     PJUD_LOG_LEVEL: str = "INFO"            # Log level: DEBUG, INFO, WARNING, ERROR
     PJUD_METRICS_ENABLED: bool = True       # Enable/disable metrics collection
+    PJUD_CHROME_PATH: str = ""              # Path to system Chrome (empty = Playwright bundled Chromium)
+    PJUD_VIEWPORT_WIDTH: int = 1920         # Browser viewport width (default full-HD)
+    PJUD_VIEWPORT_HEIGHT: int = 1080        # Browser viewport height
     PJUD_ALERTS_ENABLED: bool = True        # Enable/disable alert webhooks
 
     # Document storage (Slice 2)

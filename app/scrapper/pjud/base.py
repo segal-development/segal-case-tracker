@@ -21,6 +21,14 @@ from playwright.async_api import (
     TimeoutError as PlaywrightTimeoutError,
 )
 
+# User-agent matching the real system Chrome installed on this Mac (v149).
+# Generated from: /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --version
+_CHROME_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/149.0.0.0 Safari/537.36"
+)
+
 from app.services.pjud_session import PJUDSession
 from app.scrapper.pjud.exceptions import (
     InvalidCredentialsError,
@@ -286,17 +294,36 @@ class PJUDBaseScraper(ABC):
     # ========================================================================
     
     async def start(self) -> None:
-        """Start browser instance."""
+        """Start browser instance.
+
+        Uses the system Chrome when ``PJUD_CHROME_PATH`` is set in env (more
+        stealth — same Chrome humans use). Falls back to Playwright's bundled
+        Chromium otherwise.
+        """
         if self._browser:
             return
         
+        chrome_path = settings.PJUD_CHROME_PATH or None
+        launch_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+        ]
+        if chrome_path:
+            launch_args += [
+                "--disable-sync",              # No Chrome sync noise
+                "--no-first-run",              # Skip first-run dialogs
+                "--hide-scrollbars",
+                "--mute-audio",
+            ]
+            logger.info("Using system Chrome: %s", chrome_path)
+        else:
+            logger.info("Using Playwright bundled Chromium")
+
         self._playwright = await async_playwright().start()
         self._browser = await self._playwright.chromium.launch(
             headless=self.headless,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-            ]
+            executable_path=chrome_path,
+            args=launch_args,
         )
         logger.info(f"Browser started for {self.config.display_name} scraper")
     
@@ -393,13 +420,34 @@ class PJUDBaseScraper(ABC):
         # (the "logged-in" token) at load time; restoring localStorage AFTER
         # navigating (the old approach) lands on the login page and breaks the
         # session. storage_state injects both before any navigation.
+        from app.config import settings
         from app.scrapper.pjud.browser import build_storage_state
 
         storage_state = build_storage_state(session) if session else None
-        self._context = await self._browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            storage_state=storage_state,
+
+        # Context options that make Playwright look more like a real human
+        # browsing PJUD — anti-fingerprint / stealth:
+        #   - Chrome 149 UA (same as the system Chrome on this Mac)
+        #   - Full-HD viewport (configurable)
+        #   - Chilean locale + timezone to match PJUD expectations
+        #   - geolocation set to Santiago (Shape checks this)
+        context_options = {
+            "viewport": {
+                "width": settings.PJUD_VIEWPORT_WIDTH,
+                "height": settings.PJUD_VIEWPORT_HEIGHT,
+            },
+            "user_agent": _CHROME_UA,
+            "locale": "es-CL",
+            "timezone_id": "America/Santiago",
+            "storage_state": storage_state,
+        }
+
+        self._context = await self._browser.new_context(**context_options)
+
+        # Patch navigator.webdriver (Playwright leaves it as true by default).
+        # This is the #1 fingerprint Shape checks for bot detection.
+        await self._context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
         )
 
         self._page = await self._context.new_page()
