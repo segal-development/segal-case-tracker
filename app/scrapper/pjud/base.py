@@ -29,6 +29,7 @@ _CHROME_UA = (
     "Chrome/149.0.0.0 Safari/537.36"
 )
 
+from app.config import settings
 from app.services.pjud_session import PJUDSession
 from app.scrapper.pjud.exceptions import (
     InvalidCredentialsError,
@@ -36,6 +37,7 @@ from app.scrapper.pjud.exceptions import (
     ScrapingError,
     SessionExpiredError,
     SessionNotAuthenticatedError,
+    ShapeChallengeError,
 )
 
 
@@ -79,6 +81,31 @@ def classify_login_failure(page_content: str) -> tuple:
     if m:
         start = max(0, m.start() - 30)
         return True, text[start:m.end() + 50].strip()
+    return False, ""
+
+
+def detect_shape_challenge(page_content: str | None, url: str = "") -> tuple[bool, str]:
+    """Detect PJUD Shape/TSPD challenge pages using conservative markers."""
+    url_text = url or ""
+    if re.search(r"(?:^|[/?&_=.-])TSPD(?:_101)?(?:$|[/?&_=.-])", url_text, re.IGNORECASE):
+        return True, "TSPD URL"
+
+    if not page_content:
+        return False, ""
+
+    text = re.sub(r"<[^>]+>", " ", page_content)
+    text = re.sub(r"\s+", " ", text).strip().lower()
+    html = page_content.lower()
+
+    if "tspd_101" in html and ("failureconfig" in html or "what code is in the image" in text or "support id" in text):
+        return True, "TSPD_101 challenge"
+    if "failureconfig" in html and ("support" in text or "tspd" in html):
+        return True, "failureConfig/support"
+    if "what code is in the image" in text and ("tspd" in html or "support id" in text):
+        return True, "Shape image challenge"
+    if "tspd" in html and ("support id" in text or "what code is in the image" in text):
+        return True, "TSPD challenge content"
+
     return False, ""
 
 
@@ -741,11 +768,23 @@ class PJUDBaseScraper(ABC):
             except Exception:
                 jquery_present = False
             looks_like_login = "home/index.php" in current_url
+            try:
+                page_content = await self._safe_page_content(page)
+            except Exception:
+                page_content = ""
+            is_shape_challenge, shape_marker = detect_shape_challenge(page_content, current_url)
 
             logger.warning(
                 f"misCausas not found — session restore failed. "
                 f"url={current_url}, jquery={jquery_present}, login_page={looks_like_login}"
             )
+            if is_shape_challenge:
+                raise ShapeChallengeError(
+                    url=current_url,
+                    jquery_present=jquery_present,
+                    looks_like_login=looks_like_login,
+                    marker=shape_marker,
+                )
             raise SessionNotAuthenticatedError(
                 url=current_url,
                 jquery_present=jquery_present,

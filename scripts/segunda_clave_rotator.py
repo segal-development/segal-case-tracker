@@ -118,7 +118,7 @@ async def main() -> int:
     from app.core.database import SessionLocal
     from app.models.lawyer import Lawyer
     from app.scrapper.pjud.civil import CivilScraper
-    from app.scrapper.pjud.exceptions import InvalidCredentialsError, LoginError
+    from app.scrapper.pjud.exceptions import InvalidCredentialsError, LoginError, ShapeChallengeError
 
     db = SessionLocal()
     q = db.query(Lawyer).filter(Lawyer.encrypted_pjud_password.isnot(None))
@@ -137,17 +137,21 @@ async def main() -> int:
     total = 0
     bad_clave = []   # (name, rut) — wrong/changed password → must update
     other_fail = []  # (name, rut, msg) — token/network/other → retry-able
-    _403_hit = False
+    pjud_block_seen = False
+    cooldown_pending = False
     try:
         for i, lw in enumerate(lawyers):
-            # After a 403, apply cooldown before the next lawyer
-            if _403_hit:
+            # After a PJUD block, apply cooldown before the next lawyer.
+            # Keep pjud_block_seen true for the final summary/exit code.
+            did_cooldown = False
+            if cooldown_pending:
                 print(f"\n  ⏳ 403 cooldown {COOLDOWN_403}s…")
                 await asyncio.sleep(COOLDOWN_403)
-                _403_hit = False
+                cooldown_pending = False
+                did_cooldown = True
 
             # Spacing between lawyers (skip delay after cooldown and before first)
-            if i > 0 and LAWYER_DELAY > 0:
+            if i > 0 and not did_cooldown and LAWYER_DELAY > 0:
                 print(f"  ⏱  espera {LAWYER_DELAY}s entre abogados…")
                 await asyncio.sleep(LAWYER_DELAY)
 
@@ -173,6 +177,15 @@ async def main() -> int:
                 bad_clave.append((lw.name, lw.rut))
                 print(f"  🔑 {lw.name} ({lw.rut}): CLAVE INVÁLIDA — pedir que la actualice [{str(e)[:50]}]")
 
+            except ShapeChallengeError as e:
+                if not DRY_RUN:
+                    db.rollback()
+                pjud_block_seen = True
+                cooldown_pending = True
+                marker = getattr(e, "marker", "Shape/TSPD")
+                other_fail.append((lw.name, lw.rut, f"SHAPE BLOQUEO — {marker}"))
+                print(f"  🚫 {lw.name} ({lw.rut}): SHAPE/TSPD BLOQUEADO — cooldown tras terminar la ronda [{marker}]")
+
             except LoginError as e:
                 if not DRY_RUN:
                     db.rollback()
@@ -184,10 +197,11 @@ async def main() -> int:
                     db.rollback()
                 msg = f"{type(e).__name__}: {e}"
                 # Detect 403 (PJUD rate-limit / block) by error text or status
-                if re.search(r"\b403\b|Forbidden|HTTP.*403|too_many|rate.limit", str(e), re.IGNORECASE):
-                    _403_hit = True
-                    other_fail.append((lw.name, lw.rut, f"403 BLOQUEO — {str(e)[:60]}"))
-                    print(f"  🚫 {lw.name} ({lw.rut}): 403 BLOQUEADO — cooldown tras terminar la ronda")
+                if re.search(r"\b403\b|Forbidden|HTTP.*403|too_many|rate.limit|Shape/TSPD|TSPD|failureConfig", str(e), re.IGNORECASE):
+                    pjud_block_seen = True
+                    cooldown_pending = True
+                    other_fail.append((lw.name, lw.rut, f"PJUD BLOQUEO — {str(e)[:60]}"))
+                    print(f"  🚫 {lw.name} ({lw.rut}): PJUD BLOQUEADO — cooldown tras terminar la ronda")
                 else:
                     other_fail.append((lw.name, lw.rut, msg))
                     print(f"  ✗ {lw.name} ({lw.rut}): {type(e).__name__}: {str(e)[:50]}")
@@ -195,17 +209,18 @@ async def main() -> int:
         await sc.stop()
 
     print(f"\n==== done · {len(lawyers)} abogado(s) · {total} causas totales (mode={mode}) ====")
-    if _403_hit:
-        print(f"\n🚫 Se detectó 403 — PJUD está bloqueando. Esperá {COOLDOWN_403}s+ antes de reintentar.")
+    if pjud_block_seen:
+        print(f"\n🚫 Se detectó bloqueo PJUD (403/Shape/TSPD). Esperá {COOLDOWN_403}s+ antes de reintentar.")
     if bad_clave:
         print(f"\n🔑 {len(bad_clave)} abogado(s) con CLAVE INVÁLIDA — pedirles que la actualicen:")
         for name, rut in bad_clave:
             print(f"    - {name} ({rut})")
     if other_fail:
-        print(f"\n✗ {len(other_fail)} fallo(s) reintentables (token/red):")
+        label = "bloqueo(s)/fallo(s) PJUD" if pjud_block_seen else "fallo(s) reintentables (token/red)"
+        print(f"\n✗ {len(other_fail)} {label}:")
         for name, rut, msg in other_fail:
             print(f"    - {name} ({rut}): {msg[:70]}")
-    return int(_403_hit)
+    return int(pjud_block_seen)
 
 
 if __name__ == "__main__":
