@@ -1,7 +1,9 @@
 """API Dependencies - Authentication, DB Session, etc."""
 
+import hashlib
+from datetime import datetime
 from typing import Generator, Optional
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, Header, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 
@@ -102,6 +104,44 @@ async def require_auditor(
         )
 
     return str(lawyer.rut)
+
+
+def require_ingest_key(
+    x_ingest_key: Optional[str] = Header(default=None, alias="X-Ingest-Key"),
+    db: Session = Depends(get_db),
+):
+    """Validate the ``X-Ingest-Key`` header used by the PJUD browser extension.
+
+    Machine-to-machine credential, distinct from lawyer JWT auth: one
+    operator key authorizes ingest calls for all lawyers it manages. The
+    key is stored hashed (SHA-256, mirrors ``lawyers.password_hash``) —
+    never in plaintext — so lookup is a direct equality match, not a
+    per-row bcrypt verify.
+
+    Raises 401 when the header is missing/empty, 403 when it doesn't match
+    any active key (unknown or revoked). On success, stamps
+    ``last_used_at`` and returns the matched ``IngestKey`` row.
+    """
+    if not x_ingest_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing X-Ingest-Key header",
+        )
+
+    from app.models.ingest_key import IngestKey
+
+    key_hash = hashlib.sha256(x_ingest_key.encode()).hexdigest()
+    key = db.query(IngestKey).filter(IngestKey.key_hash == key_hash).first()
+
+    if key is None or not key.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid or revoked ingest key",
+        )
+
+    key.last_used_at = datetime.utcnow()  # type: ignore[assignment]
+    db.commit()
+    return key
 
 
 def _resolve_lawyer_id(db: Session, current_lawyer: dict) -> int:
