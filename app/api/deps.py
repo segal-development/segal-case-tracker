@@ -172,3 +172,68 @@ def _resolve_lawyer_id(db: Session, current_lawyer: dict) -> int:
         if firm is not None:
             return int(firm.id)
     return int(lawyer.id)
+
+
+class _AllCasesScope:
+    """Sentinel returned by ``resolve_case_scope`` for the auditor role.
+
+    Means "no per-lawyer filter — every case in the study is visible."
+    Distinct from any real lawyer id (which is always an ``int``).
+    """
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid only
+        return "ALL_CASES"
+
+
+ALL_CASES = _AllCasesScope()
+
+
+def resolve_case_scope(db: Session, current_lawyer: dict):
+    """Resolve the case-visibility scope for a READ/aggregation endpoint.
+
+    Unlike ``_resolve_lawyer_id`` (which maps the auditor role to the firm
+    account's own lawyer_id — a proxy that only worked while a single
+    account scraped the whole firm's caseload), this returns ``ALL_CASES``
+    for the auditor role: cases are now attributed per-lawyer, so the
+    auditor — a transversal role overseeing the WHOLE firm — must see every
+    case regardless of which lawyer owns it.
+
+    For every other role, returns the caller's own numeric lawyer id (same
+    resolution rules as ``_resolve_lawyer_id``: JWT ``sub`` is the lawyer RUT,
+    legacy/test tokens may carry the numeric id directly).
+
+    Raises 401 when no subject is present and 404 when the lawyer is unknown
+    (RUT lookup only — numeric-id tokens have no row to 404 against).
+    """
+    sub = current_lawyer.get("sub") or current_lawyer.get("lawyer_id")
+    if not sub:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    from app.models.lawyer import Lawyer
+
+    if isinstance(sub, int) or (isinstance(sub, str) and sub.isdigit()):
+        lawyer = db.query(Lawyer).filter(Lawyer.id == int(sub)).first()
+        if lawyer is not None and lawyer.role == "auditor":
+            return ALL_CASES
+        return int(sub)
+
+    lawyer = db.query(Lawyer).filter(Lawyer.rut == sub).first()
+    if not lawyer:
+        raise HTTPException(status_code=404, detail="Lawyer not found")
+    if lawyer.role == "auditor":
+        return ALL_CASES
+    return int(lawyer.id)
+
+
+def apply_case_scope(query, scope):
+    """Apply a ``resolve_case_scope`` result to a query that filters on Case.
+
+    ``scope is ALL_CASES`` -> query returned unchanged (every study case
+    visible, auditor). Otherwise -> ``query.filter(Case.lawyer_id == scope)``.
+    The query must already select or join ``app.models.case.Case``.
+    """
+    if scope is ALL_CASES:
+        return query
+    from app.models.case import Case
+
+    return query.filter(Case.lawyer_id == scope)

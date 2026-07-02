@@ -16,12 +16,17 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
-from sqlalchemy import and_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import nullslast
 
-from app.api.deps import get_current_lawyer, get_db, _resolve_lawyer_id, require_auditor
+from app.api.deps import (
+    get_current_lawyer,
+    get_db,
+    require_auditor,
+    resolve_case_scope,
+    apply_case_scope,
+)
 from app.core.deadlines_config import DEADLINE_DISCLAIMER, DeadlineType
 from app.models.alert import Alert
 from app.models.case import Case
@@ -308,8 +313,9 @@ async def list_audited_deadlines(
 ):
     """List audited deadlines (cumplido / no_cumplido) for the caller's cases.
 
-    Scoped via ``_resolve_lawyer_id`` so an auditor sees the whole firm's
-    caseload. Optional ``status`` narrows to a single audited status.
+    Scoped via ``resolve_case_scope``: the auditor role sees the whole
+    firm's caseload across ALL lawyers; every other role stays scoped to
+    its own cases. Optional ``status`` narrows to a single audited status.
     """
     audited_statuses = {"cumplido", "no_cumplido"}
     if status is not None and status not in audited_statuses:
@@ -318,16 +324,16 @@ async def list_audited_deadlines(
             detail=f"status must be one of {sorted(audited_statuses)}",
         )
 
-    lawyer_id = _resolve_lawyer_id(db, current_lawyer)
+    scope = resolve_case_scope(db, current_lawyer)
     status_filter = {status} if status is not None else audited_statuses
 
-    rows = (
+    rows_query = (
         db.query(CaseDeadline, Case)
         .join(Case, CaseDeadline.case_id == Case.id)
-        .filter(
-            Case.lawyer_id == lawyer_id,
-            CaseDeadline.status.in_(status_filter),
-        )
+        .filter(CaseDeadline.status.in_(status_filter))
+    )
+    rows = (
+        apply_case_scope(rows_query, scope)
         .order_by(
             nullslast(CaseDeadline.marked_at.desc()),
             CaseDeadline.due_date.desc(),
@@ -498,16 +504,14 @@ async def get_case_deadlines(
 ):
     """Return the procedural deadline timeline for a case.
 
-    Auth required. Case must be owned by the requesting lawyer (404 otherwise).
-    The response always includes a mandatory legal disclaimer.
+    Auth required. Case must be visible to the caller: owned by the
+    requesting lawyer, or any study case for the auditor role (404
+    otherwise). The response always includes a mandatory legal disclaimer.
     """
-    lawyer_id = _resolve_lawyer_id(db, current_lawyer)
+    scope = resolve_case_scope(db, current_lawyer)
 
-    case = db.query(Case).filter(
-        and_(
-            Case.id == case_id,
-            Case.lawyer_id == lawyer_id,
-        )
+    case = apply_case_scope(
+        db.query(Case).filter(Case.id == case_id), scope
     ).first()
 
     if not case:
