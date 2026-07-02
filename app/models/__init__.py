@@ -17,6 +17,7 @@ from app.models.case_exhorto import CaseExhorto
 from app.models.case_deadline import CaseDeadline
 from app.models.goal import Goal
 from app.models.pending_connection import PendingConnection
+from app.models.ingest_key import IngestKey
 
 __all__ = [
     "Lawyer",
@@ -36,4 +37,5 @@ __all__ = [
     "CaseDeadline",
     "Goal",
     "PendingConnection",
+    "IngestKey",
 ]
