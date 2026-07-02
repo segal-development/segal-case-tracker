@@ -126,3 +126,27 @@ class SessionNotAuthenticatedError(PJUDError):
         self.url = url
         self.jquery_present = jquery_present
         self.looks_like_login = looks_like_login
+
+
+class ShapeChallengeError(SessionNotAuthenticatedError):
+    """Raised when PJUD serves a Shape/TSPD challenge instead of Mis Causas."""
+
+    def __init__(
+        self,
+        url: str,
+        jquery_present: bool,
+        looks_like_login: bool,
+        marker: str,
+    ):
+        super().__init__(
+            url=url,
+            jquery_present=jquery_present,
+            looks_like_login=looks_like_login,
+        )
+        self.marker = marker
+        self.message = (
+            f"PJUD Shape/TSPD challenge detected. "
+            f"url={url}, marker={marker}, jquery_present={jquery_present}, "
+            f"looks_like_login={looks_like_login}. Treat as a PJUD block, not a retryable session error."
+        )
+        self.args = (self.message,)

@@ -139,6 +139,7 @@ class BrowserFactory:
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
+        self._persistent_context = False
     
     async def __aenter__(self) -> "BrowserFactory":
         """Start browser and return factory."""
@@ -155,11 +156,12 @@ class BrowserFactory:
         Uses system Chrome when ``PJUD_CHROME_PATH`` is set — same fingerprint
         humans use, less likely to trigger F5 Shape.
         """
-        if self._browser is not None:
+        if self._browser is not None or self._context is not None:
             logger.debug("Browser already started")
             return
         
         chrome_path = settings.PJUD_CHROME_PATH or None
+        user_data_dir = settings.PJUD_USER_DATA_DIR or None
         launch_args = [
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
@@ -177,11 +179,30 @@ class BrowserFactory:
         logger.info("Starting fresh browser instance")
         
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
-            headless=self.headless,
-            executable_path=chrome_path,
-            args=launch_args,
-        )
+        if user_data_dir:
+            self._persistent_context = True
+            self._context = await self._playwright.chromium.launch_persistent_context(
+                user_data_dir=user_data_dir,
+                headless=self.headless,
+                executable_path=chrome_path,
+                args=launch_args,
+                viewport={
+                    "width": settings.PJUD_VIEWPORT_WIDTH,
+                    "height": settings.PJUD_VIEWPORT_HEIGHT,
+                },
+                user_agent=_CHROME_UA,
+                locale="es-CL",
+                timezone_id="America/Santiago",
+            )
+            await self._add_stealth_init_script(self._context)
+            logger.info("BrowserFactory using persistent PJUD Chrome profile: %s", user_data_dir)
+        else:
+            self._persistent_context = False
+            self._browser = await self._playwright.chromium.launch(
+                headless=self.headless,
+                executable_path=chrome_path,
+                args=launch_args,
+            )
         
         startup_ms = (time.perf_counter() - start_time) * 1000
         _browser_startup_times.append(startup_ms)
@@ -208,7 +229,7 @@ class BrowserFactory:
             self._context = None
         
         # Close browser
-        if self._browser is not None:
+        if self._browser is not None and not self._persistent_context:
             try:
                 await self._browser.close()
             except Exception as e:
@@ -222,6 +243,7 @@ class BrowserFactory:
             except Exception as e:
                 logger.debug(f"Error stopping playwright: {e}")
             self._playwright = None
+        self._persistent_context = False
         
         logger.info("Browser instance stopped")
     
@@ -239,13 +261,19 @@ class BrowserFactory:
         Returns:
             Fresh Page instance with session restored
         """
-        if self._browser is None:
+        if self._browser is None and self._context is None:
             raise RuntimeError("Browser not started. Use 'async with BrowserFactory()' context manager.")
         
         start_time = time.perf_counter()
         
-        # Close existing context if any (clean slate per new_page call)
-        if self._context is not None:
+        if self._persistent_context:
+            if self._page is not None:
+                try:
+                    await self._page.close()
+                except Exception:
+                    pass
+                self._page = None
+        elif self._context is not None:
             try:
                 await self._context.close()
             except Exception:
@@ -277,12 +305,15 @@ class BrowserFactory:
             "storage_state": storage_state,
         }
 
-        self._context = await self._browser.new_context(**context_options)
-
-        # Patch navigator.webdriver — the #1 fingerprint Shape checks
-        await self._context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
-        )
+        if self._persistent_context:
+            if self._context is None:
+                raise RuntimeError("Persistent browser context not started")
+            await self._restore_session_to_context(self._context, storage_state)
+        else:
+            if self._browser is None:
+                raise RuntimeError("Browser not started")
+            self._context = await self._browser.new_context(**context_options)
+            await self._add_stealth_init_script(self._context)
 
         # Create new page
         self._page = await self._context.new_page()
@@ -303,6 +334,44 @@ class BrowserFactory:
         _page_creation_times.append(creation_ms)
         logger.info(f"Created new page in {creation_ms:.2f}ms (session: {session is not None})")
         return self._page
+
+    async def _add_stealth_init_script(self, context: BrowserContext) -> None:
+        # Patch navigator.webdriver before pages are created; Shape checks this signal.
+        await context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+        )
+
+    async def _restore_session_to_context(
+        self,
+        context: BrowserContext,
+        storage_state: Optional[Dict[str, Any]],
+    ) -> None:
+        if not storage_state:
+            return
+
+        cookies = storage_state.get("cookies") or []
+        if cookies:
+            await context.add_cookies(cookies)
+
+        origins = storage_state.get("origins") or []
+        local_storage = next(
+            (
+                origin.get("localStorage")
+                for origin in origins
+                if origin.get("origin") == _PJUD_BASE_URL
+            ),
+            [],
+        )
+        if local_storage:
+            await context.add_init_script(
+                f"""
+                (() => {{
+                    const items = {json.dumps(local_storage)};
+                    if (location.origin !== 'https://oficinajudicialvirtual.pjud.cl') return;
+                    for (const item of items) localStorage.setItem(item.name, item.value);
+                }})()
+                """,
+            )
 
 
 class WarmBrowserPool:

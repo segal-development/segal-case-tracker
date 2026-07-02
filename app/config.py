@@ -114,6 +114,7 @@ class Settings(BaseSettings):
     PJUD_LOG_LEVEL: str = "INFO"            # Log level: DEBUG, INFO, WARNING, ERROR
     PJUD_METRICS_ENABLED: bool = True       # Enable/disable metrics collection
     PJUD_CHROME_PATH: str = ""              # Path to system Chrome (empty = Playwright bundled Chromium)
+    PJUD_USER_DATA_DIR: str = ""            # Persistent user data dir for PJUD Chrome, empty means ephemeral Playwright context
     PJUD_VIEWPORT_WIDTH: int = 1920         # Browser viewport width (default full-HD)
     PJUD_VIEWPORT_HEIGHT: int = 1080        # Browser viewport height
     PJUD_ALERTS_ENABLED: bool = True        # Enable/disable alert webhooks

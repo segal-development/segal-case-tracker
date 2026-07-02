@@ -29,6 +29,11 @@ trap 'rm -f "$LOCKDIR/pid"; rmdir "$LOCKDIR" 2>/dev/null' EXIT
 set -a; source .env.backfill; set +a
 export PYTHONPATH="$(pwd)"
 
+SYSTEM_CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+if [ -z "${PJUD_CHROME_PATH:-}" ] && [ -x "$SYSTEM_CHROME" ]; then
+  export PJUD_CHROME_PATH="$SYSTEM_CHROME"
+fi
+
 # --- Cloud SQL Auth Proxy: reach the DB via IAM, not the IP allowlist ---
 # The Mac's residential IP rotates and breaks Cloud SQL authorized-networks.
 # The proxy authenticates with ADC and tunnels to the instance, so IP changes
