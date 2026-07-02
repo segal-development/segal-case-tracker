@@ -54,3 +54,4 @@ Thumbs.db
 # Captured PJUD session (sensitive, short-lived)
 pjud_session.json
 .env.backfill
+.pjud-chrome-profile/
