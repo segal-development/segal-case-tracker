@@ -7,11 +7,16 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_db, get_current_lawyer, _resolve_lawyer_id
+from app.api.deps import get_db, get_current_lawyer, _resolve_lawyer_id, resolve_case_scope, ALL_CASES
 from app.models.case import Case
 from app.models.goal import Goal
 from app.models.lawyer import Lawyer
-from app.services.lawyer_roster import firm_dashboard_stats, admin_dashboard_stats, case_ids_for_abogado
+from app.services.lawyer_roster import (
+    firm_dashboard_stats,
+    firm_dashboard_stats_all,
+    admin_dashboard_stats,
+    case_ids_for_abogado,
+)
 from app.utils.rut import normalize_rut
 
 router = APIRouter()
@@ -91,7 +96,16 @@ async def get_firm_stats(
     db: Session = Depends(get_db),
     current_lawyer: dict = Depends(get_current_lawyer),
 ):
-    """Return firm-wide dashboard stats: semaforo breakdown, stale cases, materias, and per-lawyer metrics."""
+    """Return firm-wide dashboard stats: semaforo breakdown, stale cases, materias, and per-lawyer metrics.
+
+    Auditor role: aggregates across EVERY study case (all lawyers), via
+    ``firm_dashboard_stats_all``. Every other role stays scoped to its own
+    account's cases via ``firm_dashboard_stats``.
+    """
+    scope = resolve_case_scope(db, current_lawyer)
+    if scope is ALL_CASES:
+        return firm_dashboard_stats_all(db)
+
     lawyer_id = _resolve_lawyer_id(db, current_lawyer)
     lawyer = db.get(Lawyer, lawyer_id)
     if not lawyer:

@@ -5,7 +5,14 @@ from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, nullslast
 
-from app.api.deps import get_db, get_current_lawyer, _resolve_lawyer_id
+from app.api.deps import (
+    get_db,
+    get_current_lawyer,
+    _resolve_lawyer_id,
+    resolve_case_scope,
+    apply_case_scope,
+    ALL_CASES,
+)
 from app.models.case import Case
 from app.models.lawyer import Lawyer
 from app.models.case_litigante import CaseLitigante
@@ -218,8 +225,13 @@ async def list_cases(
     if not lawyer_id:
         raise HTTPException(status_code=401, detail="Invalid token: no lawyer_id")
 
+    # Auditor scope: spans every study case (no single-lawyer filter). Every
+    # other role stays scoped to its own cases via lawyer_id, same as before.
+    scope = resolve_case_scope(db, current_lawyer)
+
     # Build query
-    query = db.query(Case).filter(Case.lawyer_id == lawyer_id)
+    query = db.query(Case)
+    query = apply_case_scope(query, scope)
 
     if competencia:
         query = query.filter(Case.competencia == competencia)
@@ -255,13 +267,14 @@ async def list_cases(
         .all()
     )
     
-    # Get last sync time
-    last_sync_record = db.query(SyncHistory).filter(
-        and_(
-            SyncHistory.lawyer_id == lawyer_id,
-            SyncHistory.status.in_(["completed", "partial"]),
-        )
-    ).order_by(SyncHistory.completed_at.desc()).first()
+    # Get last sync time. Auditor spans the whole firm, so surface the most
+    # recent sync across ALL lawyers instead of one account's own history.
+    last_sync_query = db.query(SyncHistory).filter(
+        SyncHistory.status.in_(["completed", "partial"])
+    )
+    if scope is not ALL_CASES:
+        last_sync_query = last_sync_query.filter(SyncHistory.lawyer_id == lawyer_id)
+    last_sync_record = last_sync_query.order_by(SyncHistory.completed_at.desc()).first()
     
     last_sync = last_sync_record.completed_at if last_sync_record else None
     
@@ -317,13 +330,10 @@ async def get_case(
     db: Session = Depends(get_db),
 ):
     """Get a specific case with its movements."""
-    lawyer_id = _resolve_lawyer_id(db, current_lawyer)
-    
-    case = db.query(Case).filter(
-        and_(
-            Case.id == case_id,
-            Case.lawyer_id == lawyer_id,
-        )
+    scope = resolve_case_scope(db, current_lawyer)
+
+    case = apply_case_scope(
+        db.query(Case).filter(Case.id == case_id), scope
     ).first()
     
     if not case:
@@ -416,14 +426,11 @@ async def get_case_movements(
     db: Session = Depends(get_db),
 ):
     """Get all movements for a case."""
-    lawyer_id = _resolve_lawyer_id(db, current_lawyer)
-    
-    # Verify case belongs to lawyer
-    case = db.query(Case).filter(
-        and_(
-            Case.id == case_id,
-            Case.lawyer_id == lawyer_id,
-        )
+    scope = resolve_case_scope(db, current_lawyer)
+
+    # Verify case is visible to the caller (own case, or any case for auditor)
+    case = apply_case_scope(
+        db.query(Case).filter(Case.id == case_id), scope
     ).first()
     
     if not case:
@@ -457,14 +464,11 @@ async def get_case_detail_entities(
     db: Session = Depends(get_db),
 ):
     """Get only the 4 entity lists for a case (litigantes, notificaciones, escritos, exhortos)."""
-    lawyer_id = _resolve_lawyer_id(db, current_lawyer)
+    scope = resolve_case_scope(db, current_lawyer)
 
-    # Verify case belongs to lawyer
-    case = db.query(Case).filter(
-        and_(
-            Case.id == case_id,
-            Case.lawyer_id == lawyer_id,
-        )
+    # Verify case is visible to the caller (own case, or any case for auditor)
+    case = apply_case_scope(
+        db.query(Case).filter(Case.id == case_id), scope
     ).first()
 
     if not case:
@@ -505,13 +509,10 @@ async def list_case_documents(
     Returns document rows with a pre-built download URL for each one.
     ``available`` is ``True`` for every status except ``"unavailable"``.
     """
-    lawyer_id = _resolve_lawyer_id(db, current_lawyer)
+    scope = resolve_case_scope(db, current_lawyer)
 
-    case = db.query(Case).filter(
-        and_(
-            Case.id == case_id,
-            Case.lawyer_id == lawyer_id,
-        )
+    case = apply_case_scope(
+        db.query(Case).filter(Case.id == case_id), scope
     ).first()
 
     if not case:
