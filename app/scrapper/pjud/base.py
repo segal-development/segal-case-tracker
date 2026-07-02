@@ -6,6 +6,7 @@ Competency-specific scrapers inherit and implement abstract methods.
 """
 
 import asyncio
+import json
 import logging
 import re
 from abc import ABC, abstractmethod
@@ -73,7 +74,7 @@ def classify_login_failure(page_content: str) -> tuple:
     wrong-user style message — meaning a retry is pointless and the lawyer must
     update their clave. ``short_msg`` is a cleaned snippet for logging/reporting.
     """
-    if not page_content:
+    if not isinstance(page_content, str) or not page_content:
         return False, ""
     text = re.sub(r"<[^>]+>", " ", page_content)
     text = re.sub(r"\s+", " ", text).strip()
@@ -90,7 +91,7 @@ def detect_shape_challenge(page_content: str | None, url: str = "") -> tuple[boo
     if re.search(r"(?:^|[/?&_=.-])TSPD(?:_101)?(?:$|[/?&_=.-])", url_text, re.IGNORECASE):
         return True, "TSPD URL"
 
-    if not page_content:
+    if not isinstance(page_content, str) or not page_content:
         return False, ""
 
     text = re.sub(r"<[^>]+>", " ", page_content)
@@ -285,6 +286,7 @@ class PJUDBaseScraper(ABC):
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
+        self._persistent_context = False
         self._panel_loaded: bool = False
         
         # Cache competency config
@@ -327,10 +329,11 @@ class PJUDBaseScraper(ABC):
         stealth — same Chrome humans use). Falls back to Playwright's bundled
         Chromium otherwise.
         """
-        if self._browser:
+        if self._browser or self._context:
             return
         
         chrome_path = settings.PJUD_CHROME_PATH or None
+        user_data_dir = settings.PJUD_USER_DATA_DIR or None
         launch_args = [
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
@@ -347,11 +350,30 @@ class PJUDBaseScraper(ABC):
             logger.info("Using Playwright bundled Chromium")
 
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
-            headless=self.headless,
-            executable_path=chrome_path,
-            args=launch_args,
-        )
+        if user_data_dir:
+            self._persistent_context = True
+            self._context = await self._playwright.chromium.launch_persistent_context(
+                user_data_dir=user_data_dir,
+                headless=self.headless,
+                executable_path=chrome_path,
+                args=launch_args,
+                viewport={
+                    "width": settings.PJUD_VIEWPORT_WIDTH,
+                    "height": settings.PJUD_VIEWPORT_HEIGHT,
+                },
+                user_agent=_CHROME_UA,
+                locale="es-CL",
+                timezone_id="America/Santiago",
+            )
+            await self._add_stealth_init_script(self._context)
+            logger.info("Using persistent PJUD Chrome profile: %s", user_data_dir)
+        else:
+            self._persistent_context = False
+            self._browser = await self._playwright.chromium.launch(
+                headless=self.headless,
+                executable_path=chrome_path,
+                args=launch_args,
+            )
         logger.info(f"Browser started for {self.config.display_name} scraper")
     
     async def stop(self) -> None:
@@ -365,7 +387,7 @@ class PJUDBaseScraper(ABC):
             await self._page.close()
         if self._context and not cdp:
             await self._context.close()
-        if self._browser:
+        if self._browser and not self._persistent_context:
             await self._browser.close()  # CDP connection: disconnects only
         if self._playwright:
             await self._playwright.stop()
@@ -374,6 +396,7 @@ class PJUDBaseScraper(ABC):
         self._context = None
         self._browser = None
         self._playwright = None
+        self._persistent_context = False
         self._panel_loaded = False
         self._cdp_attached = False
         logger.info(f"Browser stopped for {self.config.display_name} scraper")
@@ -420,7 +443,7 @@ class PJUDBaseScraper(ABC):
     
     async def _get_page(self, session: Optional[PJUDSession] = None) -> Page:
         """Get a page with optional session restoration."""
-        if not self._browser:
+        if not self._browser and not self._context:
             await self.start()
         
         # Opt-in context reuse: in HEADFUL mode every new_context() opens a new
@@ -437,8 +460,11 @@ class PJUDBaseScraper(ABC):
         ):
             return self._page
 
-        # Close existing context if any
-        if self._context:
+        if self._persistent_context:
+            if self._page and not self._page.is_closed():
+                await self._page.close()
+            self._page = None
+        elif self._context:
             await self._context.close()
             self._panel_loaded = False
         
@@ -469,17 +495,57 @@ class PJUDBaseScraper(ABC):
             "storage_state": storage_state,
         }
 
-        self._context = await self._browser.new_context(**context_options)
-
-        # Patch navigator.webdriver (Playwright leaves it as true by default).
-        # This is the #1 fingerprint Shape checks for bot detection.
-        await self._context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
-        )
+        if self._persistent_context:
+            if self._context is None:
+                raise RuntimeError("Persistent browser context not started")
+            await self._restore_session_to_context(self._context, storage_state)
+        else:
+            if self._browser is None:
+                raise RuntimeError("Browser not started")
+            self._context = await self._browser.new_context(**context_options)
+            await self._add_stealth_init_script(self._context)
 
         self._page = await self._context.new_page()
         self._page_session_key = session_key
         return self._page
+
+    async def _add_stealth_init_script(self, context: BrowserContext) -> None:
+        # Patch navigator.webdriver before pages are created; Shape checks this signal.
+        await context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+        )
+
+    async def _restore_session_to_context(
+        self,
+        context: BrowserContext,
+        storage_state: Optional[Dict[str, Any]],
+    ) -> None:
+        if not storage_state:
+            return
+
+        cookies = storage_state.get("cookies") or []
+        if cookies:
+            await context.add_cookies(cookies)
+
+        origins = storage_state.get("origins") or []
+        local_storage = next(
+            (
+                origin.get("localStorage")
+                for origin in origins
+                if origin.get("origin") == PJUD_BASE_URL
+            ),
+            [],
+        )
+        if local_storage:
+            await context.add_init_script(
+                f"""
+                (() => {{
+                    const items = {json.dumps(local_storage)};
+                    if (location.origin !== 'https://oficinajudicialvirtual.pjud.cl') return;
+                    for (const item of items) localStorage.setItem(item.name, item.value);
+                }})()
+                """,
+            )
 
     async def _safe_page_content(self, page: Page, attempts: int = 3) -> str:
         """Return page.content(), retrying if the page is mid-navigation.

@@ -12,6 +12,7 @@ Tests:
 import pytest
 from abc import ABC
 from typing import List
+from unittest.mock import AsyncMock, patch
 
 from app.scrapper.pjud import (
     PJUDBaseScraper,
@@ -119,6 +120,35 @@ class TestCivilScraper:
         assert hasattr(scraper, 'download_document')
         assert hasattr(scraper, 'download_movement_documents')
         assert hasattr(scraper, 'search_cases')
+
+    @pytest.mark.asyncio
+    async def test_civil_scraper_uses_persistent_context_when_configured(self):
+        """PJUDBaseScraper should use launch_persistent_context when configured."""
+        with (
+            patch('app.scrapper.pjud.base.settings.PJUD_USER_DATA_DIR', '/tmp/pjud-profile'),
+            patch('app.scrapper.pjud.base.async_playwright') as mock_pw,
+        ):
+            mock_playwright = AsyncMock()
+            mock_context = AsyncMock()
+            mock_page = AsyncMock()
+
+            mock_pw.return_value.start = AsyncMock(return_value=mock_playwright)
+            mock_playwright.chromium.launch_persistent_context = AsyncMock(
+                return_value=mock_context
+            )
+            mock_playwright.chromium.launch = AsyncMock()
+            mock_context.new_page = AsyncMock(return_value=mock_page)
+
+            scraper = CivilScraper(headless=True)
+            try:
+                page = await scraper._get_page()
+
+                mock_playwright.chromium.launch_persistent_context.assert_called_once()
+                mock_playwright.chromium.launch.assert_not_called()
+                mock_context.new_page.assert_called_once()
+                assert page is mock_page
+            finally:
+                await scraper.stop()
 
 
 class TestBackwardCompatibility:

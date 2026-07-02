@@ -232,3 +232,69 @@ class TestBrowserFactoryWithSession:
                 # Should still create page
                 assert page is mock_page
                 mock_context.add_cookies.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_persistent_context_uses_user_data_dir(self):
+        """Persistent mode should launch a context directly and skip browser.new_context."""
+        with (
+            patch('app.scrapper.pjud.browser.settings.PJUD_USER_DATA_DIR', '/tmp/pjud-profile'),
+            patch('app.scrapper.pjud.browser.async_playwright') as mock_pw,
+        ):
+            mock_playwright = AsyncMock()
+            mock_context = AsyncMock()
+            mock_page = AsyncMock()
+
+            mock_pw.return_value.start = AsyncMock(return_value=mock_playwright)
+            mock_playwright.chromium.launch_persistent_context = AsyncMock(
+                return_value=mock_context
+            )
+            mock_playwright.chromium.launch = AsyncMock()
+            mock_context.new_page = AsyncMock(return_value=mock_page)
+
+            from app.scrapper.pjud.browser import BrowserFactory
+
+            async with BrowserFactory() as factory:
+                page = await factory.new_page()
+
+                mock_playwright.chromium.launch_persistent_context.assert_called_once()
+                mock_playwright.chromium.launch.assert_not_called()
+                mock_context.new_page.assert_called_once()
+                assert page is mock_page
+
+    @pytest.mark.asyncio
+    async def test_persistent_context_restores_session_without_new_context(self):
+        """Persistent mode should restore cookies into the existing context."""
+        with (
+            patch('app.scrapper.pjud.browser.settings.PJUD_USER_DATA_DIR', '/tmp/pjud-profile'),
+            patch('app.scrapper.pjud.browser.async_playwright') as mock_pw,
+        ):
+            mock_playwright = AsyncMock()
+            mock_context = AsyncMock()
+            mock_page = AsyncMock()
+
+            mock_pw.return_value.start = AsyncMock(return_value=mock_playwright)
+            mock_playwright.chromium.launch_persistent_context = AsyncMock(
+                return_value=mock_context
+            )
+            mock_playwright.chromium.launch = AsyncMock()
+            mock_context.new_page = AsyncMock(return_value=mock_page)
+
+            from app.scrapper.pjud.browser import BrowserFactory
+
+            session = MockSession(
+                cookies=[
+                    {
+                        "name": "test",
+                        "value": "cookie",
+                        "domain": ".pjud.cl",
+                        "path": "/",
+                    }
+                ],
+                local_storage='{"token": "abc"}',
+            )
+
+            async with BrowserFactory() as factory:
+                await factory.new_page(session)
+
+                mock_context.add_cookies.assert_called_once_with(session.cookies)
+                assert mock_context.add_init_script.call_count >= 2
