@@ -5,13 +5,15 @@ Mirrors the fast bulk-insert approach from scripts/import_cases_html.py
 bulk_insert_mappings) instead of the slow per-case SyncService.sync_cases.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 from sqlalchemy.exc import IntegrityError
 
 from app.models.case import Case
+from app.models.court import Court
 from app.models.lawyer import Lawyer
+from app.models.movement import Movement
 from app.services.ingest_service import IngestParseError, IngestService
 
 
@@ -129,3 +131,215 @@ class TestIngestCasesValidPayload:
             lawyer_rut=lawyer_rut, competencia="civil", pages=[VALID_PAGE]
         )
         assert "errors" in result
+
+
+# ---------------------------------------------------------------------------
+# get_pending_detail — Slice 2
+# ---------------------------------------------------------------------------
+
+
+def _detail_html(rol: str, folio: str, descripcion: str, fecha: str) -> str:
+    return f"""
+    <html><body>
+      <table>
+        <tr><td><strong>ROL:</strong> {rol}</td></tr>
+        <tr><td><strong>Tribunal:</strong> 1 Juzgado Civil de Santiago</td></tr>
+      </table>
+      <div id="historiaCiv">
+        <div class="panel panel-default">
+          <div class="table-responsive">
+            <table class="table table-bordered table-striped table-hover">
+              <thead><tr><th>Folio</th><th>Doc.</th><th>Anexo</th><th>Etapa</th>
+              <th>Tramite</th><th>Desc.</th><th>Fecha</th><th>Foja</th><th>Geo</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td>{folio}</td>
+                  <td align="left"></td>
+                  <td align="center"></td>
+                  <td>En tramitacion</td>
+                  <td>Resolucion</td>
+                  <td></td>
+                  <td>{descripcion}</td>
+                  <td>{fecha}</td>
+                  <td>1</td>
+                  <td></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </body></html>
+    """
+
+
+MOVEMENTS_MALFORMED_HTML = "<html><body>Not a PJUD detail page.</body></html>"
+
+
+@pytest.fixture
+def seeded_lawyer_and_case(db):
+    lawyer = Lawyer(rut="11111111-1", name="Test Lawyer", is_active=True)
+    db.add(lawyer)
+    db.flush()
+
+    court = Court(code="T1-ING-MOV", name="Juzgado Ingest Movements Test", region="RM", type="civil")
+    db.add(court)
+    db.flush()
+
+    case = Case(
+        lawyer_id=lawyer.id,
+        court_id=court.id,
+        rol="C-1234-2026",
+        competencia="civil",
+        status="active",
+    )
+    db.add(case)
+    db.commit()
+    return {"lawyer": lawyer, "case": case}
+
+
+class TestGetPendingDetail:
+    def test_returns_stalest_first_nulls_first(self, db):
+        lawyer = Lawyer(rut="11111111-1", name="Test Lawyer", is_active=True)
+        db.add(lawyer)
+        db.flush()
+        court = Court(code="T1-PD", name="Juzgado Pending Detail Test", region="RM", type="civil")
+        db.add(court)
+        db.flush()
+
+        now = datetime.utcnow()
+        never_checked = Case(
+            lawyer_id=lawyer.id, court_id=court.id, rol="C-1111-2026",
+            competencia="civil", status="active", last_detail_checked_at=None,
+        )
+        older_checked = Case(
+            lawyer_id=lawyer.id, court_id=court.id, rol="C-2222-2026",
+            competencia="civil", status="active",
+            last_detail_checked_at=now - timedelta(days=5),
+        )
+        recently_checked = Case(
+            lawyer_id=lawyer.id, court_id=court.id, rol="C-3333-2026",
+            competencia="civil", status="active",
+            last_detail_checked_at=now - timedelta(hours=1),
+        )
+        db.add_all([never_checked, older_checked, recently_checked])
+        db.commit()
+
+        service = IngestService(db)
+        result = service.get_pending_detail(lawyer_rut="11111111-1", competencia="civil", limit=30)
+
+        assert [c["rol"] for c in result] == ["C-1111-2026", "C-2222-2026", "C-3333-2026"]
+        assert all("id" in c for c in result)
+
+    def test_respects_limit(self, db):
+        lawyer = Lawyer(rut="11111111-1", name="Test Lawyer", is_active=True)
+        db.add(lawyer)
+        db.flush()
+        court = Court(code="T1-PD2", name="Juzgado Pending Detail Test 2", region="RM", type="civil")
+        db.add(court)
+        db.flush()
+        for i in range(3):
+            db.add(Case(
+                lawyer_id=lawyer.id, court_id=court.id, rol=f"C-{i}-2026",
+                competencia="civil", status="active",
+            ))
+        db.commit()
+
+        service = IngestService(db)
+        result = service.get_pending_detail(lawyer_rut="11111111-1", competencia="civil", limit=1)
+        assert len(result) == 1
+
+    def test_unknown_lawyer_returns_empty_list(self, db):
+        service = IngestService(db)
+        result = service.get_pending_detail(lawyer_rut="99999999-9", competencia="civil", limit=30)
+        assert result == []
+
+
+# ---------------------------------------------------------------------------
+# ingest_movements — Slice 2
+# ---------------------------------------------------------------------------
+
+
+class TestIngestMovements:
+    def test_valid_detail_html_persists_movements_stamps_and_classifies(
+        self, db, seeded_lawyer_and_case
+    ):
+        service = IngestService(db)
+        result = service.ingest_movements(
+            lawyer_rut="11111111-1",
+            competencia="civil",
+            cases=[
+                {
+                    "rol": "C-1234-2026",
+                    "html": _detail_html("C-1234-2026", "1", "Se dicta resolucion", "15/01/2026"),
+                }
+            ],
+        )
+
+        assert result["cases_processed"] == 1
+        assert result["movements_new"] == 1
+        assert result["classified"] == 1
+        assert result["errors"] == []
+
+        movements = db.query(Movement).all()
+        assert len(movements) == 1
+        assert movements[0].description == "Se dicta resolucion"
+
+        case = db.query(Case).filter(Case.rol == "C-1234-2026").first()
+        assert case.last_detail_checked_at is not None
+        assert case.semaforo is not None
+
+    def test_no_duplicate_movements_on_repeat_ingest(self, db, seeded_lawyer_and_case):
+        service = IngestService(db)
+        html = _detail_html("C-1234-2026", "1", "Se dicta resolucion", "15/01/2026")
+        service.ingest_movements(
+            lawyer_rut="11111111-1", competencia="civil",
+            cases=[{"rol": "C-1234-2026", "html": html}],
+        )
+        result = service.ingest_movements(
+            lawyer_rut="11111111-1", competencia="civil",
+            cases=[{"rol": "C-1234-2026", "html": html}],
+        )
+
+        assert result["movements_new"] == 0
+        assert db.query(Movement).count() == 1
+
+    def test_unknown_rol_is_skipped_with_error(self, db, seeded_lawyer_and_case):
+        service = IngestService(db)
+        result = service.ingest_movements(
+            lawyer_rut="11111111-1",
+            competencia="civil",
+            cases=[
+                {
+                    "rol": "C-9999-2026",
+                    "html": _detail_html("C-9999-2026", "1", "Se dicta resolucion", "15/01/2026"),
+                }
+            ],
+        )
+        assert result["cases_processed"] == 0
+        assert len(result["errors"]) == 1
+
+    def test_malformed_html_is_graceful_no_raise(self, db, seeded_lawyer_and_case):
+        service = IngestService(db)
+        result = service.ingest_movements(
+            lawyer_rut="11111111-1",
+            competencia="civil",
+            cases=[{"rol": "C-1234-2026", "html": MOVEMENTS_MALFORMED_HTML}],
+        )
+        assert result["cases_processed"] == 0
+        assert len(result["errors"]) == 1
+
+    def test_unknown_lawyer_returns_error_no_crash(self, db):
+        service = IngestService(db)
+        result = service.ingest_movements(
+            lawyer_rut="99999999-9",
+            competencia="civil",
+            cases=[
+                {
+                    "rol": "C-1234-2026",
+                    "html": _detail_html("C-1234-2026", "1", "Se dicta resolucion", "15/01/2026"),
+                }
+            ],
+        )
+        assert result["cases_processed"] == 0
+        assert len(result["errors"]) == 1

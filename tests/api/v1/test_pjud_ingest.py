@@ -1,7 +1,7 @@
-"""Tests for POST /api/v1/pjud/ingest/cases.
+"""Tests for POST /api/v1/pjud/ingest/cases and POST /api/v1/pjud/ingest/movements.
 
 Auth is via the X-Ingest-Key header (require_ingest_key), NOT the lawyer
-JWT — this endpoint is called by the browser extension's service worker,
+JWT — these endpoints are called by the browser extension's service worker,
 not by a logged-in lawyer.
 """
 
@@ -9,9 +9,14 @@ import hashlib
 
 import pytest
 
+from app.models.case import Case
+from app.models.court import Court
 from app.models.ingest_key import IngestKey
+from app.models.lawyer import Lawyer
+from app.models.movement import Movement
 
 INGEST_URL = "/api/v1/pjud/ingest/cases"
+MOVEMENTS_URL = "/api/v1/pjud/ingest/movements"
 
 
 def _case_row(token: str, rol: str, tribunal: str, caratulado: str) -> str:
@@ -107,3 +112,173 @@ class TestIngestCasesEndpointHappyPath:
         data = response.json()
         assert data["new"] == 0
         assert data["existing"] == 1
+
+
+# ---------------------------------------------------------------------------
+# POST /pjud/ingest/movements
+# ---------------------------------------------------------------------------
+
+
+def _detail_html(rol: str, folio: str, descripcion: str, fecha: str) -> str:
+    return f"""
+    <html><body>
+      <table>
+        <tr><td><strong>ROL:</strong> {rol}</td></tr>
+        <tr><td><strong>Tribunal:</strong> 1 Juzgado Civil de Santiago</td></tr>
+      </table>
+      <div id="historiaCiv">
+        <div class="panel panel-default">
+          <div class="table-responsive">
+            <table class="table table-bordered table-striped table-hover">
+              <thead><tr><th>Folio</th><th>Doc.</th><th>Anexo</th><th>Etapa</th>
+              <th>Tramite</th><th>Desc.</th><th>Fecha</th><th>Foja</th><th>Geo</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td>{folio}</td>
+                  <td align="left"></td>
+                  <td align="center"></td>
+                  <td>En tramitacion</td>
+                  <td>Resolucion</td>
+                  <td></td>
+                  <td>{descripcion}</td>
+                  <td>{fecha}</td>
+                  <td>1</td>
+                  <td></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </body></html>
+    """
+
+
+MOVEMENTS_MALFORMED_HTML = "<html><body>Not a PJUD detail page.</body></html>"
+
+
+@pytest.fixture
+def seeded_case(db):
+    """Lawyer + Court + Case pre-seeded for movements ingest tests."""
+    lawyer = Lawyer(rut="11111111-1", name="Test Lawyer", is_active=True)
+    db.add(lawyer)
+    db.flush()
+
+    court = Court(code="T1-MOV", name="Juzgado Movements Test", region="RM", type="civil")
+    db.add(court)
+    db.flush()
+
+    case = Case(
+        lawyer_id=lawyer.id,
+        court_id=court.id,
+        rol="C-1234-2026",
+        competencia="civil",
+        status="active",
+    )
+    db.add(case)
+    db.commit()
+    return {"lawyer": lawyer, "case": case}
+
+
+class TestIngestMovementsEndpointAuth:
+    def test_missing_key_returns_401(self, client, seeded_case):
+        response = client.post(
+            MOVEMENTS_URL,
+            json={
+                "rut": "11111111-1",
+                "competencia": "civil",
+                "cases": [
+                    {
+                        "rol": "C-1234-2026",
+                        "html": _detail_html("C-1234-2026", "1", "Se dicta resolucion", "15/01/2026"),
+                    }
+                ],
+            },
+        )
+        assert response.status_code == 401
+
+    def test_invalid_key_returns_403(self, client, ingest_key, seeded_case):
+        response = client.post(
+            MOVEMENTS_URL,
+            json={
+                "rut": "11111111-1",
+                "competencia": "civil",
+                "cases": [
+                    {
+                        "rol": "C-1234-2026",
+                        "html": _detail_html("C-1234-2026", "1", "Se dicta resolucion", "15/01/2026"),
+                    }
+                ],
+            },
+            headers={"X-Ingest-Key": "wrong-key"},
+        )
+        assert response.status_code == 403
+
+
+class TestIngestMovementsEndpointHappyPath:
+    def test_valid_detail_html_persists_movements_and_classifies(
+        self, client, ingest_key, seeded_case, db
+    ):
+        response = client.post(
+            MOVEMENTS_URL,
+            json={
+                "rut": "11111111-1",
+                "competencia": "civil",
+                "cases": [
+                    {
+                        "rol": "C-1234-2026",
+                        "html": _detail_html("C-1234-2026", "1", "Se dicta resolucion", "15/01/2026"),
+                    }
+                ],
+            },
+            headers={"X-Ingest-Key": ingest_key},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["cases_processed"] == 1
+        assert data["movements_new"] == 1
+        assert data["classified"] == 1
+        assert data["errors"] == []
+
+        movements = db.query(Movement).all()
+        assert len(movements) == 1
+        assert movements[0].description == "Se dicta resolucion"
+
+        case = db.query(Case).filter(Case.rol == "C-1234-2026").first()
+        assert case.last_detail_checked_at is not None
+        assert case.semaforo is not None
+
+    def test_unknown_rol_is_skipped_with_error(self, client, ingest_key, seeded_case):
+        response = client.post(
+            MOVEMENTS_URL,
+            json={
+                "rut": "11111111-1",
+                "competencia": "civil",
+                "cases": [
+                    {
+                        "rol": "C-9999-2026",
+                        "html": _detail_html("C-9999-2026", "1", "Se dicta resolucion", "15/01/2026"),
+                    }
+                ],
+            },
+            headers={"X-Ingest-Key": ingest_key},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["cases_processed"] == 0
+        assert len(data["errors"]) == 1
+
+    def test_malformed_html_is_graceful_no_500(self, client, ingest_key, seeded_case):
+        response = client.post(
+            MOVEMENTS_URL,
+            json={
+                "rut": "11111111-1",
+                "competencia": "civil",
+                "cases": [{"rol": "C-1234-2026", "html": MOVEMENTS_MALFORMED_HTML}],
+            },
+            headers={"X-Ingest-Key": ingest_key},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["cases_processed"] == 0
+        assert len(data["errors"]) == 1
