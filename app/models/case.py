@@ -1,7 +1,18 @@
 """Case model - Civil court cases."""
 
 from datetime import datetime
-from sqlalchemy import Boolean, Column, Date, Integer, String, DateTime, ForeignKey, Text, text
+from sqlalchemy import (
+    Boolean,
+    Column,
+    Date,
+    Integer,
+    String,
+    DateTime,
+    ForeignKey,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
@@ -9,9 +20,12 @@ from app.core.database import Base
 
 class Case(Base):
     """Civil court case tracked by a lawyer."""
-    
+
     __tablename__ = "cases"
-    
+    __table_args__ = (
+        UniqueConstraint("lawyer_id", "rol", name="uq_cases_lawyer_rol"),
+    )
+
     id = Column(Integer, primary_key=True, index=True)
     lawyer_id = Column(Integer, ForeignKey("lawyers.id"), nullable=False)
     court_id = Column(Integer, ForeignKey("courts.id"), nullable=False)
