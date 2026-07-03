@@ -268,6 +268,27 @@ class TestIngestMovementsEndpointHappyPath:
         assert data["cases_processed"] == 0
         assert len(data["errors"]) == 1
 
+    def test_forwards_failed_rols_and_stamps_them(self, client, ingest_key, seeded_case, db):
+        """A failed-only POST (no successful cases) still stamps the failed
+        ROLs so they rotate out of subsequent batches."""
+        response = client.post(
+            MOVEMENTS_URL,
+            json={
+                "rut": "11111111-1",
+                "competencia": "civil",
+                "cases": [],
+                "failed_rols": ["C-1234-2026"],
+            },
+            headers={"X-Ingest-Key": ingest_key},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["failed_stamped"] == 1
+        assert data["cases_processed"] == 0
+
+        case = db.query(Case).filter(Case.rol == "C-1234-2026").first()
+        assert case.last_detail_checked_at is not None
+
     def test_malformed_html_is_graceful_no_500(self, client, ingest_key, seeded_case):
         response = client.post(
             MOVEMENTS_URL,

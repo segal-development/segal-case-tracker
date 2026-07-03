@@ -65,6 +65,19 @@ class TestIngestCasesValidPayload:
         cases = db.query(Case).all()
         assert {c.rol for c in cases} == {"C-1234-2026", "C-5678-2026"}
 
+    def test_populates_filed_at_from_fecha_ingreso(self, db):
+        service = IngestService(db)
+        service.ingest_cases(
+            lawyer_rut="11111111-1", competencia="civil", pages=[VALID_PAGE]
+        )
+
+        case = db.query(Case).filter(Case.rol == "C-1234-2026").first()
+        # _case_row seeds fecha "01/01/2026" (DD/MM/YYYY).
+        assert case.filed_at is not None
+        assert case.filed_at.year == 2026
+        assert case.filed_at.month == 1
+        assert case.filed_at.day == 1
+
     def test_unknown_lawyer_rut_is_get_or_create(self, db):
         assert db.query(Lawyer).filter(Lawyer.rut == "11111111-1").first() is None
 
@@ -254,6 +267,41 @@ class TestGetPendingDetail:
         result = service.get_pending_detail(lawyer_rut="99999999-9", competencia="civil", limit=30)
         assert result == []
 
+    def test_recent_year_before_old_year_when_filed_at_null(self, db):
+        """With last_detail_checked_at and filed_at both NULL, ordering must
+        fall back to the ROL year (descending) so recent active cases come
+        before old/closed ones instead of being effectively random."""
+        lawyer = Lawyer(rut="11111111-1", name="Test Lawyer", is_active=True)
+        db.add(lawyer)
+        db.flush()
+        court = Court(code="T1-YR", name="Juzgado Year Order Test", region="RM", type="civil")
+        db.add(court)
+        db.flush()
+
+        old = Case(
+            lawyer_id=lawyer.id, court_id=court.id, rol="C-100-2006",
+            competencia="civil", status="active",
+            last_detail_checked_at=None, filed_at=None,
+        )
+        mid = Case(
+            lawyer_id=lawyer.id, court_id=court.id, rol="C-500-2018",
+            competencia="civil", status="active",
+            last_detail_checked_at=None, filed_at=None,
+        )
+        recent = Case(
+            lawyer_id=lawyer.id, court_id=court.id, rol="C-6086-2026",
+            competencia="civil", status="active",
+            last_detail_checked_at=None, filed_at=None,
+        )
+        # Insert in non-sorted order so the result reflects ORDER BY, not insert order.
+        db.add_all([mid, old, recent])
+        db.commit()
+
+        service = IngestService(db)
+        result = service.get_pending_detail(lawyer_rut="11111111-1", competencia="civil", limit=30)
+
+        assert [c["rol"] for c in result] == ["C-6086-2026", "C-500-2018", "C-100-2006"]
+
 
 # ---------------------------------------------------------------------------
 # ingest_movements — Slice 2
@@ -343,3 +391,51 @@ class TestIngestMovements:
         )
         assert result["cases_processed"] == 0
         assert len(result["errors"]) == 1
+
+
+class TestIngestMovementsFailedRols:
+    def test_failed_rols_are_stamped_without_movements(self, db, seeded_lawyer_and_case):
+        """Un-fetchable ROLs the extension could not resolve are stamped so they
+        rotate to the back of the batch — no movements, no classification."""
+        service = IngestService(db)
+        result = service.ingest_movements(
+            lawyer_rut="11111111-1",
+            competencia="civil",
+            cases=[],
+            failed_rols=["C-1234-2026"],
+        )
+
+        assert result["failed_stamped"] == 1
+        assert result["cases_processed"] == 0
+        assert result["movements_new"] == 0
+        assert db.query(Movement).count() == 0
+
+        case = db.query(Case).filter(Case.rol == "C-1234-2026").first()
+        assert case.last_detail_checked_at is not None
+        assert case.semaforo is None  # never classified — no detail was parsed
+
+    def test_failed_rols_unknown_to_lawyer_are_ignored(self, db, seeded_lawyer_and_case):
+        service = IngestService(db)
+        result = service.ingest_movements(
+            lawyer_rut="11111111-1",
+            competencia="civil",
+            cases=[],
+            failed_rols=["C-0000-2099"],
+        )
+        assert result["failed_stamped"] == 0
+
+    def test_failed_rols_defaults_to_empty(self, db, seeded_lawyer_and_case):
+        """Backward compatibility: omitting failed_rols behaves as before."""
+        service = IngestService(db)
+        result = service.ingest_movements(
+            lawyer_rut="11111111-1",
+            competencia="civil",
+            cases=[
+                {
+                    "rol": "C-1234-2026",
+                    "html": _detail_html("C-1234-2026", "1", "Se dicta resolucion", "15/01/2026"),
+                }
+            ],
+        )
+        assert result["failed_stamped"] == 0
+        assert result["cases_processed"] == 1

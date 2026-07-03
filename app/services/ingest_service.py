@@ -8,8 +8,9 @@ sdd/conectar-pjud-extension/design).
 """
 
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
+from sqlalchemy import Integer, cast, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -36,6 +37,21 @@ class IngestParseError(ValueError):
 
 def _looks_like_mis_causas_html(html: str) -> bool:
     return any(marker in html for marker in _MIS_CAUSAS_MARKERS)
+
+
+def _parse_filed_at(value: Optional[str]) -> Optional[datetime]:
+    """Parse a PJUD ``fecha_ingreso`` (``DD/MM/YYYY``) into a ``datetime``.
+
+    Returns ``None`` when the value is missing or unparseable — the ROL-year
+    ordering in ``get_pending_detail`` covers rows with a NULL ``filed_at``,
+    so a parse miss degrades gracefully rather than blocking ingest.
+    """
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value.strip(), "%d/%m/%Y")
+    except (ValueError, AttributeError):
+        return None
 
 
 class IngestService:
@@ -107,6 +123,7 @@ class IngestService:
                     "defendant": defendant,
                     "procedure": (c.cuaderno or None),
                     "status": "active",
+                    "filed_at": _parse_filed_at(c.fecha_ingreso),
                     "created_at": now,
                     "updated_at": now,
                 }
@@ -139,12 +156,13 @@ class IngestService:
     ) -> List[dict]:
         """Return the stalest cases for *lawyer_rut* needing a movements refresh.
 
-        Ordered ``last_detail_checked_at ASC NULLS FIRST, filed_at DESC`` —
-        same rotation-fairness ordering as
-        ``sync_service._select_cases_for_detail_rotation``, but DB-only
-        (no live PJUD ``api_cases`` matching): the extension already has a
-        live PJUD session and can resolve each ROL's ``detalleMisCausaCivil``
-        token in-page, so only ``rol``/``id`` identifiers are needed here.
+        Ordered ``last_detail_checked_at ASC NULLS FIRST`` (never-checked first),
+        then by the YEAR embedded in the ROL descending, then
+        ``filed_at DESC NULLS LAST``. The ROL-year tiebreak is what keeps recent
+        active cases ahead of old/closed ones: ``filed_at`` is NULL on every
+        imported case, so without it the batch order among the pending pool is
+        effectively arbitrary and grabs 2006–2023 causes the extension cannot
+        resolve in the live Mis Causas list.
 
         Returns ``[]`` when the lawyer is unknown (no cases ingested yet) —
         does NOT create a lawyer (this is a read path).
@@ -155,17 +173,48 @@ class IngestService:
         if lawyer is None:
             return []
 
+        rol_year = self._rol_year_expr()
+
         cases = (
             self.db.query(Case)
             .filter(Case.lawyer_id == lawyer.id, Case.competencia == competencia)
-            .order_by(Case.last_detail_checked_at.asc().nullsfirst(), Case.filed_at.desc())
+            .order_by(
+                Case.last_detail_checked_at.asc().nullsfirst(),
+                rol_year.desc(),
+                Case.filed_at.desc().nullslast(),
+            )
             .limit(limit)
             .all()
         )
         return [{"id": int(c.id), "rol": c.rol} for c in cases]
 
+    def _rol_year_expr(self):
+        """SQL expression yielding the 4-digit year in a ``C-<n>-<year>`` ROL.
+
+        ROLs that do not match are treated as year 0 (lowest priority). Uses a
+        Postgres POSIX-regex ``substring`` in production; falls back to the
+        trailing four characters on SQLite (test suite), which has no regex.
+        """
+        try:
+            dialect = self.db.get_bind().dialect.name
+        except Exception:
+            dialect = "unknown"
+
+        if dialect == "postgresql":
+            return func.coalesce(
+                cast(func.substring(Case.rol, r"-(\d{4})$"), Integer), 0
+            )
+        # SQLite / others (tests): the year is the last four chars; a
+        # non-numeric tail casts to 0, matching the "unparseable → 0" rule.
+        return func.coalesce(cast(func.substr(Case.rol, -4), Integer), 0)
+
     def ingest_movements(
-        self, *, lawyer_rut: str, competencia: str, cases: List[dict]
+        self,
+        *,
+        lawyer_rut: str,
+        competencia: str,
+        cases: List[dict],
+        failed_rols: Optional[List[str]] = None,
     ) -> dict:
         """Parse raw detail-modal HTML relayed by the extension and persist movements.
 
@@ -183,9 +232,23 @@ class IngestService:
         ``errors`` and the batch continues — never raises, never persists a
         partial case (skip vs. commit is per-case, not per-batch).
 
-        Returns ``{"cases_processed", "movements_new", "classified", "errors"}``.
+        ``failed_rols`` are ROLs the extension could NOT resolve in the live
+        Mis Causas list (typically old/closed causes) — they carry no detail
+        HTML. For each one belonging to this lawyer+competencia, stamp
+        ``last_detail_checked_at`` (no movements, no deadline recompute) so it
+        rotates to the back of the batch instead of clogging every future
+        ``get_pending_detail`` page. ``failed_stamped`` reports how many rotated.
+
+        Returns
+        ``{"cases_processed", "movements_new", "classified", "failed_stamped", "errors"}``.
         """
-        result = {"cases_processed": 0, "movements_new": 0, "classified": 0, "errors": []}
+        result = {
+            "cases_processed": 0,
+            "movements_new": 0,
+            "classified": 0,
+            "failed_stamped": 0,
+            "errors": [],
+        }
 
         if competencia != "civil":
             result["errors"].append(f"Unsupported competencia for ingest: {competencia!r}")
@@ -250,5 +313,31 @@ class IngestService:
             result["movements_new"] += new_count
             if was_unclassified and case.semaforo is not None:
                 result["classified"] += 1
+
+        # Rotate un-fetchable ROLs to the back of the batch: stamp them so they
+        # stop refilling every pending-detail page. No movements, no deadline
+        # recompute — these have no detail to parse.
+        stamped_any = False
+        for raw_rol in failed_rols or []:
+            rol = (raw_rol or "").strip().upper()
+            if not rol:
+                continue
+            case = (
+                self.db.query(Case)
+                .filter(
+                    Case.lawyer_id == lawyer.id,
+                    Case.competencia == competencia,
+                    Case.rol == rol,
+                )
+                .first()
+            )
+            if case is None:
+                continue
+            case.last_detail_checked_at = datetime.utcnow()
+            result["failed_stamped"] += 1
+            stamped_any = True
+
+        if stamped_any:
+            self.db.commit()
 
         return result

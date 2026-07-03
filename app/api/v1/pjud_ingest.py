@@ -58,13 +58,22 @@ class IngestMovementsCaseItem(BaseModel):
 class IngestMovementsRequest(BaseModel):
     rut: str = Field(..., description="Lawyer RUT the cases belong to")
     competencia: str = Field("civil", description="Only 'civil' is supported in Slice 2")
-    cases: List[IngestMovementsCaseItem] = Field(..., min_length=1)
+    # ``cases`` may be empty when the extension only has failed ROLs to report
+    # (no case resolved a token this run); at least one of cases/failed_rols is
+    # expected, but an all-empty payload is a harmless no-op.
+    cases: List[IngestMovementsCaseItem] = Field(default_factory=list)
+    failed_rols: List[str] = Field(
+        default_factory=list,
+        description="ROLs the extension could not resolve in the live Mis Causas "
+        "list; the backend stamps them so they rotate out of future batches.",
+    )
 
 
 class IngestMovementsResponse(BaseModel):
     cases_processed: int
     movements_new: int
     classified: int
+    failed_stamped: int
     errors: List[str]
 
 
@@ -117,5 +126,6 @@ def ingest_movements(
         lawyer_rut=body.rut,
         competencia=body.competencia,
         cases=[c.model_dump() for c in body.cases],
+        failed_rols=body.failed_rols,
     )
     return IngestMovementsResponse(**result)
