@@ -8,7 +8,7 @@ sdd/conectar-pjud-extension/design).
 """
 
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
 from sqlalchemy import Integer, cast, func
 from sqlalchemy.exc import IntegrityError
@@ -193,7 +193,12 @@ class IngestService:
         return func.coalesce(cast(func.substr(Case.rol, -4), Integer), 0)
 
     def ingest_movements(
-        self, *, lawyer_rut: str, competencia: str, cases: List[dict]
+        self,
+        *,
+        lawyer_rut: str,
+        competencia: str,
+        cases: List[dict],
+        failed_rols: Optional[List[str]] = None,
     ) -> dict:
         """Parse raw detail-modal HTML relayed by the extension and persist movements.
 
@@ -211,9 +216,23 @@ class IngestService:
         ``errors`` and the batch continues — never raises, never persists a
         partial case (skip vs. commit is per-case, not per-batch).
 
-        Returns ``{"cases_processed", "movements_new", "classified", "errors"}``.
+        ``failed_rols`` are ROLs the extension could NOT resolve in the live
+        Mis Causas list (typically old/closed causes) — they carry no detail
+        HTML. For each one belonging to this lawyer+competencia, stamp
+        ``last_detail_checked_at`` (no movements, no deadline recompute) so it
+        rotates to the back of the batch instead of clogging every future
+        ``get_pending_detail`` page. ``failed_stamped`` reports how many rotated.
+
+        Returns
+        ``{"cases_processed", "movements_new", "classified", "failed_stamped", "errors"}``.
         """
-        result = {"cases_processed": 0, "movements_new": 0, "classified": 0, "errors": []}
+        result = {
+            "cases_processed": 0,
+            "movements_new": 0,
+            "classified": 0,
+            "failed_stamped": 0,
+            "errors": [],
+        }
 
         if competencia != "civil":
             result["errors"].append(f"Unsupported competencia for ingest: {competencia!r}")
@@ -278,5 +297,31 @@ class IngestService:
             result["movements_new"] += new_count
             if was_unclassified and case.semaforo is not None:
                 result["classified"] += 1
+
+        # Rotate un-fetchable ROLs to the back of the batch: stamp them so they
+        # stop refilling every pending-detail page. No movements, no deadline
+        # recompute — these have no detail to parse.
+        stamped_any = False
+        for raw_rol in failed_rols or []:
+            rol = (raw_rol or "").strip().upper()
+            if not rol:
+                continue
+            case = (
+                self.db.query(Case)
+                .filter(
+                    Case.lawyer_id == lawyer.id,
+                    Case.competencia == competencia,
+                    Case.rol == rol,
+                )
+                .first()
+            )
+            if case is None:
+                continue
+            case.last_detail_checked_at = datetime.utcnow()
+            result["failed_stamped"] += 1
+            stamped_any = True
+
+        if stamped_any:
+            self.db.commit()
 
         return result
