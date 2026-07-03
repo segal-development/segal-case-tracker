@@ -5,18 +5,22 @@ JWT — these endpoints are called by the browser extension's service worker,
 not by a logged-in lawyer.
 """
 
+import base64
 import hashlib
 
 import pytest
 
 from app.models.case import Case
 from app.models.court import Court
+from app.models.document import Document
 from app.models.ingest_key import IngestKey
 from app.models.lawyer import Lawyer
 from app.models.movement import Movement
+from app.services.document_persistence import document_identity_hash
 
 INGEST_URL = "/api/v1/pjud/ingest/cases"
 MOVEMENTS_URL = "/api/v1/pjud/ingest/movements"
+DOCUMENTS_URL = "/api/v1/pjud/ingest/documents"
 
 
 def _case_row(token: str, rol: str, tribunal: str, caratulado: str) -> str:
@@ -311,3 +315,145 @@ class TestIngestMovementsEndpointHappyPath:
         data = response.json()
         assert data["cases_processed"] == 0
         assert len(data["errors"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# POST /pjud/ingest/documents (Slice 3)
+# ---------------------------------------------------------------------------
+
+_FAKE_PDF = b"%PDF-1.4 fake pdf bytes for test"
+
+
+@pytest.fixture
+def pending_document(db, seeded_case):
+    """Insert a pending Document tied to the seeded case, return its token_hash."""
+    case = seeded_case["case"]
+    token_hash = document_identity_hash("resolution", case.rol, "1")
+    doc = Document(
+        case_id=case.id,
+        doc_type="resolution",
+        pjud_endpoint="documentos/docuS.php",
+        pjud_token_hash=token_hash,
+        status="pending",
+    )
+    db.add(doc)
+    db.commit()
+    return token_hash
+
+
+class TestIngestDocumentsEndpointAuth:
+    def test_missing_key_returns_401(self, client, seeded_case):
+        response = client.post(
+            DOCUMENTS_URL,
+            json={"rut": "11111111-1", "competencia": "civil", "documents": []},
+        )
+        assert response.status_code == 401
+
+
+class TestIngestDocumentsEndpointHappyPath:
+    def test_stores_pdf_and_updates_document(
+        self, client, ingest_key, seeded_case, pending_document, db, tmp_path, monkeypatch
+    ):
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "DOC_STORAGE_DIR", str(tmp_path))
+
+        response = client.post(
+            DOCUMENTS_URL,
+            json={
+                "rut": "11111111-1",
+                "competencia": "civil",
+                "documents": [
+                    {
+                        "rol": "C-1234-2026",
+                        "token_hash": pending_document,
+                        "filename": "resolucion.pdf",
+                        "content_type": "application/pdf",
+                        "document_date": "15/01/2026",
+                        "base64": base64.b64encode(_FAKE_PDF).decode(),
+                    }
+                ],
+            },
+            headers={"X-Ingest-Key": ingest_key},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["documents_stored"] == 1
+        assert data["skipped"] == 0
+        assert data["errors"] == []
+
+        doc = db.query(Document).filter(
+            Document.pjud_token_hash == pending_document
+        ).first()
+        assert doc.status == "stored"
+        assert doc.filename == "resolucion.pdf"
+        assert doc.content_type == "application/pdf"
+        assert doc.size_bytes == len(_FAKE_PDF)
+        assert doc.gcs_path
+
+    def test_unknown_token_hash_is_skipped_not_stored(
+        self, client, ingest_key, seeded_case, db, tmp_path, monkeypatch
+    ):
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "DOC_STORAGE_DIR", str(tmp_path))
+
+        response = client.post(
+            DOCUMENTS_URL,
+            json={
+                "rut": "11111111-1",
+                "competencia": "civil",
+                "documents": [
+                    {
+                        "rol": "C-1234-2026",
+                        "token_hash": "deadbeef" * 8,
+                        "filename": "ghost.pdf",
+                        "content_type": "application/pdf",
+                        "document_date": None,
+                        "base64": base64.b64encode(_FAKE_PDF).decode(),
+                    }
+                ],
+            },
+            headers={"X-Ingest-Key": ingest_key},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["documents_stored"] == 0
+        assert data["skipped"] == 1
+        assert len(data["errors"]) == 1
+        assert db.query(Document).count() == 0
+
+    def test_invalid_base64_is_skipped_no_raise(
+        self, client, ingest_key, seeded_case, pending_document, db, tmp_path, monkeypatch
+    ):
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "DOC_STORAGE_DIR", str(tmp_path))
+
+        response = client.post(
+            DOCUMENTS_URL,
+            json={
+                "rut": "11111111-1",
+                "competencia": "civil",
+                "documents": [
+                    {
+                        "rol": "C-1234-2026",
+                        "token_hash": pending_document,
+                        "filename": "broken.pdf",
+                        "content_type": "application/pdf",
+                        "document_date": None,
+                        "base64": "not-valid-base64!!!",
+                    }
+                ],
+            },
+            headers={"X-Ingest-Key": ingest_key},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["documents_stored"] == 0
+        assert data["skipped"] == 1
+
+        doc = db.query(Document).filter(
+            Document.pjud_token_hash == pending_document
+        ).first()
+        assert doc.status == "pending"
