@@ -9,6 +9,7 @@ sdd/conectar-pjud-extension/design).
 
 import base64
 import binascii
+import logging
 import re
 from datetime import datetime
 from typing import List, Optional
@@ -21,14 +22,20 @@ from app.api.v1.auth import _get_or_create_lawyer
 from app.models.case import Case
 from app.models.document import Document
 from app.models.lawyer import Lawyer
+from app.models.movement import Movement
 from app.scrapper.pjud.civil import CivilScraper
-from app.services.document_persistence import DocumentPersistenceService
+from app.services.document_persistence import (
+    DocumentPersistenceService,
+    document_identity_hash,
+)
 from app.services.sync_service import (
     SyncService,
     _maybe_recompute_deadlines,
     convert_api_movements_to_scraped,
 )
 from app.utils.rut import normalize_rut
+
+logger = logging.getLogger(__name__)
 
 # Markers that indicate a page is genuinely a PJUD "Mis Causas" civil
 # listing — used to reject garbage/unrelated HTML with a clear 4xx instead
@@ -391,28 +398,49 @@ class IngestService:
         documents: List[dict],
         storage_service=None,
     ) -> dict:
-        """Store PDF binaries relayed by the extension against pending Documents.
+        """Store PDF binaries relayed by the extension, upserting Document rows.
 
         The extension downloads each PDF in-browser (riding the live PJUD
         session while the JWT is still fresh) and POSTs the base64 bytes here.
-        Each item carries the STABLE identity ``token_hash`` — identical to
-        ``Document.pjud_token_hash`` = ``sha256(doc_type|case_rol|scope_key)`` —
-        so the row is matched without relying on the rotating JWT.
+        The extension is the AUTHORITATIVE source of a document's identity: it
+        already parsed ``doc_type``, ``scope_key`` (movement folio),
+        ``pjud_endpoint`` and the live ``pjud_token`` at download time, and
+        sends them here. Each item carries the STABLE identity ``token_hash`` —
+        identical to ``Document.pjud_token_hash`` =
+        ``sha256(doc_type|case_rol|scope_key)`` — so the row is matched (or
+        created) without relying on the rotating JWT.
 
         For each item:
-        - Resolve the lawyer's ``Case`` by ``rol``.
+        - Resolve the lawyer's ``Case`` by ``rol`` (unknown ROL → skip).
+        - Decode ``base64`` → bytes (invalid/empty → skip; never a partial row).
         - Match the ``Document`` by ``(case_id, pjud_token_hash == token_hash)``.
-        - Decode ``base64`` → bytes and upload via StorageService (sets
-          ``gcs_path`` + ``status="stored"``); set ``filename``,
-          ``content_type``, ``size_bytes``, and ``document_date``.
+          When NOT found, CREATE it from the extension-supplied metadata:
+          ``doc_type``, ``pjud_endpoint``, ``pjud_token``,
+          ``pjud_token_hash=token_hash``, ``status="pending"`` and
+          ``movement_id`` resolved by matching a Movement on
+          ``(case_id, folio == scope_key)`` when ``scope_key`` is non-empty.
+          The supplied ``token_hash`` is verified against
+          ``document_identity_hash(doc_type, case.rol, scope_key)`` — a mismatch
+          is logged as a warning but still stored (defensive; the extension
+          computes the same formula).
+        - Upload via StorageService (sets ``gcs_path`` + ``status="stored"``);
+          set ``filename``, ``content_type``, ``size_bytes`` and ``document_date``.
+
+        Idempotency: re-POSTing the same ``token_hash`` matches the existing row
+        (no duplicate) and ``StorageService.upload`` skips re-writing the key.
 
         Failure isolation (never raise, never poison the batch): a missing
-        case/document or invalid base64 is collected into ``errors`` and counted
-        in ``skipped``; the loop continues.
+        case, invalid base64, or storage error is collected into ``errors`` and
+        counted in ``skipped``; the loop continues.
 
-        Returns ``{"documents_stored", "skipped", "errors"}``.
+        Returns ``{"documents_stored", "documents_created", "skipped", "errors"}``.
         """
-        result = {"documents_stored": 0, "skipped": 0, "errors": []}
+        result = {
+            "documents_stored": 0,
+            "documents_created": 0,
+            "skipped": 0,
+            "errors": [],
+        }
 
         lawyer = (
             self.db.query(Lawyer).filter(Lawyer.rut == normalize_rut(lawyer_rut)).first()
@@ -432,6 +460,8 @@ class IngestService:
         for item in documents:
             rol = (item.get("rol") or "").strip().upper()
             token_hash = (item.get("token_hash") or "").strip()
+            doc_type = (item.get("doc_type") or "").strip()
+            scope_key = (item.get("scope_key") or "").strip()
 
             case = (
                 self.db.query(Case)
@@ -443,21 +473,8 @@ class IngestService:
                 result["errors"].append(f"Unknown case rol for lawyer: {rol!r}")
                 continue
 
-            doc = (
-                self.db.query(Document)
-                .filter(
-                    Document.case_id == case.id,
-                    Document.pjud_token_hash == token_hash,
-                )
-                .first()
-            )
-            if doc is None:
-                result["skipped"] += 1
-                result["errors"].append(
-                    f"No document matched token_hash {token_hash[:12]}… for {rol}"
-                )
-                continue
-
+            # Decode BEFORE any row creation so an invalid payload never leaves
+            # an orphan pending Document behind.
             try:
                 pdf_bytes = base64.b64decode(item.get("base64") or "", validate=True)
             except (binascii.Error, ValueError) as exc:
@@ -473,6 +490,54 @@ class IngestService:
                     f"Empty document payload for {rol} (hash {token_hash[:12]}…)"
                 )
                 continue
+
+            doc = (
+                self.db.query(Document)
+                .filter(
+                    Document.case_id == case.id,
+                    Document.pjud_token_hash == token_hash,
+                )
+                .first()
+            )
+            created = False
+            if doc is None:
+                # The extension is authoritative — create the row from the
+                # metadata it already parsed at download time.
+                expected_hash = document_identity_hash(doc_type, case.rol, scope_key)
+                if token_hash != expected_hash:
+                    logger.warning(
+                        "token_hash mismatch for %s (doc_type=%s, scope_key=%r): "
+                        "got %s…, expected %s… — storing anyway (defensive).",
+                        rol,
+                        doc_type,
+                        scope_key,
+                        token_hash[:12],
+                        expected_hash[:12],
+                    )
+
+                movement_id = None
+                if scope_key:
+                    movement = (
+                        self.db.query(Movement)
+                        .filter(
+                            Movement.case_id == case.id,
+                            Movement.folio == scope_key,
+                        )
+                        .first()
+                    )
+                    movement_id = movement.id if movement is not None else None
+
+                doc = Document(
+                    case_id=case.id,
+                    movement_id=movement_id,
+                    doc_type=doc_type or None,
+                    pjud_endpoint=item.get("pjud_endpoint"),
+                    pjud_token=item.get("pjud_token"),
+                    pjud_token_hash=token_hash,
+                    status="pending",
+                )
+                self.db.add(doc)
+                created = True
 
             content_type = item.get("content_type") or "application/pdf"
             try:
@@ -496,5 +561,7 @@ class IngestService:
                 continue
 
             result["documents_stored"] += 1
+            if created:
+                result["documents_created"] += 1
 
         return result

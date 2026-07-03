@@ -82,11 +82,20 @@ class IngestDocumentItem(BaseModel):
 
     ``token_hash`` is the STABLE identity — identical to
     ``Document.pjud_token_hash`` = ``sha256(doc_type|case_rol|scope_key)`` — so
-    the backend matches the pending Document row without the rotating JWT.
+    the backend matches (or creates) the Document row without the rotating JWT.
+
+    The extension is the authoritative source of a document's identity: it
+    already parsed ``doc_type``, ``scope_key`` (movement folio), ``pjud_endpoint``
+    and the live ``pjud_token`` at download time, so it sends them here and the
+    backend creates the Document row directly when none exists yet.
     """
 
     rol: str = Field(..., description="Case ROL the document belongs to")
-    token_hash: str = Field(..., description="Stable Document.pjud_token_hash to match")
+    token_hash: str = Field(..., description="Stable Document.pjud_token_hash to match/create")
+    doc_type: str = Field(..., description="Normalized document type, e.g. 'resolution'")
+    scope_key: str = Field("", description="Movement folio for movement-level docs; '' for case-level")
+    pjud_endpoint: Optional[str] = Field(None, description="PJUD document endpoint, e.g. 'documentos/docuS.php'")
+    pjud_token: Optional[str] = Field(None, description="Live JWT used to download (optional)")
     filename: str = Field(..., description="Original file name")
     content_type: str = Field("application/pdf", description="MIME type")
     document_date: Optional[str] = Field(
@@ -103,6 +112,7 @@ class IngestDocumentsRequest(BaseModel):
 
 class IngestDocumentsResponse(BaseModel):
     documents_stored: int
+    documents_created: int
     skipped: int
     errors: List[str]
 
