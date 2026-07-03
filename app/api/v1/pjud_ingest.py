@@ -77,6 +77,36 @@ class IngestMovementsResponse(BaseModel):
     errors: List[str]
 
 
+class IngestDocumentItem(BaseModel):
+    """One downloaded PDF relayed by the extension.
+
+    ``token_hash`` is the STABLE identity — identical to
+    ``Document.pjud_token_hash`` = ``sha256(doc_type|case_rol|scope_key)`` — so
+    the backend matches the pending Document row without the rotating JWT.
+    """
+
+    rol: str = Field(..., description="Case ROL the document belongs to")
+    token_hash: str = Field(..., description="Stable Document.pjud_token_hash to match")
+    filename: str = Field(..., description="Original file name")
+    content_type: str = Field("application/pdf", description="MIME type")
+    document_date: Optional[str] = Field(
+        None, description="Movement/document date (DD/MM/YYYY), optional"
+    )
+    base64: str = Field(..., description="Base64-encoded PDF bytes")
+
+
+class IngestDocumentsRequest(BaseModel):
+    rut: str = Field(..., description="Lawyer RUT the documents belong to")
+    competencia: str = Field("civil", description="Only 'civil' is supported")
+    documents: List[IngestDocumentItem] = Field(default_factory=list)
+
+
+class IngestDocumentsResponse(BaseModel):
+    documents_stored: int
+    skipped: int
+    errors: List[str]
+
+
 @router.post("/cases", response_model=IngestCasesResponse)
 def ingest_cases(
     body: IngestCasesRequest,
@@ -129,3 +159,23 @@ def ingest_movements(
         failed_rols=body.failed_rols,
     )
     return IngestMovementsResponse(**result)
+
+
+@router.post("/documents", response_model=IngestDocumentsResponse)
+def ingest_documents(
+    body: IngestDocumentsRequest,
+    db: Session = Depends(get_db),
+    _ingest_key=Depends(require_ingest_key),
+):
+    """Store PDF binaries the extension downloaded in-browser against their
+    pending Document rows (matched by the stable ``token_hash``). Per-item
+    failures (unknown case/document, invalid base64) are collected in
+    ``errors``/``skipped`` — the batch never raises.
+    """
+    service = IngestService(db)
+    result = service.ingest_documents(
+        lawyer_rut=body.rut,
+        competencia=body.competencia,
+        documents=[d.model_dump() for d in body.documents],
+    )
+    return IngestDocumentsResponse(**result)

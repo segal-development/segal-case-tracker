@@ -7,6 +7,8 @@ which was too slow through the operator's proxy (see design ADR in
 sdd/conectar-pjud-extension/design).
 """
 
+import base64
+import binascii
 import re
 from datetime import datetime
 from typing import List, Optional
@@ -17,8 +19,10 @@ from sqlalchemy.orm import Session
 
 from app.api.v1.auth import _get_or_create_lawyer
 from app.models.case import Case
+from app.models.document import Document
 from app.models.lawyer import Lawyer
 from app.scrapper.pjud.civil import CivilScraper
+from app.services.document_persistence import DocumentPersistenceService
 from app.services.sync_service import (
     SyncService,
     _maybe_recompute_deadlines,
@@ -311,6 +315,20 @@ class IngestService:
                     case_id=int(case.id), scraped_movements=scraped_movements
                 )
 
+            # Persist document tokens (Slice 3). Must run AFTER sync_movements so
+            # Movement rows exist for the folio-based lookup inside
+            # persist_from_detail. Idempotent on pjud_token_hash — re-ingesting the
+            # same detail never duplicates Document rows. Failure isolation: a
+            # document-persistence error must not poison the movement commit.
+            try:
+                DocumentPersistenceService().persist_from_detail(
+                    detail, int(case.id), self.db
+                )
+            except Exception as exc:  # noqa: BLE001 — document persistence is best-effort
+                result["errors"].append(
+                    f"Document persistence failed for {rol}: {exc}"
+                )
+
             was_unclassified = case.semaforo is None
             case.last_detail_checked_at = datetime.utcnow()
             _maybe_recompute_deadlines(self.db, case)
@@ -362,5 +380,121 @@ class IngestService:
 
         if stamped_any:
             self.db.commit()
+
+        return result
+
+    def ingest_documents(
+        self,
+        *,
+        lawyer_rut: str,
+        competencia: str,
+        documents: List[dict],
+        storage_service=None,
+    ) -> dict:
+        """Store PDF binaries relayed by the extension against pending Documents.
+
+        The extension downloads each PDF in-browser (riding the live PJUD
+        session while the JWT is still fresh) and POSTs the base64 bytes here.
+        Each item carries the STABLE identity ``token_hash`` — identical to
+        ``Document.pjud_token_hash`` = ``sha256(doc_type|case_rol|scope_key)`` —
+        so the row is matched without relying on the rotating JWT.
+
+        For each item:
+        - Resolve the lawyer's ``Case`` by ``rol``.
+        - Match the ``Document`` by ``(case_id, pjud_token_hash == token_hash)``.
+        - Decode ``base64`` → bytes and upload via StorageService (sets
+          ``gcs_path`` + ``status="stored"``); set ``filename``,
+          ``content_type``, ``size_bytes``, and ``document_date``.
+
+        Failure isolation (never raise, never poison the batch): a missing
+        case/document or invalid base64 is collected into ``errors`` and counted
+        in ``skipped``; the loop continues.
+
+        Returns ``{"documents_stored", "skipped", "errors"}``.
+        """
+        result = {"documents_stored": 0, "skipped": 0, "errors": []}
+
+        lawyer = (
+            self.db.query(Lawyer).filter(Lawyer.rut == normalize_rut(lawyer_rut)).first()
+        )
+        if lawyer is None:
+            # Skip every item — the lawyer has ingested nothing yet.
+            for _ in documents:
+                result["skipped"] += 1
+            result["errors"].append(f"Unknown lawyer rut: {lawyer_rut}")
+            return result
+
+        if storage_service is None:
+            from app.services.storage_service import StorageService, get_storage_backend
+
+            storage_service = StorageService(get_storage_backend())
+
+        for item in documents:
+            rol = (item.get("rol") or "").strip().upper()
+            token_hash = (item.get("token_hash") or "").strip()
+
+            case = (
+                self.db.query(Case)
+                .filter(Case.lawyer_id == lawyer.id, Case.rol == rol)
+                .first()
+            )
+            if case is None:
+                result["skipped"] += 1
+                result["errors"].append(f"Unknown case rol for lawyer: {rol!r}")
+                continue
+
+            doc = (
+                self.db.query(Document)
+                .filter(
+                    Document.case_id == case.id,
+                    Document.pjud_token_hash == token_hash,
+                )
+                .first()
+            )
+            if doc is None:
+                result["skipped"] += 1
+                result["errors"].append(
+                    f"No document matched token_hash {token_hash[:12]}… for {rol}"
+                )
+                continue
+
+            try:
+                pdf_bytes = base64.b64decode(item.get("base64") or "", validate=True)
+            except (binascii.Error, ValueError) as exc:
+                result["skipped"] += 1
+                result["errors"].append(
+                    f"Invalid base64 for {rol} (hash {token_hash[:12]}…): {exc}"
+                )
+                continue
+
+            if not pdf_bytes:
+                result["skipped"] += 1
+                result["errors"].append(
+                    f"Empty document payload for {rol} (hash {token_hash[:12]}…)"
+                )
+                continue
+
+            content_type = item.get("content_type") or "application/pdf"
+            try:
+                doc.filename = item.get("filename")
+                doc.content_type = content_type
+                doc.size_bytes = len(pdf_bytes)
+                parsed_date = _parse_filed_at(item.get("document_date"))
+                if parsed_date is not None:
+                    doc.document_date = parsed_date
+                # StorageService.upload sets doc.gcs_path + doc.status="stored"
+                # (idempotent: skips re-writing an existing key).
+                storage_service.upload(doc, pdf_bytes, content_type)
+                self.db.commit()
+            except Exception as exc:  # noqa: BLE001 — isolate per-document failures
+                self.db.rollback()
+                result["skipped"] += 1
+                result["errors"].append(
+                    f"Failed to store document for {rol} "
+                    f"(hash {token_hash[:12]}…): {exc}"
+                )
+                continue
+
+            result["documents_stored"] += 1
 
         return result
