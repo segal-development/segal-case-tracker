@@ -7,6 +7,7 @@ which was too slow through the operator's proxy (see design ADR in
 sdd/conectar-pjud-extension/design).
 """
 
+import re
 from datetime import datetime
 from typing import List, Optional
 
@@ -52,6 +53,12 @@ def _parse_filed_at(value: Optional[str]) -> Optional[datetime]:
         return datetime.strptime(value.strip(), "%d/%m/%Y")
     except (ValueError, AttributeError):
         return None
+
+
+def _rol_year(rol: str) -> Optional[int]:
+    """Extract the 4-digit year from a ``C-<n>-<year>`` ROL, or ``None``."""
+    match = re.search(r"-(\d{4})$", rol)
+    return int(match.group(1)) if match else None
 
 
 class IngestService:
@@ -317,11 +324,27 @@ class IngestService:
         # Rotate un-fetchable ROLs to the back of the batch: stamp them so they
         # stop refilling every pending-detail page. No movements, no deadline
         # recompute — these have no detail to parse.
+        #
+        # Systemic-failure guard: when NOTHING in the batch succeeded, a RUT /
+        # session mismatch (popup RUT ≠ the logged-in PJUD lawyer) is the likely
+        # cause — the extension asked for lawyer A's ROLs but paginated lawyer
+        # B's live list, so *every* ROL "fails". pending-detail is recent-first,
+        # so a mismatch always surfaces recent, valuable cases; rotating them
+        # would wrongly stamp a whole active caseload. In that case rotate ONLY
+        # clearly-old causes (closed, low-harm) so the all-old tail still clears
+        # while recent cases keep their priority. A single success proves the
+        # session is valid, so then every failed ROL rotates normally.
+        session_confirmed = result["cases_processed"] > 0
+        current_year = datetime.utcnow().year
         stamped_any = False
         for raw_rol in failed_rols or []:
             rol = (raw_rol or "").strip().upper()
             if not rol:
                 continue
+            if not session_confirmed:
+                year = _rol_year(rol)
+                if year is None or year >= current_year - 1:
+                    continue
             case = (
                 self.db.query(Case)
                 .filter(

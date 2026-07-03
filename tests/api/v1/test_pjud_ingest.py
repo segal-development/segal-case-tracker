@@ -269,15 +269,23 @@ class TestIngestMovementsEndpointHappyPath:
         assert len(data["errors"]) == 1
 
     def test_forwards_failed_rols_and_stamps_them(self, client, ingest_key, seeded_case, db):
-        """A failed-only POST (no successful cases) still stamps the failed
-        ROLs so they rotate out of subsequent batches."""
+        """A failed-only POST (no successful cases) stamps clearly-OLD ROLs so
+        they rotate out of subsequent batches. Recent ROLs are protected by the
+        systemic-failure guard (a RUT/session mismatch surfaces recent ROLs) —
+        covered in the service-level tests."""
+        lawyer = db.query(Lawyer).filter(Lawyer.rut == "11111111-1").first()
+        court = db.query(Court).first()
+        db.add(Case(lawyer_id=lawyer.id, court_id=court.id, rol="C-100-2006",
+                    competencia="civil", status="active"))
+        db.commit()
+
         response = client.post(
             MOVEMENTS_URL,
             json={
                 "rut": "11111111-1",
                 "competencia": "civil",
                 "cases": [],
-                "failed_rols": ["C-1234-2026"],
+                "failed_rols": ["C-100-2006"],
             },
             headers={"X-Ingest-Key": ingest_key},
         )
@@ -286,7 +294,7 @@ class TestIngestMovementsEndpointHappyPath:
         assert data["failed_stamped"] == 1
         assert data["cases_processed"] == 0
 
-        case = db.query(Case).filter(Case.rol == "C-1234-2026").first()
+        case = db.query(Case).filter(Case.rol == "C-100-2006").first()
         assert case.last_detail_checked_at is not None
 
     def test_malformed_html_is_graceful_no_500(self, client, ingest_key, seeded_case):

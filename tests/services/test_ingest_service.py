@@ -394,33 +394,93 @@ class TestIngestMovements:
 
 
 class TestIngestMovementsFailedRols:
-    def test_failed_rols_are_stamped_without_movements(self, db, seeded_lawyer_and_case):
-        """Un-fetchable ROLs the extension could not resolve are stamped so they
-        rotate to the back of the batch — no movements, no classification."""
+    def test_failed_rols_stamped_when_session_confirmed(self, db, seeded_lawyer_and_case):
+        """With the session confirmed (>=1 case processed) even a RECENT
+        un-fetchable ROL is stamped so it rotates to the back — no movements,
+        no classification. Age only matters on a systemic (zero-success) batch."""
+        lawyer = seeded_lawyer_and_case["lawyer"]
+        court = db.query(Court).first()
+        recent_failed = f"C-5555-{datetime.utcnow().year}"
+        db.add(Case(lawyer_id=lawyer.id, court_id=court.id, rol=recent_failed,
+                    competencia="civil", status="active"))
+        db.commit()
+
         service = IngestService(db)
         result = service.ingest_movements(
             lawyer_rut="11111111-1",
             competencia="civil",
-            cases=[],
-            failed_rols=["C-1234-2026"],
+            cases=[
+                {
+                    "rol": "C-1234-2026",
+                    "html": _detail_html("C-1234-2026", "1", "Se dicta resolucion", "15/01/2026"),
+                }
+            ],
+            failed_rols=[recent_failed],
         )
 
+        assert result["cases_processed"] == 1
         assert result["failed_stamped"] == 1
-        assert result["cases_processed"] == 0
-        assert result["movements_new"] == 0
-        assert db.query(Movement).count() == 0
+        assert db.query(Movement).count() == 1  # only the processed case
 
-        case = db.query(Case).filter(Case.rol == "C-1234-2026").first()
-        assert case.last_detail_checked_at is not None
-        assert case.semaforo is None  # never classified — no detail was parsed
+        failed = db.query(Case).filter(Case.rol == recent_failed).first()
+        assert failed.last_detail_checked_at is not None
+        assert failed.semaforo is None  # never classified — no detail was parsed
 
-    def test_failed_rols_unknown_to_lawyer_are_ignored(self, db, seeded_lawyer_and_case):
+    def test_recent_failed_rols_not_stamped_on_systemic_failure(self, db, seeded_lawyer_and_case):
+        """RUT/session-mismatch guard: when NOTHING in the batch succeeds, recent
+        ROLs keep their priority. A mismatch (wrong RUT for the session) surfaces
+        recent, valuable ROLs — stamping them would rotate a whole active caseload."""
+        lawyer = seeded_lawyer_and_case["lawyer"]
+        court = db.query(Court).first()
+        recent_rol = f"C-7777-{datetime.utcnow().year}"
+        db.add(Case(lawyer_id=lawyer.id, court_id=court.id, rol=recent_rol,
+                    competencia="civil", status="active"))
+        db.commit()
+
         service = IngestService(db)
         result = service.ingest_movements(
             lawyer_rut="11111111-1",
             competencia="civil",
             cases=[],
-            failed_rols=["C-0000-2099"],
+            failed_rols=[recent_rol],
+        )
+
+        assert result["cases_processed"] == 0
+        assert result["failed_stamped"] == 0
+        case = db.query(Case).filter(Case.rol == recent_rol).first()
+        assert case.last_detail_checked_at is None  # protected
+
+    def test_old_failed_rols_stamped_even_on_systemic_failure(self, db, seeded_lawyer_and_case):
+        """The all-old tail still clears: with zero successes, clearly-old (closed)
+        ROLs rotate so they stop clogging every pending-detail page."""
+        lawyer = seeded_lawyer_and_case["lawyer"]
+        court = db.query(Court).first()
+        db.add(Case(lawyer_id=lawyer.id, court_id=court.id, rol="C-100-2006",
+                    competencia="civil", status="active"))
+        db.commit()
+
+        service = IngestService(db)
+        result = service.ingest_movements(
+            lawyer_rut="11111111-1",
+            competencia="civil",
+            cases=[],
+            failed_rols=["C-100-2006"],
+        )
+
+        assert result["cases_processed"] == 0
+        assert result["failed_stamped"] == 1
+        case = db.query(Case).filter(Case.rol == "C-100-2006").first()
+        assert case.last_detail_checked_at is not None
+
+    def test_failed_rols_unknown_to_lawyer_are_ignored(self, db, seeded_lawyer_and_case):
+        """An old ROL not belonging to the lawyer is a no-op: it passes the age
+        guard but the lookup finds no matching case to stamp."""
+        service = IngestService(db)
+        result = service.ingest_movements(
+            lawyer_rut="11111111-1",
+            competencia="civil",
+            cases=[],
+            failed_rols=["C-0000-2006"],
         )
         assert result["failed_stamped"] == 0
 
