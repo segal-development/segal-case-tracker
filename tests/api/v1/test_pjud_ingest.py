@@ -7,6 +7,7 @@ not by a logged-in lawyer.
 
 import base64
 import hashlib
+from datetime import datetime
 
 import pytest
 
@@ -341,6 +342,22 @@ def pending_document(db, seeded_case):
     return token_hash
 
 
+@pytest.fixture
+def seeded_movement(db, seeded_case):
+    """A Movement on the seeded case (folio '5') for movement-level doc tests."""
+    case = seeded_case["case"]
+    mv = Movement(
+        case_id=case.id,
+        description="Resolucion folio 5",
+        folio="5",
+        movement_date=datetime(2026, 1, 15),
+    )
+    db.add(mv)
+    db.commit()
+    db.refresh(mv)
+    return mv
+
+
 class TestIngestDocumentsEndpointAuth:
     def test_missing_key_returns_401(self, client, seeded_case):
         response = client.post(
@@ -351,9 +368,10 @@ class TestIngestDocumentsEndpointAuth:
 
 
 class TestIngestDocumentsEndpointHappyPath:
-    def test_stores_pdf_and_updates_document(
+    def test_updates_existing_pending_document_and_stores(
         self, client, ingest_key, seeded_case, pending_document, db, tmp_path, monkeypatch
     ):
+        """(b) POST matching an existing pending row → updated + stored."""
         from app.config import settings
 
         monkeypatch.setattr(settings, "DOC_STORAGE_DIR", str(tmp_path))
@@ -367,6 +385,8 @@ class TestIngestDocumentsEndpointHappyPath:
                     {
                         "rol": "C-1234-2026",
                         "token_hash": pending_document,
+                        "doc_type": "resolution",
+                        "scope_key": "1",
                         "filename": "resolucion.pdf",
                         "content_type": "application/pdf",
                         "document_date": "15/01/2026",
@@ -379,9 +399,14 @@ class TestIngestDocumentsEndpointHappyPath:
         assert response.status_code == 200
         data = response.json()
         assert data["documents_stored"] == 1
+        assert data["documents_created"] == 0
         assert data["skipped"] == 0
         assert data["errors"] == []
 
+        # No duplicate row created — updated in place.
+        assert db.query(Document).filter(
+            Document.pjud_token_hash == pending_document
+        ).count() == 1
         doc = db.query(Document).filter(
             Document.pjud_token_hash == pending_document
         ).first()
@@ -391,9 +416,186 @@ class TestIngestDocumentsEndpointHappyPath:
         assert doc.size_bytes == len(_FAKE_PDF)
         assert doc.gcs_path
 
-    def test_unknown_token_hash_is_skipped_not_stored(
+    def test_creates_case_level_document_when_none_exists(
         self, client, ingest_key, seeded_case, db, tmp_path, monkeypatch
     ):
+        """(a) POST with a token_hash that has NO existing row → CREATED + stored."""
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "DOC_STORAGE_DIR", str(tmp_path))
+        case = seeded_case["case"]
+        token_hash = document_identity_hash("cert_envio", case.rol, "")
+
+        response = client.post(
+            DOCUMENTS_URL,
+            json={
+                "rut": "11111111-1",
+                "competencia": "civil",
+                "documents": [
+                    {
+                        "rol": "C-1234-2026",
+                        "token_hash": token_hash,
+                        "doc_type": "cert_envio",
+                        "scope_key": "",
+                        "pjud_endpoint": "documentos/docuS.php",
+                        "pjud_token": "live.jwt.token",
+                        "filename": "cert.pdf",
+                        "content_type": "application/pdf",
+                        "document_date": "15/01/2026",
+                        "base64": base64.b64encode(_FAKE_PDF).decode(),
+                    }
+                ],
+            },
+            headers={"X-Ingest-Key": ingest_key},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["documents_stored"] == 1
+        assert data["documents_created"] == 1
+        assert data["skipped"] == 0
+        assert data["errors"] == []
+
+        doc = db.query(Document).filter(
+            Document.pjud_token_hash == token_hash
+        ).first()
+        assert doc is not None
+        assert doc.status == "stored"
+        assert doc.doc_type == "cert_envio"
+        assert doc.case_id == case.id
+        assert doc.movement_id is None
+        assert doc.size_bytes == len(_FAKE_PDF)
+        assert doc.gcs_path
+        assert doc.pjud_endpoint == "documentos/docuS.php"
+        assert doc.pjud_token == "live.jwt.token"
+
+    def test_creates_movement_level_document_resolves_movement_id(
+        self, client, ingest_key, seeded_case, seeded_movement, db, tmp_path, monkeypatch
+    ):
+        """(a) A movement-scoped create resolves movement_id via (case_id, folio)."""
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "DOC_STORAGE_DIR", str(tmp_path))
+        case = seeded_case["case"]
+        token_hash = document_identity_hash("resolution", case.rol, "5")
+
+        response = client.post(
+            DOCUMENTS_URL,
+            json={
+                "rut": "11111111-1",
+                "competencia": "civil",
+                "documents": [
+                    {
+                        "rol": "C-1234-2026",
+                        "token_hash": token_hash,
+                        "doc_type": "resolution",
+                        "scope_key": "5",
+                        "filename": "reso.pdf",
+                        "content_type": "application/pdf",
+                        "base64": base64.b64encode(_FAKE_PDF).decode(),
+                    }
+                ],
+            },
+            headers={"X-Ingest-Key": ingest_key},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["documents_stored"] == 1
+        assert data["documents_created"] == 1
+
+        doc = db.query(Document).filter(
+            Document.pjud_token_hash == token_hash
+        ).first()
+        assert doc is not None
+        assert doc.movement_id == seeded_movement.id
+        assert doc.status == "stored"
+
+    def test_idempotent_recreate_does_not_duplicate(
+        self, client, ingest_key, seeded_case, db, tmp_path, monkeypatch
+    ):
+        """Re-POST of the same token_hash must not create a second row."""
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "DOC_STORAGE_DIR", str(tmp_path))
+        case = seeded_case["case"]
+        token_hash = document_identity_hash("cert_envio", case.rol, "")
+        payload = {
+            "rut": "11111111-1",
+            "competencia": "civil",
+            "documents": [
+                {
+                    "rol": "C-1234-2026",
+                    "token_hash": token_hash,
+                    "doc_type": "cert_envio",
+                    "scope_key": "",
+                    "filename": "cert.pdf",
+                    "content_type": "application/pdf",
+                    "base64": base64.b64encode(_FAKE_PDF).decode(),
+                }
+            ],
+        }
+        first = client.post(
+            DOCUMENTS_URL, json=payload, headers={"X-Ingest-Key": ingest_key}
+        )
+        second = client.post(
+            DOCUMENTS_URL, json=payload, headers={"X-Ingest-Key": ingest_key}
+        )
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert first.json()["documents_created"] == 1
+        assert second.json()["documents_created"] == 0
+        assert second.json()["documents_stored"] == 1
+        assert db.query(Document).filter(
+            Document.pjud_token_hash == token_hash
+        ).count() == 1
+
+    def test_mismatched_hash_still_stored_no_raise(
+        self, client, ingest_key, seeded_case, db, tmp_path, monkeypatch
+    ):
+        """(c) token_hash that does NOT equal the identity formula still stores
+        (defensive) and never raises."""
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "DOC_STORAGE_DIR", str(tmp_path))
+        case = seeded_case["case"]
+        # 64 hex chars that do NOT equal sha256(doc_type|rol|scope_key).
+        bogus_hash = "abc123" * 10 + "abcd"
+        assert len(bogus_hash) == 64
+        assert bogus_hash != document_identity_hash("resolution", case.rol, "1")
+
+        response = client.post(
+            DOCUMENTS_URL,
+            json={
+                "rut": "11111111-1",
+                "competencia": "civil",
+                "documents": [
+                    {
+                        "rol": "C-1234-2026",
+                        "token_hash": bogus_hash,
+                        "doc_type": "resolution",
+                        "scope_key": "1",
+                        "filename": "mismatch.pdf",
+                        "content_type": "application/pdf",
+                        "base64": base64.b64encode(_FAKE_PDF).decode(),
+                    }
+                ],
+            },
+            headers={"X-Ingest-Key": ingest_key},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["documents_stored"] == 1
+        assert data["skipped"] == 0
+
+        doc = db.query(Document).filter(
+            Document.pjud_token_hash == bogus_hash
+        ).first()
+        assert doc is not None
+        assert doc.status == "stored"
+
+    def test_unknown_case_rol_is_skipped(
+        self, client, ingest_key, seeded_case, db, tmp_path, monkeypatch
+    ):
+        """A ROL that is not this lawyer's case is skipped, no row created."""
         from app.config import settings
 
         monkeypatch.setattr(settings, "DOC_STORAGE_DIR", str(tmp_path))
@@ -405,11 +607,12 @@ class TestIngestDocumentsEndpointHappyPath:
                 "competencia": "civil",
                 "documents": [
                     {
-                        "rol": "C-1234-2026",
+                        "rol": "C-9999-2026",
                         "token_hash": "deadbeef" * 8,
+                        "doc_type": "resolution",
+                        "scope_key": "1",
                         "filename": "ghost.pdf",
                         "content_type": "application/pdf",
-                        "document_date": None,
                         "base64": base64.b64encode(_FAKE_PDF).decode(),
                     }
                 ],
@@ -439,6 +642,8 @@ class TestIngestDocumentsEndpointHappyPath:
                     {
                         "rol": "C-1234-2026",
                         "token_hash": pending_document,
+                        "doc_type": "resolution",
+                        "scope_key": "1",
                         "filename": "broken.pdf",
                         "content_type": "application/pdf",
                         "document_date": None,
