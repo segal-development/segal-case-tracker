@@ -39,6 +39,21 @@ def _looks_like_mis_causas_html(html: str) -> bool:
     return any(marker in html for marker in _MIS_CAUSAS_MARKERS)
 
 
+def _parse_filed_at(value: Optional[str]) -> Optional[datetime]:
+    """Parse a PJUD ``fecha_ingreso`` (``DD/MM/YYYY``) into a ``datetime``.
+
+    Returns ``None`` when the value is missing or unparseable — the ROL-year
+    ordering in ``get_pending_detail`` covers rows with a NULL ``filed_at``,
+    so a parse miss degrades gracefully rather than blocking ingest.
+    """
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value.strip(), "%d/%m/%Y")
+    except (ValueError, AttributeError):
+        return None
+
+
 class IngestService:
     """Parses raw PJUD HTML relayed by the extension and bulk-persists cases."""
 
@@ -108,6 +123,7 @@ class IngestService:
                     "defendant": defendant,
                     "procedure": (c.cuaderno or None),
                     "status": "active",
+                    "filed_at": _parse_filed_at(c.fecha_ingreso),
                     "created_at": now,
                     "updated_at": now,
                 }

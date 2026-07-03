@@ -65,6 +65,19 @@ class TestIngestCasesValidPayload:
         cases = db.query(Case).all()
         assert {c.rol for c in cases} == {"C-1234-2026", "C-5678-2026"}
 
+    def test_populates_filed_at_from_fecha_ingreso(self, db):
+        service = IngestService(db)
+        service.ingest_cases(
+            lawyer_rut="11111111-1", competencia="civil", pages=[VALID_PAGE]
+        )
+
+        case = db.query(Case).filter(Case.rol == "C-1234-2026").first()
+        # _case_row seeds fecha "01/01/2026" (DD/MM/YYYY).
+        assert case.filed_at is not None
+        assert case.filed_at.year == 2026
+        assert case.filed_at.month == 1
+        assert case.filed_at.day == 1
+
     def test_unknown_lawyer_rut_is_get_or_create(self, db):
         assert db.query(Lawyer).filter(Lawyer.rut == "11111111-1").first() is None
 
