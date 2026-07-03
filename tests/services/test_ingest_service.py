@@ -254,6 +254,41 @@ class TestGetPendingDetail:
         result = service.get_pending_detail(lawyer_rut="99999999-9", competencia="civil", limit=30)
         assert result == []
 
+    def test_recent_year_before_old_year_when_filed_at_null(self, db):
+        """With last_detail_checked_at and filed_at both NULL, ordering must
+        fall back to the ROL year (descending) so recent active cases come
+        before old/closed ones instead of being effectively random."""
+        lawyer = Lawyer(rut="11111111-1", name="Test Lawyer", is_active=True)
+        db.add(lawyer)
+        db.flush()
+        court = Court(code="T1-YR", name="Juzgado Year Order Test", region="RM", type="civil")
+        db.add(court)
+        db.flush()
+
+        old = Case(
+            lawyer_id=lawyer.id, court_id=court.id, rol="C-100-2006",
+            competencia="civil", status="active",
+            last_detail_checked_at=None, filed_at=None,
+        )
+        mid = Case(
+            lawyer_id=lawyer.id, court_id=court.id, rol="C-500-2018",
+            competencia="civil", status="active",
+            last_detail_checked_at=None, filed_at=None,
+        )
+        recent = Case(
+            lawyer_id=lawyer.id, court_id=court.id, rol="C-6086-2026",
+            competencia="civil", status="active",
+            last_detail_checked_at=None, filed_at=None,
+        )
+        # Insert in non-sorted order so the result reflects ORDER BY, not insert order.
+        db.add_all([mid, old, recent])
+        db.commit()
+
+        service = IngestService(db)
+        result = service.get_pending_detail(lawyer_rut="11111111-1", competencia="civil", limit=30)
+
+        assert [c["rol"] for c in result] == ["C-6086-2026", "C-500-2018", "C-100-2006"]
+
 
 # ---------------------------------------------------------------------------
 # ingest_movements — Slice 2

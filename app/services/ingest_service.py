@@ -10,6 +10,7 @@ sdd/conectar-pjud-extension/design).
 from datetime import datetime
 from typing import List
 
+from sqlalchemy import Integer, cast, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -139,12 +140,13 @@ class IngestService:
     ) -> List[dict]:
         """Return the stalest cases for *lawyer_rut* needing a movements refresh.
 
-        Ordered ``last_detail_checked_at ASC NULLS FIRST, filed_at DESC`` —
-        same rotation-fairness ordering as
-        ``sync_service._select_cases_for_detail_rotation``, but DB-only
-        (no live PJUD ``api_cases`` matching): the extension already has a
-        live PJUD session and can resolve each ROL's ``detalleMisCausaCivil``
-        token in-page, so only ``rol``/``id`` identifiers are needed here.
+        Ordered ``last_detail_checked_at ASC NULLS FIRST`` (never-checked first),
+        then by the YEAR embedded in the ROL descending, then
+        ``filed_at DESC NULLS LAST``. The ROL-year tiebreak is what keeps recent
+        active cases ahead of old/closed ones: ``filed_at`` is NULL on every
+        imported case, so without it the batch order among the pending pool is
+        effectively arbitrary and grabs 2006–2023 causes the extension cannot
+        resolve in the live Mis Causas list.
 
         Returns ``[]`` when the lawyer is unknown (no cases ingested yet) —
         does NOT create a lawyer (this is a read path).
@@ -155,14 +157,40 @@ class IngestService:
         if lawyer is None:
             return []
 
+        rol_year = self._rol_year_expr()
+
         cases = (
             self.db.query(Case)
             .filter(Case.lawyer_id == lawyer.id, Case.competencia == competencia)
-            .order_by(Case.last_detail_checked_at.asc().nullsfirst(), Case.filed_at.desc())
+            .order_by(
+                Case.last_detail_checked_at.asc().nullsfirst(),
+                rol_year.desc(),
+                Case.filed_at.desc().nullslast(),
+            )
             .limit(limit)
             .all()
         )
         return [{"id": int(c.id), "rol": c.rol} for c in cases]
+
+    def _rol_year_expr(self):
+        """SQL expression yielding the 4-digit year in a ``C-<n>-<year>`` ROL.
+
+        ROLs that do not match are treated as year 0 (lowest priority). Uses a
+        Postgres POSIX-regex ``substring`` in production; falls back to the
+        trailing four characters on SQLite (test suite), which has no regex.
+        """
+        try:
+            dialect = self.db.get_bind().dialect.name
+        except Exception:
+            dialect = "unknown"
+
+        if dialect == "postgresql":
+            return func.coalesce(
+                cast(func.substring(Case.rol, r"-(\d{4})$"), Integer), 0
+            )
+        # SQLite / others (tests): the year is the last four chars; a
+        # non-numeric tail casts to 0, matching the "unparseable → 0" rule.
+        return func.coalesce(cast(func.substr(Case.rol, -4), Integer), 0)
 
     def ingest_movements(
         self, *, lawyer_rut: str, competencia: str, cases: List[dict]
