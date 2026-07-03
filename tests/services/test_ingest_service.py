@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.models.case import Case
 from app.models.court import Court
+from app.models.document import Document
 from app.models.lawyer import Lawyer
 from app.models.movement import Movement
 from app.services.ingest_service import IngestParseError, IngestService
@@ -499,3 +500,123 @@ class TestIngestMovementsFailedRols:
         )
         assert result["failed_stamped"] == 0
         assert result["cases_processed"] == 1
+
+
+# ---------------------------------------------------------------------------
+# ingest_movements — Document row creation (Slice 3)
+# ---------------------------------------------------------------------------
+
+
+def _detail_html_with_doc(
+    rol: str,
+    folio: str,
+    descripcion: str,
+    fecha: str,
+    token: str = "eyJhbGciOiJub25lIn0.e30.DOC_TOK",
+) -> str:
+    """Detail HTML whose single movement carries a docuS (resolution) document.
+
+    The Doc. column (cell 1) contains a ``dtaDoc`` hidden input plus the
+    ``docuS.php`` marker, which is what ``_parse_movements_table`` keys on to
+    emit a ``resolution`` PJUDDocument.
+    """
+    doc_cell = (
+        f'<form action="documentos/docuS.php">'
+        f'<input type="hidden" name="dtaDoc" value="{token}">'
+        f"</form>"
+    )
+    return f"""
+    <html><body>
+      <table>
+        <tr><td><strong>ROL:</strong> {rol}</td></tr>
+        <tr><td><strong>Tribunal:</strong> 1 Juzgado Civil de Santiago</td></tr>
+      </table>
+      <div id="historiaCiv">
+        <div class="panel panel-default">
+          <div class="table-responsive">
+            <table class="table table-bordered table-striped table-hover">
+              <thead><tr><th>Folio</th><th>Doc.</th><th>Anexo</th><th>Etapa</th>
+              <th>Tramite</th><th>Desc.</th><th>Fecha</th><th>Foja</th><th>Geo</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td>{folio}</td>
+                  <td align="left">{doc_cell}</td>
+                  <td align="center"></td>
+                  <td>En tramitacion</td>
+                  <td>Resolucion</td>
+                  <td></td>
+                  <td>{descripcion}</td>
+                  <td>{fecha}</td>
+                  <td>1</td>
+                  <td></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </body></html>
+    """
+
+
+class TestIngestMovementsDocuments:
+    def test_document_bearing_html_creates_pending_document(
+        self, db, seeded_lawyer_and_case
+    ):
+        from app.services.document_persistence import document_identity_hash
+
+        service = IngestService(db)
+        service.ingest_movements(
+            lawyer_rut="11111111-1",
+            competencia="civil",
+            cases=[
+                {
+                    "rol": "C-1234-2026",
+                    "html": _detail_html_with_doc(
+                        "C-1234-2026", "1", "Se dicta resolucion", "15/01/2026"
+                    ),
+                }
+            ],
+        )
+
+        docs = db.query(Document).all()
+        assert len(docs) == 1
+        doc = docs[0]
+
+        case = db.query(Case).filter(Case.rol == "C-1234-2026").first()
+        movement = db.query(Movement).filter(Movement.case_id == case.id).first()
+
+        assert doc.case_id == case.id
+        assert doc.movement_id == movement.id
+        assert doc.doc_type == "resolution"
+        assert doc.status == "pending"
+        assert doc.pjud_endpoint == "documentos/docuS.php"
+        # Stable identity hash = sha256(doc_type|case_rol|folio)
+        assert doc.pjud_token_hash == document_identity_hash(
+            "resolution", "C-1234-2026", "1"
+        )
+        # document_date mirrors the movement date (15/01/2026)
+        assert doc.document_date is not None
+        assert doc.document_date.year == 2026
+        assert doc.document_date.month == 1
+        assert doc.document_date.day == 15
+
+    def test_re_ingest_does_not_duplicate_document(
+        self, db, seeded_lawyer_and_case
+    ):
+        service = IngestService(db)
+        html = _detail_html_with_doc(
+            "C-1234-2026", "1", "Se dicta resolucion", "15/01/2026"
+        )
+        service.ingest_movements(
+            lawyer_rut="11111111-1",
+            competencia="civil",
+            cases=[{"rol": "C-1234-2026", "html": html}],
+        )
+        service.ingest_movements(
+            lawyer_rut="11111111-1",
+            competencia="civil",
+            cases=[{"rol": "C-1234-2026", "html": html}],
+        )
+
+        assert db.query(Document).count() == 1

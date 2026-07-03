@@ -19,6 +19,7 @@ from app.api.v1.auth import _get_or_create_lawyer
 from app.models.case import Case
 from app.models.lawyer import Lawyer
 from app.scrapper.pjud.civil import CivilScraper
+from app.services.document_persistence import DocumentPersistenceService
 from app.services.sync_service import (
     SyncService,
     _maybe_recompute_deadlines,
@@ -309,6 +310,20 @@ class IngestService:
             if scraped_movements:
                 new_count, _alerts = sync.sync_movements(
                     case_id=int(case.id), scraped_movements=scraped_movements
+                )
+
+            # Persist document tokens (Slice 3). Must run AFTER sync_movements so
+            # Movement rows exist for the folio-based lookup inside
+            # persist_from_detail. Idempotent on pjud_token_hash — re-ingesting the
+            # same detail never duplicates Document rows. Failure isolation: a
+            # document-persistence error must not poison the movement commit.
+            try:
+                DocumentPersistenceService().persist_from_detail(
+                    detail, int(case.id), self.db
+                )
+            except Exception as exc:  # noqa: BLE001 — document persistence is best-effort
+                result["errors"].append(
+                    f"Document persistence failed for {rol}: {exc}"
                 )
 
             was_unclassified = case.semaforo is None

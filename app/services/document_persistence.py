@@ -9,11 +9,26 @@ Out of scope (Slice 2): StorageService, downloads, GCS.
 
 import hashlib
 import logging
+from datetime import datetime
 from typing import List, Optional
 
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_movement_date(value: Optional[str]) -> Optional[datetime]:
+    """Parse a PJUD movement ``fecha`` (``DD/MM/YYYY``) into a ``datetime``.
+
+    Returns ``None`` when the value is missing or unparseable — a missing
+    document_date is tolerable (it is metadata, not identity).
+    """
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value.strip(), "%d/%m/%Y")
+    except (ValueError, AttributeError):
+        return None
 
 
 def document_identity_hash(
@@ -130,6 +145,8 @@ class DocumentPersistenceService:
                 )
                 continue
 
+            document_date = _parse_movement_date(pjud_movement.fecha)
+
             for pjud_doc in pjud_movement.documentos:
                 if not pjud_doc.doc_type:
                     continue
@@ -144,6 +161,7 @@ class DocumentPersistenceService:
                     movement_id=movement_id,
                     pjud_doc=pjud_doc,
                     token_hash=token_hash,
+                    document_date=document_date,
                 )
                 if doc is not None:
                     results.append(doc)
@@ -161,6 +179,7 @@ class DocumentPersistenceService:
         movement_id: Optional[int],
         pjud_doc: "PJUDDocument",  # type: ignore[name-defined]  # noqa: F821
         token_hash: str,
+        document_date: Optional[datetime] = None,
     ) -> Optional["Document"]:  # type: ignore[name-defined]  # noqa: F821
         """SELECT then INSERT-or-UPDATE a single Document row.
 
@@ -207,6 +226,7 @@ class DocumentPersistenceService:
                 pjud_token=pjud_doc.token,
                 pjud_token_hash=token_hash,
                 status=status,
+                document_date=document_date,
             )
             db.add(doc)
             db.flush()
