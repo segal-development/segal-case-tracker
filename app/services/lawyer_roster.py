@@ -399,6 +399,45 @@ def acting_lawyer_is_case_abogado(db: Session, case: Case, acting_rut: str) -> b
     return any(normalize_rut(lit.rut) == acting_norm for lit in litigantes)
 
 
+def resolve_case_alert_recipients(db: Session, case: Case) -> list[Lawyer]:
+    """Resolve the internal-lawyer recipient set for alerts/webhooks on ``case``.
+
+    From ``case``'s AB./AP. abogado-of-record litigantes, normalize each RUT
+    and match to an internal ``Lawyer`` row. Opposing/external counsel (no
+    matching ``Lawyer`` row) are naturally excluded — they simply have
+    nothing to match. De-dupes by ``lawyer.id`` so a lawyer appearing under
+    multiple litigante rows (e.g. patrocinante + AB.DDO) yields one delivery.
+
+    Used by ``SyncService.sync_movements`` (movement-alert fan-out) and
+    ``deadlines.py`` (deadline_audit/deadline_added fan-out) per ADR-005.
+    Callers apply their own empty-recipients fallback (e.g. the firm lawyer).
+    """
+    litigantes = (
+        db.query(CaseLitigante)
+        .filter(
+            CaseLitigante.case_id == case.id,
+            CaseLitigante.participante.in_(list(ALL_ABOGADO)),
+        )
+        .all()
+    )
+    if not litigantes:
+        return []
+
+    ruts = {normalize_rut(lit.rut) for lit in litigantes if lit.rut}
+    if not ruts:
+        return []
+
+    lawyers = db.query(Lawyer).filter(Lawyer.rut.in_(ruts)).all()
+    seen: set = set()
+    result: list[Lawyer] = []
+    for lawyer in lawyers:
+        if lawyer.id in seen:
+            continue
+        seen.add(lawyer.id)
+        result.append(lawyer)
+    return result
+
+
 def admin_dashboard_stats(db: Session, account_rut: str) -> dict:
     """Real Admin dashboard aggregates: sync status, document pipeline, data quality.
 
