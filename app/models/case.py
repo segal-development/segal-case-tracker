@@ -19,7 +19,24 @@ from app.core.database import Base
 
 
 class Case(Base):
-    """Civil court case tracked by a lawyer."""
+    """Civil court case tracked by the firm.
+
+    Approach C (ADR-007, ``unificar-modelo-causas``): ``lawyer_id`` is the
+    firm's single canonical bookkeeping owner (resolved via
+    ``app.api.deps.firm_lawyer_id`` / ``FIRM_LAWYER_RUT``), NOT the
+    individual lawyer working the case. Per-lawyer attribution is derived
+    from ``CaseLitigante`` rows instead (see ``resolve_case_scope`` /
+    ``case_ids_for_abogado``), so a lawyer sees a case iff they are an
+    abogado-of-record litigante on it — not by matching ``lawyer_id``.
+
+    ``uq_cases_lawyer_rol`` below therefore now effectively enforces ONE
+    canonical ``Case`` per ROL under the firm's ``lawyer_id`` (it degenerates
+    from "one case per (lawyer, rol) pair" to "one case per rol", since every
+    row shares the same firm ``lawyer_id``). This prevents duplicate `Case`
+    rows for the same ROL being created for different lawyers, which is the
+    exact bug Approach C's migration (``case_merge`` / migration 024)
+    resolves for pre-existing data.
+    """
 
     __tablename__ = "cases"
     __table_args__ = (
