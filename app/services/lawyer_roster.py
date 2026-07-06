@@ -379,6 +379,26 @@ def case_ids_for_abogado(db: Session, account_rut: str, abogado_rut: str) -> set
     return result
 
 
+def acting_lawyer_is_case_abogado(db: Session, case: Case, acting_rut: str) -> bool:
+    """True iff ``acting_rut`` (normalized) is an AB./AP. abogado-of-record
+    litigante on ``case``.
+
+    Used to authorize owner-only mutations (e.g. ``archive_case``) under
+    Approach C, where ``Case.lawyer_id`` no longer distinguishes which
+    lawyer owns/sees a case (it is the firm's single bookkeeping owner).
+    """
+    acting_norm = normalize_rut(acting_rut)
+    litigantes = (
+        db.query(CaseLitigante)
+        .filter(
+            CaseLitigante.case_id == case.id,
+            CaseLitigante.participante.in_(list(ALL_ABOGADO)),
+        )
+        .all()
+    )
+    return any(normalize_rut(lit.rut) == acting_norm for lit in litigantes)
+
+
 def admin_dashboard_stats(db: Session, account_rut: str) -> dict:
     """Real Admin dashboard aggregates: sync status, document pipeline, data quality.
 

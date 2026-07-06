@@ -3,7 +3,7 @@
 from typing import List, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, nullslast
+from sqlalchemy import nullslast
 
 from app.api.deps import (
     get_db,
@@ -558,21 +558,42 @@ async def archive_case(
     current_lawyer: dict = Depends(get_current_lawyer),
     db: Session = Depends(get_db),
 ):
-    """Archive a case (soft delete)."""
-    lawyer_id = _resolve_lawyer_id(db, current_lawyer)
-    
-    case = db.query(Case).filter(
-        and_(
-            Case.id == case_id,
-            Case.lawyer_id == lawyer_id,
-        )
-    ).first()
-    
-    if not case:
+    """Archive a case (soft delete).
+
+    Approach C: Case.lawyer_id is the firm's single bookkeeping owner, so it
+    no longer distinguishes which lawyer may archive a case. Authorization
+    is litigante-based instead: auditor/admin (firm-wide) OR the acting
+    lawyer is an abogado-of-record litigante on the case
+    (``acting_lawyer_is_case_abogado``). Returns 404 (not 403) when
+    unauthorized to avoid leaking case existence, matching prior behavior.
+    """
+    from app.services.lawyer_roster import acting_lawyer_is_case_abogado
+
+    sub = current_lawyer.get("sub") or current_lawyer.get("lawyer_id")
+    if not sub:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
+    if isinstance(sub, int) or (isinstance(sub, str) and sub.isdigit()):
+        acting_lawyer = db.query(Lawyer).filter(Lawyer.id == int(sub)).first()
+    else:
+        acting_lawyer = db.query(Lawyer).filter(Lawyer.rut == sub).first()
+
+    case = db.query(Case).filter(Case.id == case_id).first()
+
+    if not case or not acting_lawyer:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Case not found",
         )
-    
+
+    authorized = acting_lawyer.role in {"auditor", "admin"} or acting_lawyer_is_case_abogado(
+        db, case, acting_lawyer.rut
+    )
+    if not authorized:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Case not found",
+        )
+
     case.status = "archived"
     db.commit()
