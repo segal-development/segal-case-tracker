@@ -22,13 +22,20 @@ def _clean_nombre(nombre: str) -> str:
     return _TRAILING_PAREN_RE.sub("", nombre or "").strip()
 
 
-def _abogado_litigantes_by_case(db: Session, lawyer_id: int) -> dict[int, list]:
-    """Load all abogado-coded litigantes for the account's cases, grouped by case_id."""
+def _abogado_litigantes_by_case(db: Session, *, competencia: str = "civil") -> dict[int, list]:
+    """Load all abogado-coded litigantes across ALL firm cases, grouped by case_id.
+
+    Firm-wide (Approach C): does NOT filter by ``Case.lawyer_id`` — under the
+    unified ownership model every Case's ``lawyer_id`` is the firm's bookkeeping
+    owner, not the abogado who sees/owns it. Attribution is entirely
+    litigante-derived, so the candidate case set spans every firm case
+    (bounded by ``competencia``), independent of who synced it.
+    """
     rows = (
         db.query(CaseLitigante)
         .join(Case, Case.id == CaseLitigante.case_id)
         .filter(
-            Case.lawyer_id == lawyer_id,
+            Case.competencia == competencia,
             CaseLitigante.participante.in_(list(ALL_ABOGADO)),
         )
         .all()
@@ -51,7 +58,7 @@ def firm_roster(db: Session, account_rut: str) -> list[dict]:
     if not lawyer:
         return []
 
-    by_case = _abogado_litigantes_by_case(db, lawyer.id)
+    by_case = _abogado_litigantes_by_case(db)
 
     abogado_cases: dict[str, set[int]] = defaultdict(set)
     abogado_info: dict[str, dict] = {}
@@ -106,7 +113,7 @@ def firm_dashboard_stats(db: Session, account_rut: str) -> dict:
     if not lawyer:
         return _EMPTY
 
-    by_case = _abogado_litigantes_by_case(db, lawyer.id)
+    by_case = _abogado_litigantes_by_case(db)
 
     # Build abogado_cases and abogado_info (same side-resolution as firm_roster)
     abogado_cases: dict[str, set[int]] = defaultdict(set)
@@ -341,7 +348,7 @@ def case_ids_for_abogado(db: Session, account_rut: str, abogado_rut: str) -> set
     if not lawyer:
         return set()
 
-    by_case = _abogado_litigantes_by_case(db, lawyer.id)
+    by_case = _abogado_litigantes_by_case(db)
     result: set[int] = set()
 
     for case_id, litigantes in by_case.items():
@@ -440,7 +447,7 @@ def admin_dashboard_stats(db: Session, account_rut: str) -> dict:
         )
 
     # sin_asignar: civil cases with no firm-side abogado resolvable
-    by_case = _abogado_litigantes_by_case(db, lawyer.id)
+    by_case = _abogado_litigantes_by_case(db)
     assigned: set[int] = set()
     for cid, litigantes in by_case.items():
         account_side: Optional[frozenset] = None

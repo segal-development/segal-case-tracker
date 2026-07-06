@@ -183,6 +183,39 @@ class TestFirmRoster:
         roster = firm_roster(db, "99999999-9")
         assert roster == []
 
+    def test_includes_case_synced_under_different_lawyer_id(self, db, lawyer, court):
+        """Firm-wide attribution: a case Case.lawyer_id != the account's own
+        id (synced under a different lawyer's account) still surfaces the
+        account as a litigante-abogado co-side firm lawyer."""
+        other_lawyer = Lawyer(rut="55555555-5", name="Other Syncer")
+        db.add(other_lawyer)
+        db.commit()
+        db.refresh(other_lawyer)
+
+        case = Case(
+            lawyer_id=other_lawyer.id,
+            court_id=court.id,
+            rol="C-9010-2025",
+            status="active",
+            competencia="civil",
+            plaintiff="BANCO DEMANDANTE",
+            defendant="DEUDOR DDO",
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
+        )
+        db.add(case)
+        db.commit()
+        db.refresh(case)
+
+        _seed_litigantes(
+            db, case, ACCOUNT_RUT, FIRM_LAWYER_RUT,
+            "Firm Lawyer", OPPOSING_RUT,
+        )
+
+        roster = firm_roster(db, ACCOUNT_RUT)
+        ruts = [r["rut"] for r in roster]
+        assert FIRM_LAWYER_RUT in ruts
+
     def test_sorted_by_case_count_desc(self, db, case1, case2, court):
         """Lawyer on 2 cases ranks above lawyer on 1 case."""
         OTHER_RUT = "44444444-4"
@@ -222,6 +255,35 @@ class TestCaseIdsForAbogado:
     def test_returns_empty_for_unknown_account(self, db, case1):
         ids = case_ids_for_abogado(db, "99999999-9", FIRM_LAWYER_RUT)
         assert ids == set()
+
+    def test_returns_case_regardless_of_lawyer_id_owner(self, db, lawyer, court):
+        """Firm-wide attribution: the case's Case.lawyer_id belongs to a
+        different (syncing) lawyer, yet case_ids_for_abogado still resolves
+        it via case_litigantes."""
+        other_lawyer = Lawyer(rut="66666666-6", name="Other Syncer")
+        db.add(other_lawyer)
+        db.commit()
+        db.refresh(other_lawyer)
+
+        case = Case(
+            lawyer_id=other_lawyer.id,
+            court_id=court.id,
+            rol="C-9011-2025",
+            status="active",
+            competencia="civil",
+            plaintiff="BANCO DEMANDANTE",
+            defendant="DEUDOR DDO",
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
+        )
+        db.add(case)
+        db.commit()
+        db.refresh(case)
+
+        _seed_litigantes(db, case, ACCOUNT_RUT, FIRM_LAWYER_RUT, "Firm Lawyer", OPPOSING_RUT)
+
+        ids = case_ids_for_abogado(db, ACCOUNT_RUT, FIRM_LAWYER_RUT)
+        assert case.id in ids
 
 
 # ---------------------------------------------------------------------------
