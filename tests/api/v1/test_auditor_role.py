@@ -502,3 +502,117 @@ def test_put_account_accepts_auditor_role(client, admin_lawyer, admin_headers, o
     )
     assert resp.status_code == 200
     assert resp.json()["role"] == "auditor"
+
+
+# ---------------------------------------------------------------------------
+# Task 1b-8: deadline_audit / deadline_added fan out to abogado-of-record
+# litigantes (ADR-005), not just case.lawyer_id.
+# ---------------------------------------------------------------------------
+
+
+def _add_abogado_litigante(db, case_id, participante, lawyer):
+    from app.models.case_litigante import CaseLitigante
+
+    lit = CaseLitigante(
+        case_id=case_id,
+        participante=participante,
+        rut=lawyer.rut,
+        persona_type="NATURAL",
+        nombre=lawyer.name,
+        natural_key=f"{case_id}-{participante}-{lawyer.rut}",
+    )
+    db.add(lit)
+    db.commit()
+    return lit
+
+
+def test_deadline_audit_creates_alert_per_abogado_of_record(
+    client, db, case_with_deadline, auditor, auditor_headers
+):
+    case, dl = case_with_deadline
+    sandy = Lawyer(rut="17111111-1", name="Sandy")
+    marcela = Lawyer(rut="17222222-2", name="Marcela")
+    db.add_all([sandy, marcela])
+    db.commit()
+    _add_abogado_litigante(db, case.id, "AB.DDO", sandy)
+    _add_abogado_litigante(db, case.id, "AP.DTE", marcela)
+
+    resp = client.put(
+        f"/api/v1/cases/{case.id}/deadlines/{dl.id}/status",
+        json={"status": "cumplido"},
+        headers=auditor_headers,
+    )
+    assert resp.status_code == 200
+
+    db.expire_all()
+    alerts = db.query(Alert).filter(
+        Alert.case_id == case.id, Alert.type == "deadline_audit"
+    ).all()
+    assert {a.lawyer_id for a in alerts} == {sandy.id, marcela.id}
+
+
+def test_deadline_added_creates_alert_per_abogado_of_record(
+    client, db, case_with_deadline, auditor, auditor_headers
+):
+    case, _ = case_with_deadline
+    sandy = Lawyer(rut="17111111-1", name="Sandy")
+    marcela = Lawyer(rut="17222222-2", name="Marcela")
+    db.add_all([sandy, marcela])
+    db.commit()
+    _add_abogado_litigante(db, case.id, "AB.DDO", sandy)
+    _add_abogado_litigante(db, case.id, "AP.DTE", marcela)
+
+    resp = client.post(
+        f"/api/v1/cases/{case.id}/deadlines",
+        json={"deadline_type": "apelacion_5d", "start_date": str(date.today())},
+        headers=auditor_headers,
+    )
+    assert resp.status_code == 201
+
+    db.expire_all()
+    alerts = db.query(Alert).filter(
+        Alert.case_id == case.id, Alert.type == "deadline_added"
+    ).all()
+    assert {a.lawyer_id for a in alerts} == {sandy.id, marcela.id}
+
+
+def test_deadline_alert_falls_back_to_firm_lawyer_when_no_litigante(
+    client, db, auditor, auditor_headers
+):
+    """A firm-owned case with no abogado-of-record litigante yet (bootstrap
+    window) still gets exactly one alert — to the firm lawyer, never
+    silently dropped."""
+    firm = Lawyer(rut="16021492-9", name="Firm Lawyer")
+    db.add(firm)
+    db.commit()
+    db.refresh(firm)
+
+    case = Case(rol="C-500-2026", lawyer_id=firm.id, court_id=1)
+    db.add(case)
+    db.commit()
+    db.refresh(case)
+    dl = CaseDeadline(
+        case_id=case.id,
+        deadline_type="excepciones_8d",
+        legal_basis="art. 459 CPC",
+        due_date=date.today() + timedelta(days=5),
+        triggered_at=date.today(),
+        status="active",
+    )
+    db.add(dl)
+    db.commit()
+    db.refresh(dl)
+
+    resp = client.put(
+        f"/api/v1/cases/{case.id}/deadlines/{dl.id}/status",
+        json={"status": "cumplido"},
+        headers=auditor_headers,
+    )
+    assert resp.status_code == 200
+
+    db.expire_all()
+    alerts = db.query(Alert).filter(
+        Alert.case_id == case.id, Alert.type == "deadline_audit"
+    ).all()
+    assert len(alerts) == 1
+    assert alerts[0].lawyer_id == firm.id
