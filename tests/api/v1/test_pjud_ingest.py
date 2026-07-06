@@ -180,24 +180,26 @@ MOVEMENTS_MALFORMED_HTML = "<html><body>Not a PJUD detail page.</body></html>"
 
 @pytest.fixture
 def seeded_case(db):
-    """Lawyer + Court + Case pre-seeded for movements/documents ingest tests.
+    """Lawyer + Court + Case pre-seeded for documents ingest tests.
 
-    NOTE: ``ingest_documents`` is NOT part of PR1b's firm-ownership rewrite
-    (scoped to ingest_cases/ingest_movements/get_pending_detail only — see
-    sdd/unificar-modelo-causas/tasks 1b-2..1b-5), so this case stays owned by
-    the syncing lawyer's own id. Movements endpoint tests use the separate
-    ``seeded_case_firm`` fixture below.
+    Case is FIRM-owned (Approach C, gap-fix follow-up to 1b-4) —
+    ``ingest_documents`` resolves the case by the firm lawyer_id, mirroring
+    ``ingest_movements``, never by the syncing lawyer's own id. ``lawyer`` is
+    the SYNCING lawyer passed as ``rut`` in the request payload. Movements
+    endpoint tests use the equivalent ``seeded_case_firm`` fixture below.
     """
     lawyer = Lawyer(rut="11111111-1", name="Test Lawyer", is_active=True)
     db.add(lawyer)
     db.flush()
+
+    firm = db.query(Lawyer).filter(Lawyer.rut == FIRM_RUT).first()
 
     court = Court(code="T1-MOV", name="Juzgado Movements Test", region="RM", type="civil")
     db.add(court)
     db.flush()
 
     case = Case(
-        lawyer_id=lawyer.id,
+        lawyer_id=firm.id,
         court_id=court.id,
         rol="C-1234-2026",
         competencia="civil",
@@ -205,7 +207,7 @@ def seeded_case(db):
     )
     db.add(case)
     db.commit()
-    return {"lawyer": lawyer, "case": case}
+    return {"lawyer": lawyer, "case": case, "firm": firm}
 
 
 @pytest.fixture
@@ -520,6 +522,55 @@ class TestIngestDocumentsEndpointHappyPath:
         assert doc.gcs_path
         assert doc.pjud_endpoint == "documentos/docuS.php"
         assert doc.pjud_token == "live.jwt.token"
+
+    def test_stores_document_for_firm_owned_case_synced_by_different_lawyer(
+        self, client, ingest_key, seeded_case_firm, db, tmp_path, monkeypatch
+    ):
+        """Task 1b-4b (gap fix): the case is FIRM-owned (Case.lawyer_id ==
+        firm.id), not owned by the syncing lawyer's own id — Approach C
+        means ingest_documents must resolve the case by the FIRM id + rol,
+        exactly like ingest_movements does, not by the syncing lawyer's own
+        lawyer_id. Before the fix this ROL is "unknown" to the syncing
+        lawyer and the document is silently skipped."""
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "DOC_STORAGE_DIR", str(tmp_path))
+        case = seeded_case_firm["case"]
+        token_hash = document_identity_hash("cert_envio", case.rol, "")
+
+        response = client.post(
+            DOCUMENTS_URL,
+            json={
+                "rut": "11111111-1",  # the SYNCING lawyer, not the firm
+                "competencia": "civil",
+                "documents": [
+                    {
+                        "rol": "C-1234-2026",
+                        "token_hash": token_hash,
+                        "doc_type": "cert_envio",
+                        "scope_key": "",
+                        "pjud_endpoint": "documentos/docuS.php",
+                        "pjud_token": "live.jwt.token",
+                        "filename": "cert.pdf",
+                        "content_type": "application/pdf",
+                        "document_date": "15/01/2026",
+                        "base64": base64.b64encode(_FAKE_PDF).decode(),
+                    }
+                ],
+            },
+            headers={"X-Ingest-Key": ingest_key},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["documents_stored"] == 1
+        assert data["documents_created"] == 1
+        assert data["skipped"] == 0
+        assert data["errors"] == []
+
+        doc = db.query(Document).filter(Document.pjud_token_hash == token_hash).first()
+        assert doc is not None
+        assert doc.case_id == case.id
+        assert doc.status == "stored"
 
     def test_creates_movement_level_document_resolves_movement_id(
         self, client, ingest_key, seeded_case, seeded_movement, db, tmp_path, monkeypatch

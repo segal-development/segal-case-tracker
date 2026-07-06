@@ -536,7 +536,11 @@ class IngestService:
         created) without relying on the rotating JWT.
 
         For each item:
-        - Resolve the lawyer's ``Case`` by ``rol`` (unknown ROL → skip).
+        - Resolve the FIRM-owned ``Case`` by ``rol`` (Approach C — mirrors
+          ``ingest_movements``'s case resolution: every Case is upserted
+          under the firm ``lawyer_id``, never the syncing lawyer's own id,
+          so documents POSTed by any lawyer syncing the firm's caseload
+          resolve the same Case; unknown ROL → skip).
         - Decode ``base64`` → bytes (invalid/empty → skip; never a partial row).
         - Match the ``Document`` by ``(case_id, pjud_token_hash == token_hash)``.
           When NOT found, CREATE it from the extension-supplied metadata:
@@ -577,6 +581,8 @@ class IngestService:
             result["errors"].append(f"Unknown lawyer rut: {lawyer_rut}")
             return result
 
+        owner_id = firm_lawyer_id(self.db)
+
         if storage_service is None:
             from app.services.storage_service import StorageService, get_storage_backend
 
@@ -590,7 +596,7 @@ class IngestService:
 
             case = (
                 self.db.query(Case)
-                .filter(Case.lawyer_id == lawyer.id, Case.rol == rol)
+                .filter(Case.lawyer_id == owner_id, Case.rol == rol)
                 .first()
             )
             if case is None:
