@@ -409,9 +409,12 @@ def admin_dashboard_stats(db: Session, account_rut: str) -> dict:
     cutoff_24h = now - timedelta(hours=24)
     cutoff_30d = now - timedelta(days=30)
 
+    # Firm-wide civil case load — Approach C: Case.lawyer_id is the firm's
+    # bookkeeping owner, not this account specifically, so admin quality/sync
+    # metrics span every civil case regardless of which lawyer synced it.
     cases = (
         db.query(Case.id, Case.semaforo, Case.last_detail_checked_at, Case.last_movement_at)
-        .filter(Case.lawyer_id == lawyer.id, Case.competencia == "civil")
+        .filter(Case.competencia == "civil")
         .all()
     )
     case_ids = [c.id for c in cases]

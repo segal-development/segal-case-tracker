@@ -428,6 +428,22 @@ class TestAdminDashboardStats:
         assert result["quality"]["total_cases"] == 0
         assert result["sync"]["pending_detail"] == 0
 
+    def test_admin_dashboard_includes_cases_regardless_of_lawyer_id(self, db, lawyer, court):
+        """Firm-wide: civil cases synced under a different lawyer's account
+        still count toward admin dashboard totals."""
+        other_lawyer = Lawyer(rut="88888888-8", name="Other Syncer")
+        db.add(other_lawyer)
+        db.commit()
+        db.refresh(other_lawyer)
+
+        c1 = _make_case(db, lawyer, court, "C-6010-2025")
+        c2 = _make_case(db, other_lawyer, court, "C-6011-2025")
+        _seed_litigantes(db, c1)
+        _seed_litigantes(db, c2)
+
+        quality = admin_dashboard_stats(db, ACCOUNT_RUT)["quality"]
+        assert quality["total_cases"] == 2
+
 
 # ---------------------------------------------------------------------------
 # Endpoint tests: GET /api/v1/stats/admin
