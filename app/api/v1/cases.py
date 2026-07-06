@@ -23,7 +23,6 @@ from app.models.movement import Movement
 from app.models.court import Court
 from app.models.sync_history import SyncHistory
 from app.models.document import Document
-from app.services.case_service import CaseService
 
 router = APIRouter()
 
