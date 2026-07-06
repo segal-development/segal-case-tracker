@@ -137,10 +137,13 @@ def firm_dashboard_stats(db: Session, account_rut: str) -> dict:
                 if norm not in abogado_info:
                     abogado_info[norm] = {"rut": norm, "nombre": _clean_nombre(lit.nombre)}
 
-    # Load civil cases in one query
+    # Load civil cases firm-wide — Approach C: Case.lawyer_id is the firm's
+    # bookkeeping owner, not the abogado who sees this case, so the case load
+    # is NOT restricted to this account's own lawyer_id. Attribution to this
+    # account is entirely litigante-derived (abogado_cases above).
     cases = (
         db.query(Case.id, Case.semaforo, Case.last_movement_at, Case.procedure, Case.procedural_state)
-        .filter(Case.lawyer_id == lawyer.id, Case.competencia == "civil")
+        .filter(Case.competencia == "civil")
         .all()
     )
     case_map = {c.id: c for c in cases}

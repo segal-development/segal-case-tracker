@@ -176,6 +176,23 @@ class TestFirmDashboardStats:
         assert result["totals"]["cases"] == 0
         assert result["by_lawyer"] == []
 
+    def test_totals_include_cases_synced_under_different_lawyer_id(self, db, lawyer, court):
+        """Firm-wide: a civil case synced under a different lawyer's account
+        (Case.lawyer_id != the querying account's own id) still counts toward
+        firm-wide totals when the account is an abogado-of-record litigante."""
+        other_lawyer = Lawyer(rut="77777777-7", name="Other Syncer")
+        db.add(other_lawyer)
+        db.commit()
+        db.refresh(other_lawyer)
+
+        c1 = _make_case(db, lawyer, court, "C-5010-2025")
+        c2 = _make_case(db, other_lawyer, court, "C-5011-2025")
+        _seed_litigantes(db, c1)
+        _seed_litigantes(db, c2)
+
+        result = firm_dashboard_stats(db, ACCOUNT_RUT)
+        assert result["totals"]["cases"] == 2
+
     def test_by_procedural_state_counts_and_order(self, db, lawyer, court):
         c1 = _make_case(db, lawyer, court, "C-7001-2025", procedural_state="notificado")
         c2 = _make_case(db, lawyer, court, "C-7002-2025", procedural_state="notificado")
