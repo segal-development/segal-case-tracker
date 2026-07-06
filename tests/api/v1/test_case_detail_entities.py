@@ -74,8 +74,14 @@ def authed_client(client, lawyer):
 
 
 @pytest.fixture
-def seeded_entities(db, case):
-    """Seed one row of each entity type linked to the case."""
+def seeded_entities(db, case, lawyer):
+    """Seed one row of each entity type linked to the case.
+
+    Also seeds the authenticated lawyer as an AB.DTE abogado-of-record
+    litigante: litigante-based scope (Approach C) requires it once the case
+    has ANY litigante row — otherwise the bootstrap-window fallback (which
+    only applies to cases with zero litigante rows) no longer grants scope.
+    """
     litigante = CaseLitigante(
         case_id=case.id,
         participante="DTE.",
@@ -83,6 +89,14 @@ def seeded_entities(db, case):
         persona_type="JURIDICA",
         nombre="BANCO TEST S.A.",
         natural_key="81826800-9|dte.",
+    )
+    abogado_litigante = CaseLitigante(
+        case_id=case.id,
+        participante="AB.DTE",
+        rut=lawyer.rut,
+        persona_type="NATURAL",
+        nombre="Test Lawyer",
+        natural_key=f"{lawyer.rut}|ab.dte",
     )
     notificacion = CaseNotificacion(
         case_id=case.id,
@@ -113,10 +127,11 @@ def seeded_entities(db, case):
         estado="PENDIENTE",
         natural_key="exhorto-001",
     )
-    db.add_all([litigante, notificacion, escrito, exhorto])
+    db.add_all([litigante, abogado_litigante, notificacion, escrito, exhorto])
     db.commit()
     return {
         "litigante": litigante,
+        "abogado_litigante": abogado_litigante,
         "notificacion": notificacion,
         "escrito": escrito,
         "exhorto": exhorto,
@@ -138,10 +153,9 @@ class TestGetCaseIncludesEntities:
         assert response.status_code == 200
         data = response.json()
 
-        # Litigantes
-        assert len(data["litigantes"]) == 1
-        lit = data["litigantes"][0]
-        assert lit["rut"] == "81826800-9"
+        # Litigantes — party (DTE.) + abogado-of-record (AB.DTE, seeded for scope)
+        assert len(data["litigantes"]) == 2
+        lit = next(l for l in data["litigantes"] if l["rut"] == "81826800-9")
         assert lit["participante"] == "DTE."
         assert lit["persona_type"] == "JURIDICA"
         assert lit["nombre"] == "BANCO TEST S.A."
@@ -257,8 +271,8 @@ class TestDetailEntitiesEndpoint:
         assert "escritos" in data
         assert "exhortos" in data
 
-        assert len(data["litigantes"]) == 1
-        assert data["litigantes"][0]["rut"] == "81826800-9"
+        assert len(data["litigantes"]) == 2
+        assert any(l["rut"] == "81826800-9" for l in data["litigantes"])
 
         assert len(data["notificaciones"]) == 1
         assert data["notificaciones"][0]["rol"] == "C-1001-2025"
