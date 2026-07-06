@@ -656,6 +656,17 @@ class SyncService:
 
         Returns:
             Tuple of (new_count, alert_count).
+
+        Recipient resolution (Approach C, ADR-005): fans out to every
+        abogado-of-record litigante on the case via
+        ``resolve_case_alert_recipients`` — one Alert + one notification
+        dispatch per recipient, de-duped by lawyer id (a lawyer appearing
+        under two litigante rows still gets exactly one delivery). Falls
+        back to the case's existing owner lawyer (``case.lawyer_id``) when
+        no internal recipient resolves yet (bootstrap window before
+        litigantes are scraped, or only opposing/external counsel present)
+        so an alert is never silently dropped. ``NotifyBudget`` is drained
+        per DISPATCH (i.e. per recipient), not per case/movement.
         """
         new_count = 0
         alert_count = 0
@@ -665,13 +676,22 @@ class SyncService:
         if not case:
             return 0, 0
 
-        # Hoist Lawyer + active-Webhook queries outside the per-movement loop
-        # (constant for the whole call → removes O(N) round-trips).
-        lawyer = self.db.query(Lawyer).filter(Lawyer.id == case.lawyer_id).first()
-        webhooks: list = []
-        if lawyer:
-            webhooks = self.db.query(Webhook).filter(
-                Webhook.lawyer_id == lawyer.id,
+        # Hoist recipient resolution + active-Webhook queries outside the
+        # per-movement loop (constant for the whole call → removes O(N)
+        # round-trips).
+        from app.services.lawyer_roster import resolve_case_alert_recipients
+
+        recipients = resolve_case_alert_recipients(self.db, case)
+        if not recipients:
+            fallback_lawyer = (
+                self.db.query(Lawyer).filter(Lawyer.id == case.lawyer_id).first()
+            )
+            recipients = [fallback_lawyer] if fallback_lawyer else []
+
+        recipient_webhooks: dict = {}
+        for recipient in recipients:
+            recipient_webhooks[recipient.id] = self.db.query(Webhook).filter(
+                Webhook.lawyer_id == recipient.id,
                 Webhook.is_active == True,  # noqa: E712
             ).all()
 
@@ -682,20 +702,23 @@ class SyncService:
             movement, is_new = self._upsert_movement(case_id, scraped)
             if is_new:
                 new_count += 1
-                # Alert is always persisted; only DISPATCH is budget-gated.
-                alert = self._create_movement_alert(case, movement)
-                if alert:
+                for recipient in recipients:
+                    # Alert is always persisted; only DISPATCH is budget-gated.
+                    alert = self._create_movement_alert(case, movement, recipient.id)
+                    if not alert:
+                        continue
                     alert_count += 1
-                    if lawyer and not _budget.exhausted():
+                    if not _budget.exhausted():
                         try:
                             NotificationService(self.db).notify_new_movement(
-                                alert, case, movement, lawyer, webhooks
+                                alert, case, movement, recipient,
+                                recipient_webhooks[recipient.id],
                             )
                         except Exception as exc:
                             logger.error(
                                 "Failed to dispatch notification for alert on "
-                                "case %s movement %s: %s",
-                                case.id, movement.id, exc,
+                                "case %s movement %s recipient %s: %s",
+                                case.id, movement.id, recipient.id, exc,
                             )
                         # Count every attempt (success or error) toward the cap.
                         _budget.decrement()
@@ -829,10 +852,17 @@ class SyncService:
         self.db.flush()
         return movement, True
     
-    def _create_movement_alert(self, case: Case, movement: Movement) -> Optional[Alert]:
-        """Create an alert for a new movement."""
+    def _create_movement_alert(
+        self, case: Case, movement: Movement, lawyer_id: int
+    ) -> Optional[Alert]:
+        """Create an alert for a new movement, addressed to one recipient.
+
+        Approach C (ADR-005): the caller (``sync_movements``) fans out to
+        every resolved recipient, so this creates exactly ONE Alert for
+        ``lawyer_id`` — never assumes ``case.lawyer_id`` is the recipient.
+        """
         alert = Alert(
-            lawyer_id=case.lawyer_id,
+            lawyer_id=lawyer_id,
             case_id=case.id,
             movement_id=movement.id,
             type="new_movement",
