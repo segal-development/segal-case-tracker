@@ -124,11 +124,8 @@ def run_case_merge(db: Session) -> CaseMergeResult:
         db.flush()
 
         for loser in losers:
-            _repoint_children(db, loser.id, winner.id)
-        db.flush()
-
-        _dedupe_children(db, winner.id)
-        db.flush()
+            _merge_children(db, loser.id, winner.id)
+            db.flush()
 
     loser_ids = [loser.id for losers in losers_by_rol.values() for loser in losers]
 
@@ -280,125 +277,190 @@ def _backfill_case_lawyer_source(db: Session, winner: Case, cases: List[Case]) -
     db.flush()
 
 
-def _repoint_children(db: Session, loser_id: int, winner_id: int) -> None:
-    for model in CHILD_TABLES_WITH_CASE_ID:
-        rows = db.query(model).filter(model.case_id == loser_id).all()
-        for row in rows:
-            row.case_id = winner_id
+def _merge_children(db: Session, loser_id: int, winner_id: int) -> None:
+    """Collision-aware loser -> winner merge for all 8 child tables.
+
+    Replaces the old two-phase "blind repoint (UPDATE case_id=winner for
+    every loser row) THEN dedupe" flow. That flow could emit an UPDATE that
+    collides with a row the winner ALREADY has for the same natural
+    identity (e.g. two CaseLitigante rows with the same ``natural_key``)
+    before the dedupe step ever ran — fine on SQLite's default test session,
+    but a hard ``UniqueViolation`` on Postgres for any table with a per-case
+    UNIQUE constraint (real incident: ``uq_case_litigante_natural_key``).
+
+    Each ``_merge_*`` helper below builds the winner's existing identity set
+    FIRST, then for every loser row either:
+    - the identity already exists on the winner -> repoint any references
+      to the loser row onto the winner's canonical row, then DELETE the
+      loser row (never UPDATE its case_id into a colliding identity), or
+    - the identity is new -> UPDATE case_id to the winner (safe, no
+      collision) and register it as the new canonical row.
+
+    Order matters: Movement and CaseEscrito must be merged before Document
+    (whose movement_id/escrito_id references must resolve to already-final
+    canonical ids) and before CaseDeadline/Alert (source_movement_id /
+    movement_id same reasoning).
+    """
+    _merge_movements(db, loser_id, winner_id)
+    _merge_natural_key(db, CaseLitigante, loser_id, winner_id)
+    _merge_natural_key(db, CaseNotificacion, loser_id, winner_id)
+    _merge_escritos(db, loser_id, winner_id)
+    _merge_natural_key(db, CaseExhorto, loser_id, winner_id)
+    _merge_deadlines(db, loser_id, winner_id)
+    _merge_documents(db, loser_id, winner_id)
+    _merge_alerts(db, loser_id, winner_id)
 
 
-def _dedupe_children(db: Session, case_id: int) -> None:
-    _dedupe_movements(db, case_id)
-    _dedupe_natural_key(db, CaseLitigante, case_id)
-    _dedupe_natural_key(db, CaseNotificacion, case_id)
-    _dedupe_escritos(db, case_id)
-    _dedupe_natural_key(db, CaseExhorto, case_id)
-    _dedupe_deadlines(db, case_id)
-    _dedupe_documents(db, case_id)
-    _dedupe_alerts(db, case_id)
+def _merge_movements(db: Session, loser_id: int, winner_id: int) -> None:
+    """Movements have no DB unique constraint — natural identity is
+    (folio, description), mirroring ``SyncService._upsert_movement``. Any
+    Document/CaseDeadline/Alert referencing a colliding loser movement is
+    re-pointed to the winner's canonical row before the loser row is
+    deleted.
 
-
-def _dedupe_movements(db: Session, case_id: int) -> None:
-    """Movements have no DB unique constraint — dedup on (case_id, folio,
-    description), mirroring ``SyncService._upsert_movement``. Any Document
-    or CaseDeadline referencing a deduped-away movement is re-pointed to the
-    surviving canonical row first."""
-    rows = db.query(Movement).filter(Movement.case_id == case_id).order_by(Movement.id).all()
+    The reference repoints are flushed BEFORE the loser rows are deleted:
+    Document has an ORM relationship back to its parent (``escrito`` with
+    ``backref="documents"``-style bidirectional tracking elsewhere in this
+    module) and SQLAlchemy's unit-of-work will otherwise re-query and
+    nullify still-referencing children as part of processing the DELETE,
+    undoing an in-memory-only reassignment that was never flushed first.
+    """
     seen: Dict[tuple, Movement] = {}
-    for row in rows:
+    for row in db.query(Movement).filter(Movement.case_id == winner_id).order_by(Movement.id).all():
+        seen.setdefault((row.folio, row.description), row)
+
+    to_delete: List[Movement] = []
+    for row in db.query(Movement).filter(Movement.case_id == loser_id).order_by(Movement.id).all():
         key = (row.folio, row.description)
         canonical = seen.get(key)
-        if canonical is None:
+        if canonical is not None:
+            for doc in db.query(Document).filter(Document.movement_id == row.id).all():
+                doc.movement_id = canonical.id
+            for deadline in db.query(CaseDeadline).filter(CaseDeadline.source_movement_id == row.id).all():
+                deadline.source_movement_id = canonical.id
+            for alert in db.query(Alert).filter(Alert.movement_id == row.id).all():
+                alert.movement_id = canonical.id
+            to_delete.append(row)
+        else:
+            row.case_id = winner_id
             seen[key] = row
-            continue
 
-        for doc in db.query(Document).filter(Document.movement_id == row.id).all():
-            doc.movement_id = canonical.id
-        for deadline in db.query(CaseDeadline).filter(CaseDeadline.source_movement_id == row.id).all():
-            deadline.source_movement_id = canonical.id
-        for alert in db.query(Alert).filter(Alert.movement_id == row.id).all():
-            alert.movement_id = canonical.id
-        db.delete(row)
+    if to_delete:
+        db.flush()
+        for row in to_delete:
+            db.delete(row)
 
 
-def _dedupe_natural_key(db: Session, model, case_id: int) -> None:
-    """Generic dedupe for child tables whose only identity is `natural_key`
-    and that nothing else references by id."""
-    rows = db.query(model).filter(model.case_id == case_id).order_by(model.id).all()
+def _merge_natural_key(db: Session, model, loser_id: int, winner_id: int) -> None:
+    """Collision-aware merge for child tables whose only identity is
+    `natural_key` (per-case UNIQUE constraint) and that nothing else
+    references by id."""
     seen = set()
-    for row in rows:
+    for row in db.query(model).filter(model.case_id == winner_id).order_by(model.id).all():
+        seen.add(row.natural_key)
+
+    for row in db.query(model).filter(model.case_id == loser_id).order_by(model.id).all():
         if row.natural_key in seen:
             db.delete(row)
         else:
+            row.case_id = winner_id
             seen.add(row.natural_key)
 
 
-def _dedupe_escritos(db: Session, case_id: int) -> None:
-    """CaseEscrito dedupes by natural_key, but Document.escrito_id may
-    reference a deduped-away row and must be re-pointed first."""
-    rows = db.query(CaseEscrito).filter(CaseEscrito.case_id == case_id).order_by(CaseEscrito.id).all()
+def _merge_escritos(db: Session, loser_id: int, winner_id: int) -> None:
+    """CaseEscrito's identity is `natural_key` (per-case UNIQUE constraint),
+    but Document.escrito_id may reference a colliding loser row and must be
+    re-pointed to the winner's canonical row before that row is deleted.
+
+    The Document.escrito_id repoint is flushed BEFORE the CaseEscrito row is
+    deleted: Document.escrito relationship has ``backref="documents"`` on
+    CaseEscrito, so SQLAlchemy's unit-of-work re-queries and nullifies any
+    Document still referencing the escrito's PK as part of processing the
+    DELETE — which would silently undo an unflushed in-memory repoint.
+    """
     seen: Dict[str, CaseEscrito] = {}
-    for row in rows:
+    for row in db.query(CaseEscrito).filter(CaseEscrito.case_id == winner_id).order_by(CaseEscrito.id).all():
+        seen.setdefault(row.natural_key, row)
+
+    to_delete: List[CaseEscrito] = []
+    for row in db.query(CaseEscrito).filter(CaseEscrito.case_id == loser_id).order_by(CaseEscrito.id).all():
         canonical = seen.get(row.natural_key)
-        if canonical is None:
+        if canonical is not None:
+            for doc in db.query(Document).filter(Document.escrito_id == row.id).all():
+                doc.escrito_id = canonical.id
+            to_delete.append(row)
+        else:
+            row.case_id = winner_id
             seen[row.natural_key] = row
-            continue
-        for doc in db.query(Document).filter(Document.escrito_id == row.id).all():
-            doc.escrito_id = canonical.id
-        db.delete(row)
+
+    if to_delete:
+        db.flush()
+        for row in to_delete:
+            db.delete(row)
 
 
-def _dedupe_deadlines(db: Session, case_id: int) -> None:
-    """CaseDeadline's natural key is (deadline_type, triggered_at) per
+def _merge_deadlines(db: Session, loser_id: int, winner_id: int) -> None:
+    """CaseDeadline's identity is (deadline_type, triggered_at) per
     ``uq_case_deadline_type_triggered``, not a single natural_key column."""
-    rows = db.query(CaseDeadline).filter(CaseDeadline.case_id == case_id).order_by(CaseDeadline.id).all()
     seen = set()
-    for row in rows:
+    for row in db.query(CaseDeadline).filter(CaseDeadline.case_id == winner_id).order_by(CaseDeadline.id).all():
+        seen.add((row.deadline_type, row.triggered_at))
+
+    for row in db.query(CaseDeadline).filter(CaseDeadline.case_id == loser_id).order_by(CaseDeadline.id).all():
         key = (row.deadline_type, row.triggered_at)
         if key in seen:
             db.delete(row)
         else:
+            row.case_id = winner_id
             seen.add(key)
 
 
-def _dedupe_documents(db: Session, case_id: int) -> None:
+def _merge_documents(db: Session, loser_id: int, winner_id: int) -> None:
     """Documents with a ``pjud_token_hash`` are already globally unique on
     that hash (partial unique index, migration 006) — a hash collision
     across two duplicate-ROL cases could never have been persisted in the
-    first place, so only hash-less (extension-uploaded, no stable identity)
-    documents can actually duplicate post-repoint. Dedupe those on
-    (movement_id, escrito_id) — but ONLY when at least one of the two is
-    set. A document with neither link (a standalone, hash-less upload) has
-    no real natural-key basis for comparison: two such rows sharing the
-    degenerate ``(None, None)`` key are NOT necessarily the same document,
-    so they must never be silently collapsed (that would be data loss)."""
-    rows = (
+    first place, so they are always safely repointed, never deduped. Only
+    hash-less (extension-uploaded, no stable identity) documents can
+    actually collide post-repoint, on (movement_id, escrito_id) — but ONLY
+    when at least one of the two is set. A document with neither link (a
+    standalone, hash-less upload) has no real natural-key basis for
+    comparison: two such rows sharing the degenerate ``(None, None)`` key
+    are NOT necessarily the same document, so they must never be silently
+    collapsed (that would be data loss)."""
+    seen = set()
+    for row in (
         db.query(Document)
-        .filter(Document.case_id == case_id, Document.pjud_token_hash.is_(None))
+        .filter(Document.case_id == winner_id, Document.pjud_token_hash.is_(None))
         .order_by(Document.id)
         .all()
-    )
-    seen = set()
-    for row in rows:
-        if row.movement_id is None and row.escrito_id is None:
-            continue  # no natural-key basis — never treated as a duplicate
-        key = (row.movement_id, row.escrito_id)
-        if key in seen:
-            db.delete(row)
-        else:
+    ):
+        if row.movement_id is not None or row.escrito_id is not None:
+            seen.add((row.movement_id, row.escrito_id))
+
+    for row in db.query(Document).filter(Document.case_id == loser_id).order_by(Document.id).all():
+        if row.pjud_token_hash is None and (row.movement_id is not None or row.escrito_id is not None):
+            key = (row.movement_id, row.escrito_id)
+            if key in seen:
+                db.delete(row)
+                continue
             seen.add(key)
+        row.case_id = winner_id
 
 
-def _dedupe_alerts(db: Session, case_id: int) -> None:
-    """Alerts have no natural key; per design ADR-008 decision, drop exact
-    duplicates on (lawyer_id, movement_id, type, message) after re-point."""
-    rows = db.query(Alert).filter(Alert.case_id == case_id).order_by(Alert.id).all()
+def _merge_alerts(db: Session, loser_id: int, winner_id: int) -> None:
+    """Alerts have no natural key or DB unique constraint; per design
+    ADR-008 decision, collapse exact duplicates on
+    (lawyer_id, movement_id, type, message)."""
     seen = set()
-    for row in rows:
+    for row in db.query(Alert).filter(Alert.case_id == winner_id).order_by(Alert.id).all():
+        seen.add((row.lawyer_id, row.movement_id, row.type, row.message))
+
+    for row in db.query(Alert).filter(Alert.case_id == loser_id).order_by(Alert.id).all():
         key = (row.lawyer_id, row.movement_id, row.type, row.message)
         if key in seen:
             db.delete(row)
         else:
+            row.case_id = winner_id
             seen.add(key)
 
 
