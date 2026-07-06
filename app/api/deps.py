@@ -144,6 +144,33 @@ def require_ingest_key(
     return key
 
 
+def firm_lawyer_id(db: Session) -> int:
+    """Resolve the firm's canonical ``Lawyer.id`` from ``FIRM_LAWYER_RUT``.
+
+    Centralizes the pattern duplicated at ``deps.py`` (``_resolve_lawyer_id``)
+    and ``stats.py`` (``get_public_overview``): the firm's canonical
+    ``lawyer_id`` is the sole owner of every ``Case`` row (Approach C).
+    Defaults to ``"16021492-9"`` when the env var is unset, matching the
+    existing auditor-firm convention.
+
+    Raises ``RuntimeError`` when no matching Lawyer row exists rather than
+    silently returning ``None`` (which callers could write as a NULL/invalid
+    ``lawyer_id``).
+    """
+    import os
+
+    firm_rut = os.environ.get("FIRM_LAWYER_RUT", "16021492-9")
+    from app.models.lawyer import Lawyer
+
+    firm = db.query(Lawyer).filter(Lawyer.rut == firm_rut).first()
+    if firm is None:
+        raise RuntimeError(
+            f"FIRM_LAWYER_RUT={firm_rut!r} has no matching Lawyer row; "
+            "cannot resolve the firm's canonical lawyer_id"
+        )
+    return int(firm.id)
+
+
 def _resolve_lawyer_id(db: Session, current_lawyer: dict) -> int:
     """Resolve the numeric lawyer id from a JWT payload.
 
