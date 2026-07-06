@@ -28,7 +28,7 @@ depends_on: Union[str, Sequence[str], None] = None
 def upgrade() -> None:
     op.create_table(
         "case_merge_audit",
-        sa.Column("id", sa.Integer(), primary_key=True, index=True),
+        sa.Column("id", sa.Integer(), primary_key=True),
         # NOT a ForeignKey: the loser Case row is deleted by migration 024
         # after this row is written — a FK here would either block that
         # deletion or erase the id we need to keep for the audit trail.

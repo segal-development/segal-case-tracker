@@ -26,7 +26,7 @@ depends_on: Union[str, Sequence[str], None] = None
 def upgrade() -> None:
     op.create_table(
         "case_lawyer_source",
-        sa.Column("id", sa.Integer(), primary_key=True, index=True),
+        sa.Column("id", sa.Integer(), primary_key=True),
         sa.Column("case_id", sa.Integer(), sa.ForeignKey("cases.id"), nullable=False),
         sa.Column("lawyer_id", sa.Integer(), sa.ForeignKey("lawyers.id"), nullable=False),
         sa.Column("first_seen_at", sa.DateTime(), nullable=True),
