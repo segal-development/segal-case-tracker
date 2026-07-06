@@ -23,6 +23,22 @@ INGEST_URL = "/api/v1/pjud/ingest/cases"
 MOVEMENTS_URL = "/api/v1/pjud/ingest/movements"
 DOCUMENTS_URL = "/api/v1/pjud/ingest/documents"
 
+FIRM_RUT = "16021492-9"
+
+
+@pytest.fixture(autouse=True)
+def _seed_firm_lawyer(db):
+    """Seed the firm's canonical Lawyer row (FIRM_LAWYER_RUT default).
+
+    Approach C (unificar-modelo-causas, PR1b): ingest_cases upserts Case rows
+    under the firm lawyer_id, not the syncing lawyer's own id, so
+    firm_lawyer_id(db) must resolve for every ingest endpoint test here.
+    """
+    existing = db.query(Lawyer).filter(Lawyer.rut == FIRM_RUT).first()
+    if existing is None:
+        db.add(Lawyer(rut=FIRM_RUT, name="Firm Lawyer", is_active=True))
+        db.commit()
+
 
 def _case_row(token: str, rol: str, tribunal: str, caratulado: str) -> str:
     return f"""

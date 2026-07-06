@@ -11,11 +11,30 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 
 from app.models.case import Case
+from app.models.case_lawyer_source import CaseLawyerSource
 from app.models.court import Court
 from app.models.document import Document
 from app.models.lawyer import Lawyer
 from app.models.movement import Movement
 from app.services.ingest_service import IngestParseError, IngestService
+
+FIRM_RUT = "16021492-9"
+
+
+@pytest.fixture(autouse=True)
+def _seed_firm_lawyer(db):
+    """Seed the firm's canonical Lawyer row (FIRM_LAWYER_RUT default).
+
+    Approach C (unificar-modelo-causas, PR1b): ingest_cases/ingest_movements
+    upsert Case rows under the firm lawyer_id, not the syncing lawyer's own
+    id, so firm_lawyer_id(db) must resolve for every ingest test in this
+    module. Tests that need to exercise the "missing firm lawyer" error
+    monkeypatch FIRM_LAWYER_RUT to a RUT with no matching row instead.
+    """
+    existing = db.query(Lawyer).filter(Lawyer.rut == FIRM_RUT).first()
+    if existing is None:
+        db.add(Lawyer(rut=FIRM_RUT, name="Firm Lawyer", is_active=True))
+        db.commit()
 
 
 def _case_row(token: str, rol: str, tribunal: str, caratulado: str) -> str:
@@ -110,7 +129,10 @@ class TestIngestCasesValidPayload:
             )
 
         assert db.query(Case).count() == 0
-        assert db.query(Lawyer).count() == 0
+        # Only the pre-seeded firm lawyer exists — the parse error is raised
+        # before the syncing lawyer's own row would be get-or-created.
+        assert db.query(Lawyer).count() == 1
+        assert db.query(Lawyer).filter(Lawyer.rut == FIRM_RUT).count() == 1
 
     def test_concurrent_insert_race_is_handled_via_integrity_error(self, db, monkeypatch):
         """Simulate a race: another writer inserts the same rol mid-flight."""
@@ -145,6 +167,104 @@ class TestIngestCasesValidPayload:
             lawyer_rut=lawyer_rut, competencia="civil", pages=[VALID_PAGE]
         )
         assert "errors" in result
+
+
+class TestIngestCasesFirmOwnership:
+    """Task 1b-2/1b-3: ingest_cases upserts one Case per ROL under the firm
+    lawyer_id, never the syncing lawyer's own id, and records the syncing
+    lawyer's sighting via case_lawyer_source."""
+
+    def test_ingest_new_rol_creates_case_under_firm_lawyer_id(self, db):
+        service = IngestService(db)
+        service.ingest_cases(
+            lawyer_rut="11111111-1", competencia="civil", pages=[VALID_PAGE]
+        )
+
+        firm = db.query(Lawyer).filter(Lawyer.rut == FIRM_RUT).first()
+        cases = db.query(Case).all()
+        assert len(cases) == 2
+        assert all(c.lawyer_id == firm.id for c in cases)
+
+    def test_ingest_existing_rol_under_firm_upserts_no_duplicate(self, db):
+        service = IngestService(db)
+        service.ingest_cases(
+            lawyer_rut="11111111-1", competencia="civil", pages=[VALID_PAGE]
+        )
+        # A DIFFERENT syncing lawyer ingests the same ROLs — dedup is scoped
+        # by the firm id, not by which lawyer is syncing.
+        result = service.ingest_cases(
+            lawyer_rut="22222222-2", competencia="civil", pages=[VALID_PAGE]
+        )
+
+        assert result["new"] == 0
+        assert result["existing"] == 2
+        assert db.query(Case).filter(Case.rol == "C-1234-2026").count() == 1
+
+    def test_ingest_missing_firm_lawyer_raises_clear_error(self, db, monkeypatch):
+        monkeypatch.setenv("FIRM_LAWYER_RUT", "99999999-0")
+        service = IngestService(db)
+
+        with pytest.raises(RuntimeError, match="FIRM_LAWYER_RUT"):
+            service.ingest_cases(
+                lawyer_rut="11111111-1", competencia="civil", pages=[VALID_PAGE]
+            )
+
+        assert db.query(Case).count() == 0
+
+    def test_ingest_writes_case_lawyer_source_for_syncing_lawyer(self, db):
+        service = IngestService(db)
+        service.ingest_cases(
+            lawyer_rut="11111111-1", competencia="civil", pages=[VALID_PAGE]
+        )
+
+        syncing = db.query(Lawyer).filter(Lawyer.rut == "11111111-1").first()
+        case = db.query(Case).filter(Case.rol == "C-1234-2026").first()
+        source = (
+            db.query(CaseLawyerSource)
+            .filter(
+                CaseLawyerSource.case_id == case.id,
+                CaseLawyerSource.lawyer_id == syncing.id,
+            )
+            .first()
+        )
+        assert source is not None
+        assert source.last_seen_at is not None
+
+    def test_ingest_existing_rol_updates_last_seen_at_on_source_row(self, db):
+        service = IngestService(db)
+        service.ingest_cases(
+            lawyer_rut="11111111-1", competencia="civil", pages=[VALID_PAGE]
+        )
+        syncing = db.query(Lawyer).filter(Lawyer.rut == "11111111-1").first()
+        case = db.query(Case).filter(Case.rol == "C-1234-2026").first()
+        source = (
+            db.query(CaseLawyerSource)
+            .filter(
+                CaseLawyerSource.case_id == case.id,
+                CaseLawyerSource.lawyer_id == syncing.id,
+            )
+            .first()
+        )
+        first_seen = source.first_seen_at
+        original_last_seen = source.last_seen_at
+
+        service.ingest_cases(
+            lawyer_rut="11111111-1", competencia="civil", pages=[VALID_PAGE]
+        )
+
+        db.refresh(source)
+        assert source.first_seen_at == first_seen
+        assert source.last_seen_at >= original_last_seen
+        # Still exactly one source row for this (case, lawyer) pair.
+        assert (
+            db.query(CaseLawyerSource)
+            .filter(
+                CaseLawyerSource.case_id == case.id,
+                CaseLawyerSource.lawyer_id == syncing.id,
+            )
+            .count()
+            == 1
+        )
 
 
 # ---------------------------------------------------------------------------

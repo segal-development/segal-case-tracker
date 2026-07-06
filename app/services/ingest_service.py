@@ -18,8 +18,10 @@ from sqlalchemy import Integer, cast, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.api.deps import firm_lawyer_id
 from app.api.v1.auth import _get_or_create_lawyer
 from app.models.case import Case
+from app.models.case_lawyer_source import CaseLawyerSource
 from app.models.document import Document
 from app.models.lawyer import Lawyer
 from app.models.movement import Movement
@@ -88,6 +90,16 @@ class IngestService:
         Returns ``{"new": int, "existing": int, "errors": list[str]}``.
         Raises ``IngestParseError`` when none of the supplied pages look like
         a genuine Mis Causas listing — nothing is persisted in that case.
+
+        Approach C (unificar-modelo-causas, ADR-001): every Case is upserted
+        under the FIRM's canonical ``lawyer_id`` (``firm_lawyer_id``), never
+        the syncing lawyer's own id — dedup-by-ROL is scoped to the firm id
+        so the same ROL synced by different lawyers never creates a second
+        Case row. The syncing lawyer's own ``Lawyer`` row is still
+        get-or-created (needed for the ``case_lawyer_source`` sighting
+        below, which feeds ``get_pending_detail``'s per-syncing-lawyer
+        rotation). Raises ``RuntimeError`` (via ``firm_lawyer_id``) BEFORE
+        any lawyer/case row is touched when the firm Lawyer is misconfigured.
         """
         if competencia != "civil":
             raise IngestParseError(f"Unsupported competencia for ingest: {competencia!r}")
@@ -113,65 +125,113 @@ class IngestService:
                 seen.add(rol)
                 unique.append(c)
 
+        # Resolve the firm's canonical owner BEFORE touching any row — a
+        # misconfigured FIRM_LAWYER_RUT must leave nothing persisted.
+        owner_id = firm_lawyer_id(self.db)
+
         lawyer = _get_or_create_lawyer(self.db, rut=lawyer_rut)
-        lawyer_id = int(lawyer.id)
+        syncing_lawyer_id = int(lawyer.id)
 
         existing_rols = {
-            r for (r,) in self.db.query(Case.rol).filter(Case.lawyer_id == lawyer_id)
+            r for (r,) in self.db.query(Case.rol).filter(Case.lawyer_id == owner_id)
         }
         new_cases = [c for c in unique if c.rol.strip().upper() not in existing_rols]
         result = {"new": 0, "existing": len(unique) - len(new_cases), "errors": []}
 
-        if not new_cases:
-            return result
+        if new_cases:
+            sync = SyncService(self.db)
+            courts: dict = {}
+            now = datetime.utcnow()
+            mappings = []
+            for c in new_cases:
+                name = (c.tribunal or "Desconocido").strip() or "Desconocido"
+                if name not in courts:
+                    court = sync._get_or_create_court(name, competencia)
+                    courts[name] = court.id
+                plaintiff, defendant = sync._parse_caratulado(c.caratulado)
+                mappings.append(
+                    {
+                        "lawyer_id": owner_id,
+                        "court_id": courts[name],
+                        "rol": c.rol.strip().upper(),
+                        "competencia": competencia,
+                        "plaintiff": plaintiff,
+                        "defendant": defendant,
+                        "procedure": (c.cuaderno or None),
+                        "status": "active",
+                        "filed_at": _parse_filed_at(c.fecha_ingreso),
+                        "created_at": now,
+                        "updated_at": now,
+                    }
+                )
 
-        sync = SyncService(self.db)
-        courts: dict = {}
-        now = datetime.utcnow()
-        mappings = []
-        for c in new_cases:
-            name = (c.tribunal or "Desconocido").strip() or "Desconocido"
-            if name not in courts:
-                court = sync._get_or_create_court(name, competencia)
-                courts[name] = court.id
-            plaintiff, defendant = sync._parse_caratulado(c.caratulado)
-            mappings.append(
-                {
-                    "lawyer_id": lawyer_id,
-                    "court_id": courts[name],
-                    "rol": c.rol.strip().upper(),
-                    "competencia": competencia,
-                    "plaintiff": plaintiff,
-                    "defendant": defendant,
-                    "procedure": (c.cuaderno or None),
-                    "status": "active",
-                    "filed_at": _parse_filed_at(c.fecha_ingreso),
-                    "created_at": now,
-                    "updated_at": now,
+            try:
+                self.db.bulk_insert_mappings(Case, mappings)
+                self.db.commit()
+                result["new"] = len(mappings)
+            except IntegrityError:
+                # Race-safe upsert: another writer inserted one of these rols
+                # concurrently. Roll back, re-check what's actually in the DB
+                # now, and retry with only the rols that are still missing.
+                self.db.rollback()
+                existing_rols_retry = {
+                    r for (r,) in self.db.query(Case.rol).filter(Case.lawyer_id == owner_id)
                 }
-            )
+                retry_mappings = [m for m in mappings if m["rol"] not in existing_rols_retry]
+                skipped = len(mappings) - len(retry_mappings)
+                if retry_mappings:
+                    self.db.bulk_insert_mappings(Case, retry_mappings)
+                self.db.commit()
+                result["new"] = len(retry_mappings)
+                result["existing"] += skipped
 
-        try:
-            self.db.bulk_insert_mappings(Case, mappings)
-            self.db.commit()
-            result["new"] = len(mappings)
-        except IntegrityError:
-            # Race-safe upsert: another writer inserted one of these rols
-            # concurrently. Roll back, re-check what's actually in the DB
-            # now, and retry with only the rols that are still missing.
-            self.db.rollback()
-            existing_rols_retry = {
-                r for (r,) in self.db.query(Case.rol).filter(Case.lawyer_id == lawyer_id)
+        # Record the syncing lawyer's sighting of EVERY ROL in this payload
+        # (new or already-existing under the firm id) via case_lawyer_source
+        # — this is what lets get_pending_detail rotate per syncing lawyer
+        # even though every Case is firm-owned (ADR-002).
+        all_rols = {c.rol.strip().upper() for c in unique}
+        if all_rols:
+            case_ids_by_rol = {
+                rol: cid
+                for (cid, rol) in self.db.query(Case.id, Case.rol).filter(
+                    Case.lawyer_id == owner_id, Case.rol.in_(all_rols)
+                )
             }
-            retry_mappings = [m for m in mappings if m["rol"] not in existing_rols_retry]
-            skipped = len(mappings) - len(retry_mappings)
-            if retry_mappings:
-                self.db.bulk_insert_mappings(Case, retry_mappings)
+            sighted_at = datetime.utcnow()
+            for case_id in case_ids_by_rol.values():
+                self._upsert_case_lawyer_source(case_id, syncing_lawyer_id, sighted_at)
             self.db.commit()
-            result["new"] = len(retry_mappings)
-            result["existing"] += skipped
 
         return result
+
+    def _upsert_case_lawyer_source(
+        self, case_id: int, lawyer_id: int, seen_at: datetime
+    ) -> None:
+        """Upsert a ``case_lawyer_source(case_id, lawyer_id)`` sighting.
+
+        Creates the row (stamping both ``first_seen_at``/``last_seen_at``)
+        the first time this lawyer sees this case, otherwise refreshes only
+        ``last_seen_at``. Flush-only — caller commits.
+        """
+        row = (
+            self.db.query(CaseLawyerSource)
+            .filter(
+                CaseLawyerSource.case_id == case_id,
+                CaseLawyerSource.lawyer_id == lawyer_id,
+            )
+            .first()
+        )
+        if row is None:
+            self.db.add(
+                CaseLawyerSource(
+                    case_id=case_id,
+                    lawyer_id=lawyer_id,
+                    first_seen_at=seen_at,
+                    last_seen_at=seen_at,
+                )
+            )
+        else:
+            row.last_seen_at = seen_at
 
     def get_pending_detail(
         self, *, lawyer_rut: str, competencia: str, limit: int
