@@ -142,3 +142,57 @@ class TestListCasesEndpointFirmWideAttribution:
         assert resp.status_code == 200
         ids = {item["id"] for item in resp.json()["items"]}
         assert case.id in ids
+
+
+class TestListCasesEndpointBootstrapWindowFallback:
+    """``_bootstrap_owned_case_ids`` is the load-bearing safety net for a
+    just-synced case that has no ``CaseLitigante`` rows yet (see deps.py
+    docstring). These tests exercise it through the real endpoint rather
+    than by calling the helper directly, since the endpoint is what a
+    regression would actually break.
+    """
+
+    def test_list_cases_endpoint_shows_own_case_with_zero_litigante_rows(
+        self, client, db, sandy, court
+    ):
+        """Sandy owns a case (Case.lawyer_id == sandy.id) that has NO
+        CaseLitigante rows at all yet — the bootstrap window. It must still
+        appear in her GET /api/v1/cases."""
+        case = _make_case(db, sandy, court, "C-4005-2025")
+
+        async def _mock_get_current_lawyer():
+            return {"sub": SANDY_RUT}
+
+        app.dependency_overrides[get_current_lawyer] = _mock_get_current_lawyer
+        try:
+            resp = client.get("/api/v1/cases")
+        finally:
+            app.dependency_overrides.pop(get_current_lawyer, None)
+
+        assert resp.status_code == 200
+        ids = {item["id"] for item in resp.json()["items"]}
+        assert case.id in ids
+
+    def test_list_cases_endpoint_hides_own_case_with_litigantes_when_not_abogado(
+        self, client, db, sandy, carla, court
+    ):
+        """Sandy owns a case (Case.lawyer_id == sandy.id) that DOES have
+        litigante rows, but Sandy is not among them — she is not an
+        abogado-of-record. Once a case has litigantes, ownership via
+        Case.lawyer_id alone must NOT grant visibility (the security rule
+        the bootstrap fallback must not undermine)."""
+        case = _make_case(db, sandy, court, "C-4006-2025")
+        _add_litigante(db, case, CARLA_RUT, "Carla")
+
+        async def _mock_get_current_lawyer():
+            return {"sub": SANDY_RUT}
+
+        app.dependency_overrides[get_current_lawyer] = _mock_get_current_lawyer
+        try:
+            resp = client.get("/api/v1/cases")
+        finally:
+            app.dependency_overrides.pop(get_current_lawyer, None)
+
+        assert resp.status_code == 200
+        ids = {item["id"] for item in resp.json()["items"]}
+        assert case.id not in ids
