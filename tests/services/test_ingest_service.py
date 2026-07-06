@@ -620,3 +620,198 @@ class TestIngestMovementsDocuments:
         )
 
         assert db.query(Document).count() == 1
+
+
+# ---------------------------------------------------------------------------
+# ingest_movements — Case entity (litigantes) persistence
+# ---------------------------------------------------------------------------
+
+
+def _litigante_row(participante: str, rut: str, persona_type: str, nombre: str) -> str:
+    return f"""
+    <tr>
+      <td>{participante}</td>
+      <td>{rut}</td>
+      <td>{persona_type}</td>
+      <td>{nombre}</td>
+    </tr>
+    """
+
+
+def _detail_html_with_litigantes(
+    rol: str,
+    folio: str,
+    descripcion: str,
+    fecha: str,
+    litigantes: list[str],
+) -> str:
+    """Detail HTML carrying BOTH a movements pane (historiaCiv) and a
+    Litigantes pane (litigantesCiv), mirroring the real extension payload."""
+    lit_rows = "".join(litigantes)
+    return f"""
+    <html><body>
+      <table>
+        <tr><td><strong>ROL:</strong> {rol}</td></tr>
+        <tr><td><strong>Tribunal:</strong> 1 Juzgado Civil de Santiago</td></tr>
+      </table>
+      <div id="historiaCiv">
+        <div class="panel panel-default">
+          <div class="table-responsive">
+            <table class="table table-bordered table-striped table-hover">
+              <thead><tr><th>Folio</th><th>Doc.</th><th>Anexo</th><th>Etapa</th>
+              <th>Tramite</th><th>Desc.</th><th>Fecha</th><th>Foja</th><th>Geo</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td>{folio}</td>
+                  <td align="left"></td>
+                  <td align="center"></td>
+                  <td>En tramitacion</td>
+                  <td>Resolucion</td>
+                  <td></td>
+                  <td>{descripcion}</td>
+                  <td>{fecha}</td>
+                  <td>1</td>
+                  <td></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      <div class="tab-pane fade" id="litigantesCiv">
+        <div class="panel panel-default">
+          <div class="table-responsive">
+            <table class="table table-bordered table-striped table-hover">
+              <thead><tr><th>Participante</th><th>Rut</th><th>Persona</th>
+              <th>Nombre o Razon Social</th></tr></thead>
+              <tbody>{lit_rows}</tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </body></html>
+    """
+
+
+class TestIngestMovementsLitigantes:
+    def test_litigantes_pane_creates_case_litigante_rows(
+        self, db, seeded_lawyer_and_case
+    ):
+        from app.models.case_litigante import CaseLitigante
+        from app.services.sync_service import litigante_natural_key
+        from app.scrapper.pjud.base import PJUDLitigante
+
+        html = _detail_html_with_litigantes(
+            "C-1234-2026", "1", "Se dicta resolucion", "15/01/2026",
+            litigantes=[
+                _litigante_row("DTE.", "76543210-K", "JURIDICA", "BANCO FICTICIO S.A."),
+                _litigante_row("AB.DTE", "11111111-1", "NATURAL", "TEST LAWYER"),
+                _litigante_row("DDO.", "11234567-K", "NATURAL", "ROBERTO VIDAL"),
+            ],
+        )
+
+        service = IngestService(db)
+        result = service.ingest_movements(
+            lawyer_rut="11111111-1",
+            competencia="civil",
+            cases=[{"rol": "C-1234-2026", "html": html}],
+        )
+
+        assert result["cases_processed"] == 1
+        assert result["errors"] == []
+
+        case = db.query(Case).filter(Case.rol == "C-1234-2026").first()
+        rows = (
+            db.query(CaseLitigante)
+            .filter(CaseLitigante.case_id == case.id)
+            .all()
+        )
+        assert len(rows) == 3
+        assert {r.rut for r in rows} == {"76543210-K", "11111111-1", "11234567-K"}
+        assert {r.participante for r in rows} == {"DTE.", "AB.DTE", "DDO."}
+
+        # Natural keys match the sync-layer derivation (dedup spine).
+        expected_key = litigante_natural_key(
+            PJUDLitigante(
+                participante="AB.DTE",
+                rut="11111111-1",
+                persona_type="NATURAL",
+                nombre="TEST LAWYER",
+            )
+        )
+        ab_row = next(r for r in rows if r.participante == "AB.DTE")
+        assert ab_row.natural_key == expected_key
+
+    def test_re_ingest_does_not_duplicate_litigantes(
+        self, db, seeded_lawyer_and_case
+    ):
+        from app.models.case_litigante import CaseLitigante
+
+        html = _detail_html_with_litigantes(
+            "C-1234-2026", "1", "Se dicta resolucion", "15/01/2026",
+            litigantes=[
+                _litigante_row("DTE.", "76543210-K", "JURIDICA", "BANCO FICTICIO S.A."),
+                _litigante_row("AB.DTE", "11111111-1", "NATURAL", "TEST LAWYER"),
+            ],
+        )
+        service = IngestService(db)
+        service.ingest_movements(
+            lawyer_rut="11111111-1", competencia="civil",
+            cases=[{"rol": "C-1234-2026", "html": html}],
+        )
+        service.ingest_movements(
+            lawyer_rut="11111111-1", competencia="civil",
+            cases=[{"rol": "C-1234-2026", "html": html}],
+        )
+
+        assert db.query(CaseLitigante).count() == 2
+
+    def test_case_becomes_visible_to_abogado_after_ingest(
+        self, db, seeded_lawyer_and_case
+    ):
+        """The core bug: extension-synced cases must be attributable to the
+        abogado via case_ids_for_abogado (the per-abogado frontend view)."""
+        from app.services.lawyer_roster import case_ids_for_abogado
+
+        html = _detail_html_with_litigantes(
+            "C-1234-2026", "1", "Se dicta resolucion", "15/01/2026",
+            litigantes=[
+                _litigante_row("DTE.", "76543210-K", "JURIDICA", "BANCO FICTICIO S.A."),
+                _litigante_row("AB.DTE", "11111111-1", "NATURAL", "TEST LAWYER"),
+            ],
+        )
+        service = IngestService(db)
+        service.ingest_movements(
+            lawyer_rut="11111111-1", competencia="civil",
+            cases=[{"rol": "C-1234-2026", "html": html}],
+        )
+
+        case = db.query(Case).filter(Case.rol == "C-1234-2026").first()
+        ids = case_ids_for_abogado(db, "11111111-1", "11111111-1")
+        assert case.id in ids
+
+    def test_entityless_detail_still_processes_movements(
+        self, db, seeded_lawyer_and_case
+    ):
+        """Isolation: a detail with NO litigantes pane persists movements fine
+        and simply creates zero case_litigantes rows."""
+        from app.models.case_litigante import CaseLitigante
+
+        service = IngestService(db)
+        result = service.ingest_movements(
+            lawyer_rut="11111111-1",
+            competencia="civil",
+            cases=[
+                {
+                    "rol": "C-1234-2026",
+                    "html": _detail_html(
+                        "C-1234-2026", "1", "Se dicta resolucion", "15/01/2026"
+                    ),
+                }
+            ],
+        )
+
+        assert result["cases_processed"] == 1
+        assert result["movements_new"] == 1
+        assert result["errors"] == []
+        assert db.query(CaseLitigante).count() == 0

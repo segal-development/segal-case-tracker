@@ -32,6 +32,10 @@ from app.services.sync_service import (
     SyncService,
     _maybe_recompute_deadlines,
     convert_api_movements_to_scraped,
+    upsert_escritos,
+    upsert_exhortos,
+    upsert_litigantes,
+    upsert_notificaciones,
 )
 from app.utils.rut import normalize_rut
 
@@ -258,11 +262,13 @@ class IngestService:
         ``get_pending_detail`` page. ``failed_stamped`` reports how many rotated.
 
         Returns
-        ``{"cases_processed", "movements_new", "classified", "failed_stamped", "errors"}``.
+        ``{"cases_processed", "movements_new", "litigantes_new", "classified",
+        "failed_stamped", "errors"}``.
         """
         result = {
             "cases_processed": 0,
             "movements_new": 0,
+            "litigantes_new": 0,
             "classified": 0,
             "failed_stamped": 0,
             "errors": [],
@@ -320,6 +326,34 @@ class IngestService:
             if scraped_movements:
                 new_count, _alerts = sync.sync_movements(
                     case_id=int(case.id), scraped_movements=scraped_movements
+                )
+
+            # Persist case entities (litigantes, notificaciones, escritos,
+            # exhortos) already parsed into `detail`. Without this the case has
+            # ZERO case_litigantes rows, so case_ids_for_abogado (the per-abogado
+            # frontend view) cannot attribute it to any lawyer and the case is
+            # invisible in that view — the extension sync's core bug.
+            #
+            # ADR-004: litigantes are SILENT — the upsert_* helpers deliberately
+            # create no alert/notification (storage-only), so nothing is
+            # dispatched here. Idempotent on (case_id, natural_key), so
+            # re-ingesting the same detail never duplicates rows. Flush-only
+            # (no internal commit) — covered by the single commit below.
+            # Failure isolation: an entity-persistence error lands in `errors`
+            # and must NOT poison the movement commit.
+            try:
+                lit_new = sum(
+                    1 for _, is_new in upsert_litigantes(
+                        self.db, int(case.id), detail.litigantes
+                    ) if is_new
+                )
+                upsert_notificaciones(self.db, int(case.id), detail.notificaciones)
+                upsert_escritos(self.db, int(case.id), detail.escritos)
+                upsert_exhortos(self.db, int(case.id), detail.exhortos)
+                result["litigantes_new"] += lit_new
+            except Exception as exc:  # noqa: BLE001 — entity persistence is best-effort
+                result["errors"].append(
+                    f"Entity persistence failed for {rol}: {exc}"
                 )
 
             # Persist document tokens (Slice 3). Must run AFTER sync_movements so
