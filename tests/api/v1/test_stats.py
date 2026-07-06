@@ -301,6 +301,66 @@ class TestFirmStatsEndpoint:
 
 
 # ---------------------------------------------------------------------------
+# Unit tests: firm_dashboard_stats_all (auditor, firm-wide per-abogado breakdown)
+# ---------------------------------------------------------------------------
+
+
+class TestFirmDashboardStatsAll:
+    def test_firm_dashboard_stats_all_groups_by_abogado_not_lawyer_id(self, db, court):
+        """Under Approach C, Case.lawyer_id is constant (the firm account), so
+        grouping by it would collapse everyone into one row. The auditor
+        breakdown must group by abogado-of-record litigante RUT instead."""
+        firm_account = Lawyer(rut="16021492-9", name="Firm Account")
+        db.add(firm_account)
+        db.commit()
+        db.refresh(firm_account)
+
+        c1 = _make_case(db, firm_account, court, "C-8010-2025")
+        c2 = _make_case(db, firm_account, court, "C-8011-2025")
+
+        db.add(CaseLitigante(
+            case_id=c1.id, participante="AB.DDO", rut="88888888-8",
+            persona_type="NATURAL", nombre="Lawyer A", natural_key=f"{c1.id}-a",
+        ))
+        db.add(CaseLitigante(
+            case_id=c2.id, participante="AB.DDO", rut="99999999-9",
+            persona_type="NATURAL", nombre="Lawyer B", natural_key=f"{c2.id}-b",
+        ))
+        db.commit()
+
+        from app.services.lawyer_roster import firm_dashboard_stats_all
+
+        result = firm_dashboard_stats_all(db)
+        ruts = {row["rut"] for row in result["by_lawyer"]}
+        assert ruts == {"88888888-8", "99999999-9"}
+
+    def test_firm_dashboard_stats_all_counts_case_once_per_abogado_appearing_twice(self, db, court):
+        """A lawyer listed twice as litigante (e.g. patrocinante + AB.DDO) on
+        the same case must be counted once for that case, not twice."""
+        firm_account = Lawyer(rut="16021492-9", name="Firm Account")
+        db.add(firm_account)
+        db.commit()
+        db.refresh(firm_account)
+
+        c1 = _make_case(db, firm_account, court, "C-8012-2025")
+        db.add(CaseLitigante(
+            case_id=c1.id, participante="AB.DDO", rut="88888888-8",
+            persona_type="NATURAL", nombre="Lawyer A", natural_key=f"{c1.id}-a1",
+        ))
+        db.add(CaseLitigante(
+            case_id=c1.id, participante="AP.DDO", rut="88888888-8",
+            persona_type="NATURAL", nombre="Lawyer A", natural_key=f"{c1.id}-a2",
+        ))
+        db.commit()
+
+        from app.services.lawyer_roster import firm_dashboard_stats_all
+
+        result = firm_dashboard_stats_all(db)
+        row = next(r for r in result["by_lawyer"] if r["rut"] == "88888888-8")
+        assert row["case_count"] == 1
+
+
+# ---------------------------------------------------------------------------
 # Unit tests: admin_dashboard_stats
 # ---------------------------------------------------------------------------
 

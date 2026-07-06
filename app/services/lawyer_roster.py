@@ -235,20 +235,18 @@ def firm_dashboard_stats(db: Session, account_rut: str) -> dict:
 
 
 def firm_dashboard_stats_all(db: Session) -> dict:
-    """Firm-wide dashboard stats spanning EVERY study case, across ALL lawyers.
+    """Firm-wide dashboard stats spanning EVERY study case, across ALL abogados.
 
     Used for the auditor role, a transversal role overseeing the whole
-    firm's caseload. Unlike ``firm_dashboard_stats`` (single account +
-    co-side litigante inference — the model that fit when one account
-    scraped the entire firm's caseload), this aggregates directly over
-    every civil ``Case`` row grouped by its own ``Case.lawyer_id``: cases
-    are now attributed per-lawyer, so ownership is already explicit and no
-    litigante-side inference is needed.
+    firm's caseload. Under Approach C every ``Case.lawyer_id`` is the firm's
+    single bookkeeping owner, so grouping by it (the old behavior) would
+    collapse every case into one row. The per-abogado breakdown is instead
+    entirely litigante-derived: every AB./AP. litigante firm-wide is grouped
+    by their own RUT, independent of ``Case.lawyer_id``.
     """
     cases = (
         db.query(
             Case.id,
-            Case.lawyer_id,
             Case.semaforo,
             Case.last_movement_at,
             Case.procedure,
@@ -257,6 +255,7 @@ def firm_dashboard_stats_all(db: Session) -> dict:
         .filter(Case.competencia == "civil")
         .all()
     )
+    case_map = {c.id: c for c in cases}
 
     def _sem_bucket(sem: Optional[str]) -> str:
         return sem if sem in ("rojo", "amarillo", "verde") else "otros"
@@ -270,7 +269,6 @@ def firm_dashboard_stats_all(db: Session) -> dict:
     stale_total = 0
     materia_counts: defaultdict[str, int] = defaultdict(int)
     stage_counts: defaultdict[str, int] = defaultdict(int)
-    by_lawyer_cases: defaultdict[int, list] = defaultdict(list)
 
     for c in cases:
         sem_totals[_sem_bucket(c.semaforo)] += 1
@@ -279,7 +277,6 @@ def firm_dashboard_stats_all(db: Session) -> dict:
         materia_counts[c.procedure or "Sin materia"] += 1
         stage = c.procedural_state if c.procedural_state is not None else "sin_clasificar"
         stage_counts[stage] += 1
-        by_lawyer_cases[c.lawyer_id].append(c)
 
     by_materia = sorted(
         [{"materia": m, "count": cnt} for m, cnt in materia_counts.items()],
@@ -301,26 +298,35 @@ def firm_dashboard_stats_all(db: Session) -> dict:
     )
     by_procedural_state = [{"stage": s, "count": stage_counts[s]} for s in ordered_stages]
 
-    lawyer_ids = list(by_lawyer_cases.keys())
-    lawyers_by_id = (
-        {lw.id: lw for lw in db.query(Lawyer).filter(Lawyer.id.in_(lawyer_ids)).all()}
-        if lawyer_ids
-        else {}
-    )
+    # Firm-wide per-abogado breakdown: group cases by every AB./AP. litigante
+    # RUT appearing on them (no single-account side filter — count every
+    # abogado on every case). A lawyer appearing twice on the same case
+    # (e.g. patrocinante + AB.DDO) is counted once for that case.
+    by_case = _abogado_litigantes_by_case(db)
+    abogado_case_ids: dict[str, set[int]] = defaultdict(set)
+    abogado_nombre: dict[str, str] = {}
+    for case_id, litigantes in by_case.items():
+        if case_id not in case_map:
+            continue
+        for lit in litigantes:
+            norm = normalize_rut(lit.rut)
+            abogado_case_ids[norm].add(case_id)
+            if norm not in abogado_nombre:
+                abogado_nombre[norm] = _clean_nombre(lit.nombre)
 
     by_lawyer = []
-    for lid, lcases in by_lawyer_cases.items():
+    for norm_rut, case_ids in abogado_case_ids.items():
         lsem: dict[str, int] = {"rojo": 0, "amarillo": 0, "verde": 0, "otros": 0}
         lstale = 0
-        for c in lcases:
+        for cid in case_ids:
+            c = case_map[cid]
             lsem[_sem_bucket(c.semaforo)] += 1
             if _is_stale(c.last_movement_at):
                 lstale += 1
-        lw = lawyers_by_id.get(lid)
         by_lawyer.append({
-            "rut": normalize_rut(lw.rut) if lw else "",
-            "nombre": _clean_nombre(lw.name) if lw else "",
-            "case_count": len(lcases),
+            "rut": norm_rut,
+            "nombre": abogado_nombre.get(norm_rut, ""),
+            "case_count": len(case_ids),
             "rojo": lsem["rojo"],
             "amarillo": lsem["amarillo"],
             "verde": lsem["verde"],
