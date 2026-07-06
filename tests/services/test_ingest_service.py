@@ -312,16 +312,21 @@ MOVEMENTS_MALFORMED_HTML = "<html><body>Not a PJUD detail page.</body></html>"
 
 @pytest.fixture
 def seeded_lawyer_and_case(db):
+    """Case is FIRM-owned (Approach C) — ingest_movements resolves cases by
+    the firm lawyer_id, never the syncing lawyer's own id. ``lawyer`` here is
+    the SYNCING lawyer passed as ``lawyer_rut`` to ingest_movements calls."""
     lawyer = Lawyer(rut="11111111-1", name="Test Lawyer", is_active=True)
     db.add(lawyer)
     db.flush()
+
+    firm = db.query(Lawyer).filter(Lawyer.rut == FIRM_RUT).first()
 
     court = Court(code="T1-ING-MOV", name="Juzgado Ingest Movements Test", region="RM", type="civil")
     db.add(court)
     db.flush()
 
     case = Case(
-        lawyer_id=lawyer.id,
+        lawyer_id=firm.id,
         court_id=court.id,
         rol="C-1234-2026",
         competencia="civil",
@@ -329,7 +334,7 @@ def seeded_lawyer_and_case(db):
     )
     db.add(case)
     db.commit()
-    return {"lawyer": lawyer, "case": case}
+    return {"lawyer": lawyer, "case": case, "firm": firm}
 
 
 class TestGetPendingDetail:
@@ -514,15 +519,71 @@ class TestIngestMovements:
         assert len(result["errors"]) == 1
 
 
+class TestIngestMovementsFirmOwnership:
+    """Task 1b-4: ingest_movements resolves the FIRM-owned Case (never the
+    syncing lawyer's own id) and records the syncing lawyer's sighting via
+    case_lawyer_source."""
+
+    def test_ingest_movements_resolves_firm_owned_case(self, db, seeded_lawyer_and_case):
+        """A DIFFERENT lawyer than the one who originally synced the case can
+        still resolve+process it via ingest_movements, because the Case is
+        firm-owned, not owned by whichever lawyer first synced it."""
+        other_syncer = Lawyer(rut="33333333-3", name="Other Syncer", is_active=True)
+        db.add(other_syncer)
+        db.commit()
+
+        service = IngestService(db)
+        result = service.ingest_movements(
+            lawyer_rut="33333333-3",
+            competencia="civil",
+            cases=[
+                {
+                    "rol": "C-1234-2026",
+                    "html": _detail_html("C-1234-2026", "1", "Se dicta resolucion", "15/01/2026"),
+                }
+            ],
+        )
+
+        assert result["cases_processed"] == 1
+        assert result["errors"] == []
+
+    def test_ingest_movements_writes_case_lawyer_source(self, db, seeded_lawyer_and_case):
+        lawyer = seeded_lawyer_and_case["lawyer"]
+        case = seeded_lawyer_and_case["case"]
+
+        service = IngestService(db)
+        service.ingest_movements(
+            lawyer_rut="11111111-1",
+            competencia="civil",
+            cases=[
+                {
+                    "rol": "C-1234-2026",
+                    "html": _detail_html("C-1234-2026", "1", "Se dicta resolucion", "15/01/2026"),
+                }
+            ],
+        )
+
+        source = (
+            db.query(CaseLawyerSource)
+            .filter(
+                CaseLawyerSource.case_id == case.id,
+                CaseLawyerSource.lawyer_id == lawyer.id,
+            )
+            .first()
+        )
+        assert source is not None
+        assert source.last_seen_at is not None
+
+
 class TestIngestMovementsFailedRols:
     def test_failed_rols_stamped_when_session_confirmed(self, db, seeded_lawyer_and_case):
         """With the session confirmed (>=1 case processed) even a RECENT
         un-fetchable ROL is stamped so it rotates to the back — no movements,
         no classification. Age only matters on a systemic (zero-success) batch."""
-        lawyer = seeded_lawyer_and_case["lawyer"]
+        firm = seeded_lawyer_and_case["firm"]
         court = db.query(Court).first()
         recent_failed = f"C-5555-{datetime.utcnow().year}"
-        db.add(Case(lawyer_id=lawyer.id, court_id=court.id, rol=recent_failed,
+        db.add(Case(lawyer_id=firm.id, court_id=court.id, rol=recent_failed,
                     competencia="civil", status="active"))
         db.commit()
 
@@ -547,14 +608,45 @@ class TestIngestMovementsFailedRols:
         assert failed.last_detail_checked_at is not None
         assert failed.semaforo is None  # never classified — no detail was parsed
 
+    def test_failed_rols_rotation_resolves_firm_case_not_syncing_lawyer(
+        self, db, seeded_lawyer_and_case
+    ):
+        """Task 1b-4: failed_rols rotation resolves the case by the FIRM
+        lawyer_id, not the syncing lawyer's own id — a case a DIFFERENT
+        lawyer originally synced (still firm-owned) still rotates correctly
+        when reported as failed by this syncing lawyer."""
+        firm = seeded_lawyer_and_case["firm"]
+        court = db.query(Court).first()
+        db.add(Case(lawyer_id=firm.id, court_id=court.id, rol="C-100-2006",
+                    competencia="civil", status="active"))
+        db.commit()
+
+        service = IngestService(db)
+        result = service.ingest_movements(
+            lawyer_rut="11111111-1",
+            competencia="civil",
+            cases=[
+                {
+                    "rol": "C-1234-2026",
+                    "html": _detail_html("C-1234-2026", "1", "Se dicta resolucion", "15/01/2026"),
+                }
+            ],
+            failed_rols=["C-100-2006"],
+        )
+
+        assert result["failed_stamped"] == 1
+        case = db.query(Case).filter(Case.rol == "C-100-2006").first()
+        assert case.last_detail_checked_at is not None
+        assert case.lawyer_id == firm.id  # never re-pointed to the syncing lawyer
+
     def test_recent_failed_rols_not_stamped_on_systemic_failure(self, db, seeded_lawyer_and_case):
         """RUT/session-mismatch guard: when NOTHING in the batch succeeds, recent
         ROLs keep their priority. A mismatch (wrong RUT for the session) surfaces
         recent, valuable ROLs — stamping them would rotate a whole active caseload."""
-        lawyer = seeded_lawyer_and_case["lawyer"]
+        firm = seeded_lawyer_and_case["firm"]
         court = db.query(Court).first()
         recent_rol = f"C-7777-{datetime.utcnow().year}"
-        db.add(Case(lawyer_id=lawyer.id, court_id=court.id, rol=recent_rol,
+        db.add(Case(lawyer_id=firm.id, court_id=court.id, rol=recent_rol,
                     competencia="civil", status="active"))
         db.commit()
 
@@ -574,9 +666,9 @@ class TestIngestMovementsFailedRols:
     def test_old_failed_rols_stamped_even_on_systemic_failure(self, db, seeded_lawyer_and_case):
         """The all-old tail still clears: with zero successes, clearly-old (closed)
         ROLs rotate so they stop clogging every pending-detail page."""
-        lawyer = seeded_lawyer_and_case["lawyer"]
+        firm = seeded_lawyer_and_case["firm"]
         court = db.query(Court).first()
-        db.add(Case(lawyer_id=lawyer.id, court_id=court.id, rol="C-100-2006",
+        db.add(Case(lawyer_id=firm.id, court_id=court.id, rol="C-100-2006",
                     competencia="civil", status="active"))
         db.commit()
 

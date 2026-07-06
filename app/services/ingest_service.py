@@ -301,14 +301,19 @@ class IngestService:
         """Parse raw detail-modal HTML relayed by the extension and persist movements.
 
         For each ``{"rol": ..., "html": ...}`` entry: resolve the existing
-        ``Case`` by ``(rol, lawyer_id)`` (no case creation here — cases come
-        from the Slice 1 ``/ingest/cases`` path), parse movements via
+        ``Case`` by ``(rol, firm lawyer_id)`` (Approach C — every Case is
+        firm-owned; no case creation here — cases come from the
+        ``/ingest/cases`` path), parse movements via
         ``CivilScraper._parse_case_detail_html``/``_parse_movements_table``
         (no browser), persist via ``SyncService.sync_movements``, stamp
         ``last_detail_checked_at``, and recompute the deadline/semáforo via
         ``DeadlineEngine.recompute_case`` (through the same
         ``_maybe_recompute_deadlines`` safe-fail wrapper used by the live
         scraper sync path) so previously-untracked cases get classified.
+        Also defensively upserts ``case_lawyer_source(case_id, syncing lawyer)``
+        for every resolved case (ADR-002) — ``/ingest/cases`` normally records
+        this sighting already, but a case reached only through this endpoint
+        (or a stale source row) still gets recorded here.
 
         A per-case failure (unknown ROL, malformed HTML) is recorded in
         ``errors`` and the batch continues — never raises, never persists a
@@ -316,7 +321,7 @@ class IngestService:
 
         ``failed_rols`` are ROLs the extension could NOT resolve in the live
         Mis Causas list (typically old/closed causes) — they carry no detail
-        HTML. For each one belonging to this lawyer+competencia, stamp
+        HTML. For each one belonging to the firm+competencia, stamp
         ``last_detail_checked_at`` (no movements, no deadline recompute) so it
         rotates to the back of the batch instead of clogging every future
         ``get_pending_detail`` page. ``failed_stamped`` reports how many rotated.
@@ -345,6 +350,8 @@ class IngestService:
             result["errors"].append(f"Unknown lawyer rut: {lawyer_rut}")
             return result
 
+        owner_id = firm_lawyer_id(self.db)
+
         scraper = CivilScraper(headless=True)
         sync = SyncService(self.db)
 
@@ -354,12 +361,15 @@ class IngestService:
 
             case = (
                 self.db.query(Case)
-                .filter(Case.lawyer_id == lawyer.id, Case.rol == rol)
+                .filter(Case.lawyer_id == owner_id, Case.rol == rol)
                 .first()
             )
             if case is None:
                 result["errors"].append(f"Unknown case rol for lawyer: {rol!r}")
                 continue
+
+            self._upsert_case_lawyer_source(int(case.id), int(lawyer.id), datetime.utcnow())
+            self.db.commit()
 
             try:
                 detail = scraper._parse_case_detail_html(html, case_token="")
@@ -467,7 +477,7 @@ class IngestService:
             case = (
                 self.db.query(Case)
                 .filter(
-                    Case.lawyer_id == lawyer.id,
+                    Case.lawyer_id == owner_id,
                     Case.competencia == competencia,
                     Case.rol == rol,
                 )

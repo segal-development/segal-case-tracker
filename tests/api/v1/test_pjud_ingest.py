@@ -180,7 +180,14 @@ MOVEMENTS_MALFORMED_HTML = "<html><body>Not a PJUD detail page.</body></html>"
 
 @pytest.fixture
 def seeded_case(db):
-    """Lawyer + Court + Case pre-seeded for movements ingest tests."""
+    """Lawyer + Court + Case pre-seeded for movements/documents ingest tests.
+
+    NOTE: ``ingest_documents`` is NOT part of PR1b's firm-ownership rewrite
+    (scoped to ingest_cases/ingest_movements/get_pending_detail only — see
+    sdd/unificar-modelo-causas/tasks 1b-2..1b-5), so this case stays owned by
+    the syncing lawyer's own id. Movements endpoint tests use the separate
+    ``seeded_case_firm`` fixture below.
+    """
     lawyer = Lawyer(rut="11111111-1", name="Test Lawyer", is_active=True)
     db.add(lawyer)
     db.flush()
@@ -201,8 +208,38 @@ def seeded_case(db):
     return {"lawyer": lawyer, "case": case}
 
 
+@pytest.fixture
+def seeded_case_firm(db):
+    """Lawyer + Court + Case pre-seeded for movements ingest tests.
+
+    Case is FIRM-owned (Approach C) — ingest_movements resolves cases by the
+    firm lawyer_id, never the syncing lawyer's own id. ``lawyer`` is the
+    SYNCING lawyer passed as ``rut`` in the request payload.
+    """
+    lawyer = Lawyer(rut="11111111-1", name="Test Lawyer", is_active=True)
+    db.add(lawyer)
+    db.flush()
+
+    firm = db.query(Lawyer).filter(Lawyer.rut == FIRM_RUT).first()
+
+    court = Court(code="T1-MOV-FIRM", name="Juzgado Movements Firm Test", region="RM", type="civil")
+    db.add(court)
+    db.flush()
+
+    case = Case(
+        lawyer_id=firm.id,
+        court_id=court.id,
+        rol="C-1234-2026",
+        competencia="civil",
+        status="active",
+    )
+    db.add(case)
+    db.commit()
+    return {"lawyer": lawyer, "case": case, "firm": firm}
+
+
 class TestIngestMovementsEndpointAuth:
-    def test_missing_key_returns_401(self, client, seeded_case):
+    def test_missing_key_returns_401(self, client, seeded_case_firm):
         response = client.post(
             MOVEMENTS_URL,
             json={
@@ -218,7 +255,7 @@ class TestIngestMovementsEndpointAuth:
         )
         assert response.status_code == 401
 
-    def test_invalid_key_returns_403(self, client, ingest_key, seeded_case):
+    def test_invalid_key_returns_403(self, client, ingest_key, seeded_case_firm):
         response = client.post(
             MOVEMENTS_URL,
             json={
@@ -238,7 +275,7 @@ class TestIngestMovementsEndpointAuth:
 
 class TestIngestMovementsEndpointHappyPath:
     def test_valid_detail_html_persists_movements_and_classifies(
-        self, client, ingest_key, seeded_case, db
+        self, client, ingest_key, seeded_case_firm, db
     ):
         response = client.post(
             MOVEMENTS_URL,
@@ -269,7 +306,7 @@ class TestIngestMovementsEndpointHappyPath:
         assert case.last_detail_checked_at is not None
         assert case.semaforo is not None
 
-    def test_unknown_rol_is_skipped_with_error(self, client, ingest_key, seeded_case):
+    def test_unknown_rol_is_skipped_with_error(self, client, ingest_key, seeded_case_firm):
         response = client.post(
             MOVEMENTS_URL,
             json={
@@ -289,14 +326,14 @@ class TestIngestMovementsEndpointHappyPath:
         assert data["cases_processed"] == 0
         assert len(data["errors"]) == 1
 
-    def test_forwards_failed_rols_and_stamps_them(self, client, ingest_key, seeded_case, db):
+    def test_forwards_failed_rols_and_stamps_them(self, client, ingest_key, seeded_case_firm, db):
         """A failed-only POST (no successful cases) stamps clearly-OLD ROLs so
         they rotate out of subsequent batches. Recent ROLs are protected by the
         systemic-failure guard (a RUT/session mismatch surfaces recent ROLs) —
         covered in the service-level tests."""
-        lawyer = db.query(Lawyer).filter(Lawyer.rut == "11111111-1").first()
+        firm = db.query(Lawyer).filter(Lawyer.rut == FIRM_RUT).first()
         court = db.query(Court).first()
-        db.add(Case(lawyer_id=lawyer.id, court_id=court.id, rol="C-100-2006",
+        db.add(Case(lawyer_id=firm.id, court_id=court.id, rol="C-100-2006",
                     competencia="civil", status="active"))
         db.commit()
 
@@ -318,7 +355,7 @@ class TestIngestMovementsEndpointHappyPath:
         case = db.query(Case).filter(Case.rol == "C-100-2006").first()
         assert case.last_detail_checked_at is not None
 
-    def test_malformed_html_is_graceful_no_500(self, client, ingest_key, seeded_case):
+    def test_malformed_html_is_graceful_no_500(self, client, ingest_key, seeded_case_firm):
         response = client.post(
             MOVEMENTS_URL,
             json={
