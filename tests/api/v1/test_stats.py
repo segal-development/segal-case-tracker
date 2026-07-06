@@ -176,6 +176,23 @@ class TestFirmDashboardStats:
         assert result["totals"]["cases"] == 0
         assert result["by_lawyer"] == []
 
+    def test_totals_include_cases_synced_under_different_lawyer_id(self, db, lawyer, court):
+        """Firm-wide: a civil case synced under a different lawyer's account
+        (Case.lawyer_id != the querying account's own id) still counts toward
+        firm-wide totals when the account is an abogado-of-record litigante."""
+        other_lawyer = Lawyer(rut="77777777-7", name="Other Syncer")
+        db.add(other_lawyer)
+        db.commit()
+        db.refresh(other_lawyer)
+
+        c1 = _make_case(db, lawyer, court, "C-5010-2025")
+        c2 = _make_case(db, other_lawyer, court, "C-5011-2025")
+        _seed_litigantes(db, c1)
+        _seed_litigantes(db, c2)
+
+        result = firm_dashboard_stats(db, ACCOUNT_RUT)
+        assert result["totals"]["cases"] == 2
+
     def test_by_procedural_state_counts_and_order(self, db, lawyer, court):
         c1 = _make_case(db, lawyer, court, "C-7001-2025", procedural_state="notificado")
         c2 = _make_case(db, lawyer, court, "C-7002-2025", procedural_state="notificado")
@@ -284,6 +301,66 @@ class TestFirmStatsEndpoint:
 
 
 # ---------------------------------------------------------------------------
+# Unit tests: firm_dashboard_stats_all (auditor, firm-wide per-abogado breakdown)
+# ---------------------------------------------------------------------------
+
+
+class TestFirmDashboardStatsAll:
+    def test_firm_dashboard_stats_all_groups_by_abogado_not_lawyer_id(self, db, court):
+        """Under Approach C, Case.lawyer_id is constant (the firm account), so
+        grouping by it would collapse everyone into one row. The auditor
+        breakdown must group by abogado-of-record litigante RUT instead."""
+        firm_account = Lawyer(rut="16021492-9", name="Firm Account")
+        db.add(firm_account)
+        db.commit()
+        db.refresh(firm_account)
+
+        c1 = _make_case(db, firm_account, court, "C-8010-2025")
+        c2 = _make_case(db, firm_account, court, "C-8011-2025")
+
+        db.add(CaseLitigante(
+            case_id=c1.id, participante="AB.DDO", rut="88888888-8",
+            persona_type="NATURAL", nombre="Lawyer A", natural_key=f"{c1.id}-a",
+        ))
+        db.add(CaseLitigante(
+            case_id=c2.id, participante="AB.DDO", rut="99999999-9",
+            persona_type="NATURAL", nombre="Lawyer B", natural_key=f"{c2.id}-b",
+        ))
+        db.commit()
+
+        from app.services.lawyer_roster import firm_dashboard_stats_all
+
+        result = firm_dashboard_stats_all(db)
+        ruts = {row["rut"] for row in result["by_lawyer"]}
+        assert ruts == {"88888888-8", "99999999-9"}
+
+    def test_firm_dashboard_stats_all_counts_case_once_per_abogado_appearing_twice(self, db, court):
+        """A lawyer listed twice as litigante (e.g. patrocinante + AB.DDO) on
+        the same case must be counted once for that case, not twice."""
+        firm_account = Lawyer(rut="16021492-9", name="Firm Account")
+        db.add(firm_account)
+        db.commit()
+        db.refresh(firm_account)
+
+        c1 = _make_case(db, firm_account, court, "C-8012-2025")
+        db.add(CaseLitigante(
+            case_id=c1.id, participante="AB.DDO", rut="88888888-8",
+            persona_type="NATURAL", nombre="Lawyer A", natural_key=f"{c1.id}-a1",
+        ))
+        db.add(CaseLitigante(
+            case_id=c1.id, participante="AP.DDO", rut="88888888-8",
+            persona_type="NATURAL", nombre="Lawyer A", natural_key=f"{c1.id}-a2",
+        ))
+        db.commit()
+
+        from app.services.lawyer_roster import firm_dashboard_stats_all
+
+        result = firm_dashboard_stats_all(db)
+        row = next(r for r in result["by_lawyer"] if r["rut"] == "88888888-8")
+        assert row["case_count"] == 1
+
+
+# ---------------------------------------------------------------------------
 # Unit tests: admin_dashboard_stats
 # ---------------------------------------------------------------------------
 
@@ -350,6 +427,22 @@ class TestAdminDashboardStats:
         result = admin_dashboard_stats(db, "99999999-9")
         assert result["quality"]["total_cases"] == 0
         assert result["sync"]["pending_detail"] == 0
+
+    def test_admin_dashboard_includes_cases_regardless_of_lawyer_id(self, db, lawyer, court):
+        """Firm-wide: civil cases synced under a different lawyer's account
+        still count toward admin dashboard totals."""
+        other_lawyer = Lawyer(rut="88888888-8", name="Other Syncer")
+        db.add(other_lawyer)
+        db.commit()
+        db.refresh(other_lawyer)
+
+        c1 = _make_case(db, lawyer, court, "C-6010-2025")
+        c2 = _make_case(db, other_lawyer, court, "C-6011-2025")
+        _seed_litigantes(db, c1)
+        _seed_litigantes(db, c2)
+
+        quality = admin_dashboard_stats(db, ACCOUNT_RUT)["quality"]
+        assert quality["total_cases"] == 2
 
 
 # ---------------------------------------------------------------------------

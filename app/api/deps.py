@@ -144,6 +144,33 @@ def require_ingest_key(
     return key
 
 
+def firm_lawyer_id(db: Session) -> int:
+    """Resolve the firm's canonical ``Lawyer.id`` from ``FIRM_LAWYER_RUT``.
+
+    Centralizes the pattern duplicated at ``deps.py`` (``_resolve_lawyer_id``)
+    and ``stats.py`` (``get_public_overview``): the firm's canonical
+    ``lawyer_id`` is the sole owner of every ``Case`` row (Approach C).
+    Defaults to ``"16021492-9"`` when the env var is unset, matching the
+    existing auditor-firm convention.
+
+    Raises ``RuntimeError`` when no matching Lawyer row exists rather than
+    silently returning ``None`` (which callers could write as a NULL/invalid
+    ``lawyer_id``).
+    """
+    import os
+
+    firm_rut = os.environ.get("FIRM_LAWYER_RUT", "16021492-9")
+    from app.models.lawyer import Lawyer
+
+    firm = db.query(Lawyer).filter(Lawyer.rut == firm_rut).first()
+    if firm is None:
+        raise RuntimeError(
+            f"FIRM_LAWYER_RUT={firm_rut!r} has no matching Lawyer row; "
+            "cannot resolve the firm's canonical lawyer_id"
+        )
+    return int(firm.id)
+
+
 def _resolve_lawyer_id(db: Session, current_lawyer: dict) -> int:
     """Resolve the numeric lawyer id from a JWT payload.
 
@@ -188,19 +215,53 @@ class _AllCasesScope:
 ALL_CASES = _AllCasesScope()
 
 
+def _bootstrap_owned_case_ids(db: Session, lawyer_id: int) -> set:
+    """Case ids owned (``Case.lawyer_id``) by ``lawyer_id`` that have NO
+    ``CaseLitigante`` row at all yet.
+
+    Litigantes are populated by a separate detail fetch AFTER a case is
+    first ingested (see design ADR-002/pending-detail). Without this
+    safety net, a just-synced case would be invisible to its own syncing
+    lawyer — a real regression, not just a test-fixture gap — during that
+    bootstrap window, purely litigante-based scope would hide it from
+    everyone except auditor/admin. This does NOT reintroduce lawyer_id-based
+    visibility for cases that already have litigantes: a lawyer who is not
+    a litigante on a case that DOES have litigantes still gets no scope
+    from this fallback.
+    """
+    from app.models.case import Case
+    from app.models.case_litigante import CaseLitigante
+
+    own_case_ids = {
+        cid for (cid,) in db.query(Case.id).filter(Case.lawyer_id == lawyer_id).all()
+    }
+    if not own_case_ids:
+        return set()
+    cases_with_litigantes = {
+        cid for (cid,) in (
+            db.query(CaseLitigante.case_id)
+            .filter(CaseLitigante.case_id.in_(own_case_ids))
+            .distinct()
+            .all()
+        )
+    }
+    return own_case_ids - cases_with_litigantes
+
+
 def resolve_case_scope(db: Session, current_lawyer: dict):
     """Resolve the case-visibility scope for a READ/aggregation endpoint.
 
-    Unlike ``_resolve_lawyer_id`` (which maps the auditor role to the firm
-    account's own lawyer_id — a proxy that only worked while a single
-    account scraped the whole firm's caseload), this returns ``ALL_CASES``
-    for the auditor role: cases are now attributed per-lawyer, so the
-    auditor — a transversal role overseeing the WHOLE firm — must see every
-    case regardless of which lawyer owns it.
+    Returns ``ALL_CASES`` for the auditor role: a transversal role overseeing
+    the WHOLE firm, unaffected by per-lawyer attribution.
 
-    For every other role, returns the caller's own numeric lawyer id (same
-    resolution rules as ``_resolve_lawyer_id``: JWT ``sub`` is the lawyer RUT,
-    legacy/test tokens may carry the numeric id directly).
+    For every other role, returns the SET of case ids where the caller is an
+    abogado-of-record litigante (``case_ids_for_abogado``), UNION any case
+    they own via ``Case.lawyer_id`` that has no litigante rows yet (bootstrap
+    window safety net — see ``_bootstrap_owned_case_ids``). Approach C makes
+    ``Case.lawyer_id`` the firm's single bookkeeping owner, so once a case
+    has litigantes, visibility is entirely litigante-derived — a lawyer who
+    is not a litigante on such a case gets no visibility from ``lawyer_id``
+    alone.
 
     Raises 401 when no subject is present and 404 when the lawyer is unknown
     (RUT lookup only — numeric-id tokens have no row to 404 against).
@@ -210,30 +271,38 @@ def resolve_case_scope(db: Session, current_lawyer: dict):
         raise HTTPException(status_code=401, detail="Invalid token")
 
     from app.models.lawyer import Lawyer
+    from app.services.lawyer_roster import case_ids_for_abogado
 
     if isinstance(sub, int) or (isinstance(sub, str) and sub.isdigit()):
         lawyer = db.query(Lawyer).filter(Lawyer.id == int(sub)).first()
-        if lawyer is not None and lawyer.role == "auditor":
+        if lawyer is None:
+            return set()
+        if lawyer.role == "auditor":
             return ALL_CASES
-        return int(sub)
+        return case_ids_for_abogado(db, lawyer.rut, lawyer.rut) | _bootstrap_owned_case_ids(
+            db, lawyer.id
+        )
 
     lawyer = db.query(Lawyer).filter(Lawyer.rut == sub).first()
     if not lawyer:
         raise HTTPException(status_code=404, detail="Lawyer not found")
     if lawyer.role == "auditor":
         return ALL_CASES
-    return int(lawyer.id)
+    return case_ids_for_abogado(db, lawyer.rut, lawyer.rut) | _bootstrap_owned_case_ids(
+        db, lawyer.id
+    )
 
 
 def apply_case_scope(query, scope):
     """Apply a ``resolve_case_scope`` result to a query that filters on Case.
 
     ``scope is ALL_CASES`` -> query returned unchanged (every study case
-    visible, auditor). Otherwise -> ``query.filter(Case.lawyer_id == scope)``.
-    The query must already select or join ``app.models.case.Case``.
+    visible, auditor). Otherwise ``scope`` is a set of visible case ids
+    (litigante-derived) -> ``query.filter(Case.id.in_(scope))``. The query
+    must already select or join ``app.models.case.Case``.
     """
     if scope is ALL_CASES:
         return query
     from app.models.case import Case
 
-    return query.filter(Case.lawyer_id == scope)
+    return query.filter(Case.id.in_(scope))

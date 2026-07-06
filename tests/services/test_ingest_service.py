@@ -11,11 +11,30 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 
 from app.models.case import Case
+from app.models.case_lawyer_source import CaseLawyerSource
 from app.models.court import Court
 from app.models.document import Document
 from app.models.lawyer import Lawyer
 from app.models.movement import Movement
 from app.services.ingest_service import IngestParseError, IngestService
+
+FIRM_RUT = "16021492-9"
+
+
+@pytest.fixture(autouse=True)
+def _seed_firm_lawyer(db):
+    """Seed the firm's canonical Lawyer row (FIRM_LAWYER_RUT default).
+
+    Approach C (unificar-modelo-causas, PR1b): ingest_cases/ingest_movements
+    upsert Case rows under the firm lawyer_id, not the syncing lawyer's own
+    id, so firm_lawyer_id(db) must resolve for every ingest test in this
+    module. Tests that need to exercise the "missing firm lawyer" error
+    monkeypatch FIRM_LAWYER_RUT to a RUT with no matching row instead.
+    """
+    existing = db.query(Lawyer).filter(Lawyer.rut == FIRM_RUT).first()
+    if existing is None:
+        db.add(Lawyer(rut=FIRM_RUT, name="Firm Lawyer", is_active=True))
+        db.commit()
 
 
 def _case_row(token: str, rol: str, tribunal: str, caratulado: str) -> str:
@@ -110,7 +129,10 @@ class TestIngestCasesValidPayload:
             )
 
         assert db.query(Case).count() == 0
-        assert db.query(Lawyer).count() == 0
+        # Only the pre-seeded firm lawyer exists — the parse error is raised
+        # before the syncing lawyer's own row would be get-or-created.
+        assert db.query(Lawyer).count() == 1
+        assert db.query(Lawyer).filter(Lawyer.rut == FIRM_RUT).count() == 1
 
     def test_concurrent_insert_race_is_handled_via_integrity_error(self, db, monkeypatch):
         """Simulate a race: another writer inserts the same rol mid-flight."""
@@ -145,6 +167,104 @@ class TestIngestCasesValidPayload:
             lawyer_rut=lawyer_rut, competencia="civil", pages=[VALID_PAGE]
         )
         assert "errors" in result
+
+
+class TestIngestCasesFirmOwnership:
+    """Task 1b-2/1b-3: ingest_cases upserts one Case per ROL under the firm
+    lawyer_id, never the syncing lawyer's own id, and records the syncing
+    lawyer's sighting via case_lawyer_source."""
+
+    def test_ingest_new_rol_creates_case_under_firm_lawyer_id(self, db):
+        service = IngestService(db)
+        service.ingest_cases(
+            lawyer_rut="11111111-1", competencia="civil", pages=[VALID_PAGE]
+        )
+
+        firm = db.query(Lawyer).filter(Lawyer.rut == FIRM_RUT).first()
+        cases = db.query(Case).all()
+        assert len(cases) == 2
+        assert all(c.lawyer_id == firm.id for c in cases)
+
+    def test_ingest_existing_rol_under_firm_upserts_no_duplicate(self, db):
+        service = IngestService(db)
+        service.ingest_cases(
+            lawyer_rut="11111111-1", competencia="civil", pages=[VALID_PAGE]
+        )
+        # A DIFFERENT syncing lawyer ingests the same ROLs — dedup is scoped
+        # by the firm id, not by which lawyer is syncing.
+        result = service.ingest_cases(
+            lawyer_rut="22222222-2", competencia="civil", pages=[VALID_PAGE]
+        )
+
+        assert result["new"] == 0
+        assert result["existing"] == 2
+        assert db.query(Case).filter(Case.rol == "C-1234-2026").count() == 1
+
+    def test_ingest_missing_firm_lawyer_raises_clear_error(self, db, monkeypatch):
+        monkeypatch.setenv("FIRM_LAWYER_RUT", "99999999-0")
+        service = IngestService(db)
+
+        with pytest.raises(RuntimeError, match="FIRM_LAWYER_RUT"):
+            service.ingest_cases(
+                lawyer_rut="11111111-1", competencia="civil", pages=[VALID_PAGE]
+            )
+
+        assert db.query(Case).count() == 0
+
+    def test_ingest_writes_case_lawyer_source_for_syncing_lawyer(self, db):
+        service = IngestService(db)
+        service.ingest_cases(
+            lawyer_rut="11111111-1", competencia="civil", pages=[VALID_PAGE]
+        )
+
+        syncing = db.query(Lawyer).filter(Lawyer.rut == "11111111-1").first()
+        case = db.query(Case).filter(Case.rol == "C-1234-2026").first()
+        source = (
+            db.query(CaseLawyerSource)
+            .filter(
+                CaseLawyerSource.case_id == case.id,
+                CaseLawyerSource.lawyer_id == syncing.id,
+            )
+            .first()
+        )
+        assert source is not None
+        assert source.last_seen_at is not None
+
+    def test_ingest_existing_rol_updates_last_seen_at_on_source_row(self, db):
+        service = IngestService(db)
+        service.ingest_cases(
+            lawyer_rut="11111111-1", competencia="civil", pages=[VALID_PAGE]
+        )
+        syncing = db.query(Lawyer).filter(Lawyer.rut == "11111111-1").first()
+        case = db.query(Case).filter(Case.rol == "C-1234-2026").first()
+        source = (
+            db.query(CaseLawyerSource)
+            .filter(
+                CaseLawyerSource.case_id == case.id,
+                CaseLawyerSource.lawyer_id == syncing.id,
+            )
+            .first()
+        )
+        first_seen = source.first_seen_at
+        original_last_seen = source.last_seen_at
+
+        service.ingest_cases(
+            lawyer_rut="11111111-1", competencia="civil", pages=[VALID_PAGE]
+        )
+
+        db.refresh(source)
+        assert source.first_seen_at == first_seen
+        assert source.last_seen_at >= original_last_seen
+        # Still exactly one source row for this (case, lawyer) pair.
+        assert (
+            db.query(CaseLawyerSource)
+            .filter(
+                CaseLawyerSource.case_id == case.id,
+                CaseLawyerSource.lawyer_id == syncing.id,
+            )
+            .count()
+            == 1
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -192,16 +312,21 @@ MOVEMENTS_MALFORMED_HTML = "<html><body>Not a PJUD detail page.</body></html>"
 
 @pytest.fixture
 def seeded_lawyer_and_case(db):
+    """Case is FIRM-owned (Approach C) — ingest_movements resolves cases by
+    the firm lawyer_id, never the syncing lawyer's own id. ``lawyer`` here is
+    the SYNCING lawyer passed as ``lawyer_rut`` to ingest_movements calls."""
     lawyer = Lawyer(rut="11111111-1", name="Test Lawyer", is_active=True)
     db.add(lawyer)
     db.flush()
+
+    firm = db.query(Lawyer).filter(Lawyer.rut == FIRM_RUT).first()
 
     court = Court(code="T1-ING-MOV", name="Juzgado Ingest Movements Test", region="RM", type="civil")
     db.add(court)
     db.flush()
 
     case = Case(
-        lawyer_id=lawyer.id,
+        lawyer_id=firm.id,
         court_id=court.id,
         rol="C-1234-2026",
         competencia="civil",
@@ -209,7 +334,22 @@ def seeded_lawyer_and_case(db):
     )
     db.add(case)
     db.commit()
-    return {"lawyer": lawyer, "case": case}
+    return {"lawyer": lawyer, "case": case, "firm": firm}
+
+
+def _source(db, case, lawyer, seen_at=None):
+    """Seed a case_lawyer_source row — the ADR-002 signal get_pending_detail
+    joins on (task 1b-5). ``case.lawyer_id`` (the firm's bookkeeping owner)
+    is deliberately irrelevant to this join; only the sighting matters."""
+    row = CaseLawyerSource(
+        case_id=case.id,
+        lawyer_id=lawyer.id,
+        first_seen_at=seen_at or datetime.utcnow(),
+        last_seen_at=seen_at or datetime.utcnow(),
+    )
+    db.add(row)
+    db.commit()
+    return row
 
 
 class TestGetPendingDetail:
@@ -238,6 +378,8 @@ class TestGetPendingDetail:
         )
         db.add_all([never_checked, older_checked, recently_checked])
         db.commit()
+        for c in (never_checked, older_checked, recently_checked):
+            _source(db, c, lawyer)
 
         service = IngestService(db)
         result = service.get_pending_detail(lawyer_rut="11111111-1", competencia="civil", limit=30)
@@ -253,11 +395,13 @@ class TestGetPendingDetail:
         db.add(court)
         db.flush()
         for i in range(3):
-            db.add(Case(
+            case = Case(
                 lawyer_id=lawyer.id, court_id=court.id, rol=f"C-{i}-2026",
                 competencia="civil", status="active",
-            ))
-        db.commit()
+            )
+            db.add(case)
+            db.commit()
+            _source(db, case, lawyer)
 
         service = IngestService(db)
         result = service.get_pending_detail(lawyer_rut="11111111-1", competencia="civil", limit=1)
@@ -297,11 +441,122 @@ class TestGetPendingDetail:
         # Insert in non-sorted order so the result reflects ORDER BY, not insert order.
         db.add_all([mid, old, recent])
         db.commit()
+        for c in (old, mid, recent):
+            _source(db, c, lawyer)
 
         service = IngestService(db)
         result = service.get_pending_detail(lawyer_rut="11111111-1", competencia="civil", limit=30)
 
         assert [c["rol"] for c in result] == ["C-6086-2026", "C-500-2018", "C-100-2006"]
+
+    def test_pending_detail_returns_cases_seen_by_syncing_lawyer(self, db):
+        """Task 1b-5: pending-detail is scoped by case_lawyer_source, not
+        Case.lawyer_id — a firm-owned case the syncing lawyer has actually
+        seen in their own live list is returned."""
+        firm = db.query(Lawyer).filter(Lawyer.rut == FIRM_RUT).first()
+        sandy = Lawyer(rut="17111111-1", name="Sandy", is_active=True)
+        db.add(sandy)
+        db.flush()
+        court = Court(code="T1-PD-SRC", name="Juzgado Pending Detail Source Test", region="RM", type="civil")
+        db.add(court)
+        db.flush()
+
+        case = Case(lawyer_id=firm.id, court_id=court.id, rol="C-1234-2026", competencia="civil")
+        db.add(case)
+        db.commit()
+        _source(db, case, sandy)
+
+        service = IngestService(db)
+        result = service.get_pending_detail(lawyer_rut="17111111-1", competencia="civil", limit=30)
+
+        assert [c["rol"] for c in result] == ["C-1234-2026"]
+
+    def test_pending_detail_excludes_cases_not_in_lawyers_source_list(self, db):
+        """A firm-owned case NEVER sighted by this syncing lawyer (only by a
+        different lawyer) is excluded — pending-detail stays per-syncing-
+        lawyer even though every Case shares the firm's lawyer_id."""
+        firm = db.query(Lawyer).filter(Lawyer.rut == FIRM_RUT).first()
+        sandy = Lawyer(rut="17111111-1", name="Sandy", is_active=True)
+        marcela = Lawyer(rut="17222222-2", name="Marcela", is_active=True)
+        db.add_all([sandy, marcela])
+        db.flush()
+        court = Court(code="T1-PD-EXC", name="Juzgado Pending Detail Exclude Test", region="RM", type="civil")
+        db.add(court)
+        db.flush()
+
+        sandys_case = Case(lawyer_id=firm.id, court_id=court.id, rol="C-1111-2026", competencia="civil")
+        marcelas_case = Case(lawyer_id=firm.id, court_id=court.id, rol="C-2222-2026", competencia="civil")
+        db.add_all([sandys_case, marcelas_case])
+        db.commit()
+        _source(db, sandys_case, sandy)
+        _source(db, marcelas_case, marcela)
+
+        service = IngestService(db)
+        result = service.get_pending_detail(lawyer_rut="17111111-1", competencia="civil", limit=30)
+
+        assert [c["rol"] for c in result] == ["C-1111-2026"]
+
+    def test_pending_detail_includes_bootstrap_never_checked_case(self, db):
+        """A case whose source row was just written by ingest_cases, before
+        any detail fetch or litigantes exist, must still surface — the
+        bootstrap window get_pending_detail exists to close."""
+        firm = db.query(Lawyer).filter(Lawyer.rut == FIRM_RUT).first()
+        sandy = Lawyer(rut="17111111-1", name="Sandy", is_active=True)
+        db.add(sandy)
+        db.flush()
+        court = Court(code="T1-PD-BOOT", name="Juzgado Pending Detail Bootstrap Test", region="RM", type="civil")
+        db.add(court)
+        db.flush()
+
+        brand_new_case = Case(
+            lawyer_id=firm.id, court_id=court.id, rol="C-9999-2026",
+            competencia="civil", last_detail_checked_at=None,
+        )
+        db.add(brand_new_case)
+        db.commit()
+        _source(db, brand_new_case, sandy)  # written by ingest_cases at sync time
+
+        service = IngestService(db)
+        result = service.get_pending_detail(lawyer_rut="17111111-1", competencia="civil", limit=30)
+
+        assert [c["rol"] for c in result] == ["C-9999-2026"]
+
+    def test_pending_detail_ordering_preserved(self, db):
+        """Ordering (last_detail_checked_at ASC NULLS FIRST, rol_year DESC,
+        filed_at DESC) survives the case_lawyer_source join rewrite, even
+        with an un-sourced firm case interleaved (excluded, not just
+        reordered)."""
+        firm = db.query(Lawyer).filter(Lawyer.rut == FIRM_RUT).first()
+        sandy = Lawyer(rut="17111111-1", name="Sandy", is_active=True)
+        db.add(sandy)
+        db.flush()
+        court = Court(code="T1-PD-ORD", name="Juzgado Pending Detail Order Test", region="RM", type="civil")
+        db.add(court)
+        db.flush()
+
+        now = datetime.utcnow()
+        never_checked = Case(
+            lawyer_id=firm.id, court_id=court.id, rol="C-1111-2026",
+            competencia="civil", last_detail_checked_at=None,
+        )
+        older_checked = Case(
+            lawyer_id=firm.id, court_id=court.id, rol="C-2222-2026",
+            competencia="civil", last_detail_checked_at=now - timedelta(days=5),
+        )
+        not_sandys_case = Case(
+            lawyer_id=firm.id, court_id=court.id, rol="C-0000-2026",
+            competencia="civil", last_detail_checked_at=None,
+        )
+        db.add_all([never_checked, older_checked, not_sandys_case])
+        db.commit()
+        _source(db, never_checked, sandy)
+        _source(db, older_checked, sandy)
+        # not_sandys_case deliberately gets no source row for sandy.
+
+        service = IngestService(db)
+        result = service.get_pending_detail(lawyer_rut="17111111-1", competencia="civil", limit=30)
+
+        assert [c["rol"] for c in result] == ["C-1111-2026", "C-2222-2026"]
 
 
 # ---------------------------------------------------------------------------
@@ -394,15 +649,71 @@ class TestIngestMovements:
         assert len(result["errors"]) == 1
 
 
+class TestIngestMovementsFirmOwnership:
+    """Task 1b-4: ingest_movements resolves the FIRM-owned Case (never the
+    syncing lawyer's own id) and records the syncing lawyer's sighting via
+    case_lawyer_source."""
+
+    def test_ingest_movements_resolves_firm_owned_case(self, db, seeded_lawyer_and_case):
+        """A DIFFERENT lawyer than the one who originally synced the case can
+        still resolve+process it via ingest_movements, because the Case is
+        firm-owned, not owned by whichever lawyer first synced it."""
+        other_syncer = Lawyer(rut="33333333-3", name="Other Syncer", is_active=True)
+        db.add(other_syncer)
+        db.commit()
+
+        service = IngestService(db)
+        result = service.ingest_movements(
+            lawyer_rut="33333333-3",
+            competencia="civil",
+            cases=[
+                {
+                    "rol": "C-1234-2026",
+                    "html": _detail_html("C-1234-2026", "1", "Se dicta resolucion", "15/01/2026"),
+                }
+            ],
+        )
+
+        assert result["cases_processed"] == 1
+        assert result["errors"] == []
+
+    def test_ingest_movements_writes_case_lawyer_source(self, db, seeded_lawyer_and_case):
+        lawyer = seeded_lawyer_and_case["lawyer"]
+        case = seeded_lawyer_and_case["case"]
+
+        service = IngestService(db)
+        service.ingest_movements(
+            lawyer_rut="11111111-1",
+            competencia="civil",
+            cases=[
+                {
+                    "rol": "C-1234-2026",
+                    "html": _detail_html("C-1234-2026", "1", "Se dicta resolucion", "15/01/2026"),
+                }
+            ],
+        )
+
+        source = (
+            db.query(CaseLawyerSource)
+            .filter(
+                CaseLawyerSource.case_id == case.id,
+                CaseLawyerSource.lawyer_id == lawyer.id,
+            )
+            .first()
+        )
+        assert source is not None
+        assert source.last_seen_at is not None
+
+
 class TestIngestMovementsFailedRols:
     def test_failed_rols_stamped_when_session_confirmed(self, db, seeded_lawyer_and_case):
         """With the session confirmed (>=1 case processed) even a RECENT
         un-fetchable ROL is stamped so it rotates to the back — no movements,
         no classification. Age only matters on a systemic (zero-success) batch."""
-        lawyer = seeded_lawyer_and_case["lawyer"]
+        firm = seeded_lawyer_and_case["firm"]
         court = db.query(Court).first()
         recent_failed = f"C-5555-{datetime.utcnow().year}"
-        db.add(Case(lawyer_id=lawyer.id, court_id=court.id, rol=recent_failed,
+        db.add(Case(lawyer_id=firm.id, court_id=court.id, rol=recent_failed,
                     competencia="civil", status="active"))
         db.commit()
 
@@ -427,14 +738,45 @@ class TestIngestMovementsFailedRols:
         assert failed.last_detail_checked_at is not None
         assert failed.semaforo is None  # never classified — no detail was parsed
 
+    def test_failed_rols_rotation_resolves_firm_case_not_syncing_lawyer(
+        self, db, seeded_lawyer_and_case
+    ):
+        """Task 1b-4: failed_rols rotation resolves the case by the FIRM
+        lawyer_id, not the syncing lawyer's own id — a case a DIFFERENT
+        lawyer originally synced (still firm-owned) still rotates correctly
+        when reported as failed by this syncing lawyer."""
+        firm = seeded_lawyer_and_case["firm"]
+        court = db.query(Court).first()
+        db.add(Case(lawyer_id=firm.id, court_id=court.id, rol="C-100-2006",
+                    competencia="civil", status="active"))
+        db.commit()
+
+        service = IngestService(db)
+        result = service.ingest_movements(
+            lawyer_rut="11111111-1",
+            competencia="civil",
+            cases=[
+                {
+                    "rol": "C-1234-2026",
+                    "html": _detail_html("C-1234-2026", "1", "Se dicta resolucion", "15/01/2026"),
+                }
+            ],
+            failed_rols=["C-100-2006"],
+        )
+
+        assert result["failed_stamped"] == 1
+        case = db.query(Case).filter(Case.rol == "C-100-2006").first()
+        assert case.last_detail_checked_at is not None
+        assert case.lawyer_id == firm.id  # never re-pointed to the syncing lawyer
+
     def test_recent_failed_rols_not_stamped_on_systemic_failure(self, db, seeded_lawyer_and_case):
         """RUT/session-mismatch guard: when NOTHING in the batch succeeds, recent
         ROLs keep their priority. A mismatch (wrong RUT for the session) surfaces
         recent, valuable ROLs — stamping them would rotate a whole active caseload."""
-        lawyer = seeded_lawyer_and_case["lawyer"]
+        firm = seeded_lawyer_and_case["firm"]
         court = db.query(Court).first()
         recent_rol = f"C-7777-{datetime.utcnow().year}"
-        db.add(Case(lawyer_id=lawyer.id, court_id=court.id, rol=recent_rol,
+        db.add(Case(lawyer_id=firm.id, court_id=court.id, rol=recent_rol,
                     competencia="civil", status="active"))
         db.commit()
 
@@ -454,9 +796,9 @@ class TestIngestMovementsFailedRols:
     def test_old_failed_rols_stamped_even_on_systemic_failure(self, db, seeded_lawyer_and_case):
         """The all-old tail still clears: with zero successes, clearly-old (closed)
         ROLs rotate so they stop clogging every pending-detail page."""
-        lawyer = seeded_lawyer_and_case["lawyer"]
+        firm = seeded_lawyer_and_case["firm"]
         court = db.query(Court).first()
-        db.add(Case(lawyer_id=lawyer.id, court_id=court.id, rol="C-100-2006",
+        db.add(Case(lawyer_id=firm.id, court_id=court.id, rol="C-100-2006",
                     competencia="civil", status="active"))
         db.commit()
 

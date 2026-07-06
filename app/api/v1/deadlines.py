@@ -40,6 +40,26 @@ router = APIRouter()
 
 _CHILE_TZ = ZoneInfo("America/Santiago")
 
+
+def _resolve_deadline_alert_recipient_ids(db: Session, case: Case) -> list[int]:
+    """Recipient lawyer ids for deadline_audit/deadline_added alerts (ADR-005).
+
+    Resolves every abogado-of-record litigante on ``case`` via
+    ``resolve_case_alert_recipients``; falls back to the case's existing
+    owner lawyer (``case.lawyer_id``) when no internal recipient resolves
+    yet (bootstrap window before litigantes are scraped, or only
+    opposing/external counsel present) so the alert is never silently
+    dropped. These are single auditor-initiated events — no NotifyBudget
+    loop, unlike sync_movements's fan-out.
+    """
+    from app.services.lawyer_roster import resolve_case_alert_recipients
+
+    recipients = resolve_case_alert_recipients(db, case)
+    if recipients:
+        return [r.id for r in recipients]
+    fallback_lawyer = db.query(Lawyer).filter(Lawyer.id == case.lawyer_id).first()
+    return [fallback_lawyer.id] if fallback_lawyer else []
+
 # ---------------------------------------------------------------------------
 # Human-readable labels per deadline type (display copy, NOT legal text)
 # ---------------------------------------------------------------------------
@@ -410,16 +430,20 @@ async def update_deadline_status(
     deadline.marked_by = auditor_id
     deadline.marked_at = datetime.utcnow()
 
-    # Notify the case's owning lawyer
-    alert = Alert(
-        lawyer_id=case.lawyer_id,
-        case_id=case.id,
-        type="deadline_audit",
-        title=f"Plazo {body.status} · {case.rol}",
-        message=f"El auditor marcó '{deadline.deadline_type}' como {body.status}.",
-        created_at=datetime.utcnow(),
-    )
-    db.add(alert)
+    # Notify every abogado-of-record litigante on the case (ADR-005), not
+    # just case.lawyer_id — falls back to the case's owner lawyer when no
+    # internal recipient resolves yet (bootstrap window) so the alert is
+    # never silently dropped.
+    for recipient_id in _resolve_deadline_alert_recipient_ids(db, case):
+        alert = Alert(
+            lawyer_id=recipient_id,
+            case_id=case.id,
+            type="deadline_audit",
+            title=f"Plazo {body.status} · {case.rol}",
+            message=f"El auditor marcó '{deadline.deadline_type}' como {body.status}.",
+            created_at=datetime.utcnow(),
+        )
+        db.add(alert)
     db.commit()
     db.refresh(deadline)
     return deadline
@@ -476,16 +500,18 @@ async def create_manual_deadline(
             ),
         )
 
-    # Notify the case's owning lawyer
-    alert = Alert(
-        lawyer_id=case.lawyer_id,
-        case_id=case.id,
-        type="deadline_added",
-        title=f"Nuevo plazo · {case.rol}",
-        message=f"El auditor agregó un plazo manual '{dt.value}' con vencimiento {due_date}.",
-        created_at=datetime.utcnow(),
-    )
-    db.add(alert)
+    # Notify every abogado-of-record litigante on the case (ADR-005), not
+    # just case.lawyer_id — same fallback semantics as deadline_audit above.
+    for recipient_id in _resolve_deadline_alert_recipient_ids(db, case):
+        alert = Alert(
+            lawyer_id=recipient_id,
+            case_id=case.id,
+            type="deadline_added",
+            title=f"Nuevo plazo · {case.rol}",
+            message=f"El auditor agregó un plazo manual '{dt.value}' con vencimiento {due_date}.",
+            created_at=datetime.utcnow(),
+        )
+        db.add(alert)
     db.commit()
     db.refresh(new_deadline)
     return new_deadline

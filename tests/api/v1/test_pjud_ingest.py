@@ -23,6 +23,22 @@ INGEST_URL = "/api/v1/pjud/ingest/cases"
 MOVEMENTS_URL = "/api/v1/pjud/ingest/movements"
 DOCUMENTS_URL = "/api/v1/pjud/ingest/documents"
 
+FIRM_RUT = "16021492-9"
+
+
+@pytest.fixture(autouse=True)
+def _seed_firm_lawyer(db):
+    """Seed the firm's canonical Lawyer row (FIRM_LAWYER_RUT default).
+
+    Approach C (unificar-modelo-causas, PR1b): ingest_cases upserts Case rows
+    under the firm lawyer_id, not the syncing lawyer's own id, so
+    firm_lawyer_id(db) must resolve for every ingest endpoint test here.
+    """
+    existing = db.query(Lawyer).filter(Lawyer.rut == FIRM_RUT).first()
+    if existing is None:
+        db.add(Lawyer(rut=FIRM_RUT, name="Firm Lawyer", is_active=True))
+        db.commit()
+
 
 def _case_row(token: str, rol: str, tribunal: str, caratulado: str) -> str:
     return f"""
@@ -164,17 +180,26 @@ MOVEMENTS_MALFORMED_HTML = "<html><body>Not a PJUD detail page.</body></html>"
 
 @pytest.fixture
 def seeded_case(db):
-    """Lawyer + Court + Case pre-seeded for movements ingest tests."""
+    """Lawyer + Court + Case pre-seeded for documents ingest tests.
+
+    Case is FIRM-owned (Approach C, gap-fix follow-up to 1b-4) —
+    ``ingest_documents`` resolves the case by the firm lawyer_id, mirroring
+    ``ingest_movements``, never by the syncing lawyer's own id. ``lawyer`` is
+    the SYNCING lawyer passed as ``rut`` in the request payload. Movements
+    endpoint tests use the equivalent ``seeded_case_firm`` fixture below.
+    """
     lawyer = Lawyer(rut="11111111-1", name="Test Lawyer", is_active=True)
     db.add(lawyer)
     db.flush()
+
+    firm = db.query(Lawyer).filter(Lawyer.rut == FIRM_RUT).first()
 
     court = Court(code="T1-MOV", name="Juzgado Movements Test", region="RM", type="civil")
     db.add(court)
     db.flush()
 
     case = Case(
-        lawyer_id=lawyer.id,
+        lawyer_id=firm.id,
         court_id=court.id,
         rol="C-1234-2026",
         competencia="civil",
@@ -182,11 +207,41 @@ def seeded_case(db):
     )
     db.add(case)
     db.commit()
-    return {"lawyer": lawyer, "case": case}
+    return {"lawyer": lawyer, "case": case, "firm": firm}
+
+
+@pytest.fixture
+def seeded_case_firm(db):
+    """Lawyer + Court + Case pre-seeded for movements ingest tests.
+
+    Case is FIRM-owned (Approach C) — ingest_movements resolves cases by the
+    firm lawyer_id, never the syncing lawyer's own id. ``lawyer`` is the
+    SYNCING lawyer passed as ``rut`` in the request payload.
+    """
+    lawyer = Lawyer(rut="11111111-1", name="Test Lawyer", is_active=True)
+    db.add(lawyer)
+    db.flush()
+
+    firm = db.query(Lawyer).filter(Lawyer.rut == FIRM_RUT).first()
+
+    court = Court(code="T1-MOV-FIRM", name="Juzgado Movements Firm Test", region="RM", type="civil")
+    db.add(court)
+    db.flush()
+
+    case = Case(
+        lawyer_id=firm.id,
+        court_id=court.id,
+        rol="C-1234-2026",
+        competencia="civil",
+        status="active",
+    )
+    db.add(case)
+    db.commit()
+    return {"lawyer": lawyer, "case": case, "firm": firm}
 
 
 class TestIngestMovementsEndpointAuth:
-    def test_missing_key_returns_401(self, client, seeded_case):
+    def test_missing_key_returns_401(self, client, seeded_case_firm):
         response = client.post(
             MOVEMENTS_URL,
             json={
@@ -202,7 +257,7 @@ class TestIngestMovementsEndpointAuth:
         )
         assert response.status_code == 401
 
-    def test_invalid_key_returns_403(self, client, ingest_key, seeded_case):
+    def test_invalid_key_returns_403(self, client, ingest_key, seeded_case_firm):
         response = client.post(
             MOVEMENTS_URL,
             json={
@@ -222,7 +277,7 @@ class TestIngestMovementsEndpointAuth:
 
 class TestIngestMovementsEndpointHappyPath:
     def test_valid_detail_html_persists_movements_and_classifies(
-        self, client, ingest_key, seeded_case, db
+        self, client, ingest_key, seeded_case_firm, db
     ):
         response = client.post(
             MOVEMENTS_URL,
@@ -253,7 +308,7 @@ class TestIngestMovementsEndpointHappyPath:
         assert case.last_detail_checked_at is not None
         assert case.semaforo is not None
 
-    def test_unknown_rol_is_skipped_with_error(self, client, ingest_key, seeded_case):
+    def test_unknown_rol_is_skipped_with_error(self, client, ingest_key, seeded_case_firm):
         response = client.post(
             MOVEMENTS_URL,
             json={
@@ -273,14 +328,14 @@ class TestIngestMovementsEndpointHappyPath:
         assert data["cases_processed"] == 0
         assert len(data["errors"]) == 1
 
-    def test_forwards_failed_rols_and_stamps_them(self, client, ingest_key, seeded_case, db):
+    def test_forwards_failed_rols_and_stamps_them(self, client, ingest_key, seeded_case_firm, db):
         """A failed-only POST (no successful cases) stamps clearly-OLD ROLs so
         they rotate out of subsequent batches. Recent ROLs are protected by the
         systemic-failure guard (a RUT/session mismatch surfaces recent ROLs) —
         covered in the service-level tests."""
-        lawyer = db.query(Lawyer).filter(Lawyer.rut == "11111111-1").first()
+        firm = db.query(Lawyer).filter(Lawyer.rut == FIRM_RUT).first()
         court = db.query(Court).first()
-        db.add(Case(lawyer_id=lawyer.id, court_id=court.id, rol="C-100-2006",
+        db.add(Case(lawyer_id=firm.id, court_id=court.id, rol="C-100-2006",
                     competencia="civil", status="active"))
         db.commit()
 
@@ -302,7 +357,7 @@ class TestIngestMovementsEndpointHappyPath:
         case = db.query(Case).filter(Case.rol == "C-100-2006").first()
         assert case.last_detail_checked_at is not None
 
-    def test_malformed_html_is_graceful_no_500(self, client, ingest_key, seeded_case):
+    def test_malformed_html_is_graceful_no_500(self, client, ingest_key, seeded_case_firm):
         response = client.post(
             MOVEMENTS_URL,
             json={
@@ -467,6 +522,55 @@ class TestIngestDocumentsEndpointHappyPath:
         assert doc.gcs_path
         assert doc.pjud_endpoint == "documentos/docuS.php"
         assert doc.pjud_token == "live.jwt.token"
+
+    def test_stores_document_for_firm_owned_case_synced_by_different_lawyer(
+        self, client, ingest_key, seeded_case_firm, db, tmp_path, monkeypatch
+    ):
+        """Task 1b-4b (gap fix): the case is FIRM-owned (Case.lawyer_id ==
+        firm.id), not owned by the syncing lawyer's own id — Approach C
+        means ingest_documents must resolve the case by the FIRM id + rol,
+        exactly like ingest_movements does, not by the syncing lawyer's own
+        lawyer_id. Before the fix this ROL is "unknown" to the syncing
+        lawyer and the document is silently skipped."""
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "DOC_STORAGE_DIR", str(tmp_path))
+        case = seeded_case_firm["case"]
+        token_hash = document_identity_hash("cert_envio", case.rol, "")
+
+        response = client.post(
+            DOCUMENTS_URL,
+            json={
+                "rut": "11111111-1",  # the SYNCING lawyer, not the firm
+                "competencia": "civil",
+                "documents": [
+                    {
+                        "rol": "C-1234-2026",
+                        "token_hash": token_hash,
+                        "doc_type": "cert_envio",
+                        "scope_key": "",
+                        "pjud_endpoint": "documentos/docuS.php",
+                        "pjud_token": "live.jwt.token",
+                        "filename": "cert.pdf",
+                        "content_type": "application/pdf",
+                        "document_date": "15/01/2026",
+                        "base64": base64.b64encode(_FAKE_PDF).decode(),
+                    }
+                ],
+            },
+            headers={"X-Ingest-Key": ingest_key},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["documents_stored"] == 1
+        assert data["documents_created"] == 1
+        assert data["skipped"] == 0
+        assert data["errors"] == []
+
+        doc = db.query(Document).filter(Document.pjud_token_hash == token_hash).first()
+        assert doc is not None
+        assert doc.case_id == case.id
+        assert doc.status == "stored"
 
     def test_creates_movement_level_document_resolves_movement_id(
         self, client, ingest_key, seeded_case, seeded_movement, db, tmp_path, monkeypatch

@@ -10,6 +10,7 @@ from datetime import date, datetime, timedelta
 from app.core.security import create_access_token
 from app.models.case import Case
 from app.models.case_deadline import CaseDeadline
+from app.models.case_litigante import CaseLitigante
 from app.models.court import Court
 from app.models.lawyer import Lawyer
 
@@ -90,14 +91,34 @@ def _make_case(db, lawyer, court, rol, **kwargs):
     return obj
 
 
+def _seed_abogado_litigante(db, case, rut, nombre):
+    """Firm-wide/litigante-based attribution (Approach C): a lawyer sees a
+    case if and only if they are an abogado-of-record litigante on it, not
+    merely because Case.lawyer_id points at them. Seed each case's owner as
+    an AB.DDO litigante so scope/attribution tests reflect that model."""
+    db.add(CaseLitigante(
+        case_id=case.id,
+        participante="AB.DDO",
+        rut=rut,
+        persona_type="NATURAL",
+        nombre=nombre,
+        natural_key=f"{case.id}-{rut}",
+    ))
+    db.commit()
+
+
 @pytest.fixture
 def case_a(db, lawyer_a, court):
-    return _make_case(db, lawyer_a, court, "C-9001-2026", semaforo="rojo")
+    case = _make_case(db, lawyer_a, court, "C-9001-2026", semaforo="rojo")
+    _seed_abogado_litigante(db, case, LAWYER_A_RUT, "Lawyer A")
+    return case
 
 
 @pytest.fixture
 def case_b(db, lawyer_b, court):
-    return _make_case(db, lawyer_b, court, "C-9002-2026", semaforo="verde")
+    case = _make_case(db, lawyer_b, court, "C-9002-2026", semaforo="verde")
+    _seed_abogado_litigante(db, case, LAWYER_B_RUT, "Lawyer B")
+    return case
 
 
 # ---------------------------------------------------------------------------
