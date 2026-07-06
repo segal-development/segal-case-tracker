@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from app.models.case import Case
+from app.models.case_lawyer_source import CaseLawyerSource
 from app.models.court import Court
 from app.models.ingest_key import IngestKey
 from app.models.lawyer import Lawyer
@@ -67,6 +68,17 @@ def lawyer_with_cases(db):
     )
     db.add_all([never_checked, older_checked, recently_checked])
     db.commit()
+
+    # Approach C (unificar-modelo-causas, task 1b-5): pending-detail is now
+    # scoped via case_lawyer_source, not Case.lawyer_id — seed a sighting row
+    # for each case so this lawyer's pending-detail batch still includes them.
+    now2 = datetime.utcnow()
+    for c in (never_checked, older_checked, recently_checked):
+        db.add(CaseLawyerSource(
+            case_id=c.id, lawyer_id=lawyer.id, first_seen_at=now2, last_seen_at=now2,
+        ))
+    db.commit()
+
     return {"lawyer": lawyer, "cases": [never_checked, older_checked, recently_checked]}
 
 

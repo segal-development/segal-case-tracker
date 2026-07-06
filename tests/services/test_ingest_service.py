@@ -337,6 +337,21 @@ def seeded_lawyer_and_case(db):
     return {"lawyer": lawyer, "case": case, "firm": firm}
 
 
+def _source(db, case, lawyer, seen_at=None):
+    """Seed a case_lawyer_source row — the ADR-002 signal get_pending_detail
+    joins on (task 1b-5). ``case.lawyer_id`` (the firm's bookkeeping owner)
+    is deliberately irrelevant to this join; only the sighting matters."""
+    row = CaseLawyerSource(
+        case_id=case.id,
+        lawyer_id=lawyer.id,
+        first_seen_at=seen_at or datetime.utcnow(),
+        last_seen_at=seen_at or datetime.utcnow(),
+    )
+    db.add(row)
+    db.commit()
+    return row
+
+
 class TestGetPendingDetail:
     def test_returns_stalest_first_nulls_first(self, db):
         lawyer = Lawyer(rut="11111111-1", name="Test Lawyer", is_active=True)
@@ -363,6 +378,8 @@ class TestGetPendingDetail:
         )
         db.add_all([never_checked, older_checked, recently_checked])
         db.commit()
+        for c in (never_checked, older_checked, recently_checked):
+            _source(db, c, lawyer)
 
         service = IngestService(db)
         result = service.get_pending_detail(lawyer_rut="11111111-1", competencia="civil", limit=30)
@@ -378,11 +395,13 @@ class TestGetPendingDetail:
         db.add(court)
         db.flush()
         for i in range(3):
-            db.add(Case(
+            case = Case(
                 lawyer_id=lawyer.id, court_id=court.id, rol=f"C-{i}-2026",
                 competencia="civil", status="active",
-            ))
-        db.commit()
+            )
+            db.add(case)
+            db.commit()
+            _source(db, case, lawyer)
 
         service = IngestService(db)
         result = service.get_pending_detail(lawyer_rut="11111111-1", competencia="civil", limit=1)
@@ -422,11 +441,122 @@ class TestGetPendingDetail:
         # Insert in non-sorted order so the result reflects ORDER BY, not insert order.
         db.add_all([mid, old, recent])
         db.commit()
+        for c in (old, mid, recent):
+            _source(db, c, lawyer)
 
         service = IngestService(db)
         result = service.get_pending_detail(lawyer_rut="11111111-1", competencia="civil", limit=30)
 
         assert [c["rol"] for c in result] == ["C-6086-2026", "C-500-2018", "C-100-2006"]
+
+    def test_pending_detail_returns_cases_seen_by_syncing_lawyer(self, db):
+        """Task 1b-5: pending-detail is scoped by case_lawyer_source, not
+        Case.lawyer_id — a firm-owned case the syncing lawyer has actually
+        seen in their own live list is returned."""
+        firm = db.query(Lawyer).filter(Lawyer.rut == FIRM_RUT).first()
+        sandy = Lawyer(rut="17111111-1", name="Sandy", is_active=True)
+        db.add(sandy)
+        db.flush()
+        court = Court(code="T1-PD-SRC", name="Juzgado Pending Detail Source Test", region="RM", type="civil")
+        db.add(court)
+        db.flush()
+
+        case = Case(lawyer_id=firm.id, court_id=court.id, rol="C-1234-2026", competencia="civil")
+        db.add(case)
+        db.commit()
+        _source(db, case, sandy)
+
+        service = IngestService(db)
+        result = service.get_pending_detail(lawyer_rut="17111111-1", competencia="civil", limit=30)
+
+        assert [c["rol"] for c in result] == ["C-1234-2026"]
+
+    def test_pending_detail_excludes_cases_not_in_lawyers_source_list(self, db):
+        """A firm-owned case NEVER sighted by this syncing lawyer (only by a
+        different lawyer) is excluded — pending-detail stays per-syncing-
+        lawyer even though every Case shares the firm's lawyer_id."""
+        firm = db.query(Lawyer).filter(Lawyer.rut == FIRM_RUT).first()
+        sandy = Lawyer(rut="17111111-1", name="Sandy", is_active=True)
+        marcela = Lawyer(rut="17222222-2", name="Marcela", is_active=True)
+        db.add_all([sandy, marcela])
+        db.flush()
+        court = Court(code="T1-PD-EXC", name="Juzgado Pending Detail Exclude Test", region="RM", type="civil")
+        db.add(court)
+        db.flush()
+
+        sandys_case = Case(lawyer_id=firm.id, court_id=court.id, rol="C-1111-2026", competencia="civil")
+        marcelas_case = Case(lawyer_id=firm.id, court_id=court.id, rol="C-2222-2026", competencia="civil")
+        db.add_all([sandys_case, marcelas_case])
+        db.commit()
+        _source(db, sandys_case, sandy)
+        _source(db, marcelas_case, marcela)
+
+        service = IngestService(db)
+        result = service.get_pending_detail(lawyer_rut="17111111-1", competencia="civil", limit=30)
+
+        assert [c["rol"] for c in result] == ["C-1111-2026"]
+
+    def test_pending_detail_includes_bootstrap_never_checked_case(self, db):
+        """A case whose source row was just written by ingest_cases, before
+        any detail fetch or litigantes exist, must still surface — the
+        bootstrap window get_pending_detail exists to close."""
+        firm = db.query(Lawyer).filter(Lawyer.rut == FIRM_RUT).first()
+        sandy = Lawyer(rut="17111111-1", name="Sandy", is_active=True)
+        db.add(sandy)
+        db.flush()
+        court = Court(code="T1-PD-BOOT", name="Juzgado Pending Detail Bootstrap Test", region="RM", type="civil")
+        db.add(court)
+        db.flush()
+
+        brand_new_case = Case(
+            lawyer_id=firm.id, court_id=court.id, rol="C-9999-2026",
+            competencia="civil", last_detail_checked_at=None,
+        )
+        db.add(brand_new_case)
+        db.commit()
+        _source(db, brand_new_case, sandy)  # written by ingest_cases at sync time
+
+        service = IngestService(db)
+        result = service.get_pending_detail(lawyer_rut="17111111-1", competencia="civil", limit=30)
+
+        assert [c["rol"] for c in result] == ["C-9999-2026"]
+
+    def test_pending_detail_ordering_preserved(self, db):
+        """Ordering (last_detail_checked_at ASC NULLS FIRST, rol_year DESC,
+        filed_at DESC) survives the case_lawyer_source join rewrite, even
+        with an un-sourced firm case interleaved (excluded, not just
+        reordered)."""
+        firm = db.query(Lawyer).filter(Lawyer.rut == FIRM_RUT).first()
+        sandy = Lawyer(rut="17111111-1", name="Sandy", is_active=True)
+        db.add(sandy)
+        db.flush()
+        court = Court(code="T1-PD-ORD", name="Juzgado Pending Detail Order Test", region="RM", type="civil")
+        db.add(court)
+        db.flush()
+
+        now = datetime.utcnow()
+        never_checked = Case(
+            lawyer_id=firm.id, court_id=court.id, rol="C-1111-2026",
+            competencia="civil", last_detail_checked_at=None,
+        )
+        older_checked = Case(
+            lawyer_id=firm.id, court_id=court.id, rol="C-2222-2026",
+            competencia="civil", last_detail_checked_at=now - timedelta(days=5),
+        )
+        not_sandys_case = Case(
+            lawyer_id=firm.id, court_id=court.id, rol="C-0000-2026",
+            competencia="civil", last_detail_checked_at=None,
+        )
+        db.add_all([never_checked, older_checked, not_sandys_case])
+        db.commit()
+        _source(db, never_checked, sandy)
+        _source(db, older_checked, sandy)
+        # not_sandys_case deliberately gets no source row for sandy.
+
+        service = IngestService(db)
+        result = service.get_pending_detail(lawyer_rut="17111111-1", competencia="civil", limit=30)
+
+        assert [c["rol"] for c in result] == ["C-1111-2026", "C-2222-2026"]
 
 
 # ---------------------------------------------------------------------------

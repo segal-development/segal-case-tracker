@@ -246,6 +246,20 @@ class IngestService:
         effectively arbitrary and grabs 2006–2023 causes the extension cannot
         resolve in the live Mis Causas list.
 
+        Approach C (ADR-002, THE SUBTLE ONE): every Case shares the FIRM's
+        bookkeeping ``lawyer_id``, so it can no longer scope this per
+        syncing lawyer. Scoped instead via a JOIN on ``case_lawyer_source``
+        filtered by the syncing lawyer's id — "cases this lawyer has
+        actually seen in their own live Mis Causas list" — which is exactly
+        what ``Case.lawyer_id == syncing.id`` used to mean before ingest
+        started upserting one Case per ROL under the firm id. This is what
+        keeps per-syncing-lawyer detail-rotation working: a case only the
+        firm-wide scraper (or a DIFFERENT lawyer's extension) has seen is
+        correctly excluded from THIS lawyer's pending-detail batch. Rejected
+        alternatives (pure case_litigantes scope, a single nullable
+        synced_by column) are documented in design ADR-002 — do not
+        reintroduce them.
+
         Returns ``[]`` when the lawyer is unknown (no cases ingested yet) —
         does NOT create a lawyer (this is a read path).
         """
@@ -259,7 +273,14 @@ class IngestService:
 
         cases = (
             self.db.query(Case)
-            .filter(Case.lawyer_id == lawyer.id, Case.competencia == competencia)
+            .join(
+                CaseLawyerSource,
+                CaseLawyerSource.case_id == Case.id,
+            )
+            .filter(
+                CaseLawyerSource.lawyer_id == lawyer.id,
+                Case.competencia == competencia,
+            )
             .order_by(
                 Case.last_detail_checked_at.asc().nullsfirst(),
                 rol_year.desc(),
