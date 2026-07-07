@@ -583,6 +583,117 @@ class PJUDBaseScraper(ABC):
     # AUTHENTICATION (Concrete)
     # ========================================================================
     
+    async def _generate_recaptcha_token(
+        self,
+        page: Page,
+        sitekey: str,
+        action: str,
+    ) -> str:
+        """Generate an organic reCAPTCHA v3 token in the given page.
+
+        Runs entirely client-side, in the SAME real/headless browser that
+        already passes F5 Shape — this is the legitimate path (same as a real
+        user's browser), NOT a captcha farm: injects the reCAPTCHA script if
+        it isn't already loaded, polls for ``grecaptcha.execute`` readiness
+        (~10s), then calls ``grecaptcha.ready`` + ``grecaptcha.execute``.
+
+        Args:
+            page: Playwright page (already navigated to a page that hosts
+                the reCAPTCHA widget, e.g. PJUD_HOME_URL).
+            sitekey: reCAPTCHA v3 site key.
+            action: reCAPTCHA v3 action name (server-side action binding).
+
+        Returns:
+            The organic reCAPTCHA v3 token string.
+
+        Raises:
+            LoginError: if grecaptcha never loads (``NO_GRECAPTCHA``) or
+                ``execute()`` rejects (``ERR:<reason>``).
+        """
+        token = await page.evaluate(
+            """async ({sitekey, action}) => {
+                if (!(window.grecaptcha && window.grecaptcha.execute)) {
+                    await new Promise((res) => {
+                        const s = document.createElement('script');
+                        s.src = 'https://www.google.com/recaptcha/api.js?render=' + sitekey;
+                        s.onload = res; s.onerror = res;
+                        document.head.appendChild(s);
+                    });
+                }
+                for (let i=0; i<50 && !(window.grecaptcha && window.grecaptcha.execute); i++) {
+                    await new Promise(r => setTimeout(r, 200));
+                }
+                if (!(window.grecaptcha && window.grecaptcha.execute)) return 'NO_GRECAPTCHA';
+                return await new Promise((resolve) => {
+                    grecaptcha.ready(() => {
+                        grecaptcha.execute(sitekey, {action}).then(resolve).catch(e => resolve('ERR:'+e));
+                    });
+                });
+            }""",
+            {"sitekey": sitekey, "action": action},
+        )
+
+        if not isinstance(token, str) or not token or token.startswith(("NO_", "ERR:")):
+            raise LoginError(f"Failed to generate organic reCAPTCHA token: {token!r}")
+
+        return token
+
+    async def login_with_segunda_clave(
+        self,
+        rut: str,
+        password: str,
+    ) -> PJUDSession:
+        """Login via segunda clave using an ORGANICALLY-generated reCAPTCHA v3 token.
+
+        Replaces the removed 2Captcha integration (policy: never 2Captcha).
+        A live experiment confirmed that generating the token in the same
+        real browser that already passes F5 Shape gives reCAPTCHA v3 a
+        human-looking score, so ``login_with_token`` succeeds — this is the
+        legitimate path (same as a real user's browser), not a captcha farm.
+
+        Args:
+            rut: RUT with verification digit (e.g., "19643548-4").
+            password: PJUD segunda-clave password.
+
+        Returns:
+            PJUDSession with cookies for scraping.
+
+        Raises:
+            InvalidCredentialsError: PJUD rejected the RUT/password.
+            ShapeChallengeError: PJUD served a Shape/TSPD challenge instead.
+            LoginError: any other login failure (propagated as-is).
+        """
+        from app.scrapper.pjud_civil import RECAPTCHA_SITEKEY, RECAPTCHA_ACTION_LOGIN
+
+        page = await self._get_page()
+        await page.goto(PJUD_HOME_URL, wait_until="domcontentloaded")
+
+        token = await self._generate_recaptcha_token(
+            page, RECAPTCHA_SITEKEY, RECAPTCHA_ACTION_LOGIN
+        )
+
+        try:
+            return await self.login_with_token(rut, password, token)
+        except InvalidCredentialsError:
+            raise
+        except LoginError:
+            # login_with_token already classifies wrong-credential pages as
+            # InvalidCredentialsError; anything else that reaches here could
+            # still be a Shape/TSPD block rather than a generic failure.
+            try:
+                content = await self._safe_page_content(page)
+            except Exception:
+                content = ""
+            is_shape, marker = detect_shape_challenge(content, page.url)
+            if is_shape:
+                raise ShapeChallengeError(
+                    url=page.url,
+                    jquery_present=False,
+                    looks_like_login=True,
+                    marker=marker,
+                ) from None
+            raise
+
     async def login_with_token(
         self,
         rut: str,
