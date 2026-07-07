@@ -362,12 +362,7 @@ def case_ids_for_abogado(db: Session, account_rut: str, abogado_rut: str) -> set
     account" gating, which hid legitimate cases whenever the viewing account
     was not itself a litigante on them.
     """
-    account_rut_norm = normalize_rut(account_rut)
     abogado_rut_norm = normalize_rut(abogado_rut)
-
-    lawyer = db.query(Lawyer).filter(Lawyer.rut == account_rut_norm).first()
-    if not lawyer:
-        return set()
 
     return {
         case_id
