@@ -247,10 +247,18 @@ class TestCaseIdsForAbogado:
         ids = case_ids_for_abogado(db, ACCOUNT_RUT, FIRM_LAWYER_RUT)
         assert case1.id in ids
 
-    def test_excludes_opposing_abogado(self, db, case1):
+    def test_includes_opposing_side_abogado_of_record(self, db, case1):
+        """Firm-wide fix: OPPOSING_RUT is seeded as AB.DTE — a genuine
+        abogado-of-record on the opposing side of case1. Querying for
+        OPPOSING_RUT specifically now correctly includes case1, since
+        attribution is entirely about whether the TARGET is an
+        abogado-of-record, independent of the viewing account's own side.
+        (Previously this was excluded by the account-side gate, which
+        conflated "not co-side with the viewing account" with "not an
+        abogado of record" — see the bugfix this test replaces.)"""
         _seed_litigantes(db, case1, ACCOUNT_RUT, FIRM_LAWYER_RUT, "Firm Lawyer", OPPOSING_RUT)
         ids = case_ids_for_abogado(db, ACCOUNT_RUT, OPPOSING_RUT)
-        assert case1.id not in ids
+        assert case1.id in ids
 
     def test_returns_empty_for_unknown_account(self, db, case1):
         ids = case_ids_for_abogado(db, "99999999-9", FIRM_LAWYER_RUT)
@@ -284,6 +292,61 @@ class TestCaseIdsForAbogado:
 
         ids = case_ids_for_abogado(db, ACCOUNT_RUT, FIRM_LAWYER_RUT)
         assert case.id in ids
+
+    def test_includes_case_where_viewing_account_is_not_a_litigante(self, db, case1, case2):
+        """Firm-wide fix: the target abogado (FIRM_LAWYER_RUT) is abogado-of-record
+        on case2, but the VIEWING account is not a litigante on case2 at all.
+        Dropping the account-side gate means the viewing account still sees
+        case2 when asking specifically about FIRM_LAWYER_RUT's caseload —
+        previously this case was hidden because the account had no side
+        resolved on it."""
+        _seed_litigantes(db, case1, ACCOUNT_RUT, FIRM_LAWYER_RUT, "Firm Lawyer", OPPOSING_RUT)
+        db.add(CaseLitigante(
+            case_id=case2.id,
+            participante="AB.DDO",
+            rut=FIRM_LAWYER_RUT,
+            persona_type="NATURAL",
+            nombre="Firm Lawyer",
+            natural_key=f"{case2.id}-firm-only",
+        ))
+        db.commit()
+
+        ids = case_ids_for_abogado(db, ACCOUNT_RUT, FIRM_LAWYER_RUT)
+        assert case2.id in ids
+
+    def test_excludes_case_where_target_is_not_abogado_of_record(self, db, case2):
+        """Target RUT appears on the case only as a party (DDO, not AB.DDO) —
+        not an abogado-of-record litigante — so the case is excluded."""
+        db.add(CaseLitigante(
+            case_id=case2.id,
+            participante="DDO",
+            rut=FIRM_LAWYER_RUT,
+            persona_type="NATURAL",
+            nombre="Firm Lawyer as party",
+            natural_key=f"{case2.id}-party-only",
+        ))
+        db.commit()
+
+        ids = case_ids_for_abogado(db, ACCOUNT_RUT, FIRM_LAWYER_RUT)
+        assert case2.id not in ids
+
+    def test_self_query_returns_all_own_abogado_cases_no_regression(self, db, case1, case2):
+        """No regression: querying for self (account == target abogado) still
+        returns every case where the account is abogado-of-record, matching
+        the (lawyer.rut, lawyer.rut) usage in deps.py/stats.py."""
+        _seed_litigantes(db, case1, ACCOUNT_RUT, FIRM_LAWYER_RUT, "Firm Lawyer", OPPOSING_RUT)
+        db.add(CaseLitigante(
+            case_id=case2.id,
+            participante="AB.DTE",
+            rut=ACCOUNT_RUT,
+            persona_type="NATURAL",
+            nombre="Account Lawyer",
+            natural_key=f"{case2.id}-account-solo",
+        ))
+        db.commit()
+
+        ids = case_ids_for_abogado(db, ACCOUNT_RUT, ACCOUNT_RUT)
+        assert {case1.id, case2.id} <= ids
 
 
 # ---------------------------------------------------------------------------
