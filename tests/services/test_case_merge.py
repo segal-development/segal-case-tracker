@@ -440,3 +440,198 @@ class TestNoDataLossAcrossAllEightTables:
             Alert,
         ):
             assert db.query(model).filter(model.case_id == loser.id).count() == 0
+
+
+class TestCollisionAwareMergeAcrossAllConstrainedTables:
+    """Regression test for the real Postgres incident (2026-07-06 QA run).
+
+    Winner AND loser BOTH have a child row with the SAME natural identity in
+    every table that carries a per-case unique constraint. The old flow was
+    "blind repoint (UPDATE case_id=winner for every loser row) THEN dedupe":
+    that UPDATE collides with the winner's existing row before the dedupe
+    step ever runs, raising a psycopg2 UniqueViolation on Postgres (e.g.
+    ``uq_case_litigante_natural_key``). The merge must instead detect the
+    identity collision BEFORE touching case_id: colliding loser rows are
+    deleted (after repointing any references to the winner's canonical row)
+    instead of ever being UPDATEd into a colliding identity.
+    """
+
+    def test_merge_succeeds_with_matching_identities_on_every_constrained_child_table(
+        self, db, court, carla, sandy
+    ):
+        winner = Case(lawyer_id=carla.id, court_id=court.id, rol="C-COLLIDE-2024", competencia="civil")
+        loser = Case(lawyer_id=sandy.id, court_id=court.id, rol="C-COLLIDE-2024", competencia="civil")
+        db.add_all([winner, loser])
+        db.flush()
+
+        # Movement: SAME (folio, description) on both sides -> true duplicate.
+        # Winner gets 3 extra movements so it stays unambiguously richer than
+        # the loser (which gets 2 documents below) - winner selection itself
+        # is not what this test is about.
+        db.add(_movement(winner.id, "F-EXTRA-1", "Winner-only movement 1"))
+        db.add(_movement(winner.id, "F-EXTRA-2", "Winner-only movement 2"))
+        db.add(_movement(winner.id, "F-EXTRA-3", "Winner-only movement 3"))
+        winner_movement = _movement(winner.id, "F-SHARED", "Shared movement text")
+        loser_movement = _movement(loser.id, "F-SHARED", "Shared movement text")
+        db.add_all([winner_movement, loser_movement])
+
+        # CaseLitigante: same natural_key on both sides.
+        db.add(_litigante(winner.id, "DTE", carla.rut, "Carla", "shared-lit"))
+        db.add(_litigante(loser.id, "AB.DTE", sandy.rut, "Sandy", "shared-lit"))
+
+        # CaseNotificacion: same natural_key on both sides.
+        db.add(
+            CaseNotificacion(
+                case_id=winner.id, rol="C-COLLIDE-2024", estado_notif="ok", tipo_notif="tipo",
+                tipo_participante="DTE", nombre="Carla", tramite="tramite", natural_key="shared-notif",
+            )
+        )
+        db.add(
+            CaseNotificacion(
+                case_id=loser.id, rol="C-COLLIDE-2024", estado_notif="ok", tipo_notif="tipo",
+                tipo_participante="DDO", nombre="Sandy", tramite="tramite", natural_key="shared-notif",
+            )
+        )
+
+        # CaseEscrito: same natural_key on both sides.
+        winner_escrito = CaseEscrito(
+            case_id=winner.id, tipo_escrito="tipo", solicitante="Carla", natural_key="shared-escrito"
+        )
+        loser_escrito = CaseEscrito(
+            case_id=loser.id, tipo_escrito="tipo", solicitante="Sandy", natural_key="shared-escrito"
+        )
+        db.add_all([winner_escrito, loser_escrito])
+
+        # CaseExhorto: same natural_key on both sides.
+        db.add(
+            CaseExhorto(
+                case_id=winner.id, rol_origen="C-COLLIDE-2024", tipo_exhorto="ACTIVO",
+                rol_destino="E-1-2026", tribunal_destino="Tribunal X", estado="ok",
+                natural_key="shared-exhorto",
+            )
+        )
+        db.add(
+            CaseExhorto(
+                case_id=loser.id, rol_origen="C-COLLIDE-2024", tipo_exhorto="ACTIVO",
+                rol_destino="E-2-2026", tribunal_destino="Tribunal Y", estado="ok",
+                natural_key="shared-exhorto",
+            )
+        )
+
+        # CaseDeadline: same (deadline_type, triggered_at) on both sides.
+        shared_triggered_at = datetime.utcnow().date()
+        db.add(
+            CaseDeadline(
+                case_id=winner.id, deadline_type="contestacion",
+                due_date=shared_triggered_at, triggered_at=shared_triggered_at,
+            )
+        )
+        db.add(
+            CaseDeadline(
+                case_id=loser.id, deadline_type="contestacion",
+                due_date=shared_triggered_at, triggered_at=shared_triggered_at,
+            )
+        )
+        db.flush()
+
+        # References into the loser's about-to-be-deduped Movement/CaseEscrito
+        # must be repointed to the winner's CANONICAL row, not orphaned.
+        doc_on_loser_movement = Document(case_id=loser.id, movement_id=loser_movement.id, filename="via-movement.pdf")
+        doc_on_loser_escrito = Document(case_id=loser.id, escrito_id=loser_escrito.id, filename="via-escrito.pdf")
+        db.add_all([doc_on_loser_movement, doc_on_loser_escrito])
+
+        deadline_on_loser_movement = CaseDeadline(
+            case_id=loser.id, deadline_type="replica",
+            due_date=shared_triggered_at, triggered_at=shared_triggered_at + timedelta(days=1),
+            source_movement_id=loser_movement.id,
+        )
+        db.add(deadline_on_loser_movement)
+
+        alert_on_loser_movement = Alert(
+            lawyer_id=sandy.id, case_id=loser.id, movement_id=loser_movement.id,
+            type="new_movement", title="alert",
+        )
+        db.add(alert_on_loser_movement)
+
+        db.flush()
+        doc_movement_id = doc_on_loser_movement.id
+        doc_escrito_id = doc_on_loser_escrito.id
+        deadline_id = deadline_on_loser_movement.id
+        alert_id = alert_on_loser_movement.id
+        loser_movement_id = loser_movement.id
+        loser_escrito_id = loser_escrito.id
+
+        # Must not raise (real incident: psycopg2.errors.UniqueViolation on
+        # uq_case_litigante_natural_key from a blind UPDATE before dedupe).
+        result = run_case_merge(db)
+
+        assert result.losers_deleted == 1
+        assert db.query(Case).filter(Case.id == loser.id).first() is None
+
+        # Exactly one surviving row per shared identity on the winner.
+        assert db.query(CaseLitigante).filter(
+            CaseLitigante.case_id == winner.id, CaseLitigante.natural_key == "shared-lit"
+        ).count() == 1
+        assert db.query(CaseNotificacion).filter(
+            CaseNotificacion.case_id == winner.id, CaseNotificacion.natural_key == "shared-notif"
+        ).count() == 1
+        assert db.query(CaseEscrito).filter(
+            CaseEscrito.case_id == winner.id, CaseEscrito.natural_key == "shared-escrito"
+        ).count() == 1
+        assert db.query(CaseExhorto).filter(
+            CaseExhorto.case_id == winner.id, CaseExhorto.natural_key == "shared-exhorto"
+        ).count() == 1
+        assert db.query(CaseDeadline).filter(
+            CaseDeadline.case_id == winner.id, CaseDeadline.deadline_type == "contestacion"
+        ).count() == 1
+        assert db.query(Movement).filter(
+            Movement.case_id == winner.id, Movement.folio == "F-SHARED"
+        ).count() == 1
+
+        surviving_movement = db.query(Movement).filter(
+            Movement.case_id == winner.id, Movement.folio == "F-SHARED"
+        ).first()
+        surviving_escrito = db.query(CaseEscrito).filter(
+            CaseEscrito.case_id == winner.id, CaseEscrito.natural_key == "shared-escrito"
+        ).first()
+
+        refreshed_doc_movement = db.query(Document).filter(Document.id == doc_movement_id).first()
+        assert refreshed_doc_movement is not None
+        assert refreshed_doc_movement.case_id == winner.id
+        assert refreshed_doc_movement.movement_id == surviving_movement.id
+
+        refreshed_doc_escrito = db.query(Document).filter(Document.id == doc_escrito_id).first()
+        assert refreshed_doc_escrito is not None
+        assert refreshed_doc_escrito.case_id == winner.id
+        assert refreshed_doc_escrito.escrito_id == surviving_escrito.id
+
+        refreshed_deadline = db.query(CaseDeadline).filter(CaseDeadline.id == deadline_id).first()
+        assert refreshed_deadline is not None
+        assert refreshed_deadline.case_id == winner.id
+        assert refreshed_deadline.source_movement_id == surviving_movement.id
+
+        refreshed_alert = db.query(Alert).filter(Alert.id == alert_id).first()
+        assert refreshed_alert is not None
+        assert refreshed_alert.case_id == winner.id
+        assert refreshed_alert.movement_id == surviving_movement.id
+
+        # The deduped-away loser rows are gone.
+        assert db.query(Movement).filter(Movement.id == loser_movement_id).first() is None
+        assert db.query(CaseEscrito).filter(CaseEscrito.id == loser_escrito_id).first() is None
+
+        # No duplicate natural identities anywhere on the winner (post-merge
+        # invariant, asserted independently of whether the local SQLite test
+        # DB enforces the same UNIQUE constraints as the real Postgres DB).
+        for model, key_cols in (
+            (CaseLitigante, ("natural_key",)),
+            (CaseNotificacion, ("natural_key",)),
+            (CaseEscrito, ("natural_key",)),
+            (CaseExhorto, ("natural_key",)),
+        ):
+            rows = db.query(model).filter(model.case_id == winner.id).all()
+            keys = [tuple(getattr(row, col) for col in key_cols) for row in rows]
+            assert len(keys) == len(set(keys)), f"{model.__tablename__} has duplicate identities post-merge"
+
+        deadline_rows = db.query(CaseDeadline).filter(CaseDeadline.case_id == winner.id).all()
+        deadline_keys = [(row.deadline_type, row.triggered_at) for row in deadline_rows]
+        assert len(deadline_keys) == len(set(deadline_keys))
