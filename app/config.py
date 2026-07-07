@@ -71,6 +71,16 @@ class Settings(BaseSettings):
     SENDGRID_API_KEY: str = ""
     FROM_EMAIL: str = "notificaciones@segal.cl"
 
+    # SMTP (supervisor credential-change alerts — firm-provided SMTP creds,
+    # not the SendGrid API)
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_USE_TLS: bool = True
+    SMTP_FROM: str = ""
+    SUPERVISOR_EMAIL: str = ""
+
     # Firebase (push notifications)
     FIREBASE_CREDENTIALS_PATH: str = ""
     FIREBASE_CREDENTIALS_JSON: str = ""
