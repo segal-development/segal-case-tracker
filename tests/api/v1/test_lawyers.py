@@ -314,6 +314,15 @@ class TestCaseIdsForAbogado:
         ids = case_ids_for_abogado(db, ACCOUNT_RUT, FIRM_LAWYER_RUT)
         assert case2.id in ids
 
+    def test_unknown_account_rut_still_returns_abogado_cases(self, db, case1):
+        """The account_rut is vestigial (kept for caller compat). An account
+        whose RUT doesn't resolve to a Lawyer row (e.g. a non-standard admin
+        rut like 'mtoro-admin' that normalize_rut mangles) must NOT zero out
+        the result — the abogado's cases are still returned."""
+        _seed_litigantes(db, case1, ACCOUNT_RUT, FIRM_LAWYER_RUT, "Firm Lawyer", OPPOSING_RUT)
+        ids = case_ids_for_abogado(db, "mtoro-admin", FIRM_LAWYER_RUT)
+        assert case1.id in ids
+
     def test_excludes_case_where_target_is_not_abogado_of_record(self, db, case2):
         """Target RUT appears on the case only as a party (DDO, not AB.DDO) —
         not an abogado-of-record litigante — so the case is excluded."""
