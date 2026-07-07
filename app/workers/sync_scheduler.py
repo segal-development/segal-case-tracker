@@ -26,6 +26,7 @@ from app.core.database import SessionLocal
 from app.core.security import decrypt_pjud_password
 from app.models.lawyer import Lawyer
 from app.models.sync_history import SyncHistory
+from app.scrapper.pjud.exceptions import InvalidCredentialsError
 from app.services.sync_service import (
     SyncService,
     convert_api_cases_to_scraped,
@@ -34,6 +35,7 @@ from app.services.sync_service import (
 )
 from app.services.session_store import get_session_store, SessionStore
 from app.services.pjud_session import PJUDSession
+from app.services.supervisor_alert_service import send_supervisor_credential_alert
 from app.config import settings
 
 # Configure logging
@@ -102,6 +104,17 @@ async def _reauth(
     - Missing/unrecognised method or no creds: returns
       ``(None, "no_credentials")`` — skips gracefully.
 
+    Supervisor credential-change alert:
+    ``ClaveUnicaAuth.login`` raises ``InvalidCredentialsError`` when PJUD
+    rejected the RUT/password (the lawyer likely changed their clave — retry
+    is pointless).  On that specific exception, and ONLY that one (a
+    ``ShapeChallengeError`` or any other transient error never triggers
+    this), this function emails the configured supervisor exactly once per
+    failure episode via ``send_supervisor_credential_alert`` and sets
+    ``lawyer.credential_alert_sent_at``.  A later successful re-auth clears
+    that field so a future credential change alerts again.  The caller is
+    responsible for committing the ``lawyer`` row (see ``sync_lawyer_cases``).
+
     Args:
         lawyer: Lawyer ORM row with optional encrypted credential fields.
         store: Active ``SessionStore`` for persisting the refreshed session.
@@ -138,8 +151,27 @@ async def _reauth(
                 auth = ClaveUnicaAuth()
                 session = await auth.login(page, credentials, int(lawyer.id))
                 await store.asave_session(session)
+                # Login succeeded — clear any prior credential-alert de-dup
+                # marker so a FUTURE credential change alerts again.
+                if getattr(lawyer, "credential_alert_sent_at", None) is not None:
+                    lawyer.credential_alert_sent_at = None
                 logger.info("Re-auth (clave_unica) succeeded for lawyer %d", lawyer.id)
                 return session, None
+        except InvalidCredentialsError as exc:
+            # The lawyer changed their Clave Única / segunda clave — retrying
+            # will never succeed. Alert the supervisor exactly once per
+            # failure episode (de-dup via credential_alert_sent_at); a Shape
+            # block or transient error must NEVER reach this branch.
+            logger.error(
+                "Re-auth (clave_unica) failed for lawyer %d: invalid credentials (%s)",
+                lawyer.id,
+                exc,
+            )
+            if getattr(lawyer, "credential_alert_sent_at", None) is None:
+                sent = await send_supervisor_credential_alert(lawyer, str(exc))
+                if sent:
+                    lawyer.credential_alert_sent_at = datetime.utcnow()
+            return None, "invalid_credentials"
         except Exception as exc:
             logger.error("Re-auth (clave_unica) failed for lawyer %d: %s", lawyer.id, exc)
             return None, f"reauth_failed: {exc}"
@@ -202,6 +234,10 @@ async def sync_lawyer_cases(
             return {"skipped": True, "reason": "no_session"}
 
         pjud_session, reason = await _reauth(lawyer, store)
+        # Persist any credential_alert_sent_at change _reauth made on the
+        # lawyer row (set on a new invalid-credentials episode, cleared on a
+        # successful re-auth) regardless of the outcome below.
+        db.commit()
         if pjud_session is None:
             logger.warning(f"Skipping lawyer {lawyer_id}: {reason}")
             return {"skipped": True, "reason": reason}

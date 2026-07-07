@@ -19,6 +19,8 @@ from typing import Optional, List, Dict, Any
 
 from playwright.async_api import Page, TimeoutError as PlaywrightTimeout
 
+from app.scrapper.pjud.base import classify_login_failure, detect_shape_challenge
+from app.scrapper.pjud.exceptions import InvalidCredentialsError, ShapeChallengeError
 from app.scrapper.pjud.selectors.registry import SelectorRegistry
 from app.services.pjud_session import PJUDSession
 
@@ -123,20 +125,68 @@ class ClaveUnicaAuth:
             
             # Step 7: Verify we're logged in
             if not await self._verify_logged_in(page):
-                raise ClaveUnicaAuthError("Login failed: Could not verify logged in state")
-            
+                raise await self._classify_login_failure(page, credentials)
+
             # Step 8: Extract session cookies
             session = await self._extract_session(page, credentials.rut, lawyer_id)
-            
+
             logger.info(f"Clave Unica login successful for lawyer {lawyer_id}")
             return session
-            
+
         except PlaywrightTimeout as e:
             logger.error(f"Timeout during Clave Unica login: {e}")
             raise ClaveUnicaAuthError(f"Login timeout: {e}") from e
+        except (InvalidCredentialsError, ShapeChallengeError):
+            # Already classified — never re-wrap into the generic error, the
+            # caller (_reauth) needs the specific exception type to decide
+            # whether to alert the supervisor.
+            raise
         except Exception as e:
             logger.error(f"Clave Unica login failed: {e}")
             raise ClaveUnicaAuthError(f"Login failed: {e}") from e
+
+    async def _classify_login_failure(
+        self,
+        page: Page,
+        credentials: "ClaveUnicaCredentials",
+    ) -> Exception:
+        """Inspect the stuck page and return the exception to raise.
+
+        Distinguishes (in priority order):
+        1. Shape/TSPD challenge -> ShapeChallengeError (a PJUD block, not a
+           credential problem — must NOT trigger a supervisor alert).
+        2. Wrong RUT/password -> InvalidCredentialsError (the lawyer must
+           update their clave — retry is pointless, DOES trigger an alert).
+        3. Neither marker -> the existing generic ClaveUnicaAuthError
+           (unclassified/transient failure).
+        """
+        content = await self._safe_page_content(page)
+        url = getattr(page, "url", "") or ""
+
+        is_shape, marker = detect_shape_challenge(content, url)
+        if is_shape:
+            return ShapeChallengeError(
+                url=url,
+                jquery_present=False,
+                looks_like_login=True,
+                marker=marker,
+            )
+
+        is_invalid, snippet = classify_login_failure(content)
+        if is_invalid:
+            return InvalidCredentialsError(
+                f"Clave Única rejected credentials for RUT {credentials.rut}"
+                + (f": {snippet}" if snippet else "")
+            )
+
+        return ClaveUnicaAuthError("Login failed: Could not verify logged in state")
+
+    async def _safe_page_content(self, page: Page) -> str:
+        """Best-effort page content read — never raises."""
+        try:
+            return await page.content()
+        except Exception:
+            return ""
     
     async def _close_modal_if_present(self, page: Page) -> None:
         """Close any modal that appears on page load (best-effort)."""
