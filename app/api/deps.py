@@ -277,7 +277,7 @@ def resolve_case_scope(db: Session, current_lawyer: dict):
         lawyer = db.query(Lawyer).filter(Lawyer.id == int(sub)).first()
         if lawyer is None:
             return set()
-        if lawyer.role == "auditor":
+        if lawyer.role in ("auditor", "admin"):
             return ALL_CASES
         return case_ids_for_abogado(db, lawyer.rut, lawyer.rut) | _bootstrap_owned_case_ids(
             db, lawyer.id
@@ -286,7 +286,7 @@ def resolve_case_scope(db: Session, current_lawyer: dict):
     lawyer = db.query(Lawyer).filter(Lawyer.rut == sub).first()
     if not lawyer:
         raise HTTPException(status_code=404, detail="Lawyer not found")
-    if lawyer.role == "auditor":
+    if lawyer.role in ("auditor", "admin"):
         return ALL_CASES
     return case_ids_for_abogado(db, lawyer.rut, lawyer.rut) | _bootstrap_owned_case_ids(
         db, lawyer.id

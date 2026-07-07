@@ -53,6 +53,15 @@ def auditor(db):
 
 
 @pytest.fixture
+def admin(db):
+    obj = Lawyer(rut="88888888-8", name="Admin", role="admin")
+    db.add(obj)
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+
+@pytest.fixture
 def court(db):
     obj = Court(code="T1-SCOPE", name="Juzgado Scope", region="RM", type="civil")
     db.add(obj)
@@ -118,6 +127,13 @@ class TestResolveCaseScope:
 
     def test_resolve_case_scope_auditor_still_all_cases(self, db, auditor):
         scope = resolve_case_scope(db, {"sub": auditor.rut})
+        assert scope is ALL_CASES
+
+    def test_resolve_case_scope_admin_gets_all_cases(self, db, admin):
+        # Admin is a firm-wide role (require_auditor allows admin); it must
+        # see every case, same as auditor — otherwise an admin viewing a
+        # specific abogado only sees cases they personally litigate.
+        scope = resolve_case_scope(db, {"sub": admin.rut})
         assert scope is ALL_CASES
 
 
