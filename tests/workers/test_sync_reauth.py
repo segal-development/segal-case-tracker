@@ -11,6 +11,8 @@ Tests four branches (ADR-7 + FIX-1, post 2Captcha removal):
 
 All tests mock Playwright, browser, and scraper — no live connections.
 """
+from datetime import datetime
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -30,14 +32,18 @@ def _make_lawyer(
     clave_unica_rut: str = "12345678-9",
     rut: str = "12345678-9",
     lawyer_id: int = 42,
+    name: str = "Juan Pérez",
+    credential_alert_sent_at: object = None,
 ) -> MagicMock:
     lawyer = MagicMock()
     lawyer.id = lawyer_id
     lawyer.rut = rut
+    lawyer.name = name
     lawyer.preferred_auth_method = preferred_auth_method
     lawyer.encrypted_clave_unica_password = encrypted_clave_unica_password
     lawyer.encrypted_pjud_password = encrypted_pjud_password
     lawyer.clave_unica_rut = clave_unica_rut
+    lawyer.credential_alert_sent_at = credential_alert_sent_at
     return lawyer
 
 
@@ -210,3 +216,207 @@ class TestReauthNoCredentials:
 
         assert session is None
         assert reason == "no_credentials"
+
+
+# ---------------------------------------------------------------------------
+# Supervisor credential-change alert wiring + de-dup
+# ---------------------------------------------------------------------------
+
+def _mock_browser_and_auth(login_side_effect=None, login_return_value=None):
+    """Build the (browser_class_patch, auth_class_patch) mocks for a clave_unica
+    ClaveUnicaAuth.login() call, either succeeding or raising."""
+    mock_page = AsyncMock()
+    mock_factory = MagicMock()
+    mock_factory.new_page = AsyncMock(return_value=mock_page)
+    mock_cm = MagicMock()
+    mock_cm.__aenter__ = AsyncMock(return_value=mock_factory)
+    mock_cm.__aexit__ = AsyncMock(return_value=None)
+    mock_browser_class = MagicMock(return_value=mock_cm)
+
+    mock_auth = MagicMock()
+    if login_side_effect is not None:
+        mock_auth.login = AsyncMock(side_effect=login_side_effect)
+    else:
+        mock_auth.login = AsyncMock(return_value=login_return_value)
+    mock_auth_class = MagicMock(return_value=mock_auth)
+
+    return mock_browser_class, mock_auth_class
+
+
+class TestReauthCredentialAlert:
+    """S-CCS: InvalidCredentialsError triggers exactly one supervisor alert
+    per credential-failure episode; Shape/transient failures never alert;
+    a successful re-auth clears the de-dup marker."""
+
+    @pytest.mark.asyncio
+    async def test_invalid_credentials_sends_alert_once_and_sets_timestamp(self, fake_redis):
+        from app.workers.sync_scheduler import _reauth
+        from app.services.session_store import SessionStore
+        from app.scrapper.pjud.exceptions import InvalidCredentialsError
+
+        enc_pass = encrypt_pjud_password("mypassword")
+        lawyer = _make_lawyer(
+            preferred_auth_method="clave_unica",
+            encrypted_clave_unica_password=enc_pass,
+            credential_alert_sent_at=None,
+        )
+        store = SessionStore(redis_client=fake_redis)
+
+        mock_browser_class, mock_auth_class = _mock_browser_and_auth(
+            login_side_effect=InvalidCredentialsError("PJUD rejected credentials")
+        )
+
+        with (
+            patch("app.scrapper.pjud.browser.BrowserFactory", mock_browser_class),
+            patch("app.scrapper.pjud.clave_unica.ClaveUnicaAuth", mock_auth_class),
+            patch(
+                "app.workers.sync_scheduler.send_supervisor_credential_alert",
+                new_callable=AsyncMock,
+            ) as mock_alert,
+        ):
+            mock_alert.return_value = True
+            session, reason = await _reauth(lawyer, store)
+
+        assert session is None
+        assert reason == "invalid_credentials"
+        mock_alert.assert_awaited_once()
+        assert lawyer.credential_alert_sent_at is not None
+
+    @pytest.mark.asyncio
+    async def test_second_consecutive_failure_does_not_resend_alert(self, fake_redis):
+        """De-dup: credential_alert_sent_at already set -> no second email."""
+        from app.workers.sync_scheduler import _reauth
+        from app.services.session_store import SessionStore
+        from app.scrapper.pjud.exceptions import InvalidCredentialsError
+
+        already_sent_at = datetime(2026, 7, 1, 12, 0, 0)
+        enc_pass = encrypt_pjud_password("mypassword")
+        lawyer = _make_lawyer(
+            preferred_auth_method="clave_unica",
+            encrypted_clave_unica_password=enc_pass,
+            credential_alert_sent_at=already_sent_at,
+        )
+        store = SessionStore(redis_client=fake_redis)
+
+        mock_browser_class, mock_auth_class = _mock_browser_and_auth(
+            login_side_effect=InvalidCredentialsError("PJUD rejected credentials")
+        )
+
+        with (
+            patch("app.scrapper.pjud.browser.BrowserFactory", mock_browser_class),
+            patch("app.scrapper.pjud.clave_unica.ClaveUnicaAuth", mock_auth_class),
+            patch(
+                "app.workers.sync_scheduler.send_supervisor_credential_alert",
+                new_callable=AsyncMock,
+            ) as mock_alert,
+        ):
+            session, reason = await _reauth(lawyer, store)
+
+        assert session is None
+        assert reason == "invalid_credentials"
+        mock_alert.assert_not_awaited()
+        assert lawyer.credential_alert_sent_at == already_sent_at
+
+    @pytest.mark.asyncio
+    async def test_shape_challenge_does_not_send_alert(self, fake_redis):
+        """A Shape block is NOT a credential problem -> no supervisor alert."""
+        from app.workers.sync_scheduler import _reauth
+        from app.services.session_store import SessionStore
+        from app.scrapper.pjud.exceptions import ShapeChallengeError
+
+        enc_pass = encrypt_pjud_password("mypassword")
+        lawyer = _make_lawyer(
+            preferred_auth_method="clave_unica",
+            encrypted_clave_unica_password=enc_pass,
+            credential_alert_sent_at=None,
+        )
+        store = SessionStore(redis_client=fake_redis)
+
+        mock_browser_class, mock_auth_class = _mock_browser_and_auth(
+            login_side_effect=ShapeChallengeError(
+                url="https://oficinajudicialvirtual.pjud.cl/home/index.php",
+                jquery_present=False,
+                looks_like_login=True,
+                marker="TSPD_101",
+            )
+        )
+
+        with (
+            patch("app.scrapper.pjud.browser.BrowserFactory", mock_browser_class),
+            patch("app.scrapper.pjud.clave_unica.ClaveUnicaAuth", mock_auth_class),
+            patch(
+                "app.workers.sync_scheduler.send_supervisor_credential_alert",
+                new_callable=AsyncMock,
+            ) as mock_alert,
+        ):
+            session, reason = await _reauth(lawyer, store)
+
+        assert session is None
+        mock_alert.assert_not_awaited()
+        assert lawyer.credential_alert_sent_at is None
+
+    @pytest.mark.asyncio
+    async def test_transient_error_does_not_send_alert(self, fake_redis):
+        """A generic/transient error is NOT a credential problem -> no alert."""
+        from app.workers.sync_scheduler import _reauth
+        from app.services.session_store import SessionStore
+
+        enc_pass = encrypt_pjud_password("mypassword")
+        lawyer = _make_lawyer(
+            preferred_auth_method="clave_unica",
+            encrypted_clave_unica_password=enc_pass,
+            credential_alert_sent_at=None,
+        )
+        store = SessionStore(redis_client=fake_redis)
+
+        mock_browser_class, mock_auth_class = _mock_browser_and_auth(
+            login_side_effect=Exception("network blip")
+        )
+
+        with (
+            patch("app.scrapper.pjud.browser.BrowserFactory", mock_browser_class),
+            patch("app.scrapper.pjud.clave_unica.ClaveUnicaAuth", mock_auth_class),
+            patch(
+                "app.workers.sync_scheduler.send_supervisor_credential_alert",
+                new_callable=AsyncMock,
+            ) as mock_alert,
+        ):
+            session, reason = await _reauth(lawyer, store)
+
+        assert session is None
+        mock_alert.assert_not_awaited()
+        assert lawyer.credential_alert_sent_at is None
+
+    @pytest.mark.asyncio
+    async def test_successful_reauth_clears_alert_timestamp(self, fake_redis):
+        """A successful login clears any prior de-dup marker."""
+        from app.workers.sync_scheduler import _reauth
+        from app.services.session_store import SessionStore
+
+        enc_pass = encrypt_pjud_password("mypassword")
+        lawyer = _make_lawyer(
+            preferred_auth_method="clave_unica",
+            encrypted_clave_unica_password=enc_pass,
+            credential_alert_sent_at=datetime(2026, 7, 1, 12, 0, 0),
+        )
+        store = SessionStore(redis_client=fake_redis)
+        fake_session = _make_fake_session(lawyer_id=lawyer.id)
+
+        mock_browser_class, mock_auth_class = _mock_browser_and_auth(
+            login_return_value=fake_session
+        )
+
+        with (
+            patch("app.scrapper.pjud.browser.BrowserFactory", mock_browser_class),
+            patch("app.scrapper.pjud.clave_unica.ClaveUnicaAuth", mock_auth_class),
+            patch(
+                "app.workers.sync_scheduler.send_supervisor_credential_alert",
+                new_callable=AsyncMock,
+            ) as mock_alert,
+        ):
+            session, reason = await _reauth(lawyer, store)
+
+        assert session is not None
+        assert reason is None
+        mock_alert.assert_not_awaited()
+        assert lawyer.credential_alert_sent_at is None

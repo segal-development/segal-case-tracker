@@ -39,6 +39,12 @@ class Lawyer(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     last_login_at = Column(DateTime, nullable=True)
+
+    # Set when a supervisor credential-change alert email has been sent for
+    # this lawyer's current credential-failure episode (de-dup: one alert per
+    # episode). Cleared to NULL the next time this lawyer's login succeeds,
+    # so a future credential change alerts again.
+    credential_alert_sent_at = Column(DateTime, nullable=True)
     
     # Relationships
     cases = relationship("Case", back_populates="lawyer")
