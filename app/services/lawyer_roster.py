@@ -349,7 +349,19 @@ def firm_dashboard_stats_all(db: Session) -> dict:
 
 
 def case_ids_for_abogado(db: Session, account_rut: str, abogado_rut: str) -> set[int]:
-    """Return case IDs where abogado_rut is a firm-side abogado (same side as account)."""
+    """Return case IDs where ``abogado_rut`` is an abogado-of-record litigante.
+
+    Firm-wide attribution (Approach C): an abogado sees every case where they
+    are personally an abogado-of-record (``participante`` in ``ALL_ABOGADO``),
+    regardless of which side that is, and regardless of whether the VIEWING
+    ``account_rut`` is also a litigante on that same case. ``account_rut`` is
+    kept in the signature (existing callers pass it, e.g. to authorize a
+    self-lookup or an admin viewing another firm lawyer's caseload) but it no
+    longer gates results — only ``abogado_rut``'s own litigante rows decide
+    membership. This intentionally replaces the previous "same side as
+    account" gating, which hid legitimate cases whenever the viewing account
+    was not itself a litigante on them.
+    """
     account_rut_norm = normalize_rut(account_rut)
     abogado_rut_norm = normalize_rut(abogado_rut)
 
@@ -357,26 +369,14 @@ def case_ids_for_abogado(db: Session, account_rut: str, abogado_rut: str) -> set
     if not lawyer:
         return set()
 
-    by_case = _abogado_litigantes_by_case(db)
-    result: set[int] = set()
-
-    for case_id, litigantes in by_case.items():
-        account_side: Optional[frozenset] = None
-        for lit in litigantes:
-            if normalize_rut(lit.rut) == account_rut_norm:
-                if lit.participante in DEMANDANTE_ABOGADO:
-                    account_side = DEMANDANTE_ABOGADO
-                elif lit.participante in DEMANDADO_ABOGADO:
-                    account_side = DEMANDADO_ABOGADO
-                break
-        if account_side is None:
-            continue
-        for lit in litigantes:
-            if normalize_rut(lit.rut) == abogado_rut_norm and lit.participante in account_side:
-                result.add(case_id)
-                break
-
-    return result
+    return {
+        case_id
+        for case_id, litigantes in _abogado_litigantes_by_case(db).items()
+        if any(
+            normalize_rut(lit.rut) == abogado_rut_norm and lit.participante in ALL_ABOGADO
+            for lit in litigantes
+        )
+    }
 
 
 def acting_lawyer_is_case_abogado(db: Session, case: Case, acting_rut: str) -> bool:
