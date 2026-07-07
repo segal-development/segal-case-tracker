@@ -63,9 +63,6 @@ class Settings(BaseSettings):
     ENCRYPTION_KEY_FALLBACKS: str = ""
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 24 hours
 
-    # 2Captcha
-    CAPTCHA_API_KEY: str = ""
-
     # GCP
     GCP_PROJECT_ID: str = ""
     GCP_PUBSUB_TOPIC: str = "scrape-jobs"
@@ -158,16 +155,6 @@ class Settings(BaseSettings):
     def effective_debug(self) -> bool:
         """True only when DEBUG is set AND we are in the development environment."""
         return self.DEBUG and self.ENVIRONMENT.lower() == "development"
-
-    @property
-    def has_2captcha(self) -> bool:
-        """True when a 2Captcha API key is configured (single decision point, ADR-7).
-
-        Controls the autonomous captcha re-auth path in the worker scheduler.
-        When False, lawyers authenticated via captcha are skipped on session
-        expiry (reason=``captcha_no_2captcha_key``) rather than crashing.
-        """
-        return bool(self.CAPTCHA_API_KEY)
 
     # ------------------------------------------------------------------
     # Fail-fast secrets validation

@@ -91,13 +91,13 @@ async def _reauth(
     - Plaintext passwords are NEVER written to any log, DB field, or cache
       other than the Fernet ciphertext columns above.
 
-    Branch logic (ADR-7):
+    Branch logic (ADR-7, post 2Captcha removal):
     - ``clave_unica``: always re-authenticatable (no captcha).  Decrypts
       ``encrypted_clave_unica_password``, calls headless ``ClaveUnicaAuth.login``,
       persists the fresh session.
-    - ``captcha`` + ``settings.has_2captcha``: solves the captcha via 2Captcha
-      API, calls ``login_with_token``, persists the fresh session.
-    - ``captcha`` + not ``settings.has_2captcha``: returns
+    - ``captcha``: no longer automatable. The 2Captcha integration was removed
+      (dead automated-scraping path; policy: never 2Captcha) and Shape blocks
+      unattended solving anyway, so this method always returns
       ``(None, "captcha_no_2captcha_key")`` — skips gracefully, does NOT crash.
     - Missing/unrecognised method or no creds: returns
       ``(None, "no_credentials")`` — skips gracefully.
@@ -145,53 +145,16 @@ async def _reauth(
             return None, f"reauth_failed: {exc}"
 
     elif method == "captcha":
-        enc_pass = getattr(lawyer, "encrypted_pjud_password", None)
-        if not enc_pass:
-            logger.warning("Lawyer %d: no encrypted PJUD password stored", lawyer.id)
-            return None, "no_credentials"
-
-        if not settings.has_2captcha:
-            logger.info(
-                "Skipping lawyer %d: captcha re-auth requires a 2Captcha key "
-                "(CAPTCHA_API_KEY is not configured)",
-                lawyer.id,
-            )
-            return None, "captcha_no_2captcha_key"
-
-        try:
-            password = decrypt_pjud_password(str(enc_pass))
-        except Exception as exc:
-            logger.error("Lawyer %d: failed to decrypt stored credential: %s", lawyer.id, exc)
-            return None, "decrypt_failed"
-
-        from app.scrapper.captcha_solver import CaptchaSolver
-        from app.scrapper.pjud_civil import PJUDCivilScraper, RECAPTCHA_SITEKEY
-
-        try:
-            solver = CaptchaSolver()
-            captcha_token = await solver.solve_recaptcha_v3(
-                sitekey=RECAPTCHA_SITEKEY,
-                page_url="https://oficinajudicialvirtual.pjud.cl/home/index.php",
-                action="validate_captcha_seg_clave_hn",
-            )
-
-            scraper = PJUDCivilScraper()
-            try:
-                await scraper.start()
-                session = await scraper.login_with_token(
-                    rut=str(lawyer.rut),
-                    password=password,
-                    captcha_token=captcha_token,
-                )
-                session.lawyer_id = int(lawyer.id)
-                await store.asave_session(session)
-                logger.info("Re-auth (captcha+2captcha) succeeded for lawyer %d", lawyer.id)
-                return session, None
-            finally:
-                await scraper.stop()
-        except Exception as exc:
-            logger.error("Re-auth (captcha) failed for lawyer %d: %s", lawyer.id, exc)
-            return None, f"reauth_failed: {exc}"
+        # The 2Captcha integration was removed (dead automated-scraping path;
+        # policy: never 2Captcha). Segunda-clave/captcha auth cannot be
+        # automated at all, so this method always skips gracefully — no
+        # solver import, no crash.
+        logger.info(
+            "Skipping lawyer %d: captcha re-auth is not automatable "
+            "(2Captcha integration removed)",
+            lawyer.id,
+        )
+        return None, "captcha_no_2captcha_key"
 
     else:
         logger.warning(
@@ -211,9 +174,10 @@ async def sync_lawyer_cases(
     Sync cases for a single lawyer and competencia.
 
     When no active session exists, attempts autonomous re-authentication via
-    stored credentials (_reauth).  If re-auth is not possible (no creds, no
-    2Captcha key) the lawyer is skipped with a descriptive reason rather than
-    crashing the scheduler.
+    stored credentials (_reauth).  If re-auth is not possible (no creds, or
+    auth_method="captcha" — no longer automatable since 2Captcha was removed)
+    the lawyer is skipped with a descriptive reason rather than crashing the
+    scheduler.
 
     Returns:
         Dict with sync results — one of:

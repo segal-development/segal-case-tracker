@@ -1,11 +1,13 @@
 """S3-T4: Tests for autonomous worker re-auth — _reauth function.
 
-Tests five branches (ADR-7 + FIX-1):
+Tests four branches (ADR-7 + FIX-1, post 2Captcha removal):
 1. clave_unica nominal: ClaveUnicaAuth.login called, session stored.
-2. captcha + has_2captcha=True: 2Captcha solver called, login_with_token called.
-3. captcha + has_2captcha=False: no crash, returns captcha_no_2captcha_key.
-4. No stored credentials: no crash, returns no_credentials.
-5. Corrupt ciphertext: decrypt raises → returns decrypt_failed, never raises.
+2. captcha: always returns captcha_no_2captcha_key — the 2Captcha integration
+   was removed (dead automated-scraping path; policy: never 2Captcha), so this
+   auth method can no longer be re-authenticated autonomously and is skipped
+   gracefully regardless of stored credentials.
+3. No stored credentials: no crash, returns no_credentials.
+4. Corrupt ciphertext: decrypt raises → returns decrypt_failed, never raises.
 
 All tests mock Playwright, browser, and scraper — no live connections.
 """
@@ -119,52 +121,13 @@ class TestReauthClaveUnica:
 # ---------------------------------------------------------------------------
 
 class TestReauthCaptcha:
-    """AUTH-06: Captcha re-auth is conditional on settings.has_2captcha."""
+    """AUTH-06: Captcha re-auth is unconditionally skipped — 2Captcha was removed
+    (dead automated-scraping path; policy: never 2Captcha). No solver import,
+    no crash — just a graceful skip regardless of stored credentials."""
 
     @pytest.mark.asyncio
-    async def test_captcha_with_2captcha_key_solves_and_stores_session(self, fake_redis):
-        """has_2captcha=True → solver called → login_with_token called → session stored."""
-        from app.workers.sync_scheduler import _reauth
-        from app.services.session_store import SessionStore
-
-        enc_pass = encrypt_pjud_password("pjudpass")
-        lawyer = _make_lawyer(
-            preferred_auth_method="captcha",
-            encrypted_pjud_password=enc_pass,
-        )
-        store = SessionStore(redis_client=fake_redis)
-        fake_session = _make_fake_session(lawyer_id=42, auth_method="captcha")
-
-        mock_solver = MagicMock()
-        mock_solver.solve_recaptcha_v3 = AsyncMock(return_value="fake-captcha-token")
-        mock_solver_class = MagicMock(return_value=mock_solver)
-
-        mock_scraper = MagicMock()
-        mock_scraper.start = AsyncMock()
-        mock_scraper.stop = AsyncMock()
-        mock_scraper.login_with_token = AsyncMock(return_value=fake_session)
-        mock_scraper_class = MagicMock(return_value=mock_scraper)
-
-        mock_settings = MagicMock()
-        mock_settings.has_2captcha = True
-
-        with (
-            patch("app.workers.sync_scheduler.settings", mock_settings),
-            patch("app.scrapper.captcha_solver.CaptchaSolver", mock_solver_class),
-            patch("app.scrapper.pjud_civil.PJUDCivilScraper", mock_scraper_class),
-        ):
-            session, reason = await _reauth(lawyer, store)
-
-        assert session is not None
-        assert reason is None
-        mock_solver.solve_recaptcha_v3.assert_awaited_once()
-        mock_scraper.login_with_token.assert_awaited_once()
-        saved = await store.get_session_by_lawyer(lawyer.id)
-        assert saved is not None
-
-    @pytest.mark.asyncio
-    async def test_captcha_without_2captcha_key_returns_skip_reason(self, fake_redis):
-        """has_2captcha=False → returns captcha_no_2captcha_key, no crash."""
+    async def test_captcha_always_returns_skip_reason_with_credentials(self, fake_redis):
+        """Even with a stored encrypted password, captcha re-auth always skips gracefully."""
         from app.workers.sync_scheduler import _reauth
         from app.services.session_store import SessionStore
 
@@ -175,18 +138,14 @@ class TestReauthCaptcha:
         )
         store = SessionStore(redis_client=fake_redis)
 
-        mock_settings = MagicMock()
-        mock_settings.has_2captcha = False
-
-        with patch("app.workers.sync_scheduler.settings", mock_settings):
-            session, reason = await _reauth(lawyer, store)
+        session, reason = await _reauth(lawyer, store)
 
         assert session is None
         assert reason == "captcha_no_2captcha_key"
 
     @pytest.mark.asyncio
-    async def test_no_captcha_password_returns_no_credentials(self, fake_redis):
-        """captcha method but no encrypted password → no_credentials, no exception."""
+    async def test_captcha_always_returns_skip_reason_without_credentials(self, fake_redis):
+        """No stored encrypted password either → still the same graceful skip, no exception."""
         from app.workers.sync_scheduler import _reauth
         from app.services.session_store import SessionStore
 
@@ -199,7 +158,7 @@ class TestReauthCaptcha:
         session, reason = await _reauth(lawyer, store)
 
         assert session is None
-        assert reason == "no_credentials"
+        assert reason == "captcha_no_2captcha_key"
 
 
 # ---------------------------------------------------------------------------

@@ -144,7 +144,6 @@ cp .env.qa.example .env.qa
 #   GCS_BUCKET
 #   SECRET_KEY   (generate below)
 #   ENCRYPTION_KEY  (generate below)
-#   CAPTCHA_API_KEY
 #   SENDGRID_API_KEY, SENDGRID_FROM_EMAIL
 #   BASE_URL, CORS_ORIGINS
 nano .env.qa
