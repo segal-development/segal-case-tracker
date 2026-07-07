@@ -27,7 +27,7 @@ from playwright.async_api import (
 _CHROME_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/149.0.0.0 Safari/537.36"
+    "Chrome/120.0.0.0 Safari/537.36"  # match bundled Chromium: UA 149 mismatched the real browser and tripped Shape (regression 78246de); 120 is live-validated
 )
 
 from app.config import settings
@@ -484,14 +484,13 @@ class PJUDBaseScraper(ABC):
         #   - Full-HD viewport (configurable)
         #   - Chilean locale + timezone to match PJUD expectations
         #   - geolocation set to Santiago (Shape checks this)
+        # Match the live-validated f708315 fingerprint: bundled Chromium + a
+        # UA that matches it + storage_state, and NOTHING else. The locale /
+        # timezone / viewport / webdriver overrides added in 78246de (meant as
+        # "stealth") are exactly what Shape started blocking — the extra
+        # injected/tampered signals made the browser MORE detectable, not less.
         context_options = {
-            "viewport": {
-                "width": settings.PJUD_VIEWPORT_WIDTH,
-                "height": settings.PJUD_VIEWPORT_HEIGHT,
-            },
             "user_agent": _CHROME_UA,
-            "locale": "es-CL",
-            "timezone_id": "America/Santiago",
             "storage_state": storage_state,
         }
 
@@ -503,7 +502,6 @@ class PJUDBaseScraper(ABC):
             if self._browser is None:
                 raise RuntimeError("Browser not started")
             self._context = await self._browser.new_context(**context_options)
-            await self._add_stealth_init_script(self._context)
 
         self._page = await self._context.new_page()
         self._page_session_key = session_key
