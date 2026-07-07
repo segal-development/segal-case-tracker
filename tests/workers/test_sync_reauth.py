@@ -1,11 +1,12 @@
 """S3-T4: Tests for autonomous worker re-auth — _reauth function.
 
-Tests four branches (ADR-7 + FIX-1, post 2Captcha removal):
+Tests branches (ADR-7, post organic-reCAPTCHA segunda-clave automation):
 1. clave_unica nominal: ClaveUnicaAuth.login called, session stored.
-2. captcha: always returns captcha_no_2captcha_key — the 2Captcha integration
-   was removed (dead automated-scraping path; policy: never 2Captcha), so this
-   auth method can no longer be re-authenticated autonomously and is skipped
-   gracefully regardless of stored credentials.
+2. captcha (segunda clave): decrypts the stored PJUD password, runs a headless
+   CivilScraper, and calls login_with_segunda_clave — an ORGANIC reCAPTCHA v3
+   token generated in-page (NO 2Captcha, never reintroduced). Same failure
+   handling as clave_unica: InvalidCredentialsError alerts the supervisor
+   once (de-dup), Shape/transient errors never alert.
 3. No stored credentials: no crash, returns no_credentials.
 4. Corrupt ciphertext: decrypt raises → returns decrypt_failed, never raises.
 
@@ -126,32 +127,28 @@ class TestReauthClaveUnica:
 # Captcha path
 # ---------------------------------------------------------------------------
 
+def _mock_civil_scraper(login_side_effect=None, login_return_value=None):
+    """Build a mocked CivilScraper class for the captcha/segunda-clave branch:
+    start()/stop() no-ops, login_with_segunda_clave() either succeeds or raises."""
+    mock_scraper = MagicMock()
+    mock_scraper.start = AsyncMock()
+    mock_scraper.stop = AsyncMock()
+    if login_side_effect is not None:
+        mock_scraper.login_with_segunda_clave = AsyncMock(side_effect=login_side_effect)
+    else:
+        mock_scraper.login_with_segunda_clave = AsyncMock(return_value=login_return_value)
+    mock_scraper_class = MagicMock(return_value=mock_scraper)
+    return mock_scraper_class, mock_scraper
+
+
 class TestReauthCaptcha:
-    """AUTH-06: Captcha re-auth is unconditionally skipped — 2Captcha was removed
-    (dead automated-scraping path; policy: never 2Captcha). No solver import,
-    no crash — just a graceful skip regardless of stored credentials."""
+    """AUTH-06 (post organic-reCAPTCHA automation): segunda-clave re-auth now
+    runs a headless CivilScraper and calls login_with_segunda_clave — an
+    ORGANIC reCAPTCHA v3 token generated in-page. NO 2Captcha involved."""
 
     @pytest.mark.asyncio
-    async def test_captcha_always_returns_skip_reason_with_credentials(self, fake_redis):
-        """Even with a stored encrypted password, captcha re-auth always skips gracefully."""
-        from app.workers.sync_scheduler import _reauth
-        from app.services.session_store import SessionStore
-
-        enc_pass = encrypt_pjud_password("pjudpass")
-        lawyer = _make_lawyer(
-            preferred_auth_method="captcha",
-            encrypted_pjud_password=enc_pass,
-        )
-        store = SessionStore(redis_client=fake_redis)
-
-        session, reason = await _reauth(lawyer, store)
-
-        assert session is None
-        assert reason == "captcha_no_2captcha_key"
-
-    @pytest.mark.asyncio
-    async def test_captcha_always_returns_skip_reason_without_credentials(self, fake_redis):
-        """No stored encrypted password either → still the same graceful skip, no exception."""
+    async def test_no_encrypted_password_returns_no_credentials(self, fake_redis):
+        """No stored encrypted_pjud_password → no_credentials, no crash, no scraper started."""
         from app.workers.sync_scheduler import _reauth
         from app.services.session_store import SessionStore
 
@@ -164,7 +161,191 @@ class TestReauthCaptcha:
         session, reason = await _reauth(lawyer, store)
 
         assert session is None
-        assert reason == "captcha_no_2captcha_key"
+        assert reason == "no_credentials"
+
+    @pytest.mark.asyncio
+    async def test_organic_login_succeeds_stores_session(self, fake_redis):
+        """Nominal: decrypts password, logs in via organic reCAPTCHA, session stored."""
+        from app.workers.sync_scheduler import _reauth
+        from app.services.session_store import SessionStore
+
+        enc_pass = encrypt_pjud_password("pjudpass")
+        lawyer = _make_lawyer(
+            preferred_auth_method="captcha",
+            encrypted_pjud_password=enc_pass,
+            credential_alert_sent_at=datetime(2026, 7, 1, 12, 0, 0),
+        )
+        store = SessionStore(redis_client=fake_redis)
+        fake_session = _make_fake_session(lawyer_id=lawyer.id, auth_method="captcha")
+
+        mock_scraper_class, mock_scraper = _mock_civil_scraper(login_return_value=fake_session)
+
+        with patch("app.scrapper.pjud.civil.CivilScraper", mock_scraper_class):
+            session, reason = await _reauth(lawyer, store)
+
+        assert session is fake_session
+        assert reason is None
+        mock_scraper.login_with_segunda_clave.assert_awaited_once_with(lawyer.rut, "pjudpass")
+        mock_scraper.stop.assert_awaited_once()
+        saved = await store.get_session_by_lawyer(lawyer.id)
+        assert saved is not None
+        # A successful re-auth clears any prior credential-alert de-dup marker.
+        assert lawyer.credential_alert_sent_at is None
+
+    @pytest.mark.asyncio
+    async def test_invalid_credentials_sends_alert_once_and_sets_timestamp(self, fake_redis):
+        """PJUD rejects the segunda-clave RUT/password → supervisor alerted once."""
+        from app.workers.sync_scheduler import _reauth
+        from app.services.session_store import SessionStore
+        from app.scrapper.pjud.exceptions import InvalidCredentialsError
+
+        enc_pass = encrypt_pjud_password("pjudpass")
+        lawyer = _make_lawyer(
+            preferred_auth_method="captcha",
+            encrypted_pjud_password=enc_pass,
+            credential_alert_sent_at=None,
+        )
+        store = SessionStore(redis_client=fake_redis)
+
+        mock_scraper_class, mock_scraper = _mock_civil_scraper(
+            login_side_effect=InvalidCredentialsError("PJUD rejected credentials")
+        )
+
+        with (
+            patch("app.scrapper.pjud.civil.CivilScraper", mock_scraper_class),
+            patch(
+                "app.workers.sync_scheduler.send_supervisor_credential_alert",
+                new_callable=AsyncMock,
+            ) as mock_alert,
+        ):
+            mock_alert.return_value = True
+            session, reason = await _reauth(lawyer, store)
+
+        assert session is None
+        assert reason == "invalid_credentials"
+        mock_alert.assert_awaited_once()
+        assert lawyer.credential_alert_sent_at is not None
+        mock_scraper.stop.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_second_consecutive_invalid_credentials_does_not_resend_alert(self, fake_redis):
+        """De-dup: credential_alert_sent_at already set -> no second email."""
+        from app.workers.sync_scheduler import _reauth
+        from app.services.session_store import SessionStore
+        from app.scrapper.pjud.exceptions import InvalidCredentialsError
+
+        already_sent_at = datetime(2026, 7, 1, 12, 0, 0)
+        enc_pass = encrypt_pjud_password("pjudpass")
+        lawyer = _make_lawyer(
+            preferred_auth_method="captcha",
+            encrypted_pjud_password=enc_pass,
+            credential_alert_sent_at=already_sent_at,
+        )
+        store = SessionStore(redis_client=fake_redis)
+
+        mock_scraper_class, _mock_scraper = _mock_civil_scraper(
+            login_side_effect=InvalidCredentialsError("PJUD rejected credentials")
+        )
+
+        with (
+            patch("app.scrapper.pjud.civil.CivilScraper", mock_scraper_class),
+            patch(
+                "app.workers.sync_scheduler.send_supervisor_credential_alert",
+                new_callable=AsyncMock,
+            ) as mock_alert,
+        ):
+            session, reason = await _reauth(lawyer, store)
+
+        assert session is None
+        assert reason == "invalid_credentials"
+        mock_alert.assert_not_awaited()
+        assert lawyer.credential_alert_sent_at == already_sent_at
+
+    @pytest.mark.asyncio
+    async def test_shape_challenge_does_not_send_alert(self, fake_redis):
+        """A Shape block is NOT a credential problem -> no supervisor alert."""
+        from app.workers.sync_scheduler import _reauth
+        from app.services.session_store import SessionStore
+        from app.scrapper.pjud.exceptions import ShapeChallengeError
+
+        enc_pass = encrypt_pjud_password("pjudpass")
+        lawyer = _make_lawyer(
+            preferred_auth_method="captcha",
+            encrypted_pjud_password=enc_pass,
+            credential_alert_sent_at=None,
+        )
+        store = SessionStore(redis_client=fake_redis)
+
+        mock_scraper_class, _mock_scraper = _mock_civil_scraper(
+            login_side_effect=ShapeChallengeError(
+                url="https://oficinajudicialvirtual.pjud.cl/home/index.php",
+                jquery_present=False,
+                looks_like_login=True,
+                marker="TSPD_101",
+            )
+        )
+
+        with (
+            patch("app.scrapper.pjud.civil.CivilScraper", mock_scraper_class),
+            patch(
+                "app.workers.sync_scheduler.send_supervisor_credential_alert",
+                new_callable=AsyncMock,
+            ) as mock_alert,
+        ):
+            session, reason = await _reauth(lawyer, store)
+
+        assert session is None
+        assert reason is not None and reason.startswith("reauth_failed")
+        mock_alert.assert_not_awaited()
+        assert lawyer.credential_alert_sent_at is None
+
+    @pytest.mark.asyncio
+    async def test_transient_error_does_not_send_alert(self, fake_redis):
+        """A generic/transient error is NOT a credential problem -> no alert."""
+        from app.workers.sync_scheduler import _reauth
+        from app.services.session_store import SessionStore
+
+        enc_pass = encrypt_pjud_password("pjudpass")
+        lawyer = _make_lawyer(
+            preferred_auth_method="captcha",
+            encrypted_pjud_password=enc_pass,
+            credential_alert_sent_at=None,
+        )
+        store = SessionStore(redis_client=fake_redis)
+
+        mock_scraper_class, _mock_scraper = _mock_civil_scraper(
+            login_side_effect=Exception("network blip")
+        )
+
+        with (
+            patch("app.scrapper.pjud.civil.CivilScraper", mock_scraper_class),
+            patch(
+                "app.workers.sync_scheduler.send_supervisor_credential_alert",
+                new_callable=AsyncMock,
+            ) as mock_alert,
+        ):
+            session, reason = await _reauth(lawyer, store)
+
+        assert session is None
+        mock_alert.assert_not_awaited()
+        assert lawyer.credential_alert_sent_at is None
+
+    @pytest.mark.asyncio
+    async def test_corrupt_ciphertext_returns_decrypt_failed(self, fake_redis):
+        """Corrupt encrypted_pjud_password -> decrypt raises -> decrypt_failed, never raises."""
+        from app.workers.sync_scheduler import _reauth
+        from app.services.session_store import SessionStore
+
+        lawyer = _make_lawyer(
+            preferred_auth_method="captcha",
+            encrypted_pjud_password="not-valid-fernet-ciphertext",
+        )
+        store = SessionStore(redis_client=fake_redis)
+
+        session, reason = await _reauth(lawyer, store)
+
+        assert session is None
+        assert reason == "decrypt_failed"
 
 
 # ---------------------------------------------------------------------------

@@ -93,24 +93,28 @@ async def _reauth(
     - Plaintext passwords are NEVER written to any log, DB field, or cache
       other than the Fernet ciphertext columns above.
 
-    Branch logic (ADR-7, post 2Captcha removal):
+    Branch logic (ADR-7, post organic-reCAPTCHA segunda-clave automation):
     - ``clave_unica``: always re-authenticatable (no captcha).  Decrypts
       ``encrypted_clave_unica_password``, calls headless ``ClaveUnicaAuth.login``,
       persists the fresh session.
-    - ``captcha``: no longer automatable. The 2Captcha integration was removed
-      (dead automated-scraping path; policy: never 2Captcha) and Shape blocks
-      unattended solving anyway, so this method always returns
-      ``(None, "captcha_no_2captcha_key")`` — skips gracefully, does NOT crash.
+    - ``captcha`` (segunda clave): auto-loginable via an ORGANIC reCAPTCHA v3
+      token — NOT 2Captcha (that integration was removed; policy: never
+      2Captcha).  Decrypts ``encrypted_pjud_password``, runs a headless
+      ``CivilScraper``, and calls ``login_with_segunda_clave``, which
+      generates the reCAPTCHA v3 token in-page (same real browser that
+      already passes F5 Shape gives it a human-looking score) and reuses
+      ``login_with_token``.  Persists the fresh session on success.
     - Missing/unrecognised method or no creds: returns
       ``(None, "no_credentials")`` — skips gracefully.
 
     Supervisor credential-change alert:
-    ``ClaveUnicaAuth.login`` raises ``InvalidCredentialsError`` when PJUD
-    rejected the RUT/password (the lawyer likely changed their clave — retry
-    is pointless).  On that specific exception, and ONLY that one (a
-    ``ShapeChallengeError`` or any other transient error never triggers
-    this), this function emails the configured supervisor exactly once per
-    failure episode via ``send_supervisor_credential_alert`` and sets
+    Both the ``clave_unica`` and ``captcha`` login calls raise
+    ``InvalidCredentialsError`` when PJUD rejected the RUT/password (the
+    lawyer likely changed their clave — retry is pointless).  On that
+    specific exception, and ONLY that one (a ``ShapeChallengeError`` or any
+    other transient error never triggers this), this function emails the
+    configured supervisor exactly once per failure episode via
+    ``send_supervisor_credential_alert`` and sets
     ``lawyer.credential_alert_sent_at``.  A later successful re-auth clears
     that field so a future credential change alerts again.  The caller is
     responsible for committing the ``lawyer`` row (see ``sync_lawyer_cases``).
@@ -177,16 +181,56 @@ async def _reauth(
             return None, f"reauth_failed: {exc}"
 
     elif method == "captcha":
-        # The 2Captcha integration was removed (dead automated-scraping path;
-        # policy: never 2Captcha). Segunda-clave/captcha auth cannot be
-        # automated at all, so this method always skips gracefully — no
-        # solver import, no crash.
-        logger.info(
-            "Skipping lawyer %d: captcha re-auth is not automatable "
-            "(2Captcha integration removed)",
-            lawyer.id,
-        )
-        return None, "captcha_no_2captcha_key"
+        # Segunda clave — auto-loginable via an ORGANIC reCAPTCHA v3 token
+        # generated in-page (NOT 2Captcha; that integration was removed,
+        # policy: never 2Captcha).
+        enc_pjud_pass = getattr(lawyer, "encrypted_pjud_password", None)
+        if not enc_pjud_pass:
+            logger.warning("Lawyer %d: no encrypted pjud password stored", lawyer.id)
+            return None, "no_credentials"
+
+        try:
+            password = decrypt_pjud_password(str(enc_pjud_pass))
+        except Exception as exc:
+            logger.error("Lawyer %d: failed to decrypt stored credential: %s", lawyer.id, exc)
+            return None, "decrypt_failed"
+
+        # Lazy import keeps Playwright out of the module-level namespace so
+        # the worker process doesn't require a browser installed just to
+        # import this module.
+        from app.scrapper.pjud.civil import CivilScraper
+
+        scraper = CivilScraper(headless=True)
+        try:
+            await scraper.start()
+            session = await scraper.login_with_segunda_clave(lawyer.rut, password)
+            await store.asave_session(session)
+            # Login succeeded — clear any prior credential-alert de-dup
+            # marker so a FUTURE credential change alerts again.
+            if getattr(lawyer, "credential_alert_sent_at", None) is not None:
+                lawyer.credential_alert_sent_at = None
+            logger.info("Re-auth (captcha/organic reCAPTCHA) succeeded for lawyer %d", lawyer.id)
+            return session, None
+        except InvalidCredentialsError as exc:
+            # The lawyer changed their segunda clave — retrying will never
+            # succeed. Alert the supervisor exactly once per failure episode
+            # (de-dup via credential_alert_sent_at); a Shape block or
+            # transient error must NEVER reach this branch.
+            logger.error(
+                "Re-auth (captcha) failed for lawyer %d: invalid credentials (%s)",
+                lawyer.id,
+                exc,
+            )
+            if getattr(lawyer, "credential_alert_sent_at", None) is None:
+                sent = await send_supervisor_credential_alert(lawyer, str(exc))
+                if sent:
+                    lawyer.credential_alert_sent_at = datetime.utcnow()
+            return None, "invalid_credentials"
+        except Exception as exc:
+            logger.error("Re-auth (captcha) failed for lawyer %d: %s", lawyer.id, exc)
+            return None, f"reauth_failed: {exc}"
+        finally:
+            await scraper.stop()
 
     else:
         logger.warning(
@@ -206,10 +250,10 @@ async def sync_lawyer_cases(
     Sync cases for a single lawyer and competencia.
 
     When no active session exists, attempts autonomous re-authentication via
-    stored credentials (_reauth).  If re-auth is not possible (no creds, or
-    auth_method="captcha" — no longer automatable since 2Captcha was removed)
-    the lawyer is skipped with a descriptive reason rather than crashing the
-    scheduler.
+    stored credentials (_reauth), for both auth_method="clave_unica" and
+    auth_method="captcha" (segunda clave, via an organic reCAPTCHA v3 token —
+    NOT 2Captcha).  If re-auth is not possible (no stored creds) the lawyer is
+    skipped with a descriptive reason rather than crashing the scheduler.
 
     Returns:
         Dict with sync results — one of:
