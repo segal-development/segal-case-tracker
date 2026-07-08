@@ -64,11 +64,13 @@ def _headers(rut: str) -> dict:
     return {"Authorization": f"Bearer {tok}"}
 
 
-def _make_alert(db, lawyer_id, case_id, *, title="Alert", read=False, created_at=None):
+def _make_alert(
+    db, lawyer_id, case_id, *, title="Alert", read=False, created_at=None, type="new_movement"
+):
     alert = Alert(
         lawyer_id=lawyer_id,
         case_id=case_id,
-        type="new_movement",
+        type=type,
         title=title,
         message="msg",
         read=read,
@@ -85,7 +87,7 @@ class TestListAlerts:
         _make_alert(db, sandy.id, case.id, title="Sandy's alert")
         _make_alert(db, carla.id, case.id, title="Carla's alert")
 
-        resp = client.get("/api/v1/alerts", headers=_headers(SANDY_RUT))
+        resp = client.get("/api/v1/alerts?category=all", headers=_headers(SANDY_RUT))
         assert resp.status_code == 200
         body = resp.json()
         titles = [item["title"] for item in body["items"]]
@@ -97,7 +99,7 @@ class TestListAlerts:
         _make_alert(db, sandy.id, case.id, title="Newest", created_at=base + timedelta(days=2))
         _make_alert(db, sandy.id, case.id, title="Middle", created_at=base + timedelta(days=1))
 
-        resp = client.get("/api/v1/alerts", headers=_headers(SANDY_RUT))
+        resp = client.get("/api/v1/alerts?category=all", headers=_headers(SANDY_RUT))
         titles = [item["title"] for item in resp.json()["items"]]
         assert titles == ["Newest", "Middle", "Oldest"]
 
@@ -106,7 +108,7 @@ class TestListAlerts:
         for i in range(25):
             _make_alert(db, sandy.id, case.id, title=f"Alert {i}", created_at=base + timedelta(minutes=i))
 
-        resp = client.get("/api/v1/alerts?page=1&per_page=20", headers=_headers(SANDY_RUT))
+        resp = client.get("/api/v1/alerts?page=1&per_page=20&category=all", headers=_headers(SANDY_RUT))
         body = resp.json()
         assert body["total"] == 25
         assert body["page"] == 1
@@ -114,7 +116,7 @@ class TestListAlerts:
         assert body["pages"] == 2
         assert len(body["items"]) == 20
 
-        resp2 = client.get("/api/v1/alerts?page=2&per_page=20", headers=_headers(SANDY_RUT))
+        resp2 = client.get("/api/v1/alerts?page=2&per_page=20&category=all", headers=_headers(SANDY_RUT))
         body2 = resp2.json()
         assert len(body2["items"]) == 5
 
@@ -123,7 +125,7 @@ class TestListAlerts:
         _make_alert(db, sandy.id, case.id, title="Unread one", read=False)
         _make_alert(db, sandy.id, case.id, title="Unread two", read=False)
 
-        resp = client.get("/api/v1/alerts?unread_only=true", headers=_headers(SANDY_RUT))
+        resp = client.get("/api/v1/alerts?unread_only=true&category=all", headers=_headers(SANDY_RUT))
         body = resp.json()
         titles = {item["title"] for item in body["items"]}
         assert titles == {"Unread one", "Unread two"}
@@ -131,14 +133,14 @@ class TestListAlerts:
         assert body["total"] == 2
 
         # unread_count stays correct even without the filter.
-        resp_all = client.get("/api/v1/alerts", headers=_headers(SANDY_RUT))
+        resp_all = client.get("/api/v1/alerts?category=all", headers=_headers(SANDY_RUT))
         assert resp_all.json()["unread_count"] == 2
         assert resp_all.json()["total"] == 3
 
     def test_item_includes_case_context(self, client, db, sandy, case):
         _make_alert(db, sandy.id, case.id, title="With case")
 
-        resp = client.get("/api/v1/alerts", headers=_headers(SANDY_RUT))
+        resp = client.get("/api/v1/alerts?category=all", headers=_headers(SANDY_RUT))
         item = resp.json()["items"][0]
         assert item["case_id"] == case.id
         assert item["case_rol"] == "C-9001-2026"
@@ -159,13 +161,101 @@ class TestListAlerts:
         db.execute(sa_text("DELETE FROM cases WHERE id = :cid"), {"cid": case_id})
         db.commit()
 
-        resp = client.get("/api/v1/alerts", headers=_headers(SANDY_RUT))
+        resp = client.get("/api/v1/alerts?category=all", headers=_headers(SANDY_RUT))
         assert resp.status_code == 200
         item = resp.json()["items"][0]
         assert item["case_id"] == case_id
         assert item["case_rol"] is None
         assert item["case_caratulado"] is None
         assert item["case_court_name"] is None
+
+
+class TestListAlertsCategory:
+    def test_default_category_is_actionable(self, client, db, sandy, case):
+        _make_alert(db, sandy.id, case.id, title="Movement", type="new_movement")
+        _make_alert(db, sandy.id, case.id, title="Semaforo rojo", type="semaforo_rojo")
+
+        resp = client.get("/api/v1/alerts", headers=_headers(SANDY_RUT))
+        body = resp.json()
+        titles = [item["title"] for item in body["items"]]
+        assert titles == ["Semaforo rojo"]
+        assert body["total"] == 1
+        assert body["unread_count"] == 1
+
+    def test_category_actionable_returns_only_actionable_types(self, client, db, sandy, case):
+        _make_alert(db, sandy.id, case.id, title="Movement", type="new_movement")
+        _make_alert(db, sandy.id, case.id, title="Notificacion", type="new_notificacion")
+        _make_alert(db, sandy.id, case.id, title="Semaforo rojo", type="semaforo_rojo")
+        _make_alert(db, sandy.id, case.id, title="Deadline fatal", type="deadline_fatal")
+        _make_alert(db, sandy.id, case.id, title="Deadline added", type="deadline_added")
+        _make_alert(db, sandy.id, case.id, title="Deadline audit", type="deadline_audit")
+        _make_alert(db, sandy.id, case.id, title="Credential change", type="credential_change")
+        _make_alert(db, sandy.id, case.id, title="Status change", type="status_change")
+
+        resp = client.get("/api/v1/alerts?category=actionable", headers=_headers(SANDY_RUT))
+        body = resp.json()
+        titles = {item["title"] for item in body["items"]}
+        assert titles == {
+            "Semaforo rojo",
+            "Deadline fatal",
+            "Deadline added",
+            "Deadline audit",
+            "Credential change",
+            "Status change",
+        }
+        assert body["total"] == 6
+        assert body["unread_count"] == 6
+
+    def test_category_activity_returns_only_non_actionable_types(self, client, db, sandy, case):
+        _make_alert(db, sandy.id, case.id, title="Movement", type="new_movement")
+        _make_alert(db, sandy.id, case.id, title="Notificacion", type="new_notificacion")
+        _make_alert(db, sandy.id, case.id, title="Exhorto", type="new_exhorto")
+        _make_alert(db, sandy.id, case.id, title="Escrito", type="new_escrito")
+        _make_alert(db, sandy.id, case.id, title="Semaforo rojo", type="semaforo_rojo")
+
+        resp = client.get("/api/v1/alerts?category=activity", headers=_headers(SANDY_RUT))
+        body = resp.json()
+        titles = {item["title"] for item in body["items"]}
+        assert titles == {"Movement", "Notificacion", "Exhorto", "Escrito"}
+        assert body["total"] == 4
+        assert body["unread_count"] == 4
+
+    def test_category_all_returns_current_behavior(self, client, db, sandy, case):
+        _make_alert(db, sandy.id, case.id, title="Movement", type="new_movement", read=True)
+        _make_alert(db, sandy.id, case.id, title="Semaforo rojo", type="semaforo_rojo")
+
+        resp = client.get("/api/v1/alerts?category=all", headers=_headers(SANDY_RUT))
+        body = resp.json()
+        titles = {item["title"] for item in body["items"]}
+        assert titles == {"Movement", "Semaforo rojo"}
+        assert body["total"] == 2
+        assert body["unread_count"] == 1
+
+    def test_unread_only_composes_with_category(self, client, db, sandy, case):
+        _make_alert(db, sandy.id, case.id, title="Read actionable", type="semaforo_rojo", read=True)
+        _make_alert(db, sandy.id, case.id, title="Unread actionable", type="deadline_fatal")
+        _make_alert(db, sandy.id, case.id, title="Unread activity", type="new_movement")
+
+        resp = client.get(
+            "/api/v1/alerts?category=actionable&unread_only=true", headers=_headers(SANDY_RUT)
+        )
+        body = resp.json()
+        titles = [item["title"] for item in body["items"]]
+        assert titles == ["Unread actionable"]
+        assert body["unread_count"] == 1
+        assert body["total"] == 1
+
+    def test_invalid_category_returns_422(self, client, db, sandy, case):
+        resp = client.get("/api/v1/alerts?category=bogus", headers=_headers(SANDY_RUT))
+        assert resp.status_code == 422
+
+    def test_category_scoped_to_caller(self, client, db, sandy, carla, case):
+        _make_alert(db, sandy.id, case.id, title="Sandy actionable", type="semaforo_rojo")
+        _make_alert(db, carla.id, case.id, title="Carla actionable", type="semaforo_rojo")
+
+        resp = client.get("/api/v1/alerts?category=actionable", headers=_headers(SANDY_RUT))
+        titles = [item["title"] for item in resp.json()["items"]]
+        assert titles == ["Sandy actionable"]
 
 
 class TestMarkAlertRead:
@@ -224,3 +314,49 @@ class TestMarkAllAlertsRead:
         resp = client.post("/api/v1/alerts/read-all", headers=_headers(SANDY_RUT))
 
         assert resp.json() == {"marked": 0}
+
+    def test_default_category_marks_everything(self, client, db, sandy, case):
+        actionable = _make_alert(db, sandy.id, case.id, title="Actionable", type="semaforo_rojo")
+        activity = _make_alert(db, sandy.id, case.id, title="Activity", type="new_movement")
+
+        resp = client.post("/api/v1/alerts/read-all", headers=_headers(SANDY_RUT))
+        assert resp.json() == {"marked": 2}
+
+        db.refresh(actionable)
+        db.refresh(activity)
+        assert actionable.read is True
+        assert activity.read is True
+
+    def test_category_activity_marks_only_activity_unread(self, client, db, sandy, case):
+        actionable = _make_alert(db, sandy.id, case.id, title="Actionable", type="semaforo_rojo")
+        activity = _make_alert(db, sandy.id, case.id, title="Activity", type="new_movement")
+
+        resp = client.post(
+            "/api/v1/alerts/read-all?category=activity", headers=_headers(SANDY_RUT)
+        )
+        assert resp.json() == {"marked": 1}
+
+        db.refresh(actionable)
+        db.refresh(activity)
+        assert actionable.read is False
+        assert activity.read is True
+
+    def test_category_actionable_marks_only_actionable_unread(self, client, db, sandy, case):
+        actionable = _make_alert(db, sandy.id, case.id, title="Actionable", type="deadline_fatal")
+        activity = _make_alert(db, sandy.id, case.id, title="Activity", type="new_notificacion")
+
+        resp = client.post(
+            "/api/v1/alerts/read-all?category=actionable", headers=_headers(SANDY_RUT)
+        )
+        assert resp.json() == {"marked": 1}
+
+        db.refresh(actionable)
+        db.refresh(activity)
+        assert actionable.read is True
+        assert activity.read is False
+
+    def test_invalid_category_returns_422(self, client, sandy):
+        resp = client.post(
+            "/api/v1/alerts/read-all?category=bogus", headers=_headers(SANDY_RUT)
+        )
+        assert resp.status_code == 422
