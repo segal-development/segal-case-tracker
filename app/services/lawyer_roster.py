@@ -2,13 +2,15 @@
 
 import re
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Optional
 from sqlalchemy.orm import Session
 
 from app.models.case import Case
 from app.models.case_litigante import CaseLitigante
+from app.models.court import Court
 from app.models.lawyer import Lawyer
+from app.services.deadline_engine import _today_chile
 from app.utils.rut import normalize_rut
 
 DEMANDANTE_ABOGADO = frozenset({"AB.DTE", "AP.DTE"})
@@ -345,6 +347,171 @@ def firm_dashboard_stats_all(db: Session) -> dict:
             "by_procedural_state": by_procedural_state,
         },
         "by_lawyer": by_lawyer,
+    }
+
+
+def firm_risk_board(db: Session, account_rut: str) -> dict:
+    """Return the firm-wide RISK BOARD for the auditor/admin dashboard.
+
+    Rolls up the exposure signals already denormalized on ``Case``
+    (``semaforo``, ``abandono_disponible``, ``prescripcion_cumplida``,
+    ``en_apremio``, ``next_deadline_fatal``/``next_deadline_at``) which today
+    are only ever surfaced per-case. Aggregates over ALL active (non-archived)
+    firm civil cases, independent of ``Case.lawyer_id`` (Approach C: it is the
+    firm's single bookkeeping owner, not the abogado who works the case).
+
+    Per-abogado attribution (``by_lawyer``) mirrors ``firm_dashboard_stats_all``:
+    entirely litigante-derived, grouping every AB./AP. abogado-of-record RUT
+    appearing on a case, regardless of side. A case with two abogados-of-record
+    counts toward both rows.
+    """
+    _EMPTY = {
+        "total": 0,
+        "semaforo": {"rojo": 0, "amarillo": 0, "verde": 0, "gris": 0},
+        "riesgo": {
+            "abandono_disponible": 0,
+            "prescripcion_cumplida": 0,
+            "en_apremio": 0,
+            "plazo_fatal_proximo": 0,
+            "plazo_fatal_vencido": 0,
+        },
+        "by_lawyer": [],
+        "top_critical": [],
+    }
+
+    account_rut_norm = normalize_rut(account_rut)
+    lawyer = db.query(Lawyer).filter(Lawyer.rut == account_rut_norm).first()
+    if not lawyer:
+        return _EMPTY
+
+    today = _today_chile()
+
+    cases = (
+        db.query(
+            Case.id,
+            Case.rol,
+            Case.plaintiff,
+            Case.defendant,
+            Case.court_id,
+            Case.semaforo,
+            Case.abandono_disponible,
+            Case.prescripcion_cumplida,
+            Case.en_apremio,
+            Case.next_deadline_fatal,
+            Case.next_deadline_at,
+        )
+        .filter(Case.competencia == "civil", Case.status != "archived")
+        .all()
+    )
+    case_map = {c.id: c for c in cases}
+
+    def _sem_bucket(sem: Optional[str]) -> str:
+        return sem if sem in ("rojo", "amarillo", "verde") else "gris"
+
+    sem_totals: dict[str, int] = {"rojo": 0, "amarillo": 0, "verde": 0, "gris": 0}
+    riesgo_totals = {
+        "abandono_disponible": 0,
+        "prescripcion_cumplida": 0,
+        "en_apremio": 0,
+        "plazo_fatal_proximo": 0,
+        "plazo_fatal_vencido": 0,
+    }
+
+    for c in cases:
+        sem_totals[_sem_bucket(c.semaforo)] += 1
+        if c.abandono_disponible:
+            riesgo_totals["abandono_disponible"] += 1
+        if c.prescripcion_cumplida:
+            riesgo_totals["prescripcion_cumplida"] += 1
+        if c.en_apremio:
+            riesgo_totals["en_apremio"] += 1
+        if c.next_deadline_fatal and c.next_deadline_at is not None:
+            if c.next_deadline_at >= today:
+                riesgo_totals["plazo_fatal_proximo"] += 1
+            else:
+                riesgo_totals["plazo_fatal_vencido"] += 1
+
+    # by_lawyer / top_critical abogado names: firm-wide litigante attribution
+    # (mirrors firm_dashboard_stats_all — no single-account side filter, every
+    # AB./AP. abogado-of-record RUT on a case counts toward that case).
+    by_case = _abogado_litigantes_by_case(db)
+    abogado_case_ids: dict[str, set[int]] = defaultdict(set)
+    abogado_nombre: dict[str, str] = {}
+    case_abogado_names: dict[int, list[str]] = defaultdict(list)
+    for case_id, litigantes in by_case.items():
+        if case_id not in case_map:
+            continue
+        for lit in litigantes:
+            norm = normalize_rut(lit.rut)
+            abogado_case_ids[norm].add(case_id)
+            nombre = _clean_nombre(lit.nombre)
+            if norm not in abogado_nombre:
+                abogado_nombre[norm] = nombre
+            if nombre and nombre not in case_abogado_names[case_id]:
+                case_abogado_names[case_id].append(nombre)
+
+    by_lawyer = []
+    for norm_rut, case_ids in abogado_case_ids.items():
+        rojo = abandono = apremio = 0
+        for cid in case_ids:
+            c = case_map[cid]
+            if c.semaforo == "rojo":
+                rojo += 1
+            if c.abandono_disponible:
+                abandono += 1
+            if c.en_apremio:
+                apremio += 1
+        by_lawyer.append({
+            "rut": norm_rut,
+            "nombre": abogado_nombre.get(norm_rut, ""),
+            "rojo": rojo,
+            "abandono_disponible": abandono,
+            "en_apremio": apremio,
+            "total": len(case_ids),
+        })
+    by_lawyer.sort(key=lambda x: x["rojo"], reverse=True)
+
+    # top_critical: rojo first, then soonest next_deadline_at (cases without
+    # one sort last within their group), fatal before non-fatal as tiebreak.
+    court_ids = {c.court_id for c in cases if c.court_id is not None}
+    court_names = {}
+    if court_ids:
+        court_names = {
+            court.id: court.name
+            for court in db.query(Court).filter(Court.id.in_(court_ids)).all()
+        }
+
+    def _sort_key(c) -> tuple:
+        has_deadline = c.next_deadline_at is not None
+        return (
+            0 if c.semaforo == "rojo" else 1,
+            0 if has_deadline else 1,
+            c.next_deadline_at if has_deadline else date.max,
+            0 if c.next_deadline_fatal else 1,
+        )
+
+    ordered_cases = sorted(cases, key=_sort_key)[:15]
+
+    top_critical = [
+        {
+            "case_id": c.id,
+            "rol": c.rol,
+            "caratulado": f"{c.plaintiff or ''}/{c.defendant or ''}",
+            "tribunal": court_names.get(c.court_id),
+            "abogado_nombre": ", ".join(case_abogado_names.get(c.id, [])),
+            "semaforo": c.semaforo,
+            "next_deadline_at": c.next_deadline_at,
+            "next_deadline_fatal": c.next_deadline_fatal,
+        }
+        for c in ordered_cases
+    ]
+
+    return {
+        "total": len(cases),
+        "semaforo": sem_totals,
+        "riesgo": riesgo_totals,
+        "by_lawyer": by_lawyer,
+        "top_critical": top_critical,
     }
 
 
