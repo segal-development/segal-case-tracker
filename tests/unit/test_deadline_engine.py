@@ -130,10 +130,10 @@ def _add_movement(
     return mv
 
 
-def _recompute(db, case: Case) -> None:
+def _recompute(db, case: Case):
     from app.services.deadline_engine import DeadlineEngine
 
-    DeadlineEngine.recompute_case(db, case)
+    return DeadlineEngine.recompute_case(db, case)
 
 
 # Deterministic "today" for color tests (a Monday). Color logic is exercised by
@@ -1051,6 +1051,113 @@ class TestNextDeadlineFatal:
     def test_config_traslado_ejecutante_is_not_fatal(self) -> None:
         """DeadlineType.TRASLADO_EJECUTANTE_4D.is_fatal must be False."""
         assert DeadlineType.TRASLADO_EJECUTANTE_4D.is_fatal is False
+
+
+# ---------------------------------------------------------------------------
+# --- SemaforoTransition tests ---
+# recompute_case returns a before/after snapshot so callers (sync_service)
+# can detect a ROJO-entry or fatal-deadline-appeared transition and fan out
+# alerts — the engine itself stays free of any notification coupling.
+# ---------------------------------------------------------------------------
+
+
+class TestSemaforoTransition:
+    def test_first_recompute_into_rojo_entered_rojo_true(self, db) -> None:
+        """Unclassified case (semaforo=None) whose first recompute lands on
+        ROJO must report entered_rojo=True — None != 'rojo' counts as a
+        real transition, not just 'already rojo'."""
+        case = _make_case(db)
+        _set_side(db, case, "demandado")
+        _add_movement(
+            db, case.id, TODAY - timedelta(days=30),
+            "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)",
+        )
+        transition = _recompute(db, case)
+        assert case.semaforo == "rojo"
+        assert transition.old_semaforo is None
+        assert transition.new_semaforo == "rojo"
+        assert transition.entered_rojo is True
+
+    def test_recompute_already_rojo_stays_rojo_entered_rojo_false(self, db) -> None:
+        """Recomputing an already-ROJO case that stays ROJO must NOT report a
+        new transition — this is the de-dup guarantee: no re-alert."""
+        case = _make_case(db)
+        _set_side(db, case, "demandado")
+        _add_movement(
+            db, case.id, TODAY - timedelta(days=30),
+            "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)",
+        )
+        first = _recompute(db, case)
+        assert first.entered_rojo is True
+
+        second = _recompute(db, case)
+        assert case.semaforo == "rojo"
+        assert second.old_semaforo == "rojo"
+        assert second.new_semaforo == "rojo"
+        assert second.entered_rojo is False
+
+    def test_rojo_to_verde_entered_rojo_false(self, db) -> None:
+        """A case that leaves ROJO (e.g. the firm files its opposition) must
+        NOT report entered_rojo — only entering rojo alerts, not leaving it."""
+        case = _make_case(db)
+        _set_side(db, case, "demandado")
+        _add_movement(
+            db, case.id, TODAY - timedelta(days=30),
+            "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)",
+        )
+        first = _recompute(db, case)
+        assert first.entered_rojo is True
+        assert case.semaforo == "rojo"
+
+        # Firm finally opposes today — EXCEPCIONES_8D window closes with activity.
+        _add_movement(
+            db, case.id, TODAY, "Excepciones", "Opone excepciones",
+        )
+        second = _recompute(db, case)
+        assert second.old_semaforo == "rojo"
+        assert second.new_semaforo != "rojo"
+        assert second.entered_rojo is False
+
+    def test_fatal_appears_false_to_true(self, db) -> None:
+        """next_deadline_fatal flipping False→True (a fatal-type deadline
+        becomes the nearest active one) must report fatal_appeared=True,
+        independent of the semáforo color."""
+        case = _make_case(db)
+        _set_side(db, case, "demandado")
+        notif_date = TODAY - timedelta(days=1)
+        _add_movement(db, case.id, notif_date, "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)")
+        transition = _recompute(db, case)
+        assert case.next_deadline_fatal is True
+        assert transition.old_fatal is False
+        assert transition.new_fatal is True
+        assert transition.fatal_appeared is True
+
+    def test_fatal_stays_true_no_repeat_transition(self, db) -> None:
+        """Recomputing an already-fatal case that stays fatal must NOT
+        re-report fatal_appeared — same de-dup guarantee as entered_rojo."""
+        case = _make_case(db)
+        _set_side(db, case, "demandado")
+        notif_date = TODAY - timedelta(days=1)
+        _add_movement(db, case.id, notif_date, "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)")
+        first = _recompute(db, case)
+        assert first.fatal_appeared is True
+
+        second = _recompute(db, case)
+        assert case.next_deadline_fatal is True
+        assert second.old_fatal is True
+        assert second.new_fatal is True
+        assert second.fatal_appeared is False
+
+    def test_gris_path_returns_transition_no_crash(self, db) -> None:
+        """Non-civil competencia (GRIS safe-fail path) must still return a
+        valid SemaforoTransition instead of raising."""
+        case = _make_case(db, competencia="laboral")
+        _add_movement(db, case.id, TODAY, "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)")
+        transition = _recompute(db, case)
+        assert case.semaforo == "gris"
+        assert transition.new_semaforo == "gris"
+        assert transition.entered_rojo is False
+        assert transition.fatal_appeared is False
 
 
 # ---------------------------------------------------------------------------

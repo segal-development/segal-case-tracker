@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 import pytest
 from sqlalchemy.exc import IntegrityError
 
+from app.models.alert import Alert
 from app.models.case import Case
 from app.models.case_lawyer_source import CaseLawyerSource
 from app.models.court import Court
@@ -647,6 +648,78 @@ class TestIngestMovements:
         )
         assert result["cases_processed"] == 0
         assert len(result["errors"]) == 1
+
+
+class TestIngestMovementsDeadlineAlerts:
+    """The ROJO / fatal-deadline alert emitter, wired through the primary
+    ingest path: ``ingest_movements`` → ``sync.sync_movements`` →
+    ``_maybe_recompute_deadlines`` → ``DeadlineEngine.recompute_case`` →
+    ``emit_deadline_alerts``. A movement old enough to blow the demandado's
+    default EXCEPCIONES_8D window (no litigantes seeded → side defaults to
+    demandado) flips the case straight from unclassified to ROJO on its
+    first-ever classification, which is a qualifying transition."""
+
+    def _rojo_movement_html(self, rol: str) -> str:
+        old_date = (datetime.utcnow() - timedelta(days=90)).strftime("%d/%m/%Y")
+        return _detail_html(rol, "1", "NOTIFICACIÓN DE DEMANDA (Exitosa)", old_date)
+
+    def test_movement_flipping_case_to_rojo_emits_alert(
+        self, db, seeded_lawyer_and_case
+    ):
+        firm = seeded_lawyer_and_case["firm"]
+        service = IngestService(db)
+        result = service.ingest_movements(
+            lawyer_rut="11111111-1",
+            competencia="civil",
+            cases=[
+                {"rol": "C-1234-2026", "html": self._rojo_movement_html("C-1234-2026")}
+            ],
+        )
+
+        assert result["cases_processed"] == 1
+        assert result["errors"] == []
+
+        case = db.query(Case).filter(Case.rol == "C-1234-2026").first()
+        assert case.semaforo == "rojo"
+
+        alerts = db.query(Alert).filter(
+            Alert.case_id == case.id, Alert.type == "semaforo_rojo"
+        ).all()
+        assert len(alerts) == 1
+        # No abogado-of-record litigante seeded → falls back to the firm owner.
+        assert alerts[0].lawyer_id == firm.id
+        assert case.rol in alerts[0].title
+
+    def test_notification_exception_does_not_fail_ingest(
+        self, db, seeded_lawyer_and_case, monkeypatch
+    ):
+        from app.services.notification_service import NotificationService
+
+        def _boom(self, alert, case, lawyer, webhooks):
+            raise RuntimeError("SendGrid is down")
+
+        monkeypatch.setattr(NotificationService, "notify_deadline_alert", _boom)
+
+        service = IngestService(db)
+        result = service.ingest_movements(
+            lawyer_rut="11111111-1",
+            competencia="civil",
+            cases=[
+                {"rol": "C-1234-2026", "html": self._rojo_movement_html("C-1234-2026")}
+            ],
+        )
+
+        # The notification exception must be swallowed — ingest still succeeds.
+        assert result["cases_processed"] == 1
+        assert result["errors"] == []
+
+        case = db.query(Case).filter(Case.rol == "C-1234-2026").first()
+        assert case.semaforo == "rojo"
+        # The Alert row is still persisted even though dispatch raised.
+        alerts = db.query(Alert).filter(
+            Alert.case_id == case.id, Alert.type == "semaforo_rojo"
+        ).all()
+        assert len(alerts) == 1
 
 
 class TestIngestMovementsFirmOwnership:
