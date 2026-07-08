@@ -365,25 +365,13 @@ def firm_risk_board(db: Session, account_rut: str) -> dict:
     appearing on a case, regardless of side. A case with two abogados-of-record
     counts toward both rows.
     """
-    _EMPTY = {
-        "total": 0,
-        "semaforo": {"rojo": 0, "amarillo": 0, "verde": 0, "gris": 0},
-        "riesgo": {
-            "abandono_disponible": 0,
-            "prescripcion_cumplida": 0,
-            "en_apremio": 0,
-            "plazo_fatal_proximo": 0,
-            "plazo_fatal_vencido": 0,
-        },
-        "by_lawyer": [],
-        "top_critical": [],
-    }
-
-    account_rut_norm = normalize_rut(account_rut)
-    lawyer = db.query(Lawyer).filter(Lawyer.rut == account_rut_norm).first()
-    if not lawyer:
-        return _EMPTY
-
+    # Firm-wide board: access is gated by require_auditor at the endpoint, and
+    # the aggregation below is entirely case/litigante-derived — it never uses
+    # the requester's account. So, UNLIKE firm_dashboard_stats, we must NOT bail
+    # when account_rut isn't a Lawyer row: an auditor's RUT is typically not a
+    # litigante-abogado, so bailing returned an all-zero board for exactly the
+    # auditor/admin users this board is FOR. account_rut is kept in the
+    # signature for API symmetry but is intentionally unused here.
     today = _today_chile()
 
     cases = (
