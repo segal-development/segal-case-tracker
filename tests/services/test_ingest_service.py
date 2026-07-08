@@ -17,6 +17,7 @@ from app.models.court import Court
 from app.models.document import Document
 from app.models.lawyer import Lawyer
 from app.models.movement import Movement
+from app.models.sync_history import SyncHistory
 from app.services.ingest_service import IngestParseError, IngestService
 
 FIRM_RUT = "16021492-9"
@@ -266,6 +267,55 @@ class TestIngestCasesFirmOwnership:
             .count()
             == 1
         )
+
+
+class TestIngestCasesSyncHistory:
+    """FIX #3: the extension-ingest path must write a SyncHistory row so
+    ``cases.py``'s ``last_sync`` (surfaced from ``SyncHistory.completed_at``)
+    reflects an extension-driven sync, not only the scraper worker's."""
+
+    def test_ingest_cases_writes_one_sync_history_row_for_syncing_lawyer(self, db):
+        service = IngestService(db)
+        service.ingest_cases(
+            lawyer_rut="11111111-1", competencia="civil", pages=[VALID_PAGE]
+        )
+
+        syncing = db.query(Lawyer).filter(Lawyer.rut == "11111111-1").first()
+        rows = db.query(SyncHistory).all()
+        assert len(rows) == 1
+        assert rows[0].lawyer_id == syncing.id
+        assert rows[0].status == "completed"
+        assert rows[0].completed_at is not None
+
+    def test_repeat_ingest_writes_one_sync_history_row_per_call(self, db):
+        service = IngestService(db)
+        service.ingest_cases(
+            lawyer_rut="11111111-1", competencia="civil", pages=[VALID_PAGE]
+        )
+        service.ingest_cases(
+            lawyer_rut="11111111-1", competencia="civil", pages=[VALID_PAGE]
+        )
+
+        assert db.query(SyncHistory).count() == 2
+
+    def test_sync_history_write_failure_does_not_fail_ingest(self, db, monkeypatch):
+        """Best-effort: a SyncHistory write error must not poison the ingest
+        that already persisted the cases."""
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("db is on fire")
+
+        monkeypatch.setattr("app.services.ingest_service.SyncHistory", _boom)
+
+        service = IngestService(db)
+        result = service.ingest_cases(
+            lawyer_rut="11111111-1", competencia="civil", pages=[VALID_PAGE]
+        )
+
+        assert result["new"] == 2
+        assert result["errors"] == []
+        assert db.query(Case).count() == 2
+        assert db.query(SyncHistory).count() == 0
 
 
 # ---------------------------------------------------------------------------

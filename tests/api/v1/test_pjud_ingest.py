@@ -11,6 +11,8 @@ from datetime import datetime
 
 import pytest
 
+from app.api.deps import get_current_lawyer
+from app.main import app
 from app.models.case import Case
 from app.models.court import Court
 from app.models.document import Document
@@ -133,6 +135,34 @@ class TestIngestCasesEndpointHappyPath:
         data = response.json()
         assert data["new"] == 0
         assert data["existing"] == 1
+
+
+class TestIngestCasesLastSyncFreshness:
+    """FIX #3: an extension-driven ingest must make ``last_sync`` (GET
+    /api/v1/cases) fresh for the syncing lawyer — previously only the
+    scraper worker wrote a SyncHistory row."""
+
+    def test_last_sync_reflects_extension_ingest(self, client, ingest_key, db):
+        response = client.post(
+            INGEST_URL,
+            json={"rut": "11111111-1", "competencia": "civil", "pages": [VALID_PAGE]},
+            headers={"X-Ingest-Key": ingest_key},
+        )
+        assert response.status_code == 200
+
+        syncing = db.query(Lawyer).filter(Lawyer.rut == "11111111-1").first()
+
+        async def _mock_lawyer():
+            return {"sub": str(syncing.id)}
+
+        app.dependency_overrides[get_current_lawyer] = _mock_lawyer
+        try:
+            cases_resp = client.get("/api/v1/cases")
+        finally:
+            app.dependency_overrides.pop(get_current_lawyer, None)
+
+        assert cases_resp.status_code == 200
+        assert cases_resp.json()["last_sync"] is not None
 
 
 # ---------------------------------------------------------------------------
