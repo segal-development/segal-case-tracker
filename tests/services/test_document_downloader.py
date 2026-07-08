@@ -11,6 +11,29 @@ from unittest.mock import AsyncMock, MagicMock
 # Fixtures
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _fast_document_rate_limiter(monkeypatch):
+    """Patch out the REAL process-global "document" token bucket.
+
+    ``download_and_store`` acquires ``pjud_action_limiter("document")`` as a
+    second, production-only throttle layer in addition to the injected
+    ``limiter`` param. That bucket is a persistent module-global singleton
+    shared by the whole pytest process (see
+    ``app.scrapper.pjud.resilience.rate_limiter``), and its burst/rate are
+    intentionally tiny for anti-Shape pacing (``PJUD_RL_DOCUMENT_BURST=1``,
+    ``PJUD_RL_DOCUMENT_RATE=0.15`` — see app/config.py). Without this patch,
+    any test downloading 2+ documents would incur real multi-second
+    ``asyncio.sleep`` waits waiting for token refill, making these unit
+    tests slow and order-dependent on unrelated tests' prior use of the
+    same global bucket.
+    """
+    fake_limiter = MagicMock()
+    fake_limiter.acquire = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "app.scrapper.pjud.resilience.rate_limiter.pjud_action_limiter",
+        MagicMock(return_value=fake_limiter),
+    )
+
 def _make_pending_doc(doc_id: int, endpoint="documentos/docuS.php", token="FAKE_TOKEN"):
     """Return a minimal Document-like mock with status='pending'."""
     doc = MagicMock()

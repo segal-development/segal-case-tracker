@@ -44,7 +44,13 @@ from app.models.case_escrito import CaseEscrito
 from app.models.case_exhorto import CaseExhorto
 from app.services.notification_service import NotificationService
 from app.services.document_persistence import DocumentPersistenceService
-from app.scrapper.pjud.exceptions import ConsultaSessionExpired, SessionExpiredError, SessionNotAuthenticatedError
+from app.scrapper.pjud.exceptions import (
+    ConsultaSessionExpired,
+    SessionExpiredError,
+    SessionNotAuthenticatedError,
+    ShapeChallengeError,
+)
+from app.services.shape_cooldown import get_shape_cooldown
 from app.services.deadline_engine import DeadlineEngine, SemaforoTransition
 
 
@@ -1438,6 +1444,25 @@ async def detect_and_sync_movements(
             once with the new session.  ``last_detail_checked_at`` is NEVER
             advanced on a session error — session failure is not the case's
             fault, and the rotation position must be preserved for the retry.
+            NOTE: this callback is NEVER invoked for a ``ShapeChallengeError``
+            — see below.
+
+    Shape/TSPD handling:
+        A ``ShapeChallengeError`` (subclass of ``SessionNotAuthenticatedError``)
+        is caught SEPARATELY and BEFORE the generic session-error handling
+        above.  Shape/TSPD flags the egress IP's behavioral reputation — it is
+        a station-wide rate/behavioral block, not a per-session expiry.
+        Reauthenticating and retrying within seconds (as we do for a genuine
+        session expiry) would hammer the flagged IP again during its
+        reputation-cooldown window and deepen the block.  On a Shape
+        challenge: ``reauth_callback`` is NOT called, the case is NOT
+        retried, the process-global ``ShapeCooldown`` (see
+        ``app.services.shape_cooldown``) is tripped, and the batch aborts
+        immediately (movements synced before the block are still returned).
+        Also: if ``ShapeCooldown.active()`` at entry, this function skips all
+        detail work for the whole batch and returns early — a Shape hit
+        while processing one lawyer backs off every other lawyer's cycle
+        too, since Shape flags the shared egress IP.
 
     Returns:
         Tuple of ``(movements_new, alerts_created, errors)`` where *errors* is
@@ -1447,6 +1472,16 @@ async def detect_and_sync_movements(
     movements_new: int = 0
     alerts_created: int = 0
     errors: List[str] = []
+
+    shape_cooldown = get_shape_cooldown()
+    if shape_cooldown.active():
+        logger.warning(
+            "detect_and_sync_movements: in Shape cooldown, %.0fs remaining; "
+            "skipping PJUD detail work (lawyer_id=%s)",
+            shape_cooldown.remaining(),
+            lawyer_id,
+        )
+        return movements_new, alerts_created, errors
 
     if selected_cases is not None:
         cases_for_check = selected_cases
@@ -1636,7 +1671,7 @@ async def detect_and_sync_movements(
                         pjud_session=pjud_session,
                         db=db,
                         storage_service=storage_svc,
-                        limiter=AsyncSleepLimiter(delay=0.0),
+                        limiter=AsyncSleepLimiter(delay=settings.DOCUMENT_INTER_DELAY),
                         enabled=True,
                     )
 
@@ -1646,6 +1681,33 @@ async def detect_and_sync_movements(
             delta_m, delta_a = await _do_fetch()
             movements_new += delta_m
             alerts_created += delta_a
+            shape_cooldown.clear()
+
+        except ShapeChallengeError as shape_exc:
+            # Shape/TSPD flags the egress IP's behavioral reputation — it is a
+            # station-wide RATE/behavioral block, not a per-session expiry.
+            # Reauth + immediate retry (the SessionExpiredError path below)
+            # would hammer the flagged IP again during its reputation-cooldown
+            # window and deepen the block. Do NOT reauth, do NOT retry: trip
+            # the station-wide cooldown and abort this lawyer's batch outright.
+            cooldown_seconds = shape_cooldown.trip()
+            logger.error(
+                "detect_and_sync_movements: Shape/TSPD challenge detected for "
+                "lawyer_id=%s rol=%s — tripping station-wide cooldown for "
+                "%.0fs, aborting batch: %s",
+                lawyer_id,
+                api_case.rol,
+                cooldown_seconds,
+                shape_exc,
+            )
+            # Not the case's fault — preserve rotation position, same as a
+            # genuine session error.
+            errors.append(
+                f"Shape/TSPD challenge detected processing {api_case.rol}; "
+                f"station-wide cooldown tripped for {cooldown_seconds:.0f}s; "
+                "batch stopped"
+            )
+            break
 
         except (SessionExpiredError, SessionNotAuthenticatedError) as session_exc:
             logger.warning(
@@ -1684,6 +1746,27 @@ async def detect_and_sync_movements(
                 delta_m, delta_a = await _do_fetch()
                 movements_new += delta_m
                 alerts_created += delta_a
+                shape_cooldown.clear()
+            except ShapeChallengeError as shape_retry_exc:
+                # The retry (after a successful reauth) itself hit a Shape
+                # challenge — same treatment as the first-attempt case: no
+                # further retry, trip the cooldown, abort.
+                cooldown_seconds = shape_cooldown.trip()
+                logger.error(
+                    "detect_and_sync_movements: Shape/TSPD challenge on retry "
+                    "for lawyer_id=%s rol=%s — tripping station-wide cooldown "
+                    "for %.0fs, aborting batch: %s",
+                    lawyer_id,
+                    api_case.rol,
+                    cooldown_seconds,
+                    shape_retry_exc,
+                )
+                errors.append(
+                    f"Shape/TSPD challenge detected on retry for {api_case.rol}; "
+                    f"station-wide cooldown tripped for {cooldown_seconds:.0f}s; "
+                    "batch stopped"
+                )
+                break
             except (SessionExpiredError, SessionNotAuthenticatedError):
                 logger.error(
                     "detect_and_sync_movements: second session expiry after reauth; "
@@ -1942,7 +2025,7 @@ async def sync_via_consulta(
                             pjud_session=session,
                             db=db,
                             storage_service=storage_svc,
-                            limiter=AsyncSleepLimiter(delay=0.0),
+                            limiter=AsyncSleepLimiter(delay=settings.DOCUMENT_INTER_DELAY),
                             enabled=True,
                         )
             else:
