@@ -280,6 +280,42 @@ class NotificationService:
         }
         self._dispatch(alert, lawyer, webhooks, payload)
 
+    def notify_deadline_alert(
+        self,
+        alert: Alert,
+        case: Case,
+        lawyer: Lawyer,
+        webhooks: List[Webhook],
+    ) -> None:
+        """Dispatch email + webhook notifications for a ROJO-entry or
+        fatal-deadline alert (``alert.type`` is ``"semaforo_rojo"`` or
+        ``"deadline_fatal"``).
+
+        Builds a v1 event payload named ``deadline.<alert.type>`` and fans
+        out via ``_dispatch`` (mirrors notify_new_movement structure).
+        Never raises.
+        """
+        payload = {
+            "event": f"deadline.{alert.type}",
+            "version": "1",
+            "data": {
+                "lawyer_id": lawyer.id,
+                "case": {
+                    "rol": case.rol or "",
+                    "tribunal": case.court.name if case.court else "",
+                    "caratulado": f"{case.plaintiff or ''}/{case.defendant or ''}",
+                },
+                "deadline": {
+                    "semaforo": case.semaforo or "",
+                    "next_deadline_at": (
+                        str(case.next_deadline_at) if case.next_deadline_at else ""
+                    ),
+                    "next_deadline_fatal": bool(case.next_deadline_fatal),
+                },
+            },
+        }
+        self._dispatch(alert, lawyer, webhooks, payload)
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------

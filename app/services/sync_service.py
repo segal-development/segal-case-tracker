@@ -45,7 +45,7 @@ from app.models.case_exhorto import CaseExhorto
 from app.services.notification_service import NotificationService
 from app.services.document_persistence import DocumentPersistenceService
 from app.scrapper.pjud.exceptions import ConsultaSessionExpired, SessionExpiredError, SessionNotAuthenticatedError
-from app.services.deadline_engine import DeadlineEngine
+from app.services.deadline_engine import DeadlineEngine, SemaforoTransition
 
 
 @dataclass
@@ -1233,26 +1233,150 @@ def _oldest_unchecked_label(db: Session, lawyer_id: int) -> str:
     )
 
 
-def _maybe_recompute_deadlines(db: Session, case: Case) -> None:
-    """Recompute procedural deadlines for *case* after a movement sync.
+def emit_deadline_alerts(
+    db: Session,
+    case: Case,
+    transition: SemaforoTransition,
+    *,
+    budget: Optional[NotifyBudget] = None,
+) -> int:
+    """Fan out ROJO-entry / fatal-deadline alerts for one recompute transition.
 
-    Called from inside the _do_fetch closure in detect_and_sync_movements.
-    Only processes civil competencia; silently returns for all others.
-    Never re-raises — a deadline computation failure must NOT abort the
-    surrounding sync transaction.
+    The highest-value gap this closes: ``DeadlineEngine.recompute_case``
+    computes the semáforo but never told anyone when a case turned critical.
+    This is the small alert-fan-out helper the engine deliberately does NOT
+    own (``DeadlineEngine`` stays free of any notification imports) — callers
+    (``_maybe_recompute_deadlines``) call this right after recomputing.
+
+    Transition-based = naturally de-duped: an already-ROJO case that
+    recomputes and stays ROJO does not re-alert (see
+    ``SemaforoTransition.entered_rojo`` / ``.fatal_appeared``). A case
+    leaving ROJO never alerts either — only entering it does.
+
+    Mirrors ``sync_movements``'s recipient-resolution + NotifyBudget-gated
+    dispatch (ADR-005): one Alert + one notification dispatch per recipient
+    resolved via ``resolve_case_alert_recipients``, falling back to the
+    case's existing owner lawyer when no internal recipient resolves yet.
+    Alerts are ALWAYS persisted; only the email/webhook DISPATCH is
+    budget-gated. Never raises — the caller wraps this in a best-effort
+    try/except so a notification failure never breaks ingest/sync.
+
+    Returns the number of Alert rows created (0 when there is no qualifying
+    transition, or no resolvable recipient).
+    """
+    if not (transition.entered_rojo or transition.fatal_appeared):
+        return 0
+
+    from app.services.lawyer_roster import resolve_case_alert_recipients
+
+    recipients = resolve_case_alert_recipients(db, case)
+    if not recipients:
+        fallback_lawyer = (
+            db.query(Lawyer).filter(Lawyer.id == case.lawyer_id).first()
+        )
+        recipients = [fallback_lawyer] if fallback_lawyer else []
+    if not recipients:
+        return 0
+
+    recipient_webhooks: dict = {}
+    for recipient in recipients:
+        recipient_webhooks[recipient.id] = db.query(Webhook).filter(
+            Webhook.lawyer_id == recipient.id,
+            Webhook.is_active == True,  # noqa: E712
+        ).all()
+
+    _budget = budget if budget is not None else NotifyBudget.from_settings()
+
+    tribunal = case.court.name if case.court else "tribunal no especificado"
+    plazo_txt = (
+        f"Próximo plazo: {case.next_deadline_at}."
+        if case.next_deadline_at
+        else "Sin próximo plazo activo registrado."
+    )
+
+    events: list[tuple[str, str, str]] = []
+    if transition.entered_rojo:
+        events.append((
+            "semaforo_rojo",
+            f"⚠️ Causa {case.rol} pasó a ROJO",
+            f"La causa {case.rol} ante {tribunal} pasó a estado ROJO. {plazo_txt}",
+        ))
+    if transition.fatal_appeared:
+        events.append((
+            "deadline_fatal",
+            f"⏰ Plazo fatal en causa {case.rol}",
+            f"La causa {case.rol} ante {tribunal} tiene un plazo fatal próximo. {plazo_txt}",
+        ))
+
+    notification_svc = NotificationService(db)
+    alert_count = 0
+    for alert_type, title, message in events:
+        for recipient in recipients:
+            alert = Alert(
+                lawyer_id=recipient.id,
+                case_id=case.id,
+                type=alert_type,
+                title=title,
+                message=message,
+                created_at=datetime.utcnow(),
+            )
+            db.add(alert)
+            db.flush()  # assign alert.id before dispatch/logging reference it
+            alert_count += 1
+            if not _budget.exhausted():
+                try:
+                    notification_svc.notify_deadline_alert(
+                        alert, case, recipient, recipient_webhooks[recipient.id],
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Failed to dispatch deadline alert for case %s "
+                        "recipient %s: %s",
+                        case.id, recipient.id, exc,
+                    )
+                _budget.decrement()
+
+    return alert_count
+
+
+def _maybe_recompute_deadlines(
+    db: Session, case: Case, *, budget: Optional[NotifyBudget] = None
+) -> None:
+    """Recompute procedural deadlines for *case* after a movement sync, then
+    fan out a ROJO-entry / fatal-deadline alert on a qualifying transition.
+
+    Called from inside the _do_fetch closure in detect_and_sync_movements,
+    from sync_via_consulta, and from IngestService.ingest_movements. Only
+    processes civil competencia; silently returns for all others.
+    Never re-raises — a deadline computation OR alert-emission failure must
+    NOT abort the surrounding sync/ingest transaction.
 
     Args:
-        db:   Active SQLAlchemy session (shared with the sync transaction).
-        case: Case ORM instance (already flushed, not yet committed).
+        db:     Active SQLAlchemy session (shared with the sync transaction).
+        case:   Case ORM instance (already flushed, not yet committed).
+        budget: Optional shared NotifyBudget (ADR-005) — when the caller
+                already tracks a per-sync-cycle budget (movements + entity
+                alerts), pass it through so deadline alerts drain the same
+                pool instead of getting their own independent cap.
     """
     if (case.competencia or "").lower() != "civil":
         return
     try:
-        DeadlineEngine.recompute_case(db, case)
+        transition = DeadlineEngine.recompute_case(db, case)
     except Exception:
         logger.exception(
             "_maybe_recompute_deadlines failed for case_id=%s; "
             "deadline computation skipped — sync continues",
+            getattr(case, "id", "?"),
+        )
+        return
+
+    try:
+        emit_deadline_alerts(db, case, transition, budget=budget)
+    except Exception:
+        logger.exception(
+            "emit_deadline_alerts failed for case_id=%s; "
+            "alert skipped — sync continues",
             getattr(case, "id", "?"),
         )
 
@@ -1481,7 +1605,9 @@ async def detect_and_sync_movements(
             db_case.last_detail_checked_at = datetime.utcnow()
 
             # Recompute procedural deadlines (civil only; flush-only; never raises).
-            _maybe_recompute_deadlines(db, db_case)
+            # Shares this call's NotifyBudget (ADR-005) so a ROJO-entry/fatal
+            # alert drains the same per-sync-cycle pool as movements/entities.
+            _maybe_recompute_deadlines(db, db_case, budget=shared_budget)
 
             # Commit entity upserts + document tokens + mark-checked + deadlines.
             # (sync_movements already committed its own changes.)
@@ -1791,7 +1917,9 @@ async def sync_via_consulta(
                 # "checked" with an empty cuaderno and stuck as 'indeterminate' forever.
                 if detail.movements:
                     case.last_detail_checked_at = datetime.utcnow()
-                _maybe_recompute_deadlines(db, case)
+                # Shares this call's NotifyBudget (ADR-005) — see
+                # detect_and_sync_movements for the same rationale.
+                _maybe_recompute_deadlines(db, case, budget=shared_budget)
                 db.commit()
 
                 if settings.DOC_DOWNLOAD_ENABLED and persisted_docs:

@@ -22,6 +22,7 @@ TODO: Slice B — differentiate pagaré (1y prescripción, art. 98 Ley 18.092) v
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -186,11 +187,40 @@ def _firm_side(db: Session, case: "Case") -> str:
         return "demandado"
 
 
+@dataclass(frozen=True)
+class SemaforoTransition:
+    """Before/after snapshot of a single ``recompute_case`` call.
+
+    Pure data — no notification imports here, so ``DeadlineEngine`` stays
+    free of any coupling to the alert/notification stack. Callers (e.g.
+    ``sync_service.emit_deadline_alerts``) inspect ``entered_rojo`` /
+    ``fatal_appeared`` to decide whether to fan out an alert. Comparing the
+    OLD vs NEW state (rather than just the new one) makes alerting
+    transition-based and naturally de-duped: a case that was already ROJO
+    and stays ROJO does not re-fire.
+    """
+
+    old_semaforo: Optional[str]
+    new_semaforo: Optional[str]
+    old_fatal: bool
+    new_fatal: bool
+
+    @property
+    def entered_rojo(self) -> bool:
+        """True only when this recompute is what pushed the case INTO rojo."""
+        return self.old_semaforo != "rojo" and self.new_semaforo == "rojo"
+
+    @property
+    def fatal_appeared(self) -> bool:
+        """True only when ``next_deadline_fatal`` flipped False → True now."""
+        return not self.old_fatal and self.new_fatal
+
+
 class DeadlineEngine:
     """Stateless engine — all state lives in the DB row and is recomputed on sync."""
 
     @classmethod
-    def recompute_case(cls, db: Session, case: Case) -> None:
+    def recompute_case(cls, db: Session, case: Case) -> SemaforoTransition:
         """Recompute procedural deadlines for *case* and flush to DB.
 
         Flush-only: the outer caller is responsible for commit/rollback.
@@ -200,7 +230,17 @@ class DeadlineEngine:
         Args:
             db:   Active SQLAlchemy session (shared with the sync transaction).
             case: Case ORM instance to update (modified in-place + flushed).
+
+        Returns:
+            ``SemaforoTransition`` snapshotting ``case.semaforo`` and
+            ``case.next_deadline_fatal`` before/after this call. The engine
+            itself never alerts — it is the caller's job (see
+            ``sync_service.emit_deadline_alerts``) to inspect the transition
+            and fan out notifications.
         """
+        old_semaforo = case.semaforo
+        old_fatal = bool(case.next_deadline_fatal)
+
         # Apremio detection runs unconditionally so it is set on every code path
         # (success, GRIS safe-fail, and non-civil guard) without touching _write_gris.
         case.en_apremio = cls._compute_en_apremio(db, case)
@@ -214,6 +254,13 @@ class DeadlineEngine:
                 exc,
             )
             cls._write_gris(case, db)
+
+        return SemaforoTransition(
+            old_semaforo=old_semaforo,
+            new_semaforo=case.semaforo,
+            old_fatal=old_fatal,
+            new_fatal=bool(case.next_deadline_fatal),
+        )
 
     # ------------------------------------------------------------------
     # Internal pipeline
