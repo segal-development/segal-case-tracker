@@ -273,3 +273,241 @@ class TestDownloadDocumentStorageFailure:
         mock_store.assert_not_called()
         mock_factory.assert_not_called()
         mock_scraper_cls.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# FIX #4 — document authorization must follow the litigante-based case scope
+# (resolve_case_scope/apply_case_scope), not Case.lawyer_id == acting lawyer.
+#
+# Under Approach C, Case.lawyer_id is the FIRM's single canonical owner, so a
+# regular lawyer's own id never matches it — they could LIST a case's
+# documents (litigante-scoped) but got a 404 downloading them. These tests
+# seed a case owned by a different "firm" lawyer id and authorize via a
+# CaseLitigante abogado-of-record row instead.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def firm_owner(db):
+    """The case's Case.lawyer_id owner — distinct from any acting lawyer id."""
+    obj = Lawyer(rut="16021492-9", name="Firm Owner")
+    db.add(obj)
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+
+@pytest.fixture
+def litigante_abogado(db):
+    """A regular lawyer who is an abogado-of-record litigante on the case,
+    but does NOT own it via Case.lawyer_id."""
+    obj = Lawyer(rut="66666666-6", name="Litigante Abogado")
+    db.add(obj)
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+
+@pytest.fixture
+def outsider_lawyer(db):
+    """A lawyer with no relationship at all to the case."""
+    obj = Lawyer(rut="77777777-7", name="Outsider Lawyer")
+    db.add(obj)
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+
+@pytest.fixture
+def auditor_lawyer(db):
+    obj = Lawyer(rut="88888888-8", name="Auditor", role="auditor")
+    db.add(obj)
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+
+@pytest.fixture
+def admin_lawyer(db):
+    obj = Lawyer(rut="99999999-9", name="Admin", role="admin")
+    db.add(obj)
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+
+@pytest.fixture
+def firm_owned_case(db, firm_owner, court):
+    """A case owned (Case.lawyer_id) by the firm account, mirroring Approach C."""
+    obj = Case(
+        lawyer_id=firm_owner.id,
+        court_id=court.id,
+        rol="C-4242-2026",
+        status="active",
+        competencia="civil",
+        plaintiff="DEMANDANTE",
+        defendant="DEMANDADO",
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    db.add(obj)
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+
+@pytest.fixture
+def litigante_row(db, firm_owned_case, litigante_abogado):
+    from app.models.case_litigante import CaseLitigante
+
+    row = CaseLitigante(
+        case_id=firm_owned_case.id,
+        participante="AB.DTE",
+        rut=litigante_abogado.rut,
+        persona_type="NATURAL",
+        nombre=litigante_abogado.name,
+        natural_key=f"{firm_owned_case.id}-abogado",
+    )
+    db.add(row)
+    db.commit()
+    return row
+
+
+@pytest.fixture
+def firm_owned_stored_document(db, firm_owned_case):
+    obj = Document(
+        case_id=firm_owned_case.id,
+        doc_type="resolution",
+        pjud_endpoint="documentos/docuS.php",
+        pjud_token="eyJhbGciOiJub25lIn0.e30.FIRM",
+        pjud_token_hash="ffeedd0011",
+        gcs_path="cases/firm/resolution.pdf",
+        status="stored",
+        filename="resolucion_firm.pdf",
+    )
+    db.add(obj)
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+
+def _client_as(client, sub: str):
+    """TestClient with get_current_lawyer stubbed to the given JWT sub."""
+
+    async def _mock():
+        return {"sub": sub}
+
+    app.dependency_overrides[get_current_lawyer] = _mock
+    return client
+
+
+class TestDocumentAuthorizationLitiganteScope:
+    def test_redirect_allows_litigante_abogado_on_firm_owned_case(
+        self, client, litigante_abogado, litigante_row, firm_owned_stored_document
+    ):
+        fake_url = "https://storage.googleapis.com/my-bucket/file.pdf?X-Goog-Signature=abc"
+        _client_as(client, str(litigante_abogado.id))
+        try:
+            with patch(
+                "app.api.v1.documents.StorageService.signed_url",
+                return_value=fake_url,
+            ):
+                resp = client.get(
+                    f"/api/v1/documents/{firm_owned_stored_document.id}",
+                    follow_redirects=False,
+                )
+        finally:
+            app.dependency_overrides.pop(get_current_lawyer, None)
+
+        assert resp.status_code in (302, 307)
+        assert resp.headers.get("location") == fake_url
+
+    def test_download_allows_litigante_abogado_on_firm_owned_case(
+        self, client, litigante_abogado, litigante_row, firm_owned_stored_document
+    ):
+        _client_as(client, str(litigante_abogado.id))
+        try:
+            with patch(
+                "app.api.v1.documents.StorageService.retrieve",
+                return_value=_FAKE_PDF,
+            ):
+                resp = client.get(
+                    f"/api/v1/documents/{firm_owned_stored_document.id}/download"
+                )
+        finally:
+            app.dependency_overrides.pop(get_current_lawyer, None)
+
+        assert resp.status_code == 200
+        assert resp.content == _FAKE_PDF
+
+    def test_redirect_denies_outsider_lawyer_not_on_case(
+        self, client, outsider_lawyer, firm_owned_stored_document
+    ):
+        _client_as(client, str(outsider_lawyer.id))
+        try:
+            resp = client.get(
+                f"/api/v1/documents/{firm_owned_stored_document.id}",
+                follow_redirects=False,
+            )
+        finally:
+            app.dependency_overrides.pop(get_current_lawyer, None)
+
+        assert resp.status_code == 404
+
+    def test_download_denies_outsider_lawyer_not_on_case(
+        self, client, outsider_lawyer, firm_owned_stored_document
+    ):
+        _client_as(client, str(outsider_lawyer.id))
+        try:
+            resp = client.get(
+                f"/api/v1/documents/{firm_owned_stored_document.id}/download"
+            )
+        finally:
+            app.dependency_overrides.pop(get_current_lawyer, None)
+
+        assert resp.status_code == 404
+
+    def test_download_allows_auditor_on_any_case(
+        self, client, auditor_lawyer, firm_owned_stored_document
+    ):
+        _client_as(client, str(auditor_lawyer.id))
+        try:
+            with patch(
+                "app.api.v1.documents.StorageService.retrieve",
+                return_value=_FAKE_PDF,
+            ):
+                resp = client.get(
+                    f"/api/v1/documents/{firm_owned_stored_document.id}/download"
+                )
+        finally:
+            app.dependency_overrides.pop(get_current_lawyer, None)
+
+        assert resp.status_code == 200
+        assert resp.content == _FAKE_PDF
+
+    def test_download_allows_admin_on_any_case(
+        self, client, admin_lawyer, firm_owned_stored_document
+    ):
+        _client_as(client, str(admin_lawyer.id))
+        try:
+            with patch(
+                "app.api.v1.documents.StorageService.retrieve",
+                return_value=_FAKE_PDF,
+            ):
+                resp = client.get(
+                    f"/api/v1/documents/{firm_owned_stored_document.id}/download"
+                )
+        finally:
+            app.dependency_overrides.pop(get_current_lawyer, None)
+
+        assert resp.status_code == 200
+        assert resp.content == _FAKE_PDF
+
+    def test_download_unknown_document_still_404(self, client, litigante_abogado):
+        _client_as(client, str(litigante_abogado.id))
+        try:
+            resp = client.get("/api/v1/documents/999999/download")
+        finally:
+            app.dependency_overrides.pop(get_current_lawyer, None)
+
+        assert resp.status_code == 404

@@ -20,7 +20,13 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import RedirectResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_lawyer, get_db, _resolve_lawyer_id
+from app.api.deps import (
+    apply_case_scope,
+    get_current_lawyer,
+    get_db,
+    resolve_case_scope,
+    _resolve_lawyer_id,
+)
 from app.config import settings
 from app.models.document import Document
 from app.models.case import Case
@@ -63,19 +69,16 @@ async def get_document_redirect(
         307 Temporary Redirect — ``Location`` header points to the signed URL.
 
     Raises:
-        404 — document not found, not owned by caller, or not yet stored.
+        404 — document not found, not visible to caller, or not yet stored.
     """
-    lawyer_id = _resolve_lawyer_id(db, current_lawyer)
+    scope = resolve_case_scope(db, current_lawyer)
 
-    doc = (
-        db.query(Document)
-        .join(Case, Case.id == Document.case_id)
-        .filter(
-            Document.id == document_id,
-            Case.lawyer_id == lawyer_id,
-        )
-        .first()
-    )
+    doc = apply_case_scope(
+        db.query(Document).join(Case, Case.id == Document.case_id).filter(
+            Document.id == document_id
+        ),
+        scope,
+    ).first()
     if not doc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
 
@@ -117,7 +120,7 @@ async def download_document(
         been downloaded during sync yet.
 
     Error codes:
-        404 — document not found or not owned by the authenticated lawyer.
+        404 — document not found or not visible to the authenticated lawyer.
         409 — document not stored AND no active PJUD session available.
         410 — document token expired; re-sync the case to refresh tokens.
         500 — unexpected download failure.
@@ -126,16 +129,18 @@ async def download_document(
     if not lawyer_id:
         raise HTTPException(status_code=401, detail="Invalid token: no lawyer_id")
 
-    # ── 1. Load document and verify ownership ──────────────────────────────
-    doc = (
-        db.query(Document)
-        .join(Case, Case.id == Document.case_id)
-        .filter(
-            Document.id == document_id,
-            Case.lawyer_id == lawyer_id,
-        )
-        .first()
-    )
+    # ── 1. Load document and verify visibility ──────────────────────────────
+    # Authorized the same way the case/document LIST endpoints are — via the
+    # litigante-based case scope (auditor/admin see every case) — not via
+    # Case.lawyer_id, which under Approach C is the firm's single canonical
+    # owner and never matches a regular lawyer's own id.
+    scope = resolve_case_scope(db, current_lawyer)
+    doc = apply_case_scope(
+        db.query(Document).join(Case, Case.id == Document.case_id).filter(
+            Document.id == document_id
+        ),
+        scope,
+    ).first()
     if not doc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
