@@ -5,6 +5,9 @@ __pycache__/
 # Real per-environment secret files (keep the *.example templates tracked)
 .env.*
 !.env.*.example
+# GCP service-account key (mounted at runtime, never committed)
+sa-key.json
+*sa-key.json
 .venv/
 venv/
 *.egg-info/
