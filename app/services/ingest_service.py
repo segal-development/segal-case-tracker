@@ -25,6 +25,7 @@ from app.models.case_lawyer_source import CaseLawyerSource
 from app.models.document import Document
 from app.models.lawyer import Lawyer
 from app.models.movement import Movement
+from app.models.sync_history import SyncHistory
 from app.scrapper.pjud.civil import CivilScraper
 from app.services.document_persistence import (
     DocumentPersistenceService,
@@ -202,7 +203,43 @@ class IngestService:
                 self._upsert_case_lawyer_source(case_id, syncing_lawyer_id, sighted_at)
             self.db.commit()
 
+        # Record this ingest as a completed sync for the syncing lawyer —
+        # this is what makes "última conexión" (cases.py's last_sync,
+        # surfaced from SyncHistory.completed_at) fresh under the
+        # extension-driven flow, which otherwise never writes a SyncHistory
+        # row (only the scraper worker does). One row per LIST ingest call,
+        # never per movement/case. Best-effort: a write failure here must
+        # never fail the ingest that already persisted the cases above.
+        try:
+            self._record_sync_history(syncing_lawyer_id, competencia)
+        except Exception:
+            self.db.rollback()
+            logger.exception(
+                "Failed to write SyncHistory for extension ingest (lawyer_id=%s)",
+                syncing_lawyer_id,
+            )
+
         return result
+
+    def _record_sync_history(self, lawyer_id: int, competencia: str) -> None:
+        """Write a single completed ``SyncHistory`` row for a syncing lawyer.
+
+        Mirrors the fields ``SyncService.sync_cases`` sets on the worker
+        path (``lawyer_id``, ``status``, ``completed_at``) so both flows feed
+        ``cases.py``'s ``last_sync`` query identically. Flush/commit here is
+        isolated from the caller's transaction: any failure raises and is
+        caught by the caller, which must treat it as best-effort.
+        """
+        now = datetime.utcnow()
+        record = SyncHistory(
+            lawyer_id=lawyer_id,
+            competencia=competencia,
+            started_at=now,
+            triggered_by="extension",
+        )
+        record.complete(status="completed")
+        self.db.add(record)
+        self.db.commit()
 
     def _upsert_case_lawyer_source(
         self, case_id: int, lawyer_id: int, seen_at: datetime
