@@ -111,10 +111,20 @@ class Settings(BaseSettings):
     PJUD_RL_LIST_RATE: float = 0.1        # ~1 list / 10s
     PJUD_RL_LIST_BURST: int = 3
     PJUD_RL_DETAIL_RATE: float = 0.5      # ~1 detail / 2s
-    PJUD_RL_DETAIL_BURST: int = 10
-    PJUD_RL_DOCUMENT_RATE: float = 0.33   # ~1 document / 3s
-    PJUD_RL_DOCUMENT_BURST: int = 10
+    PJUD_RL_DETAIL_BURST: int = 2         # anti-Shape: no instant multi-request burst
+    PJUD_RL_DOCUMENT_RATE: float = 0.15   # ~1 document / 6-7s (anti-Shape pacing)
+    PJUD_RL_DOCUMENT_BURST: int = 1       # anti-Shape: zero-spaced document bursts trip Shape
     PJUD_RL_WAIT_TIMEOUT: float = 120.0   # pace up to 2 min before giving up
+
+    # Anti-Shape: minimum spacing between consecutive document downloads within
+    # the same case, so a batch of documents isn't fetched back-to-back on the
+    # same session immediately after the case detail (see AsyncSleepLimiter
+    # usage in sync_service.detect_and_sync_movements).
+    DOCUMENT_INTER_DELAY: float = 4.0
+
+    # Shape/TSPD cooldown (station-wide, see app.services.shape_cooldown)
+    SHAPE_COOLDOWN_BASE_SECONDS: int = 300   # 5 min initial cooldown after a Shape hit
+    SHAPE_COOLDOWN_MAX_SECONDS: int = 900    # 15 min cap after repeated consecutive hits
 
     # PJUD Observability
     PJUD_ALERT_WEBHOOK_URL: str = ""        # Webhook URL for alerts (empty = disabled)
