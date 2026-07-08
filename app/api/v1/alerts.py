@@ -11,7 +11,7 @@ so a lawyer only ever sees or mutates their own, never another lawyer's.
 """
 
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
@@ -22,6 +22,38 @@ from app.models.alert import Alert
 from app.models.case import Case
 
 router = APIRouter()
+
+
+# ============================================================================
+# ALERT CATEGORIES
+# ============================================================================
+
+# Single source of truth for which alert types are "actionable" (require a
+# lawyer's attention/decision) vs. plain "activity" (high-volume informational
+# noise: new movements, notificaciones, exhortos, escritos). Any alert type
+# NOT in this set is treated as activity, including future types we haven't
+# thought of yet.
+ACTIONABLE_ALERT_TYPES = frozenset(
+    {
+        "semaforo_rojo",
+        "deadline_fatal",
+        "deadline_added",
+        "deadline_audit",
+        "credential_change",
+        "status_change",
+    }
+)
+
+AlertCategory = Literal["actionable", "activity", "all"]
+
+
+def _apply_category_filter(query, category: AlertCategory):
+    """Narrow an Alert query to the given category. `all` is a no-op."""
+    if category == "actionable":
+        return query.filter(Alert.type.in_(ACTIONABLE_ALERT_TYPES))
+    if category == "activity":
+        return query.filter(Alert.type.notin_(ACTIONABLE_ALERT_TYPES))
+    return query
 
 
 # ============================================================================
@@ -105,17 +137,29 @@ async def list_alerts(
     page: int = Query(1, ge=1),
     per_page: int = Query(20, ge=1, le=100),
     unread_only: bool = Query(False),
+    category: AlertCategory = Query("actionable"),
     current_lawyer: dict = Depends(get_current_lawyer),
     db: Session = Depends(get_db),
 ):
     """List the current lawyer's own alerts, most-recent-first, paginated.
 
-    ``unread_count`` always reflects the lawyer's TOTAL unread alerts,
-    regardless of the ``unread_only`` filter or the current page.
+    ``category`` splits the feed into ``actionable`` (semaforo_rojo,
+    deadline_fatal/added/audit, credential_change, status_change — the few
+    alerts that need a lawyer's attention), ``activity`` (everything else:
+    new_movement, new_notificacion, new_exhorto, new_escrito — high-volume
+    informational noise), or ``all`` (no type filter, current behavior).
+    Defaults to ``actionable`` so the default feed and unread badge stay
+    focused.
+
+    ``unread_count`` reflects the lawyer's unread alerts WITHIN the
+    requested ``category``, regardless of the ``unread_only`` filter or the
+    current page.
     """
     lawyer_id = _resolve_lawyer_id(db, current_lawyer)
 
-    base_query = db.query(Alert).filter(Alert.lawyer_id == lawyer_id)
+    base_query = _apply_category_filter(
+        db.query(Alert).filter(Alert.lawyer_id == lawyer_id), category
+    )
 
     unread_count = base_query.filter(Alert.read.is_(False)).count()
 
@@ -191,18 +235,23 @@ async def mark_alert_read(
 
 @router.post("/read-all", response_model=MarkAllReadResponse)
 async def mark_all_alerts_read(
+    category: AlertCategory = Query("all"),
     current_lawyer: dict = Depends(get_current_lawyer),
     db: Session = Depends(get_db),
 ):
-    """Mark ALL of the caller's unread alerts as read. Returns the count marked."""
+    """Mark the caller's unread alerts within ``category`` as read.
+
+    Defaults to ``all`` (preserves the previous "mark everything" behavior).
+    Returns the count marked.
+    """
     lawyer_id = _resolve_lawyer_id(db, current_lawyer)
 
     now = datetime.utcnow()
-    marked = (
-        db.query(Alert)
-        .filter(Alert.lawyer_id == lawyer_id, Alert.read.is_(False))
-        .update({Alert.read: True, Alert.read_at: now}, synchronize_session=False)
+    query = _apply_category_filter(
+        db.query(Alert).filter(Alert.lawyer_id == lawyer_id, Alert.read.is_(False)),
+        category,
     )
+    marked = query.update({Alert.read: True, Alert.read_at: now}, synchronize_session=False)
     db.commit()
 
     return MarkAllReadResponse(marked=marked)
