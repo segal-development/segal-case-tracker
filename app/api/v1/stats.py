@@ -1,19 +1,27 @@
 """Stats endpoint — firm dashboard aggregates for the authenticated account."""
 
 import calendar
-from datetime import datetime
+from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_db, get_current_lawyer, _resolve_lawyer_id, resolve_case_scope, ALL_CASES
+from app.api.deps import (
+    get_db,
+    get_current_lawyer,
+    require_auditor,
+    _resolve_lawyer_id,
+    resolve_case_scope,
+    ALL_CASES,
+)
 from app.models.case import Case
 from app.models.goal import Goal
 from app.models.lawyer import Lawyer
 from app.services.lawyer_roster import (
     firm_dashboard_stats,
     firm_dashboard_stats_all,
+    firm_risk_board,
     admin_dashboard_stats,
     case_ids_for_abogado,
 )
@@ -279,3 +287,69 @@ async def get_admin_stats(
     if not lawyer:
         raise HTTPException(status_code=404, detail="Lawyer not found")
     return admin_dashboard_stats(db, lawyer.rut)
+
+
+class RiskBoardSemaforo(BaseModel):
+    rojo: int
+    amarillo: int
+    verde: int
+    gris: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class RiskBoardRiesgo(BaseModel):
+    abandono_disponible: int
+    prescripcion_cumplida: int
+    en_apremio: int
+    plazo_fatal_proximo: int
+    plazo_fatal_vencido: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class RiskBoardLawyer(BaseModel):
+    rut: str
+    nombre: str
+    rojo: int
+    abandono_disponible: int
+    en_apremio: int
+    total: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class RiskBoardCriticalCase(BaseModel):
+    case_id: int
+    rol: str
+    caratulado: str
+    tribunal: str | None
+    abogado_nombre: str
+    semaforo: str | None
+    next_deadline_at: date | None = None
+    next_deadline_fatal: bool
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class RiskBoard(BaseModel):
+    total: int
+    semaforo: RiskBoardSemaforo
+    riesgo: RiskBoardRiesgo
+    by_lawyer: list[RiskBoardLawyer]
+    top_critical: list[RiskBoardCriticalCase]
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+@router.get("/risk-board", response_model=RiskBoard)
+async def get_risk_board(
+    db: Session = Depends(get_db),
+    auditor_rut: str = Depends(require_auditor),
+):
+    """Firm-wide RISK BOARD (auditor/admin only): rolls up per-case exposure
+    flags (semaforo, abandono_disponible, prescripcion_cumplida, en_apremio,
+    fatal deadlines) into a single firm-wide view, with a per-abogado
+    breakdown and the top ~15 most urgent cases.
+    """
+    return firm_risk_board(db, auditor_rut)
