@@ -1,7 +1,7 @@
 """Alert model - Movement alerts sent to lawyers."""
 
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean, Text
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean, Text, text
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
@@ -33,7 +33,12 @@ class Alert(Base):
     email_sent_at = Column(DateTime, nullable=True)
     webhook_sent = Column(Boolean, default=False)
     webhook_sent_at = Column(DateTime, nullable=True)
-    
+
+    # In-app alert feed read/unread state (migration 026). Existing rows
+    # backfill to read=False via the column's server_default.
+    read = Column(Boolean, nullable=False, server_default=text("false"), default=False)
+    read_at = Column(DateTime, nullable=True)
+
     # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow)
     
