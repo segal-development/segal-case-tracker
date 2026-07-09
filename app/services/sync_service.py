@@ -22,6 +22,7 @@ from datetime import datetime
 from typing import Any, Callable, List, Optional, Tuple, Awaitable, TypeVar
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, func
+from sqlalchemy.exc import OperationalError
 
 logger = logging.getLogger(__name__)
 
@@ -603,7 +604,7 @@ class SyncService:
         )
         self.db.add(sync_record)
         self.db.flush()
-        
+
         result = SyncResult(cases_total=len(scraped_cases))
 
         # N+1 fix: pre-load all of this lawyer's existing cases in ONE query
@@ -617,29 +618,126 @@ class SyncService:
             for c in self.db.query(Case).filter(Case.lawyer_id == lawyer_id).all()
         }
 
-        for scraped in scraped_cases:
-            try:
-                case, is_new = self._upsert_case(
-                    lawyer_id, scraped, competencia, existing_by_rol
+        # Chunked commits (resilience): a lawyer with a large caseload (e.g.
+        # ~2085 cases) synced over the Mac's Cloud SQL Auth Proxy can hit a
+        # dropped connection mid-commit if everything is committed in one
+        # shot at the end. Committing every SYNC_COMMIT_CHUNK_SIZE processed
+        # cases bounds the blast radius of a drop to at most one chunk
+        # instead of the whole batch, plus one final commit that finalizes
+        # the SyncHistory record.
+        chunk_size = max(1, settings.SYNC_COMMIT_CHUNK_SIZE)
+        total = len(scraped_cases)
+
+        # expire_on_commit gotcha: the default Session expires every
+        # persistent object on commit. With chunked interim commits that
+        # would expire self._court_cache's Court objects and the
+        # existing_by_rol Case objects pre-loaded above — the next attribute
+        # access on a cache/map hit (e.g. `court.id`) would trigger a reload
+        # SELECT, silently reintroducing the N+1 pattern across chunk
+        # boundaries. Disable it for the duration of this sync run only
+        # (restored in `finally`) so cached/pre-loaded objects survive
+        # interim commits without a reload.
+        original_expire_on_commit = self.db.expire_on_commit
+        self.db.expire_on_commit = False
+        try:
+            for start in range(0, total, chunk_size):
+                chunk = scraped_cases[start : start + chunk_size]
+
+                def _process_chunk(chunk=chunk):
+                    chunk_new = 0
+                    chunk_updated = 0
+                    chunk_errors: List[str] = []
+                    for scraped in chunk:
+                        try:
+                            case, is_new = self._upsert_case(
+                                lawyer_id, scraped, competencia, existing_by_rol
+                            )
+                            if is_new:
+                                chunk_new += 1
+                            else:
+                                chunk_updated += 1
+                        except Exception as e:
+                            chunk_errors.append(f"Error syncing {scraped.rol}: {str(e)}")
+                    return chunk_new, chunk_updated, chunk_errors
+
+                chunk_new, chunk_updated, chunk_errors = self._commit_with_retry(
+                    _process_chunk, caches=(existing_by_rol, self._court_cache)
                 )
-                if is_new:
-                    result.cases_new += 1
-                else:
-                    result.cases_updated += 1
-            except Exception as e:
-                result.errors.append(f"Error syncing {scraped.rol}: {str(e)}")
-        
-        # Update sync record
-        sync_record.cases_found = result.cases_total
-        sync_record.cases_new = result.cases_new
-        sync_record.cases_updated = result.cases_updated
-        sync_record.complete(
-            status="completed" if not result.errors else "partial",
-            error="; ".join(result.errors) if result.errors else None,
-        )
-        
-        self.db.commit()
+                result.cases_new += chunk_new
+                result.cases_updated += chunk_updated
+                result.errors.extend(chunk_errors)
+
+            def _finalize_sync_record():
+                # Guards the (rare) case where this is the very first commit
+                # of the whole run (e.g. zero scraped_cases -> no chunks
+                # above) and a prior failed attempt's rollback expunged the
+                # still-uncommitted sync_record — re-attach before re-setting.
+                self.db.add(sync_record)
+                sync_record.cases_found = result.cases_total
+                sync_record.cases_new = result.cases_new
+                sync_record.cases_updated = result.cases_updated
+                sync_record.complete(
+                    status="completed" if not result.errors else "partial",
+                    error="; ".join(result.errors) if result.errors else None,
+                )
+
+            self._commit_with_retry(_finalize_sync_record)
+        finally:
+            self.db.expire_on_commit = original_expire_on_commit
+
         return result
+
+    def _commit_with_retry(self, work_fn: Callable[[], T], caches: Tuple[dict, ...] = ()) -> T:
+        """(Re)apply ``work_fn()`` and commit, retrying on OperationalError.
+
+        A dropped Cloud SQL Auth Proxy connection during a long commit
+        surfaces as ``sqlalchemy.exc.OperationalError`` (e.g. "server closed
+        the connection unexpectedly"). ``pool_pre_ping=True`` (see
+        ``app.core.database``) discards the dead connection and grabs a
+        fresh one from the pool before the retry.
+
+        Why ``work_fn`` is redone on every attempt (not just the bare
+        commit): ``self.db.rollback()`` undoes everything pending in the
+        transaction — any ORM object that was only "pending" (added +
+        flushed but never committed) is expunged from the session, and any
+        already-persistent object touched in this transaction is expired.
+        A blind retry of ``self.db.commit()`` alone would therefore commit
+        nothing (the work was wiped by the rollback). Because case/court
+        upserts and the SyncHistory field assignments are idempotent, redoing
+        ``work_fn()`` before each retry is always safe.
+
+        ``caches`` are dicts (e.g. ``existing_by_rol``, ``self._court_cache``)
+        that ``work_fn`` may mutate in place (inserting newly created rows so
+        a later item in the same unit — or a later chunk — resolves to them
+        instead of re-querying/re-creating). They are snapshotted before each
+        attempt and restored verbatim on failure, so a partially-applied
+        failed attempt never leaves a stale (expunged) entry behind for the
+        redo to trip over.
+
+        Only OperationalError is retried — any other exception (e.g. a
+        genuine integrity/programming error) propagates immediately without
+        a retry, since it is not a transient connectivity issue.
+        """
+        max_attempts = max(1, settings.SYNC_COMMIT_MAX_RETRIES)
+        for attempt in range(1, max_attempts + 1):
+            snapshots = [dict(cache) for cache in caches]
+            try:
+                result = work_fn()
+                self.db.commit()
+                return result
+            except OperationalError:
+                self.db.rollback()
+                for cache, snapshot in zip(caches, snapshots):
+                    cache.clear()
+                    cache.update(snapshot)
+                if attempt >= max_attempts:
+                    raise
+                logger.warning(
+                    "sync_cases: commit attempt %d/%d failed with "
+                    "OperationalError, retrying after rollback",
+                    attempt,
+                    max_attempts,
+                )
     
     def get_last_sync(self, lawyer_id: int, competencia: str) -> Optional[SyncHistory]:
         """Get the last successful sync for a lawyer/competencia."""
