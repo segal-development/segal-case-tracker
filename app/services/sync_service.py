@@ -567,6 +567,10 @@ class SyncService:
     
     def __init__(self, db: Session):
         self.db = db
+        # Per-instance court cache (ADR: batch N+1 fix). SyncService is
+        # instantiated fresh per sync run at every call site, so this is
+        # effectively "per sync run" without needing an explicit reset hook.
+        self._court_cache: dict = {}
     
     def sync_cases(
         self,
@@ -601,10 +605,23 @@ class SyncService:
         self.db.flush()
         
         result = SyncResult(cases_total=len(scraped_cases))
-        
+
+        # N+1 fix: pre-load all of this lawyer's existing cases in ONE query
+        # instead of one SELECT per scraped case. Matches the exact filter
+        # the old per-case query used (lawyer_id + rol, NOT competencia —
+        # the unique constraint is (lawyer_id, rol), so a case can exist
+        # under a different competencia than the one being synced right now
+        # and must still be matched/updated, not duplicated).
+        existing_by_rol = {
+            c.rol: c
+            for c in self.db.query(Case).filter(Case.lawyer_id == lawyer_id).all()
+        }
+
         for scraped in scraped_cases:
             try:
-                case, is_new = self._upsert_case(lawyer_id, scraped, competencia)
+                case, is_new = self._upsert_case(
+                    lawyer_id, scraped, competencia, existing_by_rol
+                )
                 if is_new:
                     result.cases_new += 1
                 else:
@@ -760,10 +777,19 @@ class SyncService:
         lawyer_id: int,
         scraped: ScrapedCase,
         competencia: str,
+        existing_by_rol: dict,
     ) -> Tuple[Case, bool]:
         """
         Insert or update a case.
-        
+
+        Args:
+            existing_by_rol: pre-loaded map of {normalized_rol: Case} for this
+                lawyer (see sync_cases), built with ONE query instead of one
+                per case. Mutated in place when a new case is created so a
+                duplicate ROL later in the same batch resolves to the
+                just-created row (mirrors the old behavior, where the
+                per-case flush let the next per-case query find it).
+
         Returns:
             Tuple of (case, is_new)
         """
@@ -771,14 +797,9 @@ class SyncService:
         # in rotation queries, preventing starvation from mixed-case PJUD responses.
         normalized_rol = scraped.rol.strip().upper()
 
-        # Find existing case by ROL and lawyer
-        existing = self.db.query(Case).filter(
-            and_(
-                Case.lawyer_id == lawyer_id,
-                Case.rol == normalized_rol,
-            )
-        ).first()
-        
+        # Find existing case by ROL and lawyer (from the pre-loaded map).
+        existing = existing_by_rol.get(normalized_rol)
+
         # Get or create court
         court = self._get_or_create_court(scraped.tribunal, competencia)
         
@@ -817,6 +838,9 @@ class SyncService:
             )
             self.db.add(case)
             self.db.flush()  # Get the ID
+            # Make the just-created case visible to later scraped entries in
+            # this same batch that share the same ROL (duplicate-ROL guard).
+            existing_by_rol[normalized_rol] = case
             return case, True
     
     def _upsert_movement(
@@ -880,18 +904,29 @@ class SyncService:
         return alert
     
     def _get_or_create_court(self, tribunal_name: str, competencia: str) -> Court:
-        """Get or create a court by name."""
+        """Get or create a court by name.
+
+        N+1 fix: courts repeat heavily across a lawyer's caseload, so this
+        checks an in-memory cache (self._court_cache) before hitting the DB.
+        Both DB-fetched and newly-created courts are cached, so the 2nd+
+        case sharing a tribunal is a cache hit, not another query.
+        """
         # Normalize name
         name = tribunal_name.strip()
-        
+
+        cached = self._court_cache.get(name)
+        if cached is not None:
+            return cached
+
         existing = self.db.query(Court).filter(Court.name == name).first()
         if existing:
+            self._court_cache[name] = existing
             return existing
-        
+
         # Create new court
         # Generate code from name (e.g., "24º Juzgado Civil de Santiago" -> "24JCS")
         code = self._generate_court_code(name)
-        
+
         court = Court(
             code=code,
             name=name,
@@ -900,6 +935,7 @@ class SyncService:
         )
         self.db.add(court)
         self.db.flush()
+        self._court_cache[name] = court
         return court
     
     def _parse_caratulado(self, caratulado: str) -> Tuple[str, str]:
