@@ -1,7 +1,10 @@
 """Cases endpoints - Read from database."""
 
+import io
+import re
 from typing import List, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import nullslast
 
@@ -691,3 +694,91 @@ async def archive_case(
 
     case.status = "archived"
     db.commit()
+
+
+# ============================================================================
+# DOCUMENT GENERATION (system requirement #3, slice 1)
+# ============================================================================
+
+DOCX_MEDIA_TYPE = (
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+)
+
+
+class GenerateDocumentRequest(BaseModel):
+    """Body for POST /cases/{case_id}/documents/generate.
+
+    ``document_type`` is a Literal so the supported set stays explicit and
+    extensible; unsupported values are rejected by FastAPI with a 422.
+    """
+
+    document_type: Literal["escrito_oposicion"]
+
+
+@router.post("/{case_id}/documents/generate")
+async def generate_case_document(
+    case_id: int,
+    body: GenerateDocumentRequest,
+    current_lawyer: dict = Depends(get_current_lawyer),
+    db: Session = Depends(get_db),
+):
+    """Generate an editable .docx court filing from a case and stream it back.
+
+    STREAM-ONLY: the document is built on demand and returned as an attachment;
+    no Document row is persisted. The lawyer downloads it, edits it, and
+    uploads it to PJUD manually. Generation is allowed regardless of the case's
+    recommended action — the UI decides how prominently to offer it.
+    """
+    from app.services.document_generation import build_escrito_oposicion
+
+    scope = resolve_case_scope(db, current_lawyer)
+    case = apply_case_scope(
+        db.query(Case).filter(Case.id == case_id), scope
+    ).first()
+
+    if not case:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Case not found",
+        )
+
+    # Resolve the acting lawyer's name/RUT. The JWT ``sub`` is the lawyer's
+    # RUT (legacy/test tokens may carry the numeric id); the name is not in the
+    # token, so look it up. Missing values become bracketed placeholders in the
+    # generated filing.
+    sub = current_lawyer.get("sub") or current_lawyer.get("lawyer_id")
+    acting_lawyer = None
+    if sub is not None:
+        if isinstance(sub, int) or (isinstance(sub, str) and str(sub).isdigit()):
+            acting_lawyer = db.query(Lawyer).filter(Lawyer.id == int(sub)).first()
+        else:
+            acting_lawyer = db.query(Lawyer).filter(Lawyer.rut == sub).first()
+
+    acting_lawyer_name = acting_lawyer.name if acting_lawyer else None
+    acting_lawyer_rut = (
+        acting_lawyer.rut
+        if acting_lawyer
+        else (sub if isinstance(sub, str) and not sub.isdigit() else None)
+    )
+
+    litigantes = db.query(CaseLitigante).filter(
+        CaseLitigante.case_id == case_id
+    ).all()
+    court_name = case.court.name if case.court else None
+
+    docx_bytes = build_escrito_oposicion(
+        case=case,
+        litigantes=litigantes,
+        court_name=court_name,
+        acting_lawyer_name=acting_lawyer_name,
+        acting_lawyer_rut=acting_lawyer_rut,
+    )
+
+    safe_rol = re.sub(r"[^A-Za-z0-9]+", "_", case.rol or "sin_rol").strip("_") or "sin_rol"
+    filename = f"oposicion_excepciones_{safe_rol}.docx"
+
+    return StreamingResponse(
+        io.BytesIO(docx_bytes),
+        media_type=DOCX_MEDIA_TYPE,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
