@@ -122,26 +122,29 @@ def _compute_prescripcion(
     The prescription clock starts from the DEMAND FILING DATE
     (``Case.filed_at``, "Fecha de ingreso"), NOT the title's vencimiento.
 
-    Prescription ONLY applies to títulos de crédito with a 1-year plazo:
+    Plazo by título type:
       {"pagare", "letra", "cheque"} → 1 year
         (art. 98 Ley 18.092 / art. 34 Ley 18.552)
-      everything else (None, "otro", "escritura_publica", "sentencia") → no
-        prescription at all → (False, None).
+      everything else (None, "otro", "escritura_publica", "sentencia", ...) →
+        3 years — the GENERAL acción ejecutiva prescription (art. 2515 CC).
+        # 3yr general per art. 2515 CC — confirm exact from-date basis with
+        # legal review. Reusing filed_at (the same base date as the 1yr
+        # títulos-de-crédito path) is a conservative placeholder pending
+        # legal sign-off, not a confirmed art. 2515 CC interpretation.
 
     Returns (prescripcion_cumplida, prescripcion_fecha).
-    If titulo_tipo has no prescription, or filed_at is None → (False, None).
+    If filed_at is None → (False, None) (nothing computable either way).
     prescripcion_cumplida = prescripcion_fecha < today (strictly less than).
     """
     titulo_tipo = (getattr(case, "titulo_tipo", None) or "").lower().strip()
-    if titulo_tipo not in {"pagare", "letra", "cheque"}:
-        return (False, None)
 
     filed_at = getattr(case, "filed_at", None)
     if filed_at is None:
         return (False, None)
 
     start = filed_at.date()
-    prescripcion_fecha = start + relativedelta(years=1)
+    plazo_years = 1 if titulo_tipo in {"pagare", "letra", "cheque"} else 3
+    prescripcion_fecha = start + relativedelta(years=plazo_years)
     prescripcion_cumplida = prescripcion_fecha < today
     return (prescripcion_cumplida, prescripcion_fecha)
 

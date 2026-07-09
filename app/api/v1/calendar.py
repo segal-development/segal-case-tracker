@@ -1,4 +1,4 @@
-"""Calendar endpoint — slice 2a of req #5/#11 (calendarización).
+"""Calendar endpoint — slice 2a/2b of req #5/#11 (calendarización).
 
 Agenda of upcoming/overdue DEADLINES and REVIEW dates across the caller's
 scoped cases, sorted by date ascending. Reuses data already denormalized on
@@ -6,7 +6,9 @@ scoped cases, sorted by date ascending. Reuses data already denormalized on
 ``DecisionEngine``): ``next_deadline_at``/``next_deadline_fatal`` and
 ``next_review_at``/``recommended_action_code``. This endpoint performs no
 new computation — it is a read-only fan-out + windowing view over columns
-the engine already writes.
+the engine already writes. Deadline items additionally resolve a real
+``label`` by looking up the backing ``CaseDeadline`` row (same resolution
+``GET /cases/{id}/deadlines`` already performs via ``DEADLINE_LABELS``).
 """
 
 from datetime import date, timedelta
@@ -23,7 +25,9 @@ from app.api.deps import (
     apply_case_scope,
 )
 from app.core.decision_rules import resolve_rule
+from app.core.deadlines_config import DEADLINE_LABELS
 from app.models.case import Case
+from app.models.case_deadline import CaseDeadline
 from app.services.deadline_engine import _today_chile
 
 router = APIRouter()
@@ -36,8 +40,9 @@ router = APIRouter()
 
 class CalendarItemResponse(BaseModel):
     """One agenda entry: either a procedural deadline or a DecisionEngine
-    review date. ``fatal`` is only meaningful for ``kind="deadline"``;
-    ``recommended_action``/``urgency`` only for ``kind="review"``."""
+    review date. ``fatal``/``label`` are only meaningful for
+    ``kind="deadline"``; ``recommended_action``/``urgency`` only for
+    ``kind="review"``."""
 
     date: date
     kind: Literal["deadline", "review"]
@@ -47,6 +52,7 @@ class CalendarItemResponse(BaseModel):
     court_name: Optional[str] = None
     semaforo: Optional[str] = None
     fatal: Optional[bool] = None
+    label: Optional[str] = None
     recommended_action: Optional[str] = None
     urgency: Optional[str] = None
     overdue: bool
@@ -108,6 +114,34 @@ def _caratulado(case: Case) -> str:
     return f"{case.plaintiff or ''}/{case.defendant or ''}"
 
 
+def _resolve_deadline_label(db: Session, case: Case) -> Optional[str]:
+    """Resolve the real deadline label for the case's next active deadline.
+
+    Reuses the SAME resolution ``GET /cases/{id}/deadlines`` already performs
+    (look up the CaseDeadline row and map its ``deadline_type`` through the
+    shared ``DEADLINE_LABELS`` catalog) instead of reinventing it here — this
+    endpoint stays a read-only fan-out over engine-computed state.
+
+    Returns None when no matching active row is found (e.g. a case whose
+    ``next_deadline_at`` was set without a backing CaseDeadline row — should
+    not happen via the real engine pipeline, but kept safe for callers that
+    write the denormalized column directly, such as tests/fixtures).
+    """
+    row = (
+        db.query(CaseDeadline)
+        .filter(
+            CaseDeadline.case_id == case.id,
+            CaseDeadline.due_date == case.next_deadline_at,
+            CaseDeadline.status == "active",
+        )
+        .order_by(CaseDeadline.id.asc())
+        .first()
+    )
+    if row is None:
+        return None
+    return DEADLINE_LABELS.get(row.deadline_type, row.deadline_type)
+
+
 @router.get("", response_model=CalendarResponse)
 async def get_calendar(
     days: int = Query(30, ge=1, description="Horizon in days from today (inclusive)"),
@@ -157,6 +191,7 @@ async def get_calendar(
                         court_name=court_name,
                         semaforo=case.semaforo,
                         fatal=bool(case.next_deadline_fatal),
+                        label=_resolve_deadline_label(db, case),
                         overdue=overdue,
                     )
                 )

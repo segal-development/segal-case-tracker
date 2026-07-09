@@ -81,11 +81,18 @@ class DeadlineType(str, Enum):
     EXCEPCIONES_8D = ("excepciones_8d", 8, "art. 459 CPC", True)
     TRASLADO_EJECUTANTE_4D = ("traslado_ejecutante_4d", 4, "art. 466 CPC")
     TERMINO_PROBATORIO_10D = ("termino_probatorio_10d", 10, "art. 468 CPC")
-    # Stub — secondary deadline deferred to Slice B
-    LISTA_TESTIGOS_2D = ("lista_testigos_2d", 2, "art. 468 CPC")
+    # Both wired (Slice 2b) from the same AUTO_PRUEBA trigger as
+    # TERMINO_PROBATORIO_10D — see procedural_classifier._classify().
+    LISTA_TESTIGOS_2D = ("lista_testigos_2d", 2, "art. 320 CPC (aplic. 469)")
+    REPOSICION_AUTO_PRUEBA_3D = ("reposicion_auto_prueba_3d", 3, "arts. 318-319 CPC")
     OBSERVACIONES_PRUEBA_6D = ("observaciones_prueba_6d", 6, "art. 469 CPC")
     SENTENCIA_10D = ("sentencia_10d", 10, "art. 162/470 CPC")
-    APELACION_5D = ("apelacion_5d", 5, "art. 187/475 CPC", True)
+    # Defense-side (ejecutado) basis: the firm always defends the ejecutado,
+    # who appeals with SOLO efecto devolutivo (the apremio continues) — see
+    # memory/juicio-ejecutivo-defense-rules.md. Corrected from the prior
+    # dual-basis "art. 187/475 CPC" (which mixed in the ejecutante's ambos-
+    # efectos rule the firm never actually exercises).
+    APELACION_5D = ("apelacion_5d", 5, "art. 475 CPC", True)
 
 
 # ---------------------------------------------------------------------------
@@ -108,8 +115,12 @@ MANDATORY_ACTIONABLE: frozenset[DeadlineType] = frozenset({
     DeadlineType.LISTA_TESTIGOS_2D,
     DeadlineType.OBSERVACIONES_PRUEBA_6D,
 })
+# REPOSICION_AUTO_PRUEBA_3D joins APELACION_5D as optional: both are a right
+# the firm MAY exercise, not an obligation — missing the window closes it
+# without producing a false ROJO (see OPTIONAL_ACTIONABLE skip logic below).
 OPTIONAL_ACTIONABLE: frozenset[DeadlineType] = frozenset({
     DeadlineType.APELACION_5D,
+    DeadlineType.REPOSICION_AUTO_PRUEBA_3D,
 })
 ACTIONABLE_DEADLINES: frozenset[DeadlineType] = MANDATORY_ACTIONABLE | OPTIONAL_ACTIONABLE
 INFORMATIONAL_DEADLINES: frozenset[DeadlineType] = frozenset({
@@ -147,10 +158,28 @@ def actionable_sets(side: str) -> "tuple[frozenset[str], frozenset[str]]":
         mandatory = base_mandatory | {DeadlineType.TRASLADO_EJECUTANTE_4D}
     else:  # demandado (default — the firm primarily defends debtors)
         mandatory = base_mandatory | {DeadlineType.EXCEPCIONES_8D}
-    optional = {DeadlineType.APELACION_5D}
+    optional = {DeadlineType.APELACION_5D, DeadlineType.REPOSICION_AUTO_PRUEBA_3D}
     mandatory_v = frozenset(d.value for d in mandatory)
     actionable_v = frozenset(d.value for d in (mandatory | optional))
     return mandatory_v, actionable_v
+
+
+# ---------------------------------------------------------------------------
+# DEADLINE_LABELS — human-readable display copy per deadline type (NOT legal
+# text; see legal_basis on DeadlineType for that). Hoisted here so every
+# consumer (deadlines.py, calendar.py, ...) resolves the SAME label instead
+# of maintaining separate copies that can drift apart.
+# ---------------------------------------------------------------------------
+DEADLINE_LABELS: dict[str, str] = {
+    "excepciones_8d": "Plazo para oponer excepciones",
+    "traslado_ejecutante_4d": "Traslado al ejecutante",
+    "termino_probatorio_10d": "Término probatorio",
+    "lista_testigos_2d": "Lista de testigos",
+    "reposicion_auto_prueba_3d": "Reposición del auto de prueba",
+    "observaciones_prueba_6d": "Observaciones a la prueba",
+    "sentencia_10d": "Plazo para dictar sentencia",
+    "apelacion_5d": "Apelación (solo efecto devolutivo)",
+}
 
 
 # ---------------------------------------------------------------------------

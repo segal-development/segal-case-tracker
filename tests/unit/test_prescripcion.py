@@ -162,38 +162,73 @@ class TestComputePrescripcion:
         assert cumplida is True
         assert prescripcion_fecha == filed_at.date() + relativedelta(years=1)
 
-    def test_escritura_publica_no_prescription(self) -> None:
-        """Escritura pública filed 5 years ago → (False, None): no prescription."""
+    def test_escritura_publica_older_than_3yr_is_cumplida(self) -> None:
+        """Bugfix (art. 2515 CC): escritura pública filed 5 years ago is NOT
+        exempt from prescription — the GENERAL acción ejecutiva prescribes in
+        3 years. → cumplida=True, fecha = filed_at + 3yr."""
         from app.services.deadline_engine import _compute_prescripcion
 
-        case = self._case(titulo_tipo="escritura_publica", filed_at=self._filed(years=5))
+        filed_at = self._filed(years=5)
+        case = self._case(titulo_tipo="escritura_publica", filed_at=filed_at)
+        cumplida, prescripcion_fecha = _compute_prescripcion(case, TODAY)
+        assert cumplida is True
+        assert prescripcion_fecha == filed_at.date() + relativedelta(years=3)
+
+    def test_sentencia_older_than_3yr_is_cumplida(self) -> None:
+        """Bugfix: sentencia filed 5 years ago → GENERAL 3yr rule → cumplida=True."""
+        from app.services.deadline_engine import _compute_prescripcion
+
+        filed_at = self._filed(years=5)
+        case = self._case(titulo_tipo="sentencia", filed_at=filed_at)
+        cumplida, prescripcion_fecha = _compute_prescripcion(case, TODAY)
+        assert cumplida is True
+        assert prescripcion_fecha == filed_at.date() + relativedelta(years=3)
+
+    def test_otro_older_than_3yr_is_cumplida(self) -> None:
+        """Bugfix: tipo 'otro' filed 5 years ago → GENERAL 3yr rule → cumplida=True."""
+        from app.services.deadline_engine import _compute_prescripcion
+
+        filed_at = self._filed(years=5)
+        case = self._case(titulo_tipo="otro", filed_at=filed_at)
+        cumplida, prescripcion_fecha = _compute_prescripcion(case, TODAY)
+        assert cumplida is True
+        assert prescripcion_fecha == filed_at.date() + relativedelta(years=3)
+
+    def test_none_tipo_older_than_3yr_is_cumplida(self) -> None:
+        """Bugfix: titulo_tipo=None filed 5 years ago → GENERAL 3yr rule →
+        cumplida=True.
+
+        Before the fix, ``_compute_prescripcion`` silently returned
+        (False, None) for every titulo_tipo outside {pagare, letra, cheque},
+        leaving art. 2515 CC's 3-year GENERAL acción ejecutiva prescription
+        completely unimplemented — a real gap for the defense (Marcelo
+        confirmed this applies, 2026-07-09).
+        """
+        from app.services.deadline_engine import _compute_prescripcion
+
+        filed_at = self._filed(years=5)
+        case = self._case(titulo_tipo=None, filed_at=filed_at)
+        cumplida, prescripcion_fecha = _compute_prescripcion(case, TODAY)
+        assert cumplida is True
+        assert prescripcion_fecha == filed_at.date() + relativedelta(years=3)
+
+    def test_general_titulo_within_3yr_not_cumplida(self) -> None:
+        """Non-pagaré título filed 2 years ago (within the 3yr GENERAL plazo)
+        → cumplida=False."""
+        from app.services.deadline_engine import _compute_prescripcion
+
+        filed_at = self._filed(years=2)
+        case = self._case(titulo_tipo="escritura_publica", filed_at=filed_at)
         cumplida, prescripcion_fecha = _compute_prescripcion(case, TODAY)
         assert cumplida is False
-        assert prescripcion_fecha is None
+        assert prescripcion_fecha == filed_at.date() + relativedelta(years=3)
 
-    def test_sentencia_no_prescription(self) -> None:
-        """Sentencia filed 5 years ago → (False, None): no prescription."""
+    def test_general_titulo_filed_at_none_returns_false_none(self) -> None:
+        """Non-pagaré título but filed_at=None → (False, None) — not
+        computable, same safe-fail as the pagaré path."""
         from app.services.deadline_engine import _compute_prescripcion
 
-        case = self._case(titulo_tipo="sentencia", filed_at=self._filed(years=5))
-        cumplida, prescripcion_fecha = _compute_prescripcion(case, TODAY)
-        assert cumplida is False
-        assert prescripcion_fecha is None
-
-    def test_otro_no_prescription(self) -> None:
-        """Tipo 'otro' filed 5 years ago → (False, None): no prescription."""
-        from app.services.deadline_engine import _compute_prescripcion
-
-        case = self._case(titulo_tipo="otro", filed_at=self._filed(years=5))
-        cumplida, prescripcion_fecha = _compute_prescripcion(case, TODAY)
-        assert cumplida is False
-        assert prescripcion_fecha is None
-
-    def test_none_tipo_no_prescription(self) -> None:
-        """titulo_tipo=None filed 5 years ago → (False, None): no prescription."""
-        from app.services.deadline_engine import _compute_prescripcion
-
-        case = self._case(titulo_tipo=None, filed_at=self._filed(years=5))
+        case = self._case(titulo_tipo="escritura_publica", filed_at=None)
         cumplida, prescripcion_fecha = _compute_prescripcion(case, TODAY)
         assert cumplida is False
         assert prescripcion_fecha is None
@@ -240,16 +275,27 @@ class TestPrescripcionRecompute:
         assert case.prescripcion_cumplida is True
         assert case.prescripcion_fecha == filed_at.date() + relativedelta(years=1)
 
-    def test_escritura_no_prescription_after_recompute(self, db) -> None:
-        """Escritura pública filed 5 years ago → (False, None) after recompute."""
+    def test_escritura_older_than_3yr_sets_cumplida_true_after_recompute(self, db) -> None:
+        """Bugfix: escritura pública filed 5 years ago → GENERAL 3yr rule (art.
+        2515 CC) → prescripcion_cumplida=True after recompute."""
         from app.services.deadline_engine import DeadlineEngine
 
-        case = _make_case(
-            db, titulo_tipo="escritura_publica", filed_at=self._filed(years=5)
-        )
+        filed_at = self._filed(years=5)
+        case = _make_case(db, titulo_tipo="escritura_publica", filed_at=filed_at)
+        DeadlineEngine.recompute_case(db, case)
+        assert case.prescripcion_cumplida is True
+        assert case.prescripcion_fecha == filed_at.date() + relativedelta(years=3)
+
+    def test_escritura_within_3yr_not_cumplida_after_recompute(self, db) -> None:
+        """Escritura pública filed 1 year ago (within the 3yr GENERAL plazo)
+        → prescripcion_cumplida=False after recompute."""
+        from app.services.deadline_engine import DeadlineEngine
+
+        filed_at = self._filed(years=1)
+        case = _make_case(db, titulo_tipo="escritura_publica", filed_at=filed_at)
         DeadlineEngine.recompute_case(db, case)
         assert case.prescripcion_cumplida is False
-        assert case.prescripcion_fecha is None
+        assert case.prescripcion_fecha == filed_at.date() + relativedelta(years=3)
 
     def test_pagare_filed_at_none_sets_cumplida_false(self, db) -> None:
         """Pagaré with filed_at=None → prescripcion_cumplida=False, fecha=None."""

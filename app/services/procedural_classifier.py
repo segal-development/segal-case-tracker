@@ -14,7 +14,9 @@ Key design points:
 - ties (same priority) are broken by rule order in CLASSIFIER_RULES.
 - OBSERVACIONES_PRUEBA_6D trigger is computed from TERMINO_PROBATORIO_10D
   due date (a derived date, not a scraped movement).
-- LISTA_TESTIGOS_2D is intentionally excluded from computation (Slice B).
+- LISTA_TESTIGOS_2D and REPOSICION_AUTO_PRUEBA_3D (Slice 2b) are derived from
+  the SAME AUTO_PRUEBA trigger movement as TERMINO_PROBATORIO_10D — they run
+  in parallel with the término probatorio, not after it like OBSERVACIONES.
 - REBELDÍA is NOT decided here; the deadline engine checks it after classification.
 """
 
@@ -151,6 +153,12 @@ class MovementClassifier:
                     trigger_date = self._movement_date(movement)
                     tp_due = add_business_days(trigger_date, DeadlineType.TERMINO_PROBATORIO_10D.dias_habiles)
                     triggers[DeadlineType.OBSERVACIONES_PRUEBA_6D] = tp_due
+                    # LISTA_TESTIGOS_2D (art. 320 CPC) and REPOSICION_AUTO_PRUEBA_3D
+                    # (arts. 318-319 CPC) run from the SAME auto de prueba
+                    # notification as TERMINO_PROBATORIO_10D — not from its due
+                    # date like OBSERVACIONES — so they reuse the movement itself.
+                    triggers[DeadlineType.LISTA_TESTIGOS_2D] = movement
+                    triggers[DeadlineType.REPOSICION_AUTO_PRUEBA_3D] = movement
 
         if not any_match:
             return ProceduralState.INDETERMINATE, {}

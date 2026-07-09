@@ -261,6 +261,68 @@ class TestSafety:
         from datetime import date
         assert isinstance(triggers[DeadlineType.OBSERVACIONES_PRUEBA_6D], date)
 
+    def test_auto_prueba_also_triggers_lista_testigos_and_reposicion(self) -> None:
+        """Slice 2b: AUTO_PRUEBA also wires LISTA_TESTIGOS_2D and
+        REPOSICION_AUTO_PRUEBA_3D from the SAME auto de prueba movement as
+        TERMINO_PROBATORIO_10D (not from its due date, unlike OBSERVACIONES)."""
+        clf = get_classifier()
+        auto_prueba_movement = _mv(
+            "2026-05-30", "Contestación Excepciones",
+            "Notificación resolución que recibe la causa a prueba (Exitosa)",
+        )
+        movements = [auto_prueba_movement]
+        state, triggers = clf.classify(movements, TODAY)
+        assert state == ProceduralState.AUTO_PRUEBA
+
+        assert DeadlineType.LISTA_TESTIGOS_2D in triggers
+        assert DeadlineType.REPOSICION_AUTO_PRUEBA_3D in triggers
+
+        # Both share the SAME trigger date as TERMINO_PROBATORIO_10D (the
+        # auto de prueba notification itself), not the término probatorio due date.
+        termino_trigger = triggers[DeadlineType.TERMINO_PROBATORIO_10D]
+        termino_date = (
+            termino_trigger.movement_date.date()
+            if hasattr(termino_trigger.movement_date, "date")
+            else termino_trigger.movement_date
+        )
+        for dt in (DeadlineType.LISTA_TESTIGOS_2D, DeadlineType.REPOSICION_AUTO_PRUEBA_3D):
+            trigger = triggers[dt]
+            trigger_date = (
+                trigger.movement_date.date()
+                if hasattr(trigger.movement_date, "date")
+                else trigger.movement_date
+            )
+            assert trigger_date == termino_date
+
+    def test_lista_testigos_and_reposicion_catalog_values(self) -> None:
+        """Catalog values: dias_habiles / legal_basis / is_fatal for the two
+        new AUTO_PRUEBA sub-deadlines (Slice 2b)."""
+        assert DeadlineType.LISTA_TESTIGOS_2D.dias_habiles == 2
+        assert DeadlineType.LISTA_TESTIGOS_2D.legal_basis == "art. 320 CPC (aplic. 469)"
+        assert DeadlineType.LISTA_TESTIGOS_2D.is_fatal is False
+
+        assert DeadlineType.REPOSICION_AUTO_PRUEBA_3D.dias_habiles == 3
+        assert DeadlineType.REPOSICION_AUTO_PRUEBA_3D.legal_basis == "arts. 318-319 CPC"
+        assert DeadlineType.REPOSICION_AUTO_PRUEBA_3D.is_fatal is False
+
+    def test_lista_testigos_and_reposicion_labels(self) -> None:
+        """DEADLINE_LABELS (hoisted display copy) carries the requested labels."""
+        from app.core.deadlines_config import DEADLINE_LABELS
+
+        assert DEADLINE_LABELS["lista_testigos_2d"] == "Lista de testigos"
+        assert DEADLINE_LABELS["reposicion_auto_prueba_3d"] == "Reposición del auto de prueba"
+
+    def test_apelacion_5d_reflects_ejecutado_basis(self) -> None:
+        """Task 2: APELACION_5D reflects the DEFENSE (ejecutado) rule — art. 475
+        CPC, solo efecto devolutivo — since the firm is always the ejecutado
+        and never appeals as ejecutante (art. 187's ambos-efectos basis)."""
+        from app.core.deadlines_config import DEADLINE_LABELS
+
+        assert DeadlineType.APELACION_5D.legal_basis == "art. 475 CPC"
+        assert DeadlineType.APELACION_5D.dias_habiles == 5
+        assert DeadlineType.APELACION_5D.is_fatal is True
+        assert "devolutivo" in DEADLINE_LABELS["apelacion_5d"].lower()
+
     def test_citacion_sentencia_triggers_sentencia_10d(self) -> None:
         """CITACION_SENTENCIA rule starts SENTENCIA_10D deadline.
 
@@ -304,7 +366,7 @@ class TestSafety:
         assert state == ProceduralState.SENTENCIA
         assert DeadlineType.APELACION_5D in triggers
         from app.core.deadlines_config import DeadlineType as DT
-        assert DT.APELACION_5D.legal_basis == "art. 187/475 CPC"
+        assert DT.APELACION_5D.legal_basis == "art. 475 CPC"
         # Trigger date must be the sentencia movement date
         from datetime import datetime
         trigger = triggers[DeadlineType.APELACION_5D]
