@@ -274,6 +274,39 @@ class TestComputeNextReviewAt:
         assert result is not None
         assert result > TODAY
 
+    def test_standing_opportunity_review_date_is_staggered_by_case_id(self) -> None:
+        """A standing-opportunity case's review date must be
+        today + 7 + (case.id % 30) — this spreads reviews over a
+        30-day window instead of piling every no-deadline opportunity
+        onto the exact same calendar day."""
+        case = _case(abandono_disponible=True, case_id=41)
+        expected = TODAY + timedelta(days=7 + (41 % 30))
+        assert DecisionEngine.compute_next_review_at(case, today=TODAY) == expected
+
+    def test_standing_opportunity_review_date_differs_across_case_ids(self) -> None:
+        """Two cases whose ids differ mod 30 must land on DIFFERENT
+        review dates — proves the staggering actually spreads load."""
+        case_a = _case(abandono_disponible=True, case_id=1)
+        case_b = _case(abandono_disponible=True, case_id=2)
+        result_a = DecisionEngine.compute_next_review_at(case_a, today=TODAY)
+        result_b = DecisionEngine.compute_next_review_at(case_b, today=TODAY)
+        assert result_a != result_b
+
+    def test_standing_opportunity_review_date_is_stable_for_same_case_id(self) -> None:
+        """Recomputing for the same case.id must yield the SAME date —
+        no randomness, deterministic staggering."""
+        case = _case(prescripcion_cumplida=True, case_id=17)
+        first = DecisionEngine.compute_next_review_at(case, today=TODAY)
+        second = DecisionEngine.compute_next_review_at(case, today=TODAY)
+        assert first == second
+
+    def test_standing_opportunity_review_date_falls_back_when_case_id_is_none(self) -> None:
+        """A case with a missing/None id must fall back to the base
+        offset (today + 7) without raising."""
+        case = _case(en_apremio=True, case_id=None)
+        result = DecisionEngine.compute_next_review_at(case, today=TODAY)
+        assert result == TODAY + timedelta(days=7)
+
     def test_returns_none_when_nothing_pending(self) -> None:
         case = _case(procedural_state=ProceduralState.MANDAMIENTO.value)
         assert DecisionEngine.compute_next_review_at(case, today=TODAY) is None

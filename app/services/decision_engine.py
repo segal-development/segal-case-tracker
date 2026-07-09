@@ -36,6 +36,15 @@ _CHILE_TZ = ZoneInfo("America/Santiago")
 # time-sensitive advisory signals, not fire-and-forget.
 _STANDING_OPPORTUNITY_REVIEW_DAYS = 7
 
+# Window (in days) over which standing-opportunity reviews are spread,
+# keyed deterministically off case.id (see compute_next_review_at).
+# Without this, every no-dated-deadline opportunity across the whole
+# caseload lands on the exact same calendar day (observed: 2158+ cases
+# piling onto "today+7" in one QA run), making the review queue useless
+# for that day. Spreading over 30 days turns ~2000 same-day reviews into
+# ~65-70/day.
+_STANDING_OPPORTUNITY_SPREAD_DAYS = 30
+
 
 def _today_chile() -> date:
     """Return today's date in the America/Santiago timezone."""
@@ -96,8 +105,14 @@ class DecisionEngine:
              thing that matters — review then.
           2. Else, if a standing opportunity is pending (abandono /
              prescripción / apremio) with no dated deadline to anchor to,
-             review in ``_STANDING_OPPORTUNITY_REVIEW_DAYS`` — these don't
-             expire on their own, but shouldn't be silently forgotten.
+             review in ``_STANDING_OPPORTUNITY_REVIEW_DAYS`` plus a
+             deterministic stagger of ``case.id % _STANDING_OPPORTUNITY_SPREAD_DAYS``
+             days — these don't expire on their own so shouldn't be
+             silently forgotten, but a fixed offset for every case piles
+             thousands of reviews onto the exact same calendar day.
+             Staggering by case id spreads them over a
+             ``today+7 .. today+7+_STANDING_OPPORTUNITY_SPREAD_DAYS``
+             window while staying stable across recomputes.
           3. Else (nothing pending) → None.
 
         NEVER raises — mirrors ``DeadlineEngine``'s safe-fail contract.
@@ -107,7 +122,15 @@ class DecisionEngine:
             if ctx.next_deadline_at is not None:
                 return ctx.next_deadline_at
             if ctx.abandono_disponible or ctx.prescripcion_cumplida or ctx.en_apremio:
-                return ctx.today + timedelta(days=_STANDING_OPPORTUNITY_REVIEW_DAYS)
+                case_id = getattr(case, "id", None)
+                spread = (
+                    case_id % _STANDING_OPPORTUNITY_SPREAD_DAYS
+                    if isinstance(case_id, int)
+                    else 0
+                )
+                return ctx.today + timedelta(
+                    days=_STANDING_OPPORTUNITY_REVIEW_DAYS + spread
+                )
             return None
         except Exception:
             logger.exception(
