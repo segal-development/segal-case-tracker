@@ -489,6 +489,39 @@ class DeadlineEngine:
 
         db.flush()
 
+        # Step 9: decision engine — recommended action + next review date.
+        # A SEPARATE safe-fail boundary: Steps 1-8 above have already been
+        # flushed successfully by this point, so a bug in the (newer,
+        # less battle-tested) DecisionEngine must never break the deadline
+        # computation that already succeeded.
+        cls._recompute_decision(db, case, today)
+
+    @classmethod
+    def _recompute_decision(cls, db: Session, case: Case, today: date) -> None:
+        """Populate recommended_action_code + next_review_at. NEVER raises.
+
+        Independent safe-fail: any DecisionEngine error clears both columns
+        to None rather than propagating (DecisionEngine.recommend and
+        .compute_next_review_at already never raise themselves, but this
+        boundary guards against future regressions there too).
+        """
+        try:
+            from app.services.decision_engine import DecisionEngine
+
+            recommendation = DecisionEngine.recommend(case, today=today)
+            case.recommended_action_code = recommendation.code if recommendation else None
+            case.next_review_at = DecisionEngine.compute_next_review_at(case, today=today)
+        except Exception as exc:
+            logger.exception(
+                "DecisionEngine step failed for case_id=%s: %s — clearing "
+                "recommended_action_code/next_review_at",
+                getattr(case, "id", "?"),
+                exc,
+            )
+            case.recommended_action_code = None
+            case.next_review_at = None
+        db.flush()
+
     # ------------------------------------------------------------------
     # Semáforo computation
     # ------------------------------------------------------------------
@@ -620,4 +653,6 @@ class DeadlineEngine:
         case.next_deadline_fatal = False
         case.prescripcion_cumplida = False
         case.prescripcion_fecha = None
+        case.recommended_action_code = None
+        case.next_review_at = None
         db.flush()
