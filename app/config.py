@@ -158,6 +158,13 @@ class Settings(BaseSettings):
     SYNC_INTERVAL_HOURS: int = 4            # Hours between scheduled sync runs
     MAX_DATA_AGE_HOURS: int = 4             # Hours after which cached data is considered stale
 
+    # Sync commit resilience (Mac -> Cloud SQL Auth Proxy long-write drops).
+    # SyncService.sync_cases commits progress every SYNC_COMMIT_CHUNK_SIZE
+    # upserted cases instead of one commit for the whole batch, so a dropped
+    # connection mid-run only loses the current chunk, not the whole caseload.
+    SYNC_COMMIT_CHUNK_SIZE: int = 200       # Cases processed between commits
+    SYNC_COMMIT_MAX_RETRIES: int = 2        # Max commit attempts on OperationalError (incl. the first)
+
     # Environment
     ENVIRONMENT: str = "production"
     DEBUG: bool = True
