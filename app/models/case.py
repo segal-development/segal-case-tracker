@@ -80,6 +80,10 @@ class Case(Base):
     prescripcion_cumplida = Column(Boolean, nullable=False, server_default=text("false"), default=False)  # computed
     prescripcion_fecha = Column(Date, nullable=True)   # computed: titulo_fecha + plazo
 
+    # Decision engine — populated by DeadlineEngine.recompute_case (via DecisionEngine)
+    recommended_action_code = Column(String(50), nullable=True)  # e.g. "oponer_excepciones"
+    next_review_at = Column(Date, nullable=True)  # next date this case should be manually reviewed
+
     # Timestamps
     filed_at = Column(DateTime, nullable=True)  # Fecha de ingreso
     last_movement_at = Column(DateTime, nullable=True)

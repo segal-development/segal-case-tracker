@@ -109,6 +109,26 @@ def case_with_active_deadline(db, civil_case):
 
 
 @pytest.fixture
+def case_with_recommendation(db, civil_case):
+    """A case with a DecisionEngine recommendation already computed."""
+    civil_case.recommended_action_code = "oponer_excepciones"
+    civil_case.next_review_at = date.today() + timedelta(days=5)
+    db.commit()
+    db.refresh(civil_case)
+    return civil_case
+
+
+@pytest.fixture
+def case_without_recommendation(db, civil_case):
+    """A case with no pending recommendation (nothing to do)."""
+    civil_case.recommended_action_code = None
+    civil_case.next_review_at = None
+    db.commit()
+    db.refresh(civil_case)
+    return civil_case
+
+
+@pytest.fixture
 def authed_client(client, lawyer):
     """TestClient with get_current_lawyer stubbed to the primary test lawyer."""
 
@@ -397,3 +417,68 @@ class TestAbandonoPrescripcionFlags:
         response = authed_client.get(f"/api/v1/cases/{civil_case.id}/deadlines")
         data = response.json()
         assert data["prescripcion_risk"] == "none"
+
+
+# ---------------------------------------------------------------------------
+# Tests: recommended_action + next_review_at (DecisionEngine, req #5/#11)
+# ---------------------------------------------------------------------------
+
+
+class TestRecommendedAction:
+    """GET .../deadlines resolves Case.recommended_action_code into a real
+    recommendation object (action_text/legal_basis/urgency/disclaimer)."""
+
+    def test_response_contains_recommended_action_and_next_review_at_keys(
+        self, authed_client: TestClient, civil_case: Case
+    ):
+        response = authed_client.get(f"/api/v1/cases/{civil_case.id}/deadlines")
+        assert response.status_code == 200
+        data = response.json()
+        assert "recommended_action" in data
+        assert "next_review_at" in data
+
+    def test_recommended_action_resolved_from_code(
+        self, authed_client: TestClient, case_with_recommendation: Case
+    ):
+        response = authed_client.get(f"/api/v1/cases/{case_with_recommendation.id}/deadlines")
+        data = response.json()
+        rec = data["recommended_action"]
+        assert rec is not None
+        assert rec["code"] == "oponer_excepciones"
+        assert rec["action_text"] == "Oponer excepciones (escrito de oposición)"
+        assert rec["legal_basis"] == "art. 459/464 CPC"
+        assert rec["urgency"] == "critica"
+
+    def test_recommended_action_carries_disclaimer(
+        self, authed_client: TestClient, case_with_recommendation: Case
+    ):
+        response = authed_client.get(f"/api/v1/cases/{case_with_recommendation.id}/deadlines")
+        rec = response.json()["recommended_action"]
+        assert rec["disclaimer"]
+        assert "abogado" in rec["disclaimer"].lower()
+
+    def test_next_review_at_reflects_case_column(
+        self, authed_client: TestClient, case_with_recommendation: Case
+    ):
+        response = authed_client.get(f"/api/v1/cases/{case_with_recommendation.id}/deadlines")
+        data = response.json()
+        assert data["next_review_at"] == case_with_recommendation.next_review_at.isoformat()
+
+    def test_recommended_action_none_when_code_is_none(
+        self, authed_client: TestClient, case_without_recommendation: Case
+    ):
+        response = authed_client.get(f"/api/v1/cases/{case_without_recommendation.id}/deadlines")
+        data = response.json()
+        assert data["recommended_action"] is None
+        assert data["next_review_at"] is None
+
+    def test_recommended_action_none_when_code_unknown(
+        self, authed_client: TestClient, db, civil_case: Case
+    ):
+        """A stale/unrecognised code (e.g. after a rule was renamed) must
+        resolve to None rather than 500ing the endpoint."""
+        civil_case.recommended_action_code = "totally_unknown_code"
+        db.commit()
+        response = authed_client.get(f"/api/v1/cases/{civil_case.id}/deadlines")
+        assert response.status_code == 200
+        assert response.json()["recommended_action"] is None

@@ -28,6 +28,7 @@ from app.api.deps import (
     apply_case_scope,
 )
 from app.core.deadlines_config import DEADLINE_DISCLAIMER, DeadlineType
+from app.core.decision_rules import RECOMMENDATION_DISCLAIMER, resolve_rule
 from app.models.alert import Alert
 from app.models.case import Case
 from app.models.case_deadline import CaseDeadline
@@ -118,6 +119,18 @@ class ProximaAccionResponse(BaseModel):
     description: str
 
 
+class RecommendedActionResponse(BaseModel):
+    """The DecisionEngine's top-priority DEFENSE action for this case
+    (req #5/#11) — resolved from ``Case.recommended_action_code`` against
+    ``app.core.decision_rules.DECISION_RULES``. Always advisory."""
+
+    code: str
+    action_text: str
+    legal_basis: str
+    urgency: str
+    disclaimer: str
+
+
 class CaseDeadlinesResponse(BaseModel):
     """Full deadline response for a case."""
 
@@ -126,6 +139,8 @@ class CaseDeadlinesResponse(BaseModel):
     semaforo: Optional[str]
     active_deadlines: List[DeadlineItemResponse]
     proxima_accion: Optional[ProximaAccionResponse]
+    recommended_action: Optional[RecommendedActionResponse]
+    next_review_at: Optional[date]
     abandono_risk: str
     prescripcion_risk: str
     disclaimer: str
@@ -592,12 +607,29 @@ async def get_case_deadlines(
             ),
         )
 
+    # Recommended action (req #5/#11) — resolve the denormalized code
+    # DecisionEngine wrote onto the case (via DeadlineEngine.recompute_case)
+    # into real display text. A stale/unrecognised code resolves to None
+    # rather than erroring the endpoint.
+    recommended_action: Optional[RecommendedActionResponse] = None
+    rule = resolve_rule(getattr(case, "recommended_action_code", None))
+    if rule is not None:
+        recommended_action = RecommendedActionResponse(
+            code=rule.code,
+            action_text=rule.action_text,
+            legal_basis=rule.legal_basis,
+            urgency=rule.urgency.value,
+            disclaimer=RECOMMENDATION_DISCLAIMER,
+        )
+
     return CaseDeadlinesResponse(
         case_id=case.id,
         procedural_state=case.procedural_state,
         semaforo=case.semaforo,
         active_deadlines=active_deadlines,
         proxima_accion=proxima_accion,
+        recommended_action=recommended_action,
+        next_review_at=getattr(case, "next_review_at", None),
         abandono_risk=_compute_abandono_risk(case),
         prescripcion_risk=_compute_prescripcion_risk(case),
         disclaimer=DEADLINE_DISCLAIMER,
