@@ -57,6 +57,8 @@ class FirmTotals(BaseModel):
     cases: int
     semaforo: SemaforoBreakdown
     stale: int
+    actividad_mes: int
+    proyeccion_mes: int
     by_materia: list[MateriaCount]
     by_procedural_state: list[StageCount]
 

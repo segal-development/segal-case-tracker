@@ -1,5 +1,6 @@
 """Firm roster helpers: co-side firm lawyers for the authenticated account."""
 
+import calendar
 import re
 from collections import defaultdict
 from datetime import date, datetime, timedelta
@@ -93,6 +94,27 @@ def firm_roster(db: Session, account_rut: str) -> list[dict]:
     return result
 
 
+def _actividad_proyeccion_mes(cases) -> tuple[int, int]:
+    """Cases actioned this calendar month plus a linear projection to month-end.
+
+    Mirrors the ``/stats/me`` computation EXACTLY so firm-level productividad
+    numbers stay consistent with the per-lawyer ones. ``cases`` is any iterable
+    of rows exposing a ``last_movement_at`` attribute; the count/projection is
+    taken over exactly that set (the scope the caller already selected).
+    """
+    now = datetime.utcnow()
+    actividad_mes = sum(
+        1 for c in cases
+        if c.last_movement_at is not None
+        and c.last_movement_at.year == now.year
+        and c.last_movement_at.month == now.month
+    )
+    day = now.day
+    days_in_month = calendar.monthrange(now.year, now.month)[1]
+    proyeccion_mes = round(actividad_mes / day * days_in_month) if day > 0 else actividad_mes
+    return actividad_mes, proyeccion_mes
+
+
 def firm_dashboard_stats(db: Session, account_rut: str) -> dict:
     """Return firm-wide dashboard stats for the authenticated account.
 
@@ -104,6 +126,8 @@ def firm_dashboard_stats(db: Session, account_rut: str) -> dict:
             "cases": 0,
             "semaforo": {"rojo": 0, "amarillo": 0, "verde": 0, "otros": 0},
             "stale": 0,
+            "actividad_mes": 0,
+            "proyeccion_mes": 0,
             "by_materia": [],
             "by_procedural_state": [],
         },
@@ -224,11 +248,15 @@ def firm_dashboard_stats(db: Session, account_rut: str) -> dict:
 
     by_lawyer.sort(key=lambda x: x["case_count"], reverse=True)
 
+    actividad_mes, proyeccion_mes = _actividad_proyeccion_mes(cases)
+
     return {
         "totals": {
             "cases": len(cases),
             "semaforo": sem_totals,
             "stale": stale_total,
+            "actividad_mes": actividad_mes,
+            "proyeccion_mes": proyeccion_mes,
             "by_materia": by_materia,
             "by_procedural_state": by_procedural_state,
         },
@@ -338,11 +366,15 @@ def firm_dashboard_stats_all(db: Session) -> dict:
 
     by_lawyer.sort(key=lambda x: x["case_count"], reverse=True)
 
+    actividad_mes, proyeccion_mes = _actividad_proyeccion_mes(cases)
+
     return {
         "totals": {
             "cases": len(cases),
             "semaforo": sem_totals,
             "stale": stale_total,
+            "actividad_mes": actividad_mes,
+            "proyeccion_mes": proyeccion_mes,
             "by_materia": by_materia,
             "by_procedural_state": by_procedural_state,
         },
