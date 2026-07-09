@@ -44,6 +44,7 @@ def _make_pending_doc(doc_id: int, endpoint="documentos/docuS.php", token="FAKE_
     doc.doc_type = "resolution"
     doc.case_id = 1
     doc.pjud_token_hash = f"abc123def{doc_id:03d}"
+    doc.failed_at = None
     return doc
 
 
@@ -128,6 +129,51 @@ class TestDocumentDownloaderFailureIsolation:
             enabled=True,
         )
         assert doc1.status == "failed"
+
+    @pytest.mark.asyncio
+    async def test_download_exception_sets_failed_at(self):
+        """FIX (timeline req #8): a failed download must stamp failed_at, not
+        just flip status — the timeline needs a real transition timestamp."""
+        import httpx
+
+        doc1 = _make_pending_doc(1)
+        assert doc1.failed_at is None
+        scraper = _make_scraper([httpx.RequestError("network error")])
+        db = MagicMock()
+
+        from app.services.document_downloader import DocumentDownloader
+        await DocumentDownloader().download_and_store(
+            pending_docs=[doc1],
+            scraper=scraper,
+            pjud_session=MagicMock(),
+            db=db,
+            storage_service=_make_storage_svc(),
+            limiter=_make_limiter(),
+            enabled=True,
+        )
+        assert doc1.status == "failed"
+        assert doc1.failed_at is not None
+
+    @pytest.mark.asyncio
+    async def test_missing_endpoint_or_token_sets_failed_at(self):
+        """FIX (timeline req #8): the missing-endpoint/token branch also
+        transitions to 'failed' and must stamp failed_at the same way."""
+        doc1 = _make_pending_doc(1, endpoint=None, token=None)
+        assert doc1.failed_at is None
+        db = MagicMock()
+
+        from app.services.document_downloader import DocumentDownloader
+        await DocumentDownloader().download_and_store(
+            pending_docs=[doc1],
+            scraper=_make_scraper([]),
+            pjud_session=MagicMock(),
+            db=db,
+            storage_service=_make_storage_svc(),
+            limiter=_make_limiter(),
+            enabled=True,
+        )
+        assert doc1.status == "failed"
+        assert doc1.failed_at is not None
 
 
 # ---------------------------------------------------------------------------

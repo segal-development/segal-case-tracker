@@ -43,6 +43,12 @@ class Document(Base):
     # Timestamps
     document_date = Column(DateTime, nullable=True)  # Date on document
     downloaded_at = Column(DateTime, default=datetime.utcnow)
+    # Real transition timestamps (migration 028) — downloaded_at above is set
+    # at ROW CREATION, not at actual download completion, so it can't tell
+    # you when a doc became stored/failed. These two fill that gap for the
+    # case lifecycle timeline (req #8):
+    stored_at = Column(DateTime, nullable=True)  # Set when status -> "stored"
+    failed_at = Column(DateTime, nullable=True)  # Set when status -> "failed"
 
     # Relationships
     case = relationship("Case", back_populates="documents")

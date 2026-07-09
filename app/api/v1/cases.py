@@ -13,7 +13,9 @@ from app.api.deps import (
     apply_case_scope,
     ALL_CASES,
 )
+from app.models.alert import Alert
 from app.models.case import Case
+from app.models.case_deadline import CaseDeadline
 from app.models.lawyer import Lawyer
 from app.models.case_litigante import CaseLitigante
 from app.models.case_notificacion import CaseNotificacion
@@ -23,6 +25,7 @@ from app.models.movement import Movement
 from app.models.court import Court
 from app.models.sync_history import SyncHistory
 from app.models.document import Document
+from app.services.timeline_service import build_case_timeline
 
 router = APIRouter()
 
@@ -177,6 +180,33 @@ class DocumentListItem(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class TimelineEventResponse(BaseModel):
+    """Single merged lifecycle event for a case's timeline."""
+    date: datetime
+    kind: Literal[
+        "movimiento",
+        "documento",
+        "plazo",
+        "alerta",
+        "escrito",
+        "notificacion",
+        "exhorto",
+    ]
+    title: str
+    description: Optional[str] = None
+    ref_id: Optional[int] = None
+    status: Optional[str] = None
+
+
+class CaseTimelineResponse(BaseModel):
+    """Paginated, merged case lifecycle timeline."""
+    items: List[TimelineEventResponse]
+    total: int
+    page: int
+    per_page: int
+    pages: int
 
 
 class CaseDetailResponse(BaseModel):
@@ -549,6 +579,71 @@ async def list_case_documents(
         )
         for doc in docs
     ]
+
+
+@router.get("/{case_id}/timeline", response_model=CaseTimelineResponse)
+async def get_case_timeline(
+    case_id: int,
+    page: int = Query(1, ge=1),
+    per_page: int = Query(30, ge=1, le=100),
+    current_lawyer: dict = Depends(get_current_lawyer),
+    db: Session = Depends(get_db),
+):
+    """Return the merged case lifecycle timeline, most-recent-first.
+
+    Read-only aggregation across Movement, Document, CaseDeadline, Alert,
+    CaseEscrito, CaseNotificacion, and CaseExhorto — no new table is written
+    to or read from; every row already exists elsewhere.
+
+    Scope: INBOUND / OPERATIONAL traceability only (movements detected,
+    document ingestion/storage/failure, deadline computation/audit, alerts,
+    and detected escritos/notificaciones/exhortos). OUTBOUND traceability
+    (drafted -> signed -> filed generated documents) is out of scope until
+    reqs #3/#4 introduce a data model for that lifecycle.
+    """
+    scope = resolve_case_scope(db, current_lawyer)
+
+    case = apply_case_scope(
+        db.query(Case).filter(Case.id == case_id), scope
+    ).first()
+
+    if not case:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Case not found",
+        )
+
+    movements = db.query(Movement).filter(Movement.case_id == case_id).all()
+    documents = db.query(Document).filter(Document.case_id == case_id).all()
+    deadlines = db.query(CaseDeadline).filter(CaseDeadline.case_id == case_id).all()
+    alerts = db.query(Alert).filter(Alert.case_id == case_id).all()
+    escritos = db.query(CaseEscrito).filter(CaseEscrito.case_id == case_id).all()
+    notificaciones = db.query(CaseNotificacion).filter(
+        CaseNotificacion.case_id == case_id
+    ).all()
+    exhortos = db.query(CaseExhorto).filter(CaseExhorto.case_id == case_id).all()
+
+    result = build_case_timeline(
+        movements=movements,
+        documents=documents,
+        deadlines=deadlines,
+        alerts=alerts,
+        escritos=escritos,
+        notificaciones=notificaciones,
+        exhortos=exhortos,
+        page=page,
+        per_page=per_page,
+    )
+
+    return CaseTimelineResponse(
+        items=[
+            TimelineEventResponse(**event.model_dump()) for event in result.items
+        ],
+        total=result.total,
+        page=result.page,
+        per_page=result.per_page,
+        pages=result.pages,
+    )
 
 
 @router.delete("/{case_id}", status_code=status.HTTP_204_NO_CONTENT)

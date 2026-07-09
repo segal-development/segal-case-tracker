@@ -23,6 +23,7 @@ def _make_doc(case_id=1, doc_type="resolution", token_hash="abc123def456789"):
     doc.pjud_token_hash = token_hash
     doc.gcs_path = None
     doc.status = "pending"
+    doc.stored_at = None
     return doc
 
 
@@ -156,6 +157,41 @@ class TestStorageService:
         backend.upload.assert_called_once()
         assert doc.gcs_path == "gs://my-bucket/cases/1/resolution_abc123def456.pdf"
         assert doc.status == "stored"
+
+    def test_uploads_and_sets_stored_at_when_not_exists(self):
+        """FIX (timeline req #8): upload() must stamp stored_at with a real
+        transition timestamp, not just flip status."""
+        from app.services.storage_service import StorageService
+
+        backend = MagicMock()
+        backend.exists.return_value = False
+        backend.upload.return_value = "gs://my-bucket/cases/1/resolution_abc123def456.pdf"
+        svc = StorageService(backend)
+
+        doc = _make_doc()
+        assert doc.stored_at is None
+
+        svc.upload(doc, b"PDF bytes")
+
+        assert doc.stored_at is not None
+
+    def test_skip_upload_path_also_sets_stored_at(self):
+        """The idempotent reconcile-only path (key already exists) must also
+        stamp stored_at — it still transitions the doc to 'stored'."""
+        from app.services.storage_service import StorageService
+
+        expected_uri = "cases/1/resolution_abc123def456.pdf"
+        backend = MagicMock()
+        backend.exists.return_value = True
+        backend.uri_for_key.return_value = expected_uri
+        svc = StorageService(backend)
+
+        doc = _make_doc()
+        assert doc.stored_at is None
+
+        svc.upload(doc, b"bytes")
+
+        assert doc.stored_at is not None
 
     def test_signed_url_returns_none_when_gcs_path_is_none(self):
         from app.services.storage_service import StorageService

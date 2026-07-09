@@ -14,6 +14,7 @@ ADR-4: StorageBackend is a swappable Protocol. GCSStorageBackend uses ADC
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
@@ -193,6 +194,10 @@ class StorageService:
             uri = self._backend.upload(data, key, content_type)
         doc.gcs_path = uri
         doc.status = "stored"
+        # Real transition timestamp for the case lifecycle timeline (req #8) —
+        # downloaded_at is set at row creation, not here, so it can't tell you
+        # when the doc actually became "stored".
+        doc.stored_at = datetime.utcnow()
 
     def retrieve(self, storage_uri: str) -> bytes:
         """Return raw bytes for the stored document.

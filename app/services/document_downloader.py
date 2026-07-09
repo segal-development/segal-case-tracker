@@ -17,6 +17,7 @@ Design (ADR-5):
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import List, TYPE_CHECKING
 
 from app.scrapper.pjud.exceptions import SessionExpiredError, SessionNotAuthenticatedError
@@ -85,6 +86,7 @@ class DocumentDownloader:
                     doc.id,
                 )
                 doc.status = "failed"
+                doc.failed_at = datetime.utcnow()
                 db.commit()
                 continue
 
@@ -125,6 +127,7 @@ class DocumentDownloader:
                     exc,
                 )
                 doc.status = "failed"
+                doc.failed_at = datetime.utcnow()
                 db.commit()
 
 
