@@ -495,7 +495,7 @@ class TestApelacion5D:
         assert apelacion_row.due_date == expected_due, (
             f"APELACION_5D due_date: expected {expected_due}, got {apelacion_row.due_date}"
         )
-        assert apelacion_row.legal_basis == "art. 187/475 CPC"
+        assert apelacion_row.legal_basis == "art. 475 CPC"
         # SENTENCIA_10D from citación must be superseded
         sentencia_10d_row = (
             db.query(CaseDeadline)
@@ -507,6 +507,80 @@ class TestApelacion5D:
             .first()
         )
         assert sentencia_10d_row is None, "SENTENCIA_10D must be superseded after SENTENCIA state"
+
+
+# ---------------------------------------------------------------------------
+# Slice 2b: AUTO_PRUEBA sub-deadlines — LISTA_TESTIGOS_2D + REPOSICION_AUTO_PRUEBA_3D
+# ---------------------------------------------------------------------------
+
+
+class TestAutoPruebaSubDeadlines:
+    def test_lista_testigos_and_reposicion_active_alongside_observaciones(self, db) -> None:
+        """A case entering AUTO_PRUEBA produces LISTA_TESTIGOS_2D and
+        REPOSICION_AUTO_PRUEBA_3D as active CaseDeadline rows, alongside the
+        pre-existing OBSERVACIONES_PRUEBA_6D and TERMINO_PROBATORIO_10D —
+        with correct due-date math and is_fatal=False for both new types."""
+        from app.services.business_days import add_business_days
+
+        case = _make_case(db)
+        auto_prueba_date = date(2026, 4, 1)
+        _add_movement(db, case.id, date(2026, 3, 1), "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)")
+        _add_movement(
+            db, case.id, auto_prueba_date, "Contestación Excepciones",
+            "Notificación resolución que recibe la causa a prue (Exitosa)",
+        )
+        _recompute(db, case)
+
+        assert case.procedural_state == ProceduralState.AUTO_PRUEBA.value
+
+        def _active_row(dtype: DeadlineType) -> CaseDeadline:
+            row = (
+                db.query(CaseDeadline)
+                .filter(
+                    CaseDeadline.case_id == case.id,
+                    CaseDeadline.deadline_type == dtype.value,
+                    CaseDeadline.status == "active",
+                )
+                .first()
+            )
+            assert row is not None, f"{dtype.value} must be active in AUTO_PRUEBA"
+            return row
+
+        termino_row = _active_row(DeadlineType.TERMINO_PROBATORIO_10D)
+        observaciones_row = _active_row(DeadlineType.OBSERVACIONES_PRUEBA_6D)
+        lista_row = _active_row(DeadlineType.LISTA_TESTIGOS_2D)
+        reposicion_row = _active_row(DeadlineType.REPOSICION_AUTO_PRUEBA_3D)
+
+        # LISTA_TESTIGOS_2D and REPOSICION_AUTO_PRUEBA_3D run from the SAME
+        # auto de prueba notification date as TERMINO_PROBATORIO_10D — not
+        # from its due date, unlike OBSERVACIONES.
+        assert lista_row.triggered_at == auto_prueba_date
+        assert reposicion_row.triggered_at == auto_prueba_date
+        assert lista_row.due_date == add_business_days(auto_prueba_date, 2)
+        assert reposicion_row.due_date == add_business_days(auto_prueba_date, 3)
+        assert lista_row.legal_basis == "art. 320 CPC (aplic. 469)"
+        assert reposicion_row.legal_basis == "arts. 318-319 CPC"
+
+        assert DeadlineType(lista_row.deadline_type).is_fatal is False
+        assert DeadlineType(reposicion_row.deadline_type).is_fatal is False
+
+        # Sanity: term + observaciones still present (regression, unaffected).
+        assert termino_row.due_date == add_business_days(auto_prueba_date, 10)
+        assert observaciones_row is not None
+
+    def test_recompute_never_raises_with_new_auto_prueba_deadlines(self, db) -> None:
+        """Safe-fail contract: recompute_case must never raise with the new
+        AUTO_PRUEBA sub-deadlines wired in, even repeated (idempotent) runs."""
+        case = _make_case(db)
+        _add_movement(db, case.id, date(2026, 3, 1), "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)")
+        _add_movement(
+            db, case.id, date(2026, 4, 1), "Contestación Excepciones",
+            "Notificación resolución que recibe la causa a prue (Exitosa)",
+        )
+        _recompute(db, case)
+        _recompute(db, case)  # idempotent second run must not raise either
+        assert case.procedural_state == ProceduralState.AUTO_PRUEBA.value
+        assert case.semaforo is not None
 
 
 # ---------------------------------------------------------------------------
@@ -1045,7 +1119,7 @@ class TestNextDeadlineFatal:
         assert DeadlineType.EXCEPCIONES_8D.is_fatal is True
 
     def test_config_apelacion_5d_is_fatal(self) -> None:
-        """DeadlineType.APELACION_5D.is_fatal must be True (art. 187/475 CPC)."""
+        """DeadlineType.APELACION_5D.is_fatal must be True (art. 475 CPC)."""
         assert DeadlineType.APELACION_5D.is_fatal is True
 
     def test_config_traslado_ejecutante_is_not_fatal(self) -> None:

@@ -27,7 +27,7 @@ from app.api.deps import (
     resolve_case_scope,
     apply_case_scope,
 )
-from app.core.deadlines_config import DEADLINE_DISCLAIMER, DeadlineType
+from app.core.deadlines_config import DEADLINE_DISCLAIMER, DEADLINE_LABELS, DeadlineType
 from app.core.decision_rules import RECOMMENDATION_DISCLAIMER, resolve_rule
 from app.models.alert import Alert
 from app.models.case import Case
@@ -62,27 +62,26 @@ def _resolve_deadline_alert_recipient_ids(db: Session, case: Case) -> list[int]:
     return [fallback_lawyer.id] if fallback_lawyer else []
 
 # ---------------------------------------------------------------------------
-# Human-readable labels per deadline type (display copy, NOT legal text)
+# Human-readable labels per deadline type (display copy, NOT legal text).
+# Hoisted to deadlines_config.DEADLINE_LABELS so other consumers (e.g.
+# calendar.py) resolve the exact same label — kept as a local alias here to
+# avoid touching every call site in this module.
 # ---------------------------------------------------------------------------
 
-_DEADLINE_LABELS: dict[str, str] = {
-    "excepciones_8d": "Plazo para oponer excepciones",
-    "traslado_ejecutante_4d": "Traslado al ejecutante",
-    "termino_probatorio_10d": "Término probatorio",
-    "lista_testigos_2d": "Lista de testigos",
-    "observaciones_prueba_6d": "Observaciones a la prueba",
-    "sentencia_10d": "Plazo para dictar sentencia",
-    "apelacion_5d": "Plazo de apelación",
-}
+_DEADLINE_LABELS: dict[str, str] = DEADLINE_LABELS
 
 _DEADLINE_ACTIONS: dict[str, str] = {
     "excepciones_8d": "Vence el plazo para que el ejecutado oponga excepciones (art. 459 CPC).",
     "traslado_ejecutante_4d": "Vence el traslado al ejecutante para responder a las excepciones (art. 466 CPC).",
     "termino_probatorio_10d": "Vence el término probatorio (art. 468 CPC).",
-    "lista_testigos_2d": "Vence el plazo para presentar lista de testigos (art. 468 CPC).",
+    "lista_testigos_2d": "Vence el plazo para presentar lista de testigos (art. 320 CPC, aplic. 469).",
+    "reposicion_auto_prueba_3d": "Vence el plazo para reponer el auto de prueba (arts. 318-319 CPC).",
     "observaciones_prueba_6d": "Vence el plazo para hacer observaciones a la prueba (art. 469 CPC).",
     "sentencia_10d": "Vence el plazo para dictar sentencia definitiva (arts. 162/470 CPC).",
-    "apelacion_5d": "Vence el plazo para interponer apelación (arts. 187/475 CPC).",
+    "apelacion_5d": (
+        "Vence el plazo para apelar de la sentencia; el ejecutado apela con "
+        "solo efecto devolutivo, por lo que el apremio continúa (art. 475 CPC)."
+    ),
 }
 
 

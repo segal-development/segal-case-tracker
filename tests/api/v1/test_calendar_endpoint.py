@@ -12,6 +12,7 @@ from datetime import date, datetime, timedelta
 from app.api.deps import get_current_lawyer
 from app.main import app
 from app.models.case import Case
+from app.models.case_deadline import CaseDeadline
 from app.models.case_litigante import CaseLitigante
 from app.models.court import Court
 from app.models.lawyer import Lawyer
@@ -336,6 +337,60 @@ class TestSortingAndCaratulado:
         assert item["caratulado"] == "BANCO ACME/JUAN PEREZ"
         assert item["rol"] == "C-1403-2026"
         assert item["court_name"] == court.name
+
+
+# ---------------------------------------------------------------------------
+# Deadline label resolution (Slice 2b, Task 3)
+# ---------------------------------------------------------------------------
+
+
+class TestDeadlineLabel:
+    def test_deadline_item_shows_real_label_not_generic(self, authed_client, db, lawyer, court):
+        """A deadline-kind calendar item resolves the real DeadlineType label
+        (via the backing CaseDeadline row), reusing the same DEADLINE_LABELS
+        catalog GET /cases/{id}/deadlines already uses — not a generic
+        placeholder string."""
+        c = _make_case(
+            db, lawyer, court, "C-1701-2026",
+            next_deadline_at=TODAY + timedelta(days=2),
+            next_deadline_fatal=False,
+            semaforo="amarillo",
+        )
+        db.add(CaseDeadline(
+            case_id=c.id,
+            deadline_type="traslado_ejecutante_4d",
+            legal_basis="art. 466 CPC",
+            due_date=TODAY + timedelta(days=2),
+            triggered_at=TODAY,
+            status="active",
+        ))
+        db.commit()
+
+        response = authed_client.get("/api/v1/calendar")
+        assert response.status_code == 200
+        item = next(
+            i for i in response.json()["items"]
+            if i["case_id"] == c.id and i["kind"] == "deadline"
+        )
+        assert item["label"] == "Traslado al ejecutante"
+        assert item["label"] != "Plazo procesal"
+
+    def test_deadline_item_without_backing_row_has_none_label(self, authed_client, db, lawyer, court):
+        """No matching active CaseDeadline row → label is None (safe fallback),
+        not a crash — e.g. a next_deadline_at written without a backing row."""
+        c = _make_case(
+            db, lawyer, court, "C-1702-2026",
+            next_deadline_at=TODAY + timedelta(days=2),
+            next_deadline_fatal=False,
+            semaforo="amarillo",
+        )
+        response = authed_client.get("/api/v1/calendar")
+        assert response.status_code == 200
+        item = next(
+            i for i in response.json()["items"]
+            if i["case_id"] == c.id and i["kind"] == "deadline"
+        )
+        assert item["label"] is None
 
 
 # ---------------------------------------------------------------------------
