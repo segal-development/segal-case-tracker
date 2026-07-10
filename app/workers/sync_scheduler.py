@@ -467,8 +467,20 @@ async def sync_all_lawyers():
     logger.info("=" * 60)
     
     db = SessionLocal()
-    
+
     try:
+        # Detect PJUD credential rotations (ciphertext-fingerprint diff) once per
+        # cycle so the monitoring vault stays current without a manual scan.
+        # SAFE-FAIL: a scan error must never abort the sync run.
+        try:
+            from app.services.credential_audit import scan_credential_changes
+
+            recorded = scan_credential_changes(db)
+            if recorded:
+                logger.info("Credential scan: %d credential change(s) recorded", recorded)
+        except Exception:
+            logger.exception("Credential change scan failed (non-fatal)")
+
         # Get all active lawyers
         lawyers = db.query(Lawyer).filter(Lawyer.is_active == True).all()
         

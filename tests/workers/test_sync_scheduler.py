@@ -9,6 +9,42 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from app.models.sync_history import SyncHistory
 
 
+class TestSyncCycleCredentialScan:
+    """Each sync cycle must run the credential-change scan (vault stays current)."""
+
+    @pytest.mark.asyncio
+    async def test_cycle_runs_credential_scan_before_syncing(self):
+        from app.workers.sync_scheduler import sync_all_lawyers
+
+        mock_db = MagicMock()
+        # No active lawyers → the cycle returns right after the scan.
+        mock_db.query.return_value.filter.return_value.all.return_value = []
+
+        with patch("app.workers.sync_scheduler.SessionLocal", return_value=mock_db), \
+             patch(
+                 "app.services.credential_audit.scan_credential_changes",
+                 return_value=0,
+             ) as mock_scan:
+            await sync_all_lawyers()
+
+        mock_scan.assert_called_once_with(mock_db)
+
+    @pytest.mark.asyncio
+    async def test_scan_failure_does_not_abort_the_cycle(self):
+        from app.workers.sync_scheduler import sync_all_lawyers
+
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.all.return_value = []
+
+        with patch("app.workers.sync_scheduler.SessionLocal", return_value=mock_db), \
+             patch(
+                 "app.services.credential_audit.scan_credential_changes",
+                 side_effect=RuntimeError("boom"),
+             ):
+            # Must NOT raise — the scan is safe-fail.
+            await sync_all_lawyers()
+
+
 class TestSyncLawyerCasesSessionLookup:
     """sync_lawyer_cases must await store.get_session_by_lawyer (S1-T10)."""
 
