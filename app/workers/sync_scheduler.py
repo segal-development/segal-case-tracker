@@ -79,6 +79,12 @@ def _audit_validation(
     swallowed and logged (never the credential itself). Uses the ORM session
     already attached to ``lawyer`` (the caller loaded it from the DB and mutates
     ``credential_alert_sent_at`` on the same session).
+
+    Called ONLY on definitive credential outcomes — auth success or a
+    PJUD-*rejected* credential. It is deliberately NOT called on transient
+    failures (Shape blocks, timeouts, network errors): those do not mean the
+    credential changed, and recording them would pollute the audit with false
+    "failing" events and mask a genuine rotation.
     """
     try:
         from sqlalchemy.orm import object_session

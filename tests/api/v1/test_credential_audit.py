@@ -249,6 +249,13 @@ def test_status_endpoint_forbidden_for_non_auditor(client, monitored_lawyer, law
     assert resp.status_code == 403
 
 
+def test_scan_endpoint_forbidden_for_non_auditor(client, monitored_lawyer, lawyer_headers):
+    # The mutating endpoint must be no weaker than the read one — lock it in so a
+    # future edit can't silently drop require_auditor.
+    resp = client.post("/api/v1/credentials/scan", headers=lawyer_headers)
+    assert resp.status_code == 403
+
+
 def test_scan_endpoint_triggers_change_detection_for_auditor(
     client, db, monitored_lawyer, auditor, auditor_headers
 ):
