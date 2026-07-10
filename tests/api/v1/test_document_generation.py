@@ -16,6 +16,7 @@ from app.models.court import Court
 from app.models.lawyer import Lawyer
 from app.services.document_generation import (
     build_escrito_oposicion,
+    resolve_firm_side,
     resolve_parties,
 )
 
@@ -50,6 +51,41 @@ class TestResolveParties:
     def test_missing_sides_return_none(self):
         ejecutante, ejecutado = resolve_parties([])
         assert ejecutante is None and ejecutado is None
+
+
+class TestResolveFirmSide:
+    """The escrito must never ASSERT a representation it cannot verify.
+
+    deadline_engine._firm_side collapses "confirmed demandado" and "no idea"
+    into "demandado". For a court filing that is not acceptable — an unmatched
+    lawyer must surface as "desconocido", not as a silent claim of defence.
+    """
+
+    def test_ab_ddo_match_is_demandado(self):
+        lits = [_lit("AB.DDO", "9999999-9", "Abogada Defensora"),
+                _lit("DDO.", "12345678-9", "Juan Pérez")]
+        assert resolve_firm_side(lits, "9999999-9") == "demandado"
+
+    def test_ap_ddo_match_is_demandado(self):
+        assert resolve_firm_side([_lit("AP.DDO", "9999999-9", "X")], "9999999-9") == "demandado"
+
+    def test_ab_dte_match_is_demandante(self):
+        lits = [_lit("AB.DTE", "9999999-9", "Abogado del Banco")]
+        assert resolve_firm_side(lits, "9999999-9") == "demandante"
+
+    def test_no_litigantes_is_desconocido_not_demandado(self):
+        assert resolve_firm_side([], "9999999-9") == "desconocido"
+
+    def test_lawyer_not_among_litigantes_is_desconocido(self):
+        lits = [_lit("AB.DDO", "1111111-1", "Otro Abogado")]
+        assert resolve_firm_side(lits, "9999999-9") == "desconocido"
+
+    def test_missing_acting_rut_is_desconocido(self):
+        assert resolve_firm_side([_lit("AB.DDO", "9999999-9", "X")], None) == "desconocido"
+
+    def test_rut_matching_ignores_dots(self):
+        lits = [_lit("AB.DDO", "9.999.999-9", "Abogada")]
+        assert resolve_firm_side(lits, "9999999-9") == "demandado"
 
 
 class TestBuildEscrito:
@@ -136,6 +172,40 @@ class TestBuildEscrito:
         )
         text = "\n".join(p.text for p in Document(io.BytesIO(data)).paragraphs)
         assert "[FECHA DEL PROTESTO]" in text
+
+    def test_unconfirmed_representation_is_flagged_not_asserted(self):
+        from docx import Document
+        import io
+
+        # No AB.DDO litigante matches the acting lawyer → the system cannot know
+        # whom it represents. It must SAY so instead of silently naming a client.
+        data = build_escrito_oposicion(
+            case=self._case(plaintiff="Barrera", defendant="Promotora CMR Falabella S.A."),
+            litigantes=[],
+            court_name=None,
+            acting_lawyer_name="Abogada X",
+            acting_lawyer_rut="9999999-9",
+            firm_side="desconocido",
+        )
+        text = "\n".join(p.text for p in Document(io.BytesIO(data)).paragraphs)
+        assert "[CONFIRMAR REPRESENTACIÓN" in text
+
+    def test_confirmed_defence_has_no_confirmation_marker(self):
+        from docx import Document
+        import io
+
+        data = build_escrito_oposicion(
+            case=self._case(),
+            litigantes=[_lit("DDO.", "12345678-9", "Juan Pérez"),
+                        _lit("AB.DDO", "9999999-9", "Abogada X")],
+            court_name=None,
+            acting_lawyer_name="Abogada X",
+            acting_lawyer_rut="9999999-9",
+            firm_side="demandado",
+        )
+        text = "\n".join(p.text for p in Document(io.BytesIO(data)).paragraphs)
+        assert "[CONFIRMAR REPRESENTACIÓN" not in text
+        assert "Juan Pérez" in text
 
     def test_prescripcion_generic_titulo_uses_three_year_2515(self):
         from docx import Document
@@ -238,6 +308,23 @@ class TestGenerateEndpoint:
             headers=_headers(AUDITOR_RUT),
         )
         assert resp.status_code == 422
+
+    def test_refuses_when_the_firm_represents_the_ejecutante(self, db, client, case, auditor):
+        # The escrito de oposición is filed BY the ejecutado. If our lawyer is the
+        # creditor's abogado (AB.DTE) the document is the wrong instrument — the
+        # endpoint must refuse rather than emit a filing that contradicts itself.
+        db.add(CaseLitigante(
+            case_id=case.id, participante="AB.DTE", rut=AUDITOR_RUT,
+            persona_type="NATURAL", nombre="Auditor", natural_key=f"{case.id}-abdte",
+        ))
+        db.commit()
+        resp = client.post(
+            f"/api/v1/cases/{case.id}/documents/generate",
+            json={"document_type": "escrito_oposicion"},
+            headers=_headers(AUDITOR_RUT),
+        )
+        assert resp.status_code == 409
+        assert "ejecutante" in resp.json()["detail"].lower()
 
     def test_missing_case_returns_404(self, client, auditor):
         resp = client.post(

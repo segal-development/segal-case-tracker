@@ -729,7 +729,11 @@ async def generate_case_document(
     uploads it to PJUD manually. Generation is allowed regardless of the case's
     recommended action — the UI decides how prominently to offer it.
     """
-    from app.services.document_generation import build_escrito_oposicion
+    from app.services.document_generation import (
+        FIRM_SIDE_DEMANDANTE,
+        build_escrito_oposicion,
+        resolve_firm_side,
+    )
 
     scope = resolve_case_scope(db, current_lawyer)
     case = apply_case_scope(
@@ -766,12 +770,26 @@ async def generate_case_document(
     ).all()
     court_name = case.court.name if case.court else None
 
+    # An escrito de oposición is filed BY the ejecutado (art. 459/464 CPC). If the
+    # acting lawyer is the creditor's abogado on this case, the document is the
+    # wrong instrument — refuse instead of emitting a self-contradicting filing.
+    firm_side = resolve_firm_side(litigantes, acting_lawyer_rut)
+    if firm_side == FIRM_SIDE_DEMANDANTE:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "El abogado figura como representante del ejecutante en esta causa. "
+                "El escrito de oposición de excepciones lo presenta el ejecutado."
+            ),
+        )
+
     docx_bytes = build_escrito_oposicion(
         case=case,
         litigantes=litigantes,
         court_name=court_name,
         acting_lawyer_name=acting_lawyer_name,
         acting_lawyer_rut=acting_lawyer_rut,
+        firm_side=firm_side,
     )
 
     safe_rol = re.sub(r"[^A-Za-z0-9]+", "_", case.rol or "sin_rol").strip("_") or "sin_rol"
