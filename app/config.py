@@ -158,6 +158,12 @@ class Settings(BaseSettings):
     SYNC_INTERVAL_HOURS: int = 4            # Hours between scheduled sync runs
     MAX_DATA_AGE_HOURS: int = 4             # Hours after which cached data is considered stale
 
+    # Competencias the scheduled worker syncs (CSV). The firm only handles
+    # juicio-ejecutivo DEFENSE (civil), so laboral/penal are wasted PJUD
+    # requests and extra Shape exposure. Default civil-only; override via env
+    # (e.g. "civil,laboral") without a code change.
+    SYNC_COMPETENCIAS: str = "civil"
+
     # Sync commit resilience (Mac -> Cloud SQL Auth Proxy long-write drops).
     # SyncService.sync_cases commits progress every SYNC_COMMIT_CHUNK_SIZE
     # upserted cases instead of one commit for the whole batch, so a dropped
@@ -177,6 +183,11 @@ class Settings(BaseSettings):
     def cors_origins_list(self) -> list[str]:
         """Split CORS_ORIGINS on commas, strip whitespace, drop empties."""
         return [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
+
+    @property
+    def sync_competencias_list(self) -> list[str]:
+        """Split SYNC_COMPETENCIAS on commas, strip whitespace, drop empties."""
+        return [c.strip() for c in self.SYNC_COMPETENCIAS.split(",") if c.strip()]
 
     @property
     def effective_debug(self) -> bool:
