@@ -247,6 +247,13 @@ class DeadlineEngine:
         # Apremio detection runs unconditionally so it is set on every code path
         # (success, GRIS safe-fail, and non-civil guard) without touching _write_gris.
         case.en_apremio = cls._compute_en_apremio(db, case)
+        # Transient (NOT a DB column): the apremio sub-stage refines the
+        # recommendation only. Recomputed here so recommend() can read it
+        # within this pipeline; only the resulting recommended_action_code
+        # persists. None when not in remate → generic apremio behaviour.
+        case._apremio_substage = (
+            cls._compute_apremio_substage(db, case) if case.en_apremio else None
+        )
         try:
             cls._recompute_safe(db, case)
         except Exception as exc:
@@ -657,6 +664,42 @@ class DeadlineEngine:
             return False
         except Exception:
             return False
+
+    @classmethod
+    def _compute_apremio_substage(cls, db: Session, case: "Case") -> Optional[str]:
+        """Detect the apremio SUB-stage — currently only ``"remate"``.
+
+        Mirrors ``_compute_en_apremio`` exactly (same movement-loading via
+        the loaded relationship or a query; same never-raises contract):
+
+          Returns ``"remate"`` when ANY movement has stage OR description
+          (case-insensitive) containing 'remate', 'martillero', or 'subasta'
+          — i.e. the auction sub-stage of the cuaderno de apremio has begun.
+
+          Returns ``None`` for a generic embargo-only apremio (or on any
+          error). This is a RECOMMENDATION refinement only — it carries no
+          deadline and is stored transiently on the case (``_apremio_substage``)
+          for ``DecisionEngine`` to read; it is never persisted to a column.
+        """
+        try:
+            # Reuse loaded relationship if already in instance dict; otherwise query.
+            if "movements" in case.__dict__:
+                movements = case.__dict__["movements"]
+            else:
+                movements = (
+                    db.query(Movement)
+                    .filter(Movement.case_id == case.id)
+                    .all()
+                )
+            for mv in movements:
+                stage = (mv.stage or "").lower()
+                desc = (mv.description or "").lower()
+                for token in ("remate", "martillero", "subasta"):
+                    if token in stage or token in desc:
+                        return "remate"
+            return None
+        except Exception:
+            return None
 
     @staticmethod
     def _write_gris(case: Case, db: Session) -> None:

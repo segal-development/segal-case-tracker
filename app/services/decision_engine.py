@@ -150,4 +150,5 @@ class DecisionEngine:
             next_deadline_at=getattr(case, "next_deadline_at", None),
             next_deadline_fatal=bool(getattr(case, "next_deadline_fatal", False)),
             today=today if today is not None else _today_chile(),
+            apremio_substage=getattr(case, "_apremio_substage", None),
         )
