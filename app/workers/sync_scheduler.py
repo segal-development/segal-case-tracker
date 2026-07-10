@@ -67,6 +67,42 @@ COMPETENCIAS = ["civil", "laboral", "penal"]
 # SYNC JOBS
 # ============================================================================
 
+def _audit_validation(
+    lawyer: Lawyer,
+    credential_type: str,
+    ok: bool,
+    detail: Optional[str] = None,
+) -> None:
+    """Record a credential validation outcome for the monitoring module.
+
+    SAFE-FAIL: an audit failure must NEVER break re-auth, so every error is
+    swallowed and logged (never the credential itself). Uses the ORM session
+    already attached to ``lawyer`` (the caller loaded it from the DB and mutates
+    ``credential_alert_sent_at`` on the same session).
+
+    Called ONLY on definitive credential outcomes — auth success or a
+    PJUD-*rejected* credential. It is deliberately NOT called on transient
+    failures (Shape blocks, timeouts, network errors): those do not mean the
+    credential changed, and recording them would pollute the audit with false
+    "failing" events and mask a genuine rotation.
+    """
+    try:
+        from sqlalchemy.orm import object_session
+        from app.services.credential_audit import record_validation
+
+        db = object_session(lawyer)
+        if db is None:
+            return
+        record_validation(db, int(lawyer.id), credential_type, ok=ok, detail=detail)
+    except Exception as exc:  # pragma: no cover - defensive; must not break reauth
+        logger.warning(
+            "Credential audit failed for lawyer %s (%s): %s",
+            getattr(lawyer, "id", "?"),
+            credential_type,
+            exc,
+        )
+
+
 async def _reauth(
     lawyer: Lawyer,
     store: SessionStore,
@@ -160,6 +196,7 @@ async def _reauth(
                 if getattr(lawyer, "credential_alert_sent_at", None) is not None:
                     lawyer.credential_alert_sent_at = None
                 logger.info("Re-auth (clave_unica) succeeded for lawyer %d", lawyer.id)
+                _audit_validation(lawyer, "clave_unica", ok=True)
                 return session, None
         except InvalidCredentialsError as exc:
             # The lawyer changed their Clave Única / segunda clave — retrying
@@ -175,6 +212,7 @@ async def _reauth(
                 sent = await send_supervisor_credential_alert(lawyer, str(exc))
                 if sent:
                     lawyer.credential_alert_sent_at = datetime.utcnow()
+            _audit_validation(lawyer, "clave_unica", ok=False, detail="invalid_credentials")
             return None, "invalid_credentials"
         except Exception as exc:
             logger.error("Re-auth (clave_unica) failed for lawyer %d: %s", lawyer.id, exc)
@@ -210,6 +248,7 @@ async def _reauth(
             if getattr(lawyer, "credential_alert_sent_at", None) is not None:
                 lawyer.credential_alert_sent_at = None
             logger.info("Re-auth (captcha/organic reCAPTCHA) succeeded for lawyer %d", lawyer.id)
+            _audit_validation(lawyer, "pjud", ok=True)
             return session, None
         except InvalidCredentialsError as exc:
             # The lawyer changed their segunda clave — retrying will never
@@ -225,6 +264,7 @@ async def _reauth(
                 sent = await send_supervisor_credential_alert(lawyer, str(exc))
                 if sent:
                     lawyer.credential_alert_sent_at = datetime.utcnow()
+            _audit_validation(lawyer, "pjud", ok=False, detail="invalid_credentials")
             return None, "invalid_credentials"
         except Exception as exc:
             logger.error("Re-auth (captcha) failed for lawyer %d: %s", lawyer.id, exc)
