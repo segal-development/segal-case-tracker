@@ -28,9 +28,16 @@ CU_PASSWORD = os.environ.get("CU_PASSWORD", "")
 # runs from a RESIDENTIAL machine with a HEADFUL browser (the only combo that
 # passes Shape). Headless is opt-in for legacy/testing only.
 HEADLESS = os.environ.get("BACKFILL_HEADLESS", "false").lower() == "true"
+# detect_and_sync_movements keeps its DB session open across every browser fetch
+# (tens of seconds each). Handing it the whole backlog leaves one connection idle
+# for hours, and the Cloud SQL Auth Proxy drops connections that idle that long.
+# Feeding it short chunks — each with a fresh session — bounds a drop to one chunk.
+CHUNK = int(os.environ.get("BACKFILL_CHUNK", "25"))
 
 
 async def main() -> None:
+    from sqlalchemy.exc import OperationalError
+
     from app.services.session_store import get_session_store
     from app.scrapper.pjud_civil import PJUDCivilScraper
     from app.core.database import SessionLocal
@@ -130,18 +137,33 @@ async def main() -> None:
             print(f"  list fetch failed: {e}"); break
 
         batch = _select_cases_for_detail_rotation(db, lawyer_id, COMPETENCIA, api_cases, 100000)
-        print(f"  processing {len(batch)} unchecked cases (auto-reauth on session death)...")
-        try:
-            created, updated, errors = await detect_and_sync_movements(
-                db=db, scraper=sc, pjud_session=session, lawyer_id=lawyer_id,
-                api_cases=api_cases, selected_cases=batch,
-                delay_between_fetches=1.0, reauth_callback=reauth_cb,
-            )
-            db.commit()
-            print(f"  round done: movements+{created}, errors={len(errors)}")
-        except Exception as e:
-            db.rollback()
-            print(f"  round error: {str(e)[:100]}")
+        print(f"  processing {len(batch)} unchecked cases in chunks of {CHUNK} "
+              f"(auto-reauth on session death)...")
+        created_total = 0
+        errors_total = 0
+        for i in range(0, len(batch), CHUNK):
+            chunk = batch[i:i + CHUNK]
+            chunk_db = SessionLocal()   # fresh, short-lived connection per chunk
+            try:
+                created, _updated, errors = await detect_and_sync_movements(
+                    db=chunk_db, scraper=sc, pjud_session=session, lawyer_id=lawyer_id,
+                    api_cases=api_cases, selected_cases=chunk,
+                    delay_between_fetches=1.0, reauth_callback=reauth_cb,
+                )
+                chunk_db.commit()
+                created_total += created
+                errors_total += len(errors)
+            except OperationalError as e:
+                chunk_db.rollback()
+                errors_total += len(chunk)
+                print(f"  chunk @{i}: connection dropped, chunk skipped ({str(e)[:60]})")
+            except Exception as e:
+                chunk_db.rollback()
+                errors_total += len(chunk)
+                print(f"  chunk @{i}: {type(e).__name__}: {str(e)[:80]}")
+            finally:
+                chunk_db.close()
+        print(f"  round done: movements+{created_total}, errors={errors_total}")
 
         rem_after = remaining()[1]
         done = rem_before - rem_after
