@@ -511,8 +511,20 @@ class DeadlineEngine:
         try:
             from app.services.decision_engine import DecisionEngine
 
-            recommendation = DecisionEngine.recommend(case, today=today)
-            case.recommended_action_code = recommendation.code if recommendation else None
+            # Every DecisionEngine rule is a DEFENSE action (oponer excepciones,
+            # solicitar abandono, …). PJUD's litigantes show 431 civil cases where a
+            # firm lawyer is the ejecutante's abogado of record — recommending a
+            # defense there is nonsense. `_firm_side` answers "demandado" when it
+            # cannot tell, so only CONFIRMED plaintiff-side cases are suppressed.
+            # `next_review_at` still stands: a prescripción running against our own
+            # client is exactly what the plaintiff's lawyer needs to see.
+            if _firm_side(db, case) == "demandante":
+                case.recommended_action_code = None
+            else:
+                recommendation = DecisionEngine.recommend(case, today=today)
+                case.recommended_action_code = (
+                    recommendation.code if recommendation else None
+                )
             case.next_review_at = DecisionEngine.compute_next_review_at(case, today=today)
         except Exception as exc:
             logger.exception(

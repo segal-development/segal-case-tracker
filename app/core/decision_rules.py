@@ -1,10 +1,17 @@
 """Decision rules for the DEFENSE-side action recommendation engine (req #5/#11).
 
-Chilean juicio ejecutivo. The firm's side is FIXED — it always defends the
-ejecutado/deudor (see ``app/services/deadline_engine.py::_firm_side``,
-default "demandado"). Every rule below encodes a CONFIRMED-by-the-firm
-action (2026-07-09); see ``memory/juicio-ejecutivo-defense-rules.md`` for
-the legal source (CPC + Ley 21.394 + CC art. 2515 + DFL 707).
+Chilean juicio ejecutivo. Every rule below is a DEFENSE action taken by the
+ejecutado/deudor, and encodes a CONFIRMED-by-the-firm action (2026-07-09);
+see ``memory/juicio-ejecutivo-defense-rules.md`` for the legal source
+(CPC + Ley 21.394 + CC art. 2515 + DFL 707).
+
+The firm's side is NOT fixed, despite what this docstring used to claim:
+PJUD's litigante rows show 431 civil cases where a firm lawyer is the
+ejecutante's abogado of record (AB.DTE/AP.DTE). Because these rules are
+defense-only, ``DeadlineEngine._recompute_decision`` withholds the
+recommendation whenever ``deadline_engine._firm_side`` CONFIRMS the firm is
+"demandante". That helper answers "demandado" when it cannot tell, so the
+~83% of cases without an abogado litigante keep the defense default.
 
 These rules are a pure, declarative mapping over state ``DeadlineEngine``
 has ALREADY computed (``DecisionContext``) — this module never touches the
