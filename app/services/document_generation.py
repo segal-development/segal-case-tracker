@@ -24,7 +24,25 @@ from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Pt
 
-from app.services.lawyer_roster import _clean_nombre
+from app.services.lawyer_roster import (
+    DEMANDADO_ABOGADO,
+    DEMANDANTE_ABOGADO,
+    _clean_nombre,
+)
+from app.utils.rut import normalize_rut
+
+# Which side the acting lawyer is on. Unlike ``deadline_engine._firm_side`` —
+# which folds "cannot tell" into "demandado" because a semáforo may safely
+# assume the firm defends — a court filing must never ASSERT a representation
+# it cannot verify. Hence the explicit third state.
+FIRM_SIDE_DEMANDANTE = "demandante"
+FIRM_SIDE_DEMANDADO = "demandado"
+FIRM_SIDE_DESCONOCIDO = "desconocido"
+
+_CONFIRM_REPRESENTACION = (
+    " [CONFIRMAR REPRESENTACIÓN: el sistema no pudo verificar, a partir de los "
+    "litigantes de esta causa, que este estudio represente al ejecutado]"
+)
 
 # Prescription of the executive action, per the firm's reference document
 # "Procedimiento Ejecutivo — Chile" (its deadline table). Citations follow that
@@ -121,6 +139,32 @@ def resolve_parties(litigantes) -> tuple[Optional[Party], Optional[Party]]:
     return ejecutante, ejecutado
 
 
+def resolve_firm_side(litigantes, acting_lawyer_rut: Optional[str]) -> str:
+    """Which side ``acting_lawyer_rut`` represents on this case.
+
+    Returns ``"demandante"`` / ``"demandado"`` only when an AB./AP. litigante
+    row actually matches the acting lawyer's RUT; otherwise ``"desconocido"``.
+    It NEVER falls back to a side — an escrito that names a client the system
+    could not verify is worse than one that asks the lawyer to confirm.
+    """
+    if not acting_lawyer_rut:
+        return FIRM_SIDE_DESCONOCIDO
+    acting = normalize_rut(acting_lawyer_rut)
+    if not acting:
+        return FIRM_SIDE_DESCONOCIDO
+
+    roles = {
+        (getattr(lit, "participante", "") or "").strip()
+        for lit in (litigantes or [])
+        if normalize_rut(getattr(lit, "rut", "") or "") == acting
+    }
+    if roles & DEMANDANTE_ABOGADO:
+        return FIRM_SIDE_DEMANDANTE
+    if roles & DEMANDADO_ABOGADO:
+        return FIRM_SIDE_DEMANDADO
+    return FIRM_SIDE_DESCONOCIDO
+
+
 def _add_paragraph(doc: Document, *, justify: bool = True):
     """Add an empty paragraph, justified by default, and return it."""
     para = doc.add_paragraph()
@@ -140,6 +184,7 @@ def build_escrito_oposicion(
     court_name: Optional[str],
     acting_lawyer_name: Optional[str],
     acting_lawyer_rut: Optional[str],
+    firm_side: str = FIRM_SIDE_DESCONOCIDO,
 ) -> bytes:
     """Build the *escrito de oposición de excepciones* and return docx bytes.
 
@@ -198,11 +243,16 @@ def build_escrito_oposicion(
     _add_paragraph(doc, justify=False)  # blank line
 
     # ── Intro / comparecencia ─────────────────────────────────────────────
+    # Only a litigante-confirmed defence lets us assert whom we represent; any
+    # other state carries a visible marker the lawyer must resolve before filing.
+    confirmacion = (
+        "" if firm_side == FIRM_SIDE_DEMANDADO else _CONFIRM_REPRESENTACION
+    )
     intro = _add_paragraph(doc)
     _add_run(
         intro,
         f"{lawyer_name}, abogado, RUT {lawyer_rut}, en representación "
-        f"convencional de {ejecutado_nombre}, {ejecutado_rut_txt}, parte "
+        f"convencional de {ejecutado_nombre}{confirmacion}, {ejecutado_rut_txt}, parte "
         f"ejecutada en los autos ejecutivos caratulados "
         f'"{ejecutante_nombre} con {ejecutado_nombre}", Rol {rol}, a US. '
         f"respetuosamente digo:",
