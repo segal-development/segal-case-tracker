@@ -31,6 +31,7 @@ from app.models.case_escrito import CaseEscrito
 from app.models.case_exhorto import CaseExhorto
 from app.models.case_notificacion import CaseNotificacion
 from app.models.document import Document
+from app.models.generated_document import GeneratedDocument
 from app.models.movement import Movement
 
 TimelineKind = Literal[
@@ -41,7 +42,14 @@ TimelineKind = Literal[
     "escrito",
     "notificacion",
     "exhorto",
+    "documento_generado",
 ]
+
+# Human labels for generated document types (req #3). Falls back to the raw
+# filename, then the document_type, when a type is not listed here.
+GENERATED_DOCUMENT_LABELS = {
+    "escrito_oposicion": "Escrito de oposición de excepciones",
+}
 
 
 class TimelineEvent(BaseModel):
@@ -180,6 +188,23 @@ def map_exhorto(ex: CaseExhorto) -> TimelineEvent:
     )
 
 
+def map_generated_document(gd: GeneratedDocument) -> TimelineEvent:
+    label = GENERATED_DOCUMENT_LABELS.get(
+        gd.document_type, gd.filename or gd.document_type
+    )
+    description = (
+        f"Generado por {gd.generated_by_name}" if gd.generated_by_name else None
+    )
+    return TimelineEvent(
+        date=gd.generated_at,
+        kind="documento_generado",
+        title=label,
+        description=description,
+        ref_id=gd.id,
+        status=gd.status,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Aggregator
 # ---------------------------------------------------------------------------
@@ -194,6 +219,7 @@ def build_case_timeline(
     escritos: Iterable[CaseEscrito] = (),
     notificaciones: Iterable[CaseNotificacion] = (),
     exhortos: Iterable[CaseExhorto] = (),
+    generated_documents: Iterable[GeneratedDocument] = (),
     page: int = 1,
     per_page: int = 30,
 ) -> CaseTimelinePage:
@@ -211,6 +237,7 @@ def build_case_timeline(
     events.extend(map_escrito(e) for e in escritos)
     events.extend(map_notificacion(n) for n in notificaciones)
     events.extend(map_exhorto(ex) for ex in exhortos)
+    events.extend(map_generated_document(g) for g in generated_documents)
 
     events.sort(key=lambda e: e.date, reverse=True)
 
