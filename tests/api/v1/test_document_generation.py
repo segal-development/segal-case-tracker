@@ -95,8 +95,63 @@ class TestBuildEscrito:
         )
         text = "\n".join(p.text for p in Document(io.BytesIO(data)).paragraphs)
         assert "artículo 98 del DFL N°707" in text
+        assert "contado desde el vencimiento del documento" in text
         assert "5 de marzo de 2020" in text
         assert "[EJECUTADO]" in text  # placeholder when litigante absent
+
+    def test_prescripcion_cheque_uses_art_34_from_protesto(self):
+        from docx import Document
+        import io
+
+        # Per the firm's reference doc: cheque prescribes in 1 year counted from
+        # the PROTESTO (art. 34 DFL 707) — not art. 98, and not from the vencimiento.
+        data = build_escrito_oposicion(
+            case=self._case(
+                titulo_tipo="cheque",
+                titulo_fecha=date(2021, 11, 8),
+                prescripcion_cumplida=True,
+            ),
+            litigantes=[],
+            court_name=None,
+            acting_lawyer_name=None,
+            acting_lawyer_rut=None,
+        )
+        text = "\n".join(p.text for p in Document(io.BytesIO(data)).paragraphs)
+        assert "artículo 34 del DFL N°707" in text
+        assert "Cuentas Corrientes Bancarias y Cheques" in text
+        assert "contado desde la fecha del protesto" in text
+        assert "8 de noviembre de 2021" in text
+        assert "artículo 98" not in text  # must NOT reuse the cambiaria citation
+
+    def test_prescripcion_cheque_without_date_uses_protesto_placeholder(self):
+        from docx import Document
+        import io
+
+        data = build_escrito_oposicion(
+            case=self._case(titulo_tipo="cheque", prescripcion_cumplida=True),
+            litigantes=[],
+            court_name=None,
+            acting_lawyer_name=None,
+            acting_lawyer_rut=None,
+        )
+        text = "\n".join(p.text for p in Document(io.BytesIO(data)).paragraphs)
+        assert "[FECHA DEL PROTESTO]" in text
+
+    def test_prescripcion_generic_titulo_uses_three_year_2515(self):
+        from docx import Document
+        import io
+
+        data = build_escrito_oposicion(
+            case=self._case(titulo_tipo="escritura_publica", prescripcion_cumplida=True),
+            litigantes=[],
+            court_name=None,
+            acting_lawyer_name=None,
+            acting_lawyer_rut=None,
+        )
+        text = "\n".join(p.text for p in Document(io.BytesIO(data)).paragraphs)
+        assert "artículo 2515 del Código Civil" in text
+        assert "que la obligación se hizo exigible" in text
+        assert "[FECHA DEL TÍTULO]" in text
 
     def test_falls_back_to_case_plaintiff_defendant_without_litigantes(self):
         from docx import Document

@@ -26,19 +26,46 @@ from docx.shared import Pt
 
 from app.services.lawyer_roster import _clean_nombre
 
-# Título types whose executive action prescribes in ONE year under the Ley
-# sobre Letras de Cambio y Pagarés (DFL N°707, art. 98). Everything else falls
-# back to the generic three-year executive-action prescription (art. 2515 CC).
-_ONE_YEAR_TITULO_TIPOS = frozenset({"pagare", "letra", "cheque"})
-
-_ONE_YEAR_PLAZO_PHRASE = (
+# Prescription of the executive action, per the firm's reference document
+# "Procedimiento Ejecutivo — Chile" (its deadline table). Citations follow that
+# document VERBATIM — if the source is ever corrected, change them only here.
+#
+#   pagaré / letra de cambio → 1 year from the VENCIMIENTO  (art. 98 DFL N°707)
+#   cheque (portador)        → 1 year from the PROTESTO     (art. 34 DFL N°707)
+#   everything else          → 3 years, generic             (art. 2515 CC)
+#
+# Each entry is (citation phrase, dies a quo phrase, date placeholder). The
+# dies a quo differs per título, so it is part of the basis, not the caller.
+_PRESCRIPCION_ONE_YEAR_CAMBIARIA = (
     "el plazo de prescripción de un año que establece el artículo 98 del "
-    "DFL N°707 (Ley sobre Letras de Cambio y Pagarés)"
+    "DFL N°707 (Ley sobre Letras de Cambio y Pagarés)",
+    "el vencimiento del documento",
+    "[FECHA DE VENCIMIENTO]",
 )
-_THREE_YEAR_PLAZO_PHRASE = (
+
+_PRESCRIPCION_BASES: dict[str, tuple[str, str, str]] = {
+    "pagare": _PRESCRIPCION_ONE_YEAR_CAMBIARIA,
+    "letra": _PRESCRIPCION_ONE_YEAR_CAMBIARIA,
+    "cheque": (
+        "el plazo de prescripción de un año que establece el artículo 34 del "
+        "DFL N°707 (Ley sobre Cuentas Corrientes Bancarias y Cheques)",
+        "la fecha del protesto",
+        "[FECHA DEL PROTESTO]",
+    ),
+}
+
+_PRESCRIPCION_GENERAL = (
     "el plazo de prescripción de tres años de la acción ejecutiva que "
-    "establece el artículo 2515 del Código Civil"
+    "establece el artículo 2515 del Código Civil",
+    "que la obligación se hizo exigible",
+    "[FECHA DEL TÍTULO]",
 )
+
+
+def _prescripcion_basis(titulo_tipo: Optional[str]) -> tuple[str, str, str]:
+    """Return (citation, dies a quo, date placeholder) for a título type."""
+    key = (titulo_tipo or "").strip().lower()
+    return _PRESCRIPCION_BASES.get(key, _PRESCRIPCION_GENERAL)
 
 # Spanish month names — kept explicit so date formatting never depends on the
 # process locale (which is not guaranteed to carry an es_CL/es_ES catalogue).
@@ -198,15 +225,12 @@ def build_escrito_oposicion(
     # ── Excepciones (numbered) ────────────────────────────────────────────
     number = 1
     if getattr(case, "prescripcion_cumplida", False):
-        titulo_tipo = (getattr(case, "titulo_tipo", None) or "").strip().lower()
-        plazo_phrase = (
-            _ONE_YEAR_PLAZO_PHRASE
-            if titulo_tipo in _ONE_YEAR_TITULO_TIPOS
-            else _THREE_YEAR_PLAZO_PHRASE
+        plazo_phrase, dies_a_quo, fecha_placeholder = _prescripcion_basis(
+            getattr(case, "titulo_tipo", None)
         )
         titulo_fecha_txt = (
             _format_spanish_date(getattr(case, "titulo_fecha", None))
-            or "[FECHA DEL TÍTULO]"
+            or fecha_placeholder
         )
 
         presc = _add_paragraph(doc)
@@ -220,8 +244,8 @@ def build_escrito_oposicion(
             presc,
             "Opongo la excepción de prescripción, por cuanto a la fecha de "
             "notificación de la demanda se encontraba cumplido "
-            f"{plazo_phrase}, contado desde {titulo_fecha_txt}. En "
-            "consecuencia, la acción ejecutiva se encuentra prescrita y así "
+            f"{plazo_phrase}, contado desde {dies_a_quo} ({titulo_fecha_txt}). "
+            "En consecuencia, la acción ejecutiva se encuentra prescrita y así "
             "solicito se declare.",
         )
         number += 1
