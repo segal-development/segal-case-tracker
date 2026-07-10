@@ -45,6 +45,80 @@ class TestSyncCycleCredentialScan:
             await sync_all_lawyers()
 
 
+class TestSyncAllLawyersSessionIsolation:
+    """FIX 2: each (lawyer, competencia) work unit uses its OWN short-lived
+    session, so a dropped connection that poisons one session does NOT abort the
+    whole cycle — the next lawyer gets a fresh session and still syncs.
+    """
+
+    @pytest.mark.asyncio
+    async def test_one_lawyer_failure_does_not_abort_cycle(self):
+        from app.workers.sync_scheduler import sync_all_lawyers
+
+        # Two active lawyers resolved from the OUTER session.
+        lawyer1 = MagicMock()
+        lawyer1.id = 1
+        lawyer2 = MagicMock()
+        lawyer2.id = 2
+
+        outer_db = MagicMock()
+        outer_db.query.return_value.filter.return_value.all.return_value = [
+            lawyer1,
+            lawyer2,
+        ]
+
+        # One fresh work session per (lawyer, competencia). With the default
+        # civil-only COMPETENCIAS that is exactly two work sessions.
+        work_db1 = MagicMock()
+        work_db2 = MagicMock()
+
+        # SessionLocal is called once for the outer session, then once per work
+        # unit. Hand them out in order.
+        session_sequence = [outer_db, work_db1, work_db2]
+
+        # SyncService(work_db).needs_sync(...) → always True so both work units run.
+        mock_sync_service = MagicMock()
+        mock_sync_service.return_value.needs_sync.return_value = True
+
+        # First lawyer's sync raises (simulate a poisoned/dropped connection);
+        # the second succeeds. The cycle must reach the second one.
+        sync_results = [
+            RuntimeError("server closed the connection unexpectedly"),
+            {"success": True, "cases_total": 3, "cases_new": 1},
+        ]
+
+        with patch(
+            "app.workers.sync_scheduler.SessionLocal",
+            side_effect=session_sequence,
+        ), patch(
+            "app.workers.sync_scheduler.SyncService", mock_sync_service
+        ), patch(
+            "app.workers.sync_scheduler.COMPETENCIAS", ["civil"]
+        ), patch(
+            "app.services.credential_audit.scan_credential_changes",
+            return_value=0,
+        ), patch(
+            "app.workers.sync_scheduler.asyncio.sleep", new_callable=AsyncMock
+        ), patch(
+            "app.workers.sync_scheduler.sync_lawyer_cases",
+            new_callable=AsyncMock,
+        ) as mock_sync:
+            mock_sync.side_effect = sync_results
+
+            # Must NOT raise even though the first work unit failed.
+            await sync_all_lawyers()
+
+        # Both lawyers were attempted despite the first one failing.
+        assert mock_sync.await_count == 2
+        synced_lawyer_ids = [call.args[0] for call in mock_sync.await_args_list]
+        assert synced_lawyer_ids == [1, 2]
+
+        # Each work-unit session was closed in its finally, plus the outer one.
+        work_db1.close.assert_called_once()
+        work_db2.close.assert_called_once()
+        outer_db.close.assert_called_once()
+
+
 class TestSyncLawyerCasesSessionLookup:
     """sync_lawyer_cases must await store.get_session_by_lawyer (S1-T10)."""
 

@@ -59,8 +59,12 @@ SYNC_INTERVAL_HOURS = settings.SYNC_INTERVAL_HOURS
 # Max age before considering data stale (in hours)
 MAX_DATA_AGE_HOURS = settings.MAX_DATA_AGE_HOURS
 
-# Competencias to sync
-COMPETENCIAS = ["civil", "laboral", "penal"]
+# Competencias to sync — sourced from settings (default civil-only). The firm
+# only handles juicio-ejecutivo DEFENSE (civil); laboral/penal would be wasted
+# PJUD requests and extra Shape exposure. Reversible via SYNC_COMPETENCIAS env
+# var without a code change. Kept a module-level list so the two
+# `for competencia in COMPETENCIAS` loops below are unchanged.
+COMPETENCIAS = settings.sync_competencias_list
 
 
 # ============================================================================
@@ -481,49 +485,72 @@ async def sync_all_lawyers():
         except Exception:
             logger.exception("Credential change scan failed (non-fatal)")
 
-        # Get all active lawyers
+        # Get all active lawyers. We only need lawyer IDs downstream —
+        # sync_lawyer_cases re-resolves the Lawyer row from whatever session it
+        # is handed — so capture the IDs and release the outer session's rows.
         lawyers = db.query(Lawyer).filter(Lawyer.is_active == True).all()
-        
-        if not lawyers:
+        lawyer_ids = [lawyer.id for lawyer in lawyers]
+
+        if not lawyer_ids:
             logger.info("No active lawyers found, nothing to sync")
             return
-        
-        logger.info(f"Found {len(lawyers)} active lawyers")
-        
+
+        logger.info(f"Found {len(lawyer_ids)} active lawyers")
+
         results = {
-            "total_lawyers": len(lawyers),
+            "total_lawyers": len(lawyer_ids),
             "synced": 0,
             "skipped": 0,
             "failed": 0,
         }
-        
-        for lawyer in lawyers:
+
+        for lawyer_id in lawyer_ids:
             for competencia in COMPETENCIAS:
-                # Check if sync is needed
-                sync_service = SyncService(db)
-                if not sync_service.needs_sync(lawyer.id, competencia, MAX_DATA_AGE_HOURS):
-                    logger.debug(f"Lawyer {lawyer.id} {competencia} is fresh, skipping")
-                    continue
-                
-                result = await sync_lawyer_cases(lawyer.id, competencia, db)
-                
-                if result.get("skipped"):
-                    results["skipped"] += 1
-                elif result.get("success"):
-                    results["synced"] += 1
-                else:
+                # Fresh, short-lived session PER (lawyer, competencia) work unit.
+                # If the Cloud SQL Auth Proxy drops the connection mid-batch, the
+                # poisoned session is confined to this iteration and discarded;
+                # the next iteration opens a clean connection instead of the
+                # whole cycle failing on a shared, poisoned session.
+                work_db = SessionLocal()
+                try:
+                    # Check if sync is needed
+                    sync_service = SyncService(work_db)
+                    if not sync_service.needs_sync(lawyer_id, competencia, MAX_DATA_AGE_HOURS):
+                        logger.debug(f"Lawyer {lawyer_id} {competencia} is fresh, skipping")
+                        continue
+
+                    result = await sync_lawyer_cases(lawyer_id, competencia, work_db)
+
+                    if result.get("skipped"):
+                        results["skipped"] += 1
+                    elif result.get("success"):
+                        results["synced"] += 1
+                    else:
+                        results["failed"] += 1
+                except Exception as iter_exc:
+                    # A single work-unit failure (e.g. a dropped connection that
+                    # poisoned work_db) must NOT abort the cycle — count it and
+                    # move on to the next lawyer/competencia with a fresh session.
+                    logger.error(
+                        "Sync failed for lawyer %s %s: %s",
+                        lawyer_id,
+                        competencia,
+                        iter_exc,
+                    )
                     results["failed"] += 1
-                
+                finally:
+                    work_db.close()
+
                 # Small delay between requests to avoid overwhelming PJUD
                 await asyncio.sleep(2)
-        
+
         logger.info("=" * 60)
         logger.info(f"Sync complete: {results}")
         logger.info("=" * 60)
-        
+
     except Exception as e:
         logger.error(f"Sync job failed: {e}")
-    
+
     finally:
         db.close()
 
