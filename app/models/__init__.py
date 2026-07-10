@@ -20,6 +20,7 @@ from app.models.pending_connection import PendingConnection
 from app.models.ingest_key import IngestKey
 from app.models.case_lawyer_source import CaseLawyerSource
 from app.models.case_merge_audit import CaseMergeAudit
+from app.models.generated_document import GeneratedDocument
 
 __all__ = [
     "Lawyer",
@@ -42,4 +43,5 @@ __all__ = [
     "IngestKey",
     "CaseLawyerSource",
     "CaseMergeAudit",
+    "GeneratedDocument",
 ]

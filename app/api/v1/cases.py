@@ -1,6 +1,7 @@
 """Cases endpoints - Read from database."""
 
 import io
+import logging
 import re
 from typing import List, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Query
@@ -28,7 +29,10 @@ from app.models.movement import Movement
 from app.models.court import Court
 from app.models.sync_history import SyncHistory
 from app.models.document import Document
+from app.models.generated_document import GeneratedDocument
 from app.services.timeline_service import build_case_timeline
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -196,6 +200,7 @@ class TimelineEventResponse(BaseModel):
         "escrito",
         "notificacion",
         "exhorto",
+        "documento_generado",
     ]
     title: str
     description: Optional[str] = None
@@ -625,6 +630,9 @@ async def get_case_timeline(
         CaseNotificacion.case_id == case_id
     ).all()
     exhortos = db.query(CaseExhorto).filter(CaseExhorto.case_id == case_id).all()
+    generated_docs = db.query(GeneratedDocument).filter(
+        GeneratedDocument.case_id == case_id
+    ).all()
 
     result = build_case_timeline(
         movements=movements,
@@ -634,6 +642,7 @@ async def get_case_timeline(
         escritos=escritos,
         notificaciones=notificaciones,
         exhortos=exhortos,
+        generated_documents=generated_docs,
         page=page,
         per_page=per_page,
     )
@@ -794,6 +803,50 @@ async def generate_case_document(
 
     safe_rol = re.sub(r"[^A-Za-z0-9]+", "_", case.rol or "sin_rol").strip("_") or "sin_rol"
     filename = f"oposicion_excepciones_{safe_rol}.docx"
+
+    # Persist a provenance record + the rendered bytes (req #3, slice 2).
+    # A storage hiccup must NEVER block the download: on failure we record the
+    # attempt with status="failed" and still stream the document.
+    from app.config import settings
+    from app.services.storage_service import (
+        generated_document_key,
+        get_storage_backend,
+    )
+
+    record = GeneratedDocument(
+        case_id=case.id,
+        document_type=body.document_type,
+        filename=filename,
+        content_type=DOCX_MEDIA_TYPE,
+        size_bytes=len(docx_bytes),
+        status="stored",
+        generated_by_rut=acting_lawyer_rut,
+        generated_by_name=acting_lawyer_name,
+        firm_side=firm_side,
+        generated_at=datetime.utcnow(),
+    )
+    try:
+        key = generated_document_key(case.id, body.document_type, docx_bytes)
+        storage_uri = get_storage_backend(settings).upload(
+            docx_bytes, key, content_type=DOCX_MEDIA_TYPE
+        )
+        record.storage_key = storage_uri
+        db.add(record)
+        db.commit()
+    except Exception:  # noqa: BLE001 — generation must not fail on a storage hiccup
+        logger.exception(
+            "Failed to persist generated document for case %s", case.id
+        )
+        db.rollback()
+        record.status = "failed"
+        try:
+            db.add(record)
+            db.commit()
+        except Exception:  # noqa: BLE001 — even the failure record is best-effort
+            logger.exception(
+                "Failed to record generation failure for case %s", case.id
+            )
+            db.rollback()
 
     return StreamingResponse(
         io.BytesIO(docx_bytes),

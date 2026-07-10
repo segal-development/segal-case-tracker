@@ -97,6 +97,7 @@ class Case(Base):
     court = relationship("Court", back_populates="cases")
     movements = relationship("Movement", back_populates="case", order_by="desc(Movement.movement_date)")
     documents = relationship("Document", back_populates="case")
+    generated_documents = relationship("GeneratedDocument", back_populates="case")
     alerts = relationship("Alert", back_populates="case")
     # Case-detail entity back-refs (populated from PJUD tabs)
     litigantes = relationship("CaseLitigante", back_populates="case")

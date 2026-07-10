@@ -13,6 +13,7 @@ ADR-4: StorageBackend is a swappable Protocol. GCSStorageBackend uses ADC
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -40,6 +41,19 @@ def document_storage_key(doc: "Document") -> str:
     doc_type = doc.doc_type or "unknown"
     hash12 = (doc.pjud_token_hash or "nohash")[:12]
     return f"cases/{doc.case_id}/{doc_type}_{hash12}.pdf"
+
+
+def generated_document_key(case_id: int, document_type: str, data: bytes) -> str:
+    """Build a content-addressable storage key for a GENERATED document (req #3).
+
+    Format: ``cases/{case_id}/generated/{document_type}_{hash12}.docx``
+
+    Keyed on ``sha256(data)[:12]`` so re-generating identical bytes is
+    idempotent (same key → same object). Distinct from ``document_storage_key``,
+    which is PDF-only and tied to the inbound ``pjud_token_hash`` identity.
+    """
+    hash12 = hashlib.sha256(data).hexdigest()[:12]
+    return f"cases/{case_id}/generated/{document_type}_{hash12}.docx"
 
 
 # ---------------------------------------------------------------------------
