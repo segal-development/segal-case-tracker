@@ -78,6 +78,9 @@ class DecisionContext:
     next_deadline_at: Optional[date]
     next_deadline_fatal: bool
     today: date
+    # Apremio sub-stage refinement (recommendation only, no deadline).
+    # "remate" when the auction phase has begun; None → generic apremio.
+    apremio_substage: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +145,13 @@ def _is_auto_prueba(ctx: DecisionContext) -> bool:
     return ctx.procedural_state == ProceduralState.AUTO_PRUEBA.value
 
 
+def _is_remate(ctx: DecisionContext) -> bool:
+    """Apremio case whose auction sub-stage has begun (remate/martillero/
+    subasta detected). More specific than ``_is_apremio`` — evaluated first
+    so a case in remate gets the sharper recommendation."""
+    return bool(ctx.en_apremio and ctx.apremio_substage == "remate")
+
+
 def _is_apremio(ctx: DecisionContext) -> bool:
     return ctx.en_apremio
 
@@ -202,6 +212,16 @@ DECISION_RULES: list[DecisionRule] = [
         legal_basis="art. 318-319 CPC",
         urgency=Urgency.MEDIA,
         predicate=_is_auto_prueba,
+    ),
+    DecisionRule(
+        code="gestion_remate",
+        action_text=(
+            "Remate en curso — evaluar oposición a las bases del remate, "
+            "tercerías y objeción de tasación."
+        ),
+        legal_basis="arts. 486-518 CPC",
+        urgency=Urgency.CRITICA,
+        predicate=_is_remate,
     ),
     DecisionRule(
         code="gestion_apremio",
