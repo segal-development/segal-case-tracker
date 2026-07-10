@@ -471,3 +471,43 @@ class TestScoping:
         case_ids = {i["case_id"] for i in response.json()["items"]}
         assert case_a.id in case_ids
         assert case_b.id in case_ids
+
+
+class TestAbogadoRutScoping:
+    """abogado_rut narrows an auditor/admin's calendar to one lawyer's cases."""
+
+    @pytest.fixture
+    def auditor_client(self, client, auditor):
+        async def _mock():
+            return {"sub": str(auditor.id)}
+
+        app.dependency_overrides[get_current_lawyer] = _mock
+        yield client
+        app.dependency_overrides.pop(get_current_lawyer, None)
+
+    def _two_cases(self, db, lawyer, court):
+        from datetime import date, timedelta
+
+        due = date.today() + timedelta(days=3)
+        mine = _make_case(db, lawyer, court, "C-1-2026",
+                          next_deadline_at=due, next_deadline_fatal=True, semaforo="rojo")
+        _seed_litigante(db, mine, "99999999-9", "Abogada Carla")
+        theirs = _make_case(db, lawyer, court, "C-2-2026",
+                            next_deadline_at=due, semaforo="rojo")
+        _seed_litigante(db, theirs, "44444444-4", "Otro Abogado")
+        return mine, theirs
+
+    def test_without_param_auditor_sees_both(self, auditor_client, db, lawyer, court):
+        self._two_cases(db, lawyer, court)
+        resp = auditor_client.get("/api/v1/calendar?days=30")
+        assert resp.status_code == 200
+        rols = {i["rol"] for i in resp.json()["items"]}
+        assert {"C-1-2026", "C-2-2026"} <= rols
+
+    def test_abogado_rut_narrows_to_that_lawyers_cases(self, auditor_client, db, lawyer, court):
+        self._two_cases(db, lawyer, court)
+        resp = auditor_client.get("/api/v1/calendar?days=30&abogado_rut=99999999-9")
+        assert resp.status_code == 200
+        rols = {i["rol"] for i in resp.json()["items"]}
+        assert "C-1-2026" in rols
+        assert "C-2-2026" not in rols

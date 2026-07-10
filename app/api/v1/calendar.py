@@ -28,6 +28,7 @@ from app.core.decision_rules import resolve_rule
 from app.core.deadlines_config import DEADLINE_LABELS
 from app.models.case import Case
 from app.models.case_deadline import CaseDeadline
+from app.models.lawyer import Lawyer
 from app.services.deadline_engine import _today_chile
 
 router = APIRouter()
@@ -148,6 +149,13 @@ async def get_calendar(
     include_overdue: bool = Query(
         True, description="Also include past-due items that are still active"
     ),
+    abogado_rut: Optional[str] = Query(
+        None,
+        description=(
+            "Narrow the calendar to cases where this RUT is a firm-side abogado. "
+            "Lets an auditor/admin see one lawyer's personal agenda; mirrors /cases."
+        ),
+    ),
     db: Session = Depends(get_db),
     current_lawyer: dict = Depends(get_current_lawyer),
 ):
@@ -166,6 +174,19 @@ async def get_calendar(
     scope = resolve_case_scope(db, current_lawyer)
     query = db.query(Case).filter(Case.status != "archived")
     query = apply_case_scope(query, scope)
+
+    # Optional per-abogado narrowing (mirrors /cases): an auditor/admin can pull
+    # one lawyer's personal agenda by passing that lawyer's RUT. Intersect the
+    # scoped set with the cases where abogado_rut is an abogado-of-record.
+    if abogado_rut:
+        from app.api.deps import _resolve_lawyer_id
+        from app.services.lawyer_roster import case_ids_for_abogado
+
+        account_lawyer = db.get(Lawyer, _resolve_lawyer_id(db, current_lawyer))
+        if account_lawyer:
+            allowed_ids = case_ids_for_abogado(db, account_lawyer.rut, abogado_rut)
+            query = query.filter(Case.id.in_(list(allowed_ids)))
+
     cases = query.all()
 
     today = _today_chile()
