@@ -436,3 +436,60 @@ class TestFaultIsolation:
         assert (
             mem_db.query(Movement).filter(Movement.case_id == case.id).count() == 1
         )
+
+
+# ---------------------------------------------------------------------------
+# (e) Cross-case shared token_hash (same rol under two lawyers) → update, not dup
+# ---------------------------------------------------------------------------
+
+class TestCrossCaseSharedTokenHash:
+    def test_shared_rol_across_lawyers_updates_not_duplicate_insert(
+        self, mem_db: Session, lawyer_and_court
+    ) -> None:
+        """The SAME PJUD rol can exist under two different lawyers (uq_cases is
+        unique per (lawyer, rol)), producing two Case rows whose documents share a
+        token_hash. Because ix_documents_pjud_token_hash is GLOBAL, persisting the
+        second case must find the first case's document by token_hash and UPDATE it,
+        NOT INSERT a duplicate (which raises UniqueViolation on Postgres and
+        duplicates the row on SQLite). Regression guard for the case_id-scoped
+        prefetch bug that shipped in #158 and failed on real shared cases.
+        """
+        lawyer_a, court = lawyer_and_court
+
+        # A second lawyer so the same rol can be tracked twice.
+        lawyer_b = Lawyer(
+            rut="22222222-2",
+            email="b@example.com",
+            name="Lawyer B",
+            created_at=datetime.utcnow(),
+        )
+        mem_db.add(lawyer_b)
+        mem_db.flush()
+
+        shared_rol = "C-9999-2026"
+        svc = DocumentPersistenceService()
+
+        # Case A persists first — creates the Document rows (1 movement doc + 2 case).
+        case_a = _seed_case(mem_db, lawyer_a, court, shared_rol)
+        _seed_movements(mem_db, case_a, 1)
+        docs_a = svc.persist_from_detail(_build_detail(shared_rol, 1), case_a.id, mem_db)
+        mem_db.commit()
+        total_after_a = mem_db.query(Document).count()
+        assert total_after_a == 1 + 2
+        assert docs_a
+
+        # Case B — SAME rol under lawyer B → identical token_hashes. Must UPDATE the
+        # existing rows (found by GLOBAL token_hash), not INSERT duplicates.
+        case_b = _seed_case(mem_db, lawyer_b, court, shared_rol)
+        _seed_movements(mem_db, case_b, 1)
+        docs_b = svc.persist_from_detail(_build_detail(shared_rol, 1), case_b.id, mem_db)
+        mem_db.commit()
+
+        total_after_b = mem_db.query(Document).count()
+        assert total_after_b == total_after_a, (
+            "Persisting a second case with the same rol/token_hash duplicated "
+            f"Document rows ({total_after_a} -> {total_after_b}) — the prefetch must "
+            "look up documents by GLOBAL token_hash, not case_id."
+        )
+        # The phase must have succeeded (not rolled back to [] on a collision).
+        assert docs_b, "case B document phase returned [] — an INSERT likely collided"
