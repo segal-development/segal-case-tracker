@@ -205,6 +205,8 @@ class TimelineEventResponse(BaseModel):
     description: Optional[str] = None
     ref_id: Optional[int] = None
     status: Optional[str] = None
+    # Nested events — documents filed under a movement appear as its children.
+    children: List["TimelineEventResponse"] = []
 
 
 class CaseTimelineResponse(BaseModel):
