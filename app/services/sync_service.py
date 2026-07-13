@@ -423,19 +423,29 @@ def _sync_entities(
     alerts_created = 0
     dispatched = 0
 
+    # Batch the existence check: ONE SELECT for all of this case's existing rows,
+    # keyed by natural_key, instead of a query per scraped item (N+1 → 1). A case
+    # with dozens of entities otherwise pays dozens of proxy round-trips right here;
+    # this collapses them into a single query.
+    existing_by_key = {
+        row.natural_key: row
+        for row in db.query(spec.model)
+        .filter(spec.model.case_id == case_id)
+        .all()
+    }
+
     for item in scraped_list:
         key = spec.natural_key_fn(item)
-        existing = db.query(spec.model).filter(
-            spec.model.case_id == case_id,
-            spec.model.natural_key == key,
-        ).first()
+        existing = existing_by_key.get(key)
         if existing:
             if spec.updatable_fields:
                 fields = spec.to_model_fields(item, case_id)
                 for col in spec.updatable_fields:
                     if col in fields:
                         setattr(existing, col, fields[col])
-                db.flush()
+                # No per-item flush — dirty rows are flushed once after the loop
+                # (and by the caller's commit). A per-row flush reintroduced a
+                # round-trip per entity, the other half of the N+1.
             results.append((existing, False))
             continue
 
@@ -445,7 +455,10 @@ def _sync_entities(
         fields["created_at"] = datetime.utcnow()
         row = spec.model(**fields)
         db.add(row)
-        db.flush()
+        db.flush()  # assign row.id — needed for the Alert below
+        # Keep the map consistent so a duplicate natural_key later in this same
+        # batch resolves to the just-inserted row instead of a second INSERT.
+        existing_by_key[key] = row
 
         # Slice 2: create Alert when spec.creates_alert and context is available.
         # Guard: silently skip when case/lawyer is absent (backward compat for
@@ -497,6 +510,10 @@ def _sync_entities(
             dispatched += 1
 
         results.append((row, True))
+
+    # Single flush for any deferred field updates so rows are persisted before the
+    # caller commits (preserves the pre-batching "flushed before return" contract).
+    db.flush()
 
     # Cap-reached warning when the budget prevented some dispatches.
     if spec.notify and alerts_created > dispatched:
@@ -834,8 +851,21 @@ class SyncService:
         # Use the caller's shared budget or create a local one (backward compat).
         _budget = budget if budget is not None else NotifyBudget.from_settings()
 
+        # Batch the per-movement existence check (N+1 → 1): one SELECT for all of
+        # this case's existing movements, keyed by (folio, description) to match
+        # _upsert_movement's lookup, instead of a query per scraped movement. A case
+        # with dozens of movements otherwise pays a proxy round-trip on each.
+        existing_movements = {
+            (m.folio, m.description): m
+            for m in self.db.query(Movement)
+            .filter(Movement.case_id == case_id)
+            .all()
+        }
+
         for scraped in scraped_movements:
-            movement, is_new = self._upsert_movement(case_id, scraped)
+            movement, is_new = self._upsert_movement(
+                case_id, scraped, existing_by_key=existing_movements
+            )
             if is_new:
                 new_count += 1
                 for recipient in recipients:
@@ -960,27 +990,36 @@ class SyncService:
         self,
         case_id: int,
         scraped: ScrapedMovement,
+        existing_by_key: Optional[dict] = None,
     ) -> Tuple[Movement, bool]:
         """
         Insert movement if it doesn't exist.
-        
+
+        When ``existing_by_key`` (a {(folio, description): Movement} map prefetched
+        by the caller) is provided, the existence check is an in-memory lookup
+        instead of a per-movement SELECT — see sync_movements' batch prefetch.
+
         Returns:
             Tuple of (movement, is_new)
         """
         movement_date = self._parse_date(scraped.fecha)
-        
-        # Check if movement already exists (by folio + date + description)
-        existing = self.db.query(Movement).filter(
-            and_(
-                Movement.case_id == case_id,
-                Movement.folio == scraped.folio,
-                Movement.description == scraped.descripcion,
-            )
-        ).first()
-        
+        key = (scraped.folio, scraped.descripcion)
+
+        # Check if movement already exists (by folio + description)
+        if existing_by_key is not None:
+            existing = existing_by_key.get(key)
+        else:
+            existing = self.db.query(Movement).filter(
+                and_(
+                    Movement.case_id == case_id,
+                    Movement.folio == scraped.folio,
+                    Movement.description == scraped.descripcion,
+                )
+            ).first()
+
         if existing:
             return existing, False
-        
+
         # Create new movement
         movement = Movement(
             case_id=case_id,
@@ -993,6 +1032,10 @@ class SyncService:
         )
         self.db.add(movement)
         self.db.flush()
+        # Keep the prefetched map consistent so a duplicate (folio, description)
+        # later in the same batch resolves to the just-inserted row.
+        if existing_by_key is not None:
+            existing_by_key[key] = movement
         return movement, True
     
     def _create_movement_alert(
