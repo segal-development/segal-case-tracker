@@ -114,8 +114,29 @@ def map_movement(m: Movement) -> TimelineEvent:
     )
 
 
-def map_document(d: Document) -> TimelineEvent:
-    event_date = _first_not_none(d.stored_at, d.failed_at, d.downloaded_at)
+def map_document(
+    d: Document,
+    movement_dates: Optional[dict] = None,
+    fallback_date=None,
+) -> TimelineEvent:
+    # Date the document by its REAL filing date — the linked movement's date —
+    # not stored_at (when WE ingested it, which collapses every backfilled doc to
+    # the scrape date and piles them at the top of the feed). Case-level docs
+    # (texto_demanda, ebook…) have no movement; fall back to the case's own filing
+    # date so they land at the case origin, and only then to the ingestion
+    # timestamps as a last resort.
+    mv_date = (
+        movement_dates.get(d.movement_id)
+        if movement_dates and d.movement_id is not None
+        else None
+    )
+    event_date = _first_not_none(
+        _as_datetime(mv_date),
+        _as_datetime(fallback_date),
+        d.stored_at,
+        d.failed_at,
+        d.downloaded_at,
+    )
     return TimelineEvent(
         date=event_date,
         kind="documento",
@@ -215,11 +236,12 @@ def build_case_timeline(
     movements: Iterable[Movement] = (),
     documents: Iterable[Document] = (),
     deadlines: Iterable[CaseDeadline] = (),
-    alerts: Iterable[Alert] = (),
     escritos: Iterable[CaseEscrito] = (),
     notificaciones: Iterable[CaseNotificacion] = (),
     exhortos: Iterable[CaseExhorto] = (),
     generated_documents: Iterable[GeneratedDocument] = (),
+    movement_dates: Optional[dict] = None,
+    default_document_date=None,
     page: int = 1,
     per_page: int = 30,
 ) -> CaseTimelinePage:
@@ -231,9 +253,14 @@ def build_case_timeline(
     """
     events: List[TimelineEvent] = []
     events.extend(map_movement(m) for m in movements)
-    events.extend(map_document(d) for d in documents)
+    events.extend(
+        map_document(d, movement_dates, default_document_date) for d in documents
+    )
     events.extend(map_deadline(dl) for dl in deadlines)
-    events.extend(map_alert(a) for a in alerts)
+    # Alerts are intentionally excluded from the timeline: the "Nuevo
+    # movimiento/entidad" alerts duplicate the movements/entities already in the
+    # feed (with their real dates) and are stamped at ingestion time, so they
+    # collapse every backfilled case to the scrape date.
     events.extend(map_escrito(e) for e in escritos)
     events.extend(map_notificacion(n) for n in notificaciones)
     events.extend(map_exhorto(ex) for ex in exhortos)

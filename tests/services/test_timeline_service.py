@@ -225,23 +225,23 @@ class TestBuildCaseTimeline:
             id=1, case_id=10, description="Movimiento",
             movement_date=datetime(2026, 5, 1, 0, 0, 0),
         )
+        # Linked to the movement → inherits its date (05-01), NOT stored_at (05-05).
         document = Document(
-            id=2, case_id=10, doc_type="resolution", status="stored",
+            id=2, case_id=10, movement_id=1, doc_type="resolution", status="stored",
             downloaded_at=datetime(2026, 5, 2, 0, 0, 0),
             stored_at=datetime(2026, 5, 5, 0, 0, 0),
         )
-        alert = Alert(
-            id=3, lawyer_id=1, case_id=10, type="new_movement",
-            title="Alerta", created_at=datetime(2026, 5, 3, 0, 0, 0),
-        )
 
         result = build_case_timeline(
-            movements=[movement], documents=[document], alerts=[alert]
+            movements=[movement], documents=[document],
+            movement_dates={1: datetime(2026, 5, 1, 0, 0, 0)},
         )
 
-        assert result.total == 3
-        # document (5th) > alert (3rd) > movement (1st)
-        assert [e.kind for e in result.items] == ["documento", "alerta", "movimiento"]
+        # Alerts are no longer part of the timeline (they duplicate movements).
+        assert result.total == 2
+        assert {e.kind for e in result.items} == {"documento", "movimiento"}
+        doc = next(e for e in result.items if e.kind == "documento")
+        assert doc.date == datetime(2026, 5, 1, 0, 0, 0)
 
     def test_pagination_total_and_pages(self):
         movements = [
