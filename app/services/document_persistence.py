@@ -100,15 +100,47 @@ class DocumentPersistenceService:
         # not a document problem, so let it propagate to the caller's handler.
         db.flush()
 
-        # Prefetch this case's existing rows ONCE (N+1 → 1). Over Cloud SQL from a
-        # residential IP each round-trip is ~135ms, and this loop otherwise issued a
-        # SELECT per document and per movement. Key documents by their stable
-        # token_hash (which embeds case_rol, so it's already case-scoped) and
-        # movements by folio, exactly matching the per-item lookups below.
-        existing_docs: dict = {
-            d.pjud_token_hash: d
-            for d in db.query(Document).filter(Document.case_id == case_id).all()
-        }
+        # Prefetch existing rows ONCE (N+1 → 1). Over Cloud SQL from a residential IP
+        # each round-trip is ~135ms, and this loop otherwise issued a SELECT per
+        # document and per movement.
+        #
+        # Documents MUST be prefetched by pjud_token_hash GLOBALLY, not by case_id:
+        # ix_documents_pjud_token_hash is a global unique index, and the same PJUD
+        # rol can appear under multiple lawyers (uq_cases_lawyer_rol is unique per
+        # (lawyer, rol), not per rol) → multiple Case rows sharing a token_hash. A
+        # case_id-scoped prefetch would miss a sibling case's already-persisted row
+        # and then INSERT a duplicate token_hash, rolling back the whole document
+        # phase. Compute the detail's token_hashes up front (pure Python) and fetch
+        # exactly those rows — mirroring the old per-doc SELECT, which filtered on
+        # token_hash alone.
+        wanted_hashes: set = set()
+        for pjud_doc in detail.case_documents:
+            if pjud_doc.doc_type:
+                wanted_hashes.add(
+                    document_identity_hash(pjud_doc.doc_type, case_rol, scope_key="")
+                )
+        for pjud_movement in detail.movements:
+            if not pjud_movement.folio:
+                continue
+            for pjud_doc in pjud_movement.documentos:
+                if pjud_doc.doc_type:
+                    wanted_hashes.add(
+                        document_identity_hash(
+                            pjud_doc.doc_type, case_rol, scope_key=pjud_movement.folio
+                        )
+                    )
+        existing_docs: dict = (
+            {
+                d.pjud_token_hash: d
+                for d in db.query(Document)
+                .filter(Document.pjud_token_hash.in_(wanted_hashes))
+                .all()
+            }
+            if wanted_hashes
+            else {}
+        )
+        # Movements ARE case-scoped (a movement row belongs to exactly one case), so
+        # the folio lookup is correctly scoped by case_id.
         movements_by_folio: dict = {
             m.folio: m
             for m in db.query(Movement).filter(Movement.case_id == case_id).all()
