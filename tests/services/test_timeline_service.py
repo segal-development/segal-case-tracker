@@ -237,11 +237,14 @@ class TestBuildCaseTimeline:
             movement_dates={1: datetime(2026, 5, 1, 0, 0, 0)},
         )
 
-        # Alerts are no longer part of the timeline (they duplicate movements).
-        assert result.total == 2
-        assert {e.kind for e in result.items} == {"documento", "movimiento"}
-        doc = next(e for e in result.items if e.kind == "documento")
-        assert doc.date == datetime(2026, 5, 1, 0, 0, 0)
+        # The document nests UNDER its movement (not a separate top-level event),
+        # and alerts are excluded entirely.
+        assert result.total == 1
+        assert [e.kind for e in result.items] == ["movimiento"]
+        children = result.items[0].children
+        assert [c.kind for c in children] == ["documento"]
+        # Child inherits the movement's date, not stored_at (05-05).
+        assert children[0].date == datetime(2026, 5, 1, 0, 0, 0)
 
     def test_pagination_total_and_pages(self):
         movements = [

@@ -22,7 +22,7 @@ from __future__ import annotations
 from datetime import date, datetime, time
 from typing import Iterable, List, Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.core.deadlines_config import DEADLINE_LABELS
 from app.models.alert import Alert
@@ -61,6 +61,10 @@ class TimelineEvent(BaseModel):
     description: Optional[str] = None
     ref_id: Optional[int] = None
     status: Optional[str] = None
+    # Nested child events. Documents nest under the movement that filed them, so
+    # a "resolution"/"escrito_doc" reads as an attachment of its movement rather
+    # than a context-free row. Empty for leaf events.
+    children: List["TimelineEvent"] = Field(default_factory=list)
 
 
 class CaseTimelinePage(BaseModel):
@@ -251,11 +255,27 @@ def build_case_timeline(
     target case_id and passing the resulting rows in. This function performs
     no DB I/O of its own.
     """
+    # Movement events keyed by ref_id (= movement id) so documents can nest under
+    # the movement that filed them.
+    movement_events: dict = {}
     events: List[TimelineEvent] = []
-    events.extend(map_movement(m) for m in movements)
-    events.extend(
-        map_document(d, movement_dates, default_document_date) for d in documents
-    )
+    for m in movements:
+        ev = map_movement(m)
+        movement_events[ev.ref_id] = ev
+        events.append(ev)
+
+    # Documents nest under their parent movement when linked; case-level docs
+    # (texto_demanda, ebook…) with no movement stay as top-level events.
+    for d in documents:
+        ev = map_document(d, movement_dates, default_document_date)
+        parent = (
+            movement_events.get(d.movement_id) if d.movement_id is not None else None
+        )
+        if parent is not None:
+            parent.children.append(ev)
+        else:
+            events.append(ev)
+
     events.extend(map_deadline(dl) for dl in deadlines)
     # Alerts are intentionally excluded from the timeline: the "Nuevo
     # movimiento/entidad" alerts duplicate the movements/entities already in the
@@ -267,7 +287,12 @@ def build_case_timeline(
     events.extend(map_generated_document(g) for g in generated_documents)
 
     events.sort(key=lambda e: e.date, reverse=True)
+    # Newest-first children within each movement, consistent with the outer feed.
+    for ev in movement_events.values():
+        ev.children.sort(key=lambda c: c.date, reverse=True)
 
+    # Pagination counts TOP-LEVEL events only — a movement and its nested
+    # documents are a single unit.
     total = len(events)
     pages = (total + per_page - 1) // per_page if total > 0 else 0
     start = (page - 1) * per_page

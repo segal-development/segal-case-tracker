@@ -108,15 +108,18 @@ class TestCaseTimelineEndpoint:
         resp = authed_client.get(f"/api/v1/cases/{case.id}/timeline")
         assert resp.status_code == 200
         body = resp.json()
-        # Alerts are no longer part of the timeline (they duplicate movements).
-        assert body["total"] == 3
+        # The document nests under its movement, so top-level = movement + deadline
+        # (alerts are excluded entirely).
+        assert body["total"] == 2
         kinds = [item["kind"] for item in body["items"]]
         assert "alerta" not in kinds
-        # Deadline (05-03) is most recent; the document inherits its movement's
-        # date (05-01), not stored_at (05-05).
+        # Deadline (05-03) is most recent.
         assert kinds[0] == "plazo"
-        doc = next(i for i in body["items"] if i["kind"] == "documento")
-        assert doc["date"].startswith("2026-05-01")
+        # The document is a CHILD of its movement, dated by the movement (05-01),
+        # not stored_at (05-05).
+        mov = next(i for i in body["items"] if i["kind"] == "movimiento")
+        assert [c["kind"] for c in mov["children"]] == ["documento"]
+        assert mov["children"][0]["date"].startswith("2026-05-01")
 
     def test_document_with_no_stored_at_falls_back_to_downloaded_at(
         self, authed_client, db, case
