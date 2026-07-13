@@ -208,6 +208,108 @@ class TestListCaseDocuments:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# GET /api/v1/cases/{case_id}/documents — DATE ORDERING (regression)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestListCaseDocumentsOrdering:
+    """Regression: the list must be ordered by ``doc_date`` DESCENDING (newest
+    first), with case-level docs that have no date (doc_date=None) sorting LAST.
+
+    The seed data below is arranged so that DB/insertion (PK) order deliberately
+    differs from date order: movements are inserted mid → oldest → newest, and a
+    case-level (null-date) doc is inserted in the middle. Without the endpoint's
+    sort, the response would come back in insertion order and this test fails.
+    """
+
+    def test_documents_ordered_by_date_desc_nulls_last(
+        self, authed_client, db, case
+    ):
+        from app.models.movement import Movement
+
+        # Insert movements OUT of chronological order: mid, then oldest, then
+        # newest → PK/insertion order != date order.
+        mv_mid = Movement(
+            case_id=case.id,
+            description="Resolución media",
+            movement_date=datetime(2026, 3, 15),
+        )
+        mv_old = Movement(
+            case_id=case.id,
+            description="Resolución antigua",
+            movement_date=datetime(2026, 1, 1),
+        )
+        mv_new = Movement(
+            case_id=case.id,
+            description="Resolución reciente",
+            movement_date=datetime(2026, 6, 30),
+        )
+        db.add_all([mv_mid, mv_old, mv_new])
+        db.commit()
+        db.refresh(mv_mid)
+        db.refresh(mv_old)
+        db.refresh(mv_new)
+
+        # One document per movement, inserted in the same skewed order, plus a
+        # case-level (movement_id=None) doc dropped in the MIDDLE of insertion.
+        doc_mid = Document(
+            case_id=case.id,
+            doc_type="resolution",
+            status="stored",
+            movement_id=mv_mid.id,
+        )
+        doc_old = Document(
+            case_id=case.id,
+            doc_type="resolution",
+            status="stored",
+            movement_id=mv_old.id,
+        )
+        doc_static = Document(
+            case_id=case.id,
+            doc_type="texto_demanda",
+            status="stored",
+        )  # case-level, no movement → doc_date is None
+        doc_new = Document(
+            case_id=case.id,
+            doc_type="resolution",
+            status="stored",
+            movement_id=mv_new.id,
+        )
+        db.add_all([doc_mid, doc_old, doc_static, doc_new])
+        db.commit()
+        for d in (doc_mid, doc_old, doc_static, doc_new):
+            db.refresh(d)
+
+        resp = authed_client.get(f"/api/v1/cases/{case.id}/documents")
+        assert resp.status_code == 200
+        items = resp.json()
+        assert len(items) == 4
+
+        # Exact expected doc_date sequence: newest → oldest → null last.
+        dates = [it["doc_date"] for it in items]
+        assert dates == ["2026-06-30", "2026-03-15", "2026-01-01", None]
+
+        # Dated docs must be strictly non-increasing (ignoring the null tail).
+        dated = [d for d in dates if d is not None]
+        assert dated == sorted(dated, reverse=True)
+
+        # Null-date (case-level) doc(s) appear LAST.
+        assert dates[-1] is None
+        null_positions = [i for i, d in enumerate(dates) if d is None]
+        assert null_positions == list(range(len(dates) - len(null_positions), len(dates)))
+
+        # The newest-dated doc is FIRST; the oldest-dated is LAST AMONG DATED.
+        ids = [it["id"] for it in items]
+        assert ids[0] == doc_new.id
+        last_dated_pos = max(
+            i for i, d in enumerate(dates) if d is not None
+        )
+        assert ids[last_dated_pos] == doc_old.id
+        # And the null-date doc is the final element overall.
+        assert ids[-1] == doc_static.id
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # GET /api/v1/documents/{document_id}/download
 # ─────────────────────────────────────────────────────────────────────────────
 

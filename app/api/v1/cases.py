@@ -574,7 +574,7 @@ async def list_case_documents(
             if mdate is not None:
                 mv_dates[mid] = mdate.date()
 
-    return [
+    items = [
         DocumentListItem(
             id=doc.id,
             doc_type=doc.doc_type,
@@ -587,6 +587,12 @@ async def list_case_documents(
         )
         for doc in docs
     ]
+
+    # Order by document date, newest first (matching how movements are listed).
+    # Case-level docs (texto_demanda, ebook…) have no movement date → doc_date is
+    # None; they sort last via date.min.
+    items.sort(key=lambda it: it.doc_date or date.min, reverse=True)
+    return items
 
 
 @router.get("/{case_id}/timeline", response_model=CaseTimelineResponse)
