@@ -17,7 +17,6 @@ from app.api.deps import (
     apply_case_scope,
     ALL_CASES,
 )
-from app.models.alert import Alert
 from app.models.case import Case
 from app.models.case_deadline import CaseDeadline
 from app.models.lawyer import Lawyer
@@ -605,12 +604,14 @@ async def get_case_timeline(
 ):
     """Return the merged case lifecycle timeline, most-recent-first.
 
-    Read-only aggregation across Movement, Document, CaseDeadline, Alert,
-    CaseEscrito, CaseNotificacion, and CaseExhorto — no new table is written
-    to or read from; every row already exists elsewhere.
+    Read-only aggregation across Movement, Document, CaseDeadline, CaseEscrito,
+    CaseNotificacion, and CaseExhorto — no new table is written to or read from;
+    every row already exists elsewhere. Documents are dated by their linked
+    movement's date (real filing date), not the ingestion timestamp. Alerts are
+    excluded: they duplicate the movements/entities already in the feed.
 
     Scope: INBOUND / OPERATIONAL traceability only (movements detected,
-    document ingestion/storage/failure, deadline computation/audit, alerts,
+    document ingestion/storage/failure, deadline computation/audit,
     and detected escritos/notificaciones/exhortos). OUTBOUND traceability
     (drafted -> signed -> filed generated documents) is out of scope until
     reqs #3/#4 introduce a data model for that lifecycle.
@@ -630,7 +631,6 @@ async def get_case_timeline(
     movements = db.query(Movement).filter(Movement.case_id == case_id).all()
     documents = db.query(Document).filter(Document.case_id == case_id).all()
     deadlines = db.query(CaseDeadline).filter(CaseDeadline.case_id == case_id).all()
-    alerts = db.query(Alert).filter(Alert.case_id == case_id).all()
     escritos = db.query(CaseEscrito).filter(CaseEscrito.case_id == case_id).all()
     notificaciones = db.query(CaseNotificacion).filter(
         CaseNotificacion.case_id == case_id
@@ -640,15 +640,21 @@ async def get_case_timeline(
         GeneratedDocument.case_id == case_id
     ).all()
 
+    # Real filing date per movement, so each document inherits its movement's date
+    # instead of the ingestion timestamp (stored_at). Case-level docs with no
+    # movement fall back to the case's own filing date.
+    movement_dates = {m.id: m.movement_date for m in movements}
+
     result = build_case_timeline(
         movements=movements,
         documents=documents,
         deadlines=deadlines,
-        alerts=alerts,
         escritos=escritos,
         notificaciones=notificaciones,
         exhortos=exhortos,
         generated_documents=generated_docs,
+        movement_dates=movement_dates,
+        default_document_date=case.filed_at,
         page=page,
         per_page=per_page,
     )

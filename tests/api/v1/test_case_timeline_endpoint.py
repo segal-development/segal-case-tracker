@@ -83,8 +83,12 @@ class TestCaseTimelineEndpoint:
             description="Movimiento inicial",
             movement_date=datetime(2026, 5, 1, 0, 0, 0),
         )
+        db.add(movement)
+        db.flush()  # need movement.id to link the document below
+        # Linked to the movement → inherits its date (05-01), NOT stored_at (05-05).
         document = Document(
             case_id=case.id,
+            movement_id=movement.id,
             doc_type="resolution",
             status="stored",
             downloaded_at=datetime(2026, 5, 2, 0, 0, 0),
@@ -98,23 +102,21 @@ class TestCaseTimelineEndpoint:
             status="active",
             created_at=datetime(2026, 5, 3, 0, 0, 0),
         )
-        alert = Alert(
-            lawyer_id=case.lawyer_id,
-            case_id=case.id,
-            type="new_movement",
-            title="Alerta de movimiento",
-            created_at=datetime(2026, 5, 4, 0, 0, 0),
-        )
-        db.add_all([movement, document, deadline, alert])
+        db.add_all([document, deadline])
         db.commit()
 
         resp = authed_client.get(f"/api/v1/cases/{case.id}/timeline")
         assert resp.status_code == 200
         body = resp.json()
-        assert body["total"] == 4
+        # Alerts are no longer part of the timeline (they duplicate movements).
+        assert body["total"] == 3
         kinds = [item["kind"] for item in body["items"]]
-        # documento (5th) > alerta (4th) > plazo (3rd) > movimiento (1st)
-        assert kinds == ["documento", "alerta", "plazo", "movimiento"]
+        assert "alerta" not in kinds
+        # Deadline (05-03) is most recent; the document inherits its movement's
+        # date (05-01), not stored_at (05-05).
+        assert kinds[0] == "plazo"
+        doc = next(i for i in body["items"] if i["kind"] == "documento")
+        assert doc["date"].startswith("2026-05-01")
 
     def test_document_with_no_stored_at_falls_back_to_downloaded_at(
         self, authed_client, db, case
