@@ -29,6 +29,21 @@ logger = logging.getLogger(__name__)
 # Maximum concurrent case detail fetches
 MAX_CONCURRENT_FETCHES = 3
 
+# Hard per-case ceiling for a single detail fetch+sync. The PJUD scraper drives a
+# headful browser whose ops (page.evaluate / page.goto) have NO native timeout,
+# so an unresponsive Shape-challenged page hangs the await indefinitely and
+# freezes the whole batch — the observed "~0.3 cases/min" stall. A hang is not an
+# exception, so the per-case error handling below never fires without this cutoff.
+# 60s is ~10x the ~6s normal fetch: generous enough to avoid false positives,
+# tight enough to cut the multi-minute stalls.
+PER_CASE_DETAIL_TIMEOUT_SECONDS = 60.0
+
+# Resetting the panel flag recovers a single bad case, but if cases time out
+# back-to-back the browser/page is systemically wedged (e.g. a Shape challenge),
+# not one bad case — recovery won't help. After this many consecutive timeouts,
+# abort the batch like the Shape path does and let the next run start fresh.
+MAX_CONSECUTIVE_TIMEOUTS = 3
+
 T = TypeVar("T")
 
 from app.config import settings
@@ -1655,6 +1670,9 @@ async def detect_and_sync_movements(
 
     sync_svc = SyncService(db)
 
+    # Consecutive per-case timeouts; reset on any success (see MAX_CONSECUTIVE_TIMEOUTS).
+    consecutive_timeouts = 0
+
     for api_case in cases_for_check:
         if not api_case.case_token:
             logger.debug(
@@ -1682,9 +1700,19 @@ async def detect_and_sync_movements(
                 ``(movements_new_delta, alerts_created_delta)``
             """
             from app.scrapper.pjud.resilience.integration import resilient_call
-            detail = await resilient_call(
-                "detail",
-                lambda: scraper.get_case_detail(session=pjud_session, case_token=api_case.case_token),
+            # Hard timeout scoped to JUST the browser fetch (panel + detail) — the
+            # op that hangs on an unresponsive Shape/PJUD page (page.evaluate /
+            # page.goto have no native timeout). Document downloads run AFTER this
+            # with their own retry/rate-limit resilience and must NOT share this
+            # budget, or a legitimately slow multi-document case is falsely killed.
+            detail = await asyncio.wait_for(
+                resilient_call(
+                    "detail",
+                    lambda: scraper.get_case_detail(
+                        session=pjud_session, case_token=api_case.case_token
+                    ),
+                ),
+                timeout=PER_CASE_DETAIL_TIMEOUT_SECONDS,
             )
 
             scraped_movements = convert_api_movements_to_scraped([
@@ -1816,6 +1844,7 @@ async def detect_and_sync_movements(
             movements_new += delta_m
             alerts_created += delta_a
             shape_cooldown.clear()
+            consecutive_timeouts = 0
 
         except ShapeChallengeError as shape_exc:
             # Shape/TSPD flags the egress IP's behavioral reputation — it is a
@@ -1914,21 +1943,96 @@ async def detect_and_sync_movements(
                 break
             except Exception as retry_exc:
                 # Non-session error on retry — case-specific; advance timestamp.
-                db.rollback()
+                # Guard the rollback: a reaped connection (see the timeout handler)
+                # would otherwise raise here and abort the whole batch.
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                is_timeout = isinstance(retry_exc, asyncio.TimeoutError)
+                # A retry timeout can leave the live page renderer poisoned —
+                # reset the panel cache so the next case reloads from scratch.
+                if is_timeout:
+                    scraper._panel_loaded = False
                 if db_case is not None:
                     db_case.last_detail_checked_at = datetime.utcnow()
                     try:
                         db.commit()
                     except Exception:
-                        db.rollback()
+                        try:
+                            db.rollback()
+                        except Exception:
+                            pass
+                # str(TimeoutError()) is empty; spell the timeout out so log-based
+                # monitoring keyed on "per-case timeout" also catches this path.
+                reason = (
+                    f"per-case timeout ({PER_CASE_DETAIL_TIMEOUT_SECONDS:.0f}s)"
+                    if is_timeout
+                    else str(retry_exc)
+                )
                 logger.error(
                     "detect_and_sync_movements: retry failed for %s: %s",
                     api_case.rol,
-                    retry_exc,
+                    reason,
                 )
                 errors.append(
-                    f"Movement fetch failed on retry for {api_case.rol}: {retry_exc}"
+                    f"Movement fetch failed on retry for {api_case.rol}: {reason}"
                 )
+
+        except asyncio.TimeoutError:
+            # A per-case hard timeout fired (PER_CASE_DETAIL_TIMEOUT_SECONDS): an
+            # await inside the scraper — typically page.evaluate/page.goto, which
+            # have no native timeout — hung on an unresponsive PJUD/Shape page. A
+            # hang is not an exception the block below can catch (the coroutine
+            # never returns), so without this cutoff one bad case freezes the whole
+            # batch. wait_for cancelled the coroutine; roll back its partial writes,
+            # reset the panel cache so the NEXT case forces a fresh reload (the live
+            # page renderer may be poisoned), advance the rotation timestamp so this
+            # case drops to the back instead of re-hanging every run, then continue.
+            # Guard the rollback: after a 60s idle stall the DB connection may have
+            # been reaped server-side (documented Cloud-SQL-proxy behavior), and an
+            # unguarded rollback against a dead connection would itself raise and
+            # abort the whole batch — the exact freeze this cutoff exists to prevent.
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            scraper._panel_loaded = False
+            if db_case is not None:
+                db_case.last_detail_checked_at = datetime.utcnow()
+                try:
+                    db.commit()
+                except Exception:
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+            consecutive_timeouts += 1
+            logger.error(
+                "detect_and_sync_movements: per-case timeout (%.0fs) for "
+                "lawyer_id=%s rol=%s — panel reset, rotated to back, continuing",
+                PER_CASE_DETAIL_TIMEOUT_SECONDS,
+                lawyer_id,
+                api_case.rol,
+            )
+            errors.append(
+                f"Per-case timeout ({PER_CASE_DETAIL_TIMEOUT_SECONDS:.0f}s) for "
+                f"{api_case.rol}; rotated to back"
+            )
+            # Back-to-back timeouts = systemically wedged browser, not one bad
+            # case; the panel reset won't help. Abort like the Shape path so the
+            # next run restarts with a fresh session/page.
+            if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS:
+                logger.error(
+                    "detect_and_sync_movements: %d consecutive per-case timeouts "
+                    "(lawyer_id=%s) — page/browser wedged, aborting batch",
+                    consecutive_timeouts,
+                    lawyer_id,
+                )
+                errors.append(
+                    f"{consecutive_timeouts} consecutive per-case timeouts; batch stopped"
+                )
+                break
 
         except Exception as exc:
             # Rollback any partial entity/alert rows flushed (but not yet committed)
