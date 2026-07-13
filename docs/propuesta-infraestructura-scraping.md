@@ -2,8 +2,8 @@
 
 **Dirigido a:** Gerencia
 **Preparado por:** Equipo de Desarrollo
-**Fecha:** Junio 2026
-**Decisión requerida:** Aprobación de un equipo dedicado (inversión única estimada US$150–450) para dejar el monitoreo de causas funcionando de forma automática y permanente.
+**Fecha:** Junio 2026 · **Actualizado:** Julio 2026 (con datos de rendimiento medidos en producción)
+**Decisión requerida:** Destinar un equipo dedicado, encendido de forma permanente en la oficina, para dejar el monitoreo automático. La opción preferente es **reutilizar un equipo que el estudio ya posea (inversión US$0)**; si no hubiera uno disponible, un mini-PC nuevo (~US$150–450).
 
 ---
 
@@ -87,11 +87,33 @@ vez, cancelable)** que confirma o descarta la Opción B con datos reales en 5–
 Esta prueba es la forma responsable de decidir entre "comprar equipo" y "pagar mensualidad",
 sin apostar a ciegas en ninguna dirección. *(Detalle técnico en el documento de respaldo.)*
 
+### 5.2 Rendimiento: por qué la velocidad dejó de ser un problema *(medición Julio 2026)*
+
+Al poner el sistema a cubrir la cartera completa, encontramos y resolvimos el factor que más
+lo enlentecía:
+
+- **De dónde venía la lentitud:** la base de datos del sistema vive en un servidor en el
+  exterior (EE.UU.), y cada consulta viaja ida y vuelta desde el equipo que monitorea. Con
+  muchas consultas por causa, eso sumaba alrededor de **30 segundos por causa**.
+- **Qué hicimos:** reducimos drásticamente la cantidad de consultas por causa. La mejora,
+  **medida en producción, fue de ~2,7× en velocidad** (de ~2 a ~5,5 causas por minuto), sin
+  ningún cambio de infraestructura.
+- **La clave operativa:** con un equipo **encendido las 24 horas**, la velocidad deja de
+  importar. El equipo trabaja solo —de noche y los fines de semana— y va cubriendo la cartera
+  sin supervisión. Como referencia real medida: la cartera de un abogado con ~4.400 causas se
+  cubre en **menos de un día de trabajo continuo** del equipo; algo imposible en un computador
+  personal que se apaga y hay que atender.
+
+Esto **refuerza la Opción A**: el equipo dedicado no solo elimina la dependencia de una persona
+—también convierte la velocidad en un tema resuelto, por el simple hecho de estar siempre encendido.
+
 ---
 
 ## 6. Recomendación
 
-**Adquirir un equipo dedicado (Opción A)** y operarlo como infraestructura permanente de la oficina.
+**Destinar un equipo dedicado (Opción A)**, operado como infraestructura permanente de la oficina.
+La forma preferente es **reutilizar un equipo que el estudio ya posea (inversión US$0)**; solo si
+no hubiera uno disponible, adquirir un mini-PC nuevo (~US$150–450).
 
 - **Económicamente:** una inversión única menor frente a un costo mensual indefinido.
 - **Técnicamente:** es la configuración **ya probada y funcionando**, sin incertidumbre.
