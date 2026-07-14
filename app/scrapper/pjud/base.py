@@ -973,16 +973,22 @@ class PJUDBaseScraper(ABC):
         except Exception:
             pass
 
-        # Check if misCausas function exists. Retry once if a late navigation
-        # destroys the execution context mid-evaluate.
-        try:
-            has_fn = await page.evaluate("typeof misCausas === 'function'")
-        except Exception as e:
-            if "Execution context was destroyed" not in str(e):
-                raise
-            await page.wait_for_load_state("domcontentloaded", timeout=10000)
-            await asyncio.sleep(1)
-            has_fn = await page.evaluate("typeof misCausas === 'function'")
+        # Check if misCausas function exists. A late PJUD navigation can destroy
+        # the execution context mid-evaluate; retry (bounded) so a second navigation
+        # on the retry itself doesn't propagate out and abort the whole lawyer.
+        has_fn = False
+        for _attempt in range(3):
+            try:
+                has_fn = await page.evaluate("typeof misCausas === 'function'")
+                break
+            except Exception as e:
+                if "Execution context was destroyed" not in str(e):
+                    raise
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
         
         if has_fn:
             # Call misCausas() to load the panel. It can trigger a navigation
@@ -1129,9 +1135,9 @@ class PJUDBaseScraper(ABC):
             
             while True:
                 logger.info(f"Fetching {self.config.display_name} cases page {current_page}...")
-                
-                html = await self._fetch_cases_page(
-                    page, rut_num, dv, tipo_causa, year, 
+
+                html = await self._fetch_cases_page_resilient(
+                    page, rut_num, dv, tipo_causa, year,
                     fecha_desde, fecha_hasta, current_page
                 )
                 
@@ -1162,7 +1168,55 @@ class PJUDBaseScraper(ABC):
         except Exception as e:
             logger.error(f"Error getting cases: {e}")
             raise
-    
+
+    async def _fetch_cases_page_resilient(
+        self,
+        page: Page,
+        rut_num: str,
+        dv: str,
+        tipo_causa: str,
+        year: str,
+        fecha_desde: str,
+        fecha_hasta: str,
+        current_page: int,
+    ) -> str:
+        """Fetch one list page, tolerating a mid-fetch navigation that destroys
+        the JS execution context.
+
+        On a very large caseload (e.g. ~2000 causas / 139 pages) the shared page
+        can navigate while a list-page ``$.ajax`` is in flight, which makes the
+        underlying ``page.evaluate`` reject with "Execution context was
+        destroyed". Previously that propagated out of ``get_my_cases`` and
+        aborted the ENTIRE lawyer's sync over a single transient page. Here we
+        re-establish the panel (restoring jQuery + the authenticated context) and
+        retry just that page, so one navigation no longer discards thousands of
+        already-fetched cases. Only after the retries are exhausted do we give up.
+        """
+        last_exc: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                return await self._fetch_cases_page(
+                    page, rut_num, dv, tipo_causa, year,
+                    fecha_desde, fecha_hasta, current_page
+                )
+            except Exception as e:
+                if "Execution context was destroyed" not in str(e):
+                    raise
+                last_exc = e
+                logger.warning(
+                    "list page %d: execution context destroyed by navigation "
+                    "(attempt %d/3) — reloading panel and retrying",
+                    current_page, attempt + 1,
+                )
+                self._panel_loaded = False
+                try:
+                    await self._ensure_panel_loaded(page)
+                except Exception:
+                    pass  # best-effort; the retried fetch surfaces a real failure
+        raise ScrapingError(
+            f"list page {current_page}: execution context destroyed after 3 retries"
+        ) from last_exc
+
     @abstractmethod
     async def _fetch_cases_page(
         self,
@@ -1177,7 +1231,7 @@ class PJUDBaseScraper(ABC):
     ) -> str:
         """
         Fetch a single page of cases from the endpoint.
-        
+
         Returns HTML response string.
         """
         ...
