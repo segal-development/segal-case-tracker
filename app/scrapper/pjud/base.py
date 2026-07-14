@@ -55,6 +55,86 @@ PJUD_SESSION_URL = f"{PJUD_BASE_URL}/sessionN.php"
 PJUD_INDEX_URL = f"{PJUD_BASE_URL}/indexN.php"
 
 
+# ---------------------------------------------------------------------------
+# Login POST builder — runs inside the login page.
+#
+# PJUD rotates the login POST field names DAILY (their field-rotation.php): the
+# RUT, password and JWT are sent under obfuscated keys such as 'f_6b5373856e8c'
+# that change every day, alongside a per-load constant field and an always-empty
+# honeypot (sessionN.php cuts the session if a bot fills it). So instead of
+# hardcoding 'rut'/'password', we PARSE the day's mapping straight from PJUD's own
+# login handler — its `postData['<key>'] = <source>;` block — and reproduce it.
+#
+# It MUST be submitted as a full-page form NAVIGATION (never fetch/XHR): a real
+# navigation lets F5 Shape/TSPD run its challenge transparently in the browser,
+# exactly like a user's click. An XHR POST instead receives the raw TSPD challenge
+# script as its response body and never establishes the session.
+#
+# Credentials/JWT/token are passed in as an argument object (never string-
+# interpolated, so a quote/backslash in a password can't corrupt the JS). Every
+# credential-critical field (rut, clave, JWT, recaptcha) MUST resolve to a
+# non-empty value; otherwise we return {ok:false} and the caller raises a clear
+# LoginError — never a silent empty-field POST, which PJUD would echo as a
+# credential error and trip a false "clave inválida" supervisor alert. Returns
+# roleMap (key → source category) so a future rotation drift is visible in logs
+# without ever logging the values themselves.
+# ---------------------------------------------------------------------------
+_BUILD_LOGIN_POST_JS = r"""({ rut, clave, token, jwt }) => {
+    const scripts = [...document.querySelectorAll('script:not([src])')]
+        .map(s => s.textContent).join('\n');
+    const i0 = scripts.indexOf('var postData');
+    if (i0 === -1) return { ok: false, reason: 'postData block not found' };
+    // Anchor the block end on the handler's own #formSSGGNN .load() call so an
+    // unrelated .load( in another inline script can't truncate the mapping.
+    const anchor = scripts.indexOf('formSSGGNN', i0);
+    const i1 = scripts.indexOf('.load(', anchor === -1 ? i0 : anchor);
+    if (i1 === -1) return { ok: false, reason: '.load() terminator not found' };
+    const block = scripts.slice(i0, i1);
+    const endpoint = (scripts.slice(i1).match(/\.load\(\s*["']([^"']+)["']/) || [])[1] || '../sessionN.php';
+    const frm = document.forms['frm'];
+    const re = /postData\[['"]([^'"]+)['"]\]\s*=\s*([^;]+);/g;
+    const values = {}, roleMap = {}, roles = {}, unknown = [];
+    let m;
+    while ((m = re.exec(block)) !== null) {
+        const key = m[1], src = m[2].trim();
+        let val = '', cat;
+        if (src === 'rut') { val = rut; cat = 'rut'; roles.rut = val; }
+        else if (src === 'clave') { val = clave; cat = 'clave'; roles.clave = val; }
+        else if (src === 'acceso_paso') { val = jwt; cat = 'jwt'; roles.jwt = val; }
+        else if (src === 'g_recaptcha_clave_paso') { val = token; cat = 'recaptcha'; roles.token = val; }
+        else if (src === 'action_paso') { val = frm && frm['action'] ? frm['action'].value : ''; cat = 'action'; }
+        else if (/^['"]/.test(src)) { val = src.replace(/^['"]|['"]$/g, ''); cat = 'literal'; }
+        else {
+            const dm = src.match(/#([A-Za-z0-9_]+)/);
+            if (dm) { const el = document.getElementById(dm[1]); val = el ? (el.value || '') : ''; cat = 'dom'; }
+            else { unknown.push(src); cat = 'unknown'; }
+        }
+        values[key] = val; roleMap[key] = cat;
+    }
+    if (Object.keys(values).length === 0) return { ok: false, reason: 'no postData fields parsed' };
+    // Fail loud if any credential-critical field didn't resolve to a real value.
+    const missing = [];
+    if (!roles.rut) missing.push('rut');
+    if (!roles.clave) missing.push('clave');
+    if (!roles.token) missing.push('recaptcha');
+    if (!roles.jwt) missing.push('jwt');
+    if (missing.length) return { ok: false,
+        reason: 'unresolved required fields: ' + missing.join(',') +
+                (unknown.length ? '; unknown sources: ' + unknown.join(',') : '') };
+    const url = new URL(endpoint, location.href).href;
+    const form = document.createElement('form');
+    form.method = 'POST'; form.action = url;
+    for (const [name, value] of Object.entries(values)) {
+        const input = document.createElement('input');
+        input.type = 'hidden'; input.name = name; input.value = value;
+        form.appendChild(input);
+    }
+    document.body.appendChild(form);
+    form.submit();
+    return { ok: true, fields: Object.keys(values), endpoint: url, roleMap };
+}"""
+
+
 # Matches PJUD's "wrong password / wrong user" messages on the login page, so a
 # stuck-on-login can be classified as bad credentials (the lawyer must update
 # their clave) vs. a rejected captcha token or a transient error (retry-able).
@@ -729,14 +809,18 @@ class PJUDBaseScraper(ABC):
             await page.goto(PJUD_HOME_URL, wait_until="domcontentloaded")
             await asyncio.sleep(1)
             
-            # 2. Get the JWT token from the hidden field (dynamically find it by value pattern)
+            # 2. Get the JWT token from the hidden field. Identify it by the token's
+            # STRUCTURE (a JWT is 'eyJ...'.<payload>.<signature> — 3 dot-separated
+            # parts), NOT by the field's name length. PJUD renamed this field (it was
+            # a 40-char random name, now "ACCESO"); keying on name.length === 40 broke
+            # every login. A structural check survives future field renames.
             jwt_data = await page.evaluate("""
                 () => {
-                    // Find hidden input whose value starts with 'eyJ' (JWT header)
                     const inputs = document.querySelectorAll('input[type="hidden"]');
                     for (const input of inputs) {
-                        if (input.value && input.value.startsWith('eyJ') && input.name.length === 40) {
-                            return { name: input.name, value: input.value };
+                        const v = input.value || "";
+                        if (v.startsWith('eyJ') && v.includes('.')) {
+                            return { name: input.name, value: v };
                         }
                     }
                     return null;
@@ -750,32 +834,31 @@ class PJUDBaseScraper(ABC):
             jwt_token = jwt_data['value']
             logger.info(f"JWT token found in field '{jwt_field_name}': {bool(jwt_token)}")
             
-            # 3. Login via FORM SUBMIT (not fetch!) - this is critical
-            await page.evaluate(f"""
-                () => {{
-                    const form = document.createElement('form');
-                    form.method = 'POST';
-                    form.action = '{PJUD_SESSION_URL}';
-                    
-                    const fields = {{
-                        '{jwt_field_name}': '{jwt_token}',
-                        'g-recaptcha-response-seg-clave_hn': '{captcha_token}',
-                        'rut': '{rut_clean}',
-                        'password': '{password}'
-                    }};
-                    
-                    for (const [name, value] of Object.entries(fields)) {{
-                        const input = document.createElement('input');
-                        input.type = 'hidden';
-                        input.name = name;
-                        input.value = value;
-                        form.appendChild(input);
-                    }}
-                    
-                    document.body.appendChild(form);
-                    form.submit();
-                }}
-            """)
+            # 3. Build and submit the login POST by parsing PJUD's own daily-rotating
+            # field mapping (see _BUILD_LOGIN_POST_JS). The structurally-detected JWT
+            # (jwt_token) is passed in rather than re-read by a hardcoded field name,
+            # so a future rename of the "ACCESO" field fails with a clear reason
+            # instead of an opaque page-context exception.
+            posted = await page.evaluate(
+                _BUILD_LOGIN_POST_JS,
+                {
+                    "rut": rut_clean,
+                    "clave": password,
+                    "token": captcha_token,
+                    "jwt": jwt_token,
+                },
+            )
+
+            if not posted or not posted.get("ok"):
+                reason = (posted or {}).get("reason", "unknown")
+                raise LoginError(f"Could not build PJUD login POST: {reason}")
+            categories = ",".join(sorted(set((posted.get("roleMap") or {}).values())))
+            logger.info(
+                "Login POST → %s (%d fields; sources: %s)",
+                posted["endpoint"],
+                len(posted["fields"]),
+                categories,
+            )
             
             # 4. Wait for the redirect chain to settle at the authenticated destination.
             # PJUD does: sessionN.php → indexN.php (sometimes an extra hop).
