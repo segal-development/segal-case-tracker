@@ -49,6 +49,33 @@ def _abogado_litigantes_by_case(db: Session, *, competencia: str = "civil") -> d
     return dict(by_case)
 
 
+def firm_lawyer_ruts(db: Session) -> set[str]:
+    """Normalized RUTs of the firm's OWN litigating lawyers (Lawyer.is_firm_lawyer).
+
+    The transversal study views count only these; the ~475 opposing/external
+    abogados that appear only as case litigantes (never as accounts) are excluded,
+    as are non-litigating accounts (super-admin, auditor).
+    """
+    rows = db.query(Lawyer.rut).filter(Lawyer.is_firm_lawyer.is_(True)).all()
+    return {normalize_rut(r[0]) for r in rows if r[0]}
+
+
+def _firm_case_ids(db: Session, firm_ruts: set[str], *, competencia: str = "civil") -> set[int]:
+    """Case ids where at least one firm lawyer is an abogado-of-record litigante.
+
+    This is the firm's REAL caseload — the scope of the transversal study views
+    (risk board, productividad), as opposed to every scraped/monitored case.
+    """
+    return {
+        cid
+        for cid, litigantes in _abogado_litigantes_by_case(db, competencia=competencia).items()
+        if any(
+            normalize_rut(lit.rut) in firm_ruts and lit.participante in ALL_ABOGADO
+            for lit in litigantes
+        )
+    }
+
+
 def firm_roster(db: Session, account_rut: str) -> list[dict]:
     """Return firm lawyers (co-side abogados) across the account's cases.
 
@@ -285,6 +312,11 @@ def firm_dashboard_stats_all(db: Session) -> dict:
         .filter(Case.competencia == "civil")
         .all()
     )
+    # Scope to the firm's REAL caseload: only cases where one of the firm's own
+    # lawyers is an abogado of record (not every monitored/external case).
+    firm_ruts = firm_lawyer_ruts(db)
+    firm_ids = _firm_case_ids(db, firm_ruts)
+    cases = [c for c in cases if c.id in firm_ids]
     case_map = {c.id: c for c in cases}
 
     def _sem_bucket(sem: Optional[str]) -> str:
@@ -346,6 +378,8 @@ def firm_dashboard_stats_all(db: Session) -> dict:
 
     by_lawyer = []
     for norm_rut, case_ids in abogado_case_ids.items():
+        if norm_rut not in firm_ruts:  # only the firm's own lawyers in the ranking
+            continue
         lsem: dict[str, int] = {"rojo": 0, "amarillo": 0, "verde": 0, "otros": 0}
         lstale = 0
         for cid in case_ids:
@@ -423,6 +457,11 @@ def firm_risk_board(db: Session, account_rut: str) -> dict:
         .filter(Case.competencia == "civil", Case.status != "archived")
         .all()
     )
+    # Scope to the firm's REAL caseload: only cases where one of the firm's own
+    # lawyers is an abogado of record (not every monitored/external case).
+    firm_ruts = firm_lawyer_ruts(db)
+    firm_ids = _firm_case_ids(db, firm_ruts)
+    cases = [c for c in cases if c.id in firm_ids]
     case_map = {c.id: c for c in cases}
 
     def _sem_bucket(sem: Optional[str]) -> str:
@@ -472,6 +511,8 @@ def firm_risk_board(db: Session, account_rut: str) -> dict:
 
     by_lawyer = []
     for norm_rut, case_ids in abogado_case_ids.items():
+        if norm_rut not in firm_ruts:  # only the firm's own lawyers in the ranking
+            continue
         rojo = abandono = apremio = 0
         for cid in case_ids:
             c = case_map[cid]
