@@ -318,6 +318,12 @@ class TestFirmDashboardStatsAll:
         c1 = _make_case(db, firm_account, court, "C-8010-2025")
         c2 = _make_case(db, firm_account, court, "C-8011-2025")
 
+        # Firm-scoped views count a case only when a firm lawyer is its abogado
+        # of record, so register these litigante RUTs as firm lawyers.
+        for r, n in (("88888888-8", "Lawyer A"), ("99999999-9", "Lawyer B")):
+            db.add(Lawyer(rut=r, name=n, role="lawyer", is_firm_lawyer=True))
+        db.commit()
+
         db.add(CaseLitigante(
             case_id=c1.id, participante="AB.DDO", rut="88888888-8",
             persona_type="NATURAL", nombre="Lawyer A", natural_key=f"{c1.id}-a",
@@ -343,6 +349,8 @@ class TestFirmDashboardStatsAll:
         db.refresh(firm_account)
 
         c1 = _make_case(db, firm_account, court, "C-8012-2025")
+        db.add(Lawyer(rut="88888888-8", name="Lawyer A", role="lawyer", is_firm_lawyer=True))
+        db.commit()
         db.add(CaseLitigante(
             case_id=c1.id, participante="AB.DDO", rut="88888888-8",
             persona_type="NATURAL", nombre="Lawyer A", natural_key=f"{c1.id}-a1",

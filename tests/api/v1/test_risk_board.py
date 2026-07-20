@@ -90,6 +90,12 @@ def _make_case(
 
 
 def _seed_abogado(db, case, rut, nombre, participante="AB.DDO"):
+    # Register the abogado as a firm lawyer so the firm-scoped views count this
+    # case: firm_risk_board / firm_dashboard_stats_all only consider cases where
+    # a Lawyer.is_firm_lawyer abogado of record appears.
+    if not db.query(Lawyer).filter(Lawyer.rut == rut).first():
+        db.add(Lawyer(rut=rut, name=nombre, role="lawyer", is_firm_lawyer=True))
+        db.commit()
     suffix = case.rol.replace("-", "")
     lit = CaseLitigante(
         case_id=case.id,
@@ -366,6 +372,33 @@ class TestFirmRiskBoardArchived:
         assert result["semaforo"]["rojo"] == 1
         rols = [c["rol"] for c in result["top_critical"]]
         assert "C-9502-2025" not in rols
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: firm_risk_board — firm-lawyer scoping (the study's REAL caseload)
+# ---------------------------------------------------------------------------
+
+
+class TestFirmRiskBoardFirmScope:
+    def test_case_with_only_external_abogado_is_excluded(self, db, firm_account, court):
+        """A case whose only abogado of record is NOT a firm lawyer (e.g. the
+        opposing counsel) is excluded from the study views — totals and ranking."""
+        # Firm case: a firm lawyer is the abogado of record → counts.
+        c_firm = _make_case(db, firm_account, court, "C-9600-2025", semaforo="rojo")
+        _seed_abogado(db, c_firm, LAWYER_A_RUT, "Firm Lawyer A")  # registers A as firm lawyer
+        # External case: abogado of record has no firm-lawyer account → excluded.
+        c_ext = _make_case(db, firm_account, court, "C-9601-2025", semaforo="rojo")
+        db.add(CaseLitigante(
+            case_id=c_ext.id, participante="AB.DDO", rut="70707070-7",
+            persona_type="NATURAL", nombre="Opposing Counsel",
+            natural_key=f"{c_ext.id}-ext",
+        ))
+        db.commit()
+
+        result = firm_risk_board(db, ACCOUNT_RUT)
+        assert result["total"] == 1  # only the firm case is the firm's caseload
+        assert result["semaforo"]["rojo"] == 1
+        assert {row["rut"] for row in result["by_lawyer"]} == {LAWYER_A_RUT}
 
 
 # ---------------------------------------------------------------------------

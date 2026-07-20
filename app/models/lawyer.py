@@ -3,7 +3,7 @@
 from datetime import datetime
 from enum import Enum
 
-from sqlalchemy import Column, Integer, String, DateTime, Boolean
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, text
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
@@ -36,6 +36,14 @@ class Lawyer(Base):
     preferred_auth_method = Column(String(20), default=AuthMethod.CAPTCHA.value)
     
     is_active = Column(Boolean, default=True)
+
+    # Whether this account is one of the firm's OWN litigating lawyers, so its
+    # caseload counts in the transversal study views (risk board, productividad).
+    # Excludes non-litigating accounts (the super-admin, the auditor) and keeps
+    # the ~475 opposing/external abogados — who appear only as case litigantes,
+    # never as accounts — naturally out. New lawyer accounts default in (True).
+    is_firm_lawyer = Column(Boolean, nullable=False, server_default=text("true"), default=True)
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     last_login_at = Column(DateTime, nullable=True)
