@@ -22,6 +22,7 @@ from app.models.case_lawyer_source import CaseLawyerSource
 from app.models.case_merge_audit import CaseMergeAudit
 from app.models.generated_document import GeneratedDocument
 from app.models.credential_audit_event import CredentialAuditEvent
+from app.models.hito import Hito, HitoTipo
 
 __all__ = [
     "Lawyer",
@@ -46,4 +47,6 @@ __all__ = [
     "CaseMergeAudit",
     "GeneratedDocument",
     "CredentialAuditEvent",
+    "Hito",
+    "HitoTipo",
 ]

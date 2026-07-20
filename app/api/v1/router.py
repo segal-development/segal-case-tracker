@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api.v1 import auth, cases, deadlines, movements, courts, scrapper, webhooks, pjud, pjud_ingest, sync, documents, lawyers, stats, goals, alerts, calendar, credentials
+from app.api.v1 import auth, cases, deadlines, movements, courts, scrapper, webhooks, pjud, pjud_ingest, sync, documents, lawyers, stats, goals, alerts, calendar, credentials, hitos
 
 api_router = APIRouter()
 
@@ -20,3 +20,4 @@ api_router.include_router(stats.router, prefix="/stats", tags=["stats"])
 api_router.include_router(goals.router, prefix="/goals", tags=["goals"])
 api_router.include_router(calendar.router, prefix="/calendar", tags=["calendar"])
 api_router.include_router(credentials.router, prefix="/credentials", tags=["credentials"])
+api_router.include_router(hitos.router, prefix="/hitos", tags=["hitos"])
