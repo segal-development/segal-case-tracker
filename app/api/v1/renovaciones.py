@@ -183,11 +183,11 @@ async def create_renovacion(
     total = body.monto_cuota * CUOTAS_RENOVACION
 
     reno = Renovacion(
-        numero_contrato=body.numero_contrato,
-        cliente_rut=normalize_rut(body.cliente_rut),
-        cliente_nombre=body.cliente_nombre,
+        numero_contrato=body.numero_contrato[:50],
+        cliente_rut=normalize_rut(body.cliente_rut)[:20],
+        cliente_nombre=body.cliente_nombre[:255],
         lawyer_id=abogado.id,
-        renovador_raw=abogado.name,
+        renovador_raw=abogado.name[:100],
         fecha_desde=desde,
         fecha_hasta=hasta,
         monto_cuota=body.monto_cuota,
@@ -345,11 +345,13 @@ async def importar_excel(
                 err += 1
                 continue
             desde = desde.date()
-            contrato = str(row[2]).strip() if row[2] is not None else ""
+            # Truncate to column limits — real files have junk (e.g. a name in
+            # the RUT cell) that Postgres would reject; never 500 on one bad cell.
+            contrato = (str(row[2]).strip() if row[2] is not None else "")[:50]
             if not contrato:
                 err += 1
                 continue
-            rut = normalize_rut(str(row[0])) if row[0] is not None else ""
+            rut = (normalize_rut(str(row[0])) if row[0] is not None else "")[:20]
             try:
                 cuotas = int(row[3]) if row[3] else CUOTAS_RENOVACION
             except (ValueError, TypeError):
@@ -363,7 +365,7 @@ async def importar_excel(
                 monto = MONTO_DEFAULT
             if monto <= 0 or monto > 1_000_000:
                 monto = MONTO_DEFAULT
-            renovador = str(row[6]).strip() if row[6] else None
+            renovador = (str(row[6]).strip()[:100] if row[6] else None)
             lawyer_id = _match_renovador(renovador, idx)
 
             key = (contrato, rut, desde)
@@ -372,7 +374,7 @@ async def importar_excel(
                 continue
             seen.add(key)
             nuevos.append(Renovacion(
-                numero_contrato=contrato, cliente_rut=rut, cliente_nombre=str(nombre).strip(),
+                numero_contrato=contrato, cliente_rut=rut, cliente_nombre=str(nombre).strip()[:255],
                 lawyer_id=lawyer_id, renovador_raw=renovador,
                 fecha_desde=desde, fecha_hasta=hasta,
                 monto_cuota=monto, cuotas=cuotas, total=monto * cuotas,
