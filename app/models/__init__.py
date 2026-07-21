@@ -26,6 +26,7 @@ from app.models.hito import Hito, HitoTipo
 from app.models.liberacion import LiberacionRequest
 from app.models.bono import BonoVariables
 from app.models.bono_cierre import BonoCierre
+from app.models.renovacion import Renovacion
 
 __all__ = [
     "Lawyer",
@@ -55,4 +56,5 @@ __all__ = [
     "LiberacionRequest",
     "BonoVariables",
     "BonoCierre",
+    "Renovacion",
 ]
