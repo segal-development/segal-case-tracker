@@ -5,16 +5,18 @@ amount); everything else is derived: a renewal always runs 12 months, so
 fecha_hasta = fecha_desde + 1 year, and total = monto_cuota * 12. The lawyer
 selector is the firm's own active lawyers.
 """
+import io
 import logging
+import unicodedata
 from datetime import date, datetime
 from typing import List, Optional
 
 from dateutil.relativedelta import relativedelta
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_lawyer, get_db
+from app.api.deps import get_current_lawyer, get_db, require_admin
 from app.models.lawyer import Lawyer
 from app.models.renovacion import Renovacion, CUOTAS_RENOVACION
 from app.utils.rut import format_rut, normalize_rut
@@ -49,8 +51,9 @@ class RenovacionResponse(BaseModel):
     numero_contrato: str
     cliente_rut: str  # formatted for display
     cliente_nombre: str
-    lawyer_id: int
+    lawyer_id: Optional[int] = None
     lawyer_nombre: Optional[str] = None
+    renovador: Optional[str] = None  # display: system lawyer name or the raw name
     fecha_desde: date
     fecha_hasta: date
     monto_cuota: int
@@ -90,6 +93,7 @@ def _to_response(r: Renovacion) -> RenovacionResponse:
         cliente_nombre=r.cliente_nombre,
         lawyer_id=r.lawyer_id,
         lawyer_nombre=r.lawyer.name if r.lawyer else None,
+        renovador=(r.lawyer.name if r.lawyer else None) or r.renovador_raw,
         fecha_desde=r.fecha_desde,
         fecha_hasta=r.fecha_hasta,
         monto_cuota=r.monto_cuota,
@@ -97,6 +101,33 @@ def _to_response(r: Renovacion) -> RenovacionResponse:
         total=r.total,
         created_by_name=r.created_by_name,
     )
+
+
+def _norm(s) -> str:
+    return unicodedata.normalize("NFKD", str(s or "")).encode("ascii", "ignore").decode().upper().strip()
+
+
+def _build_renovador_index(db: Session) -> dict:
+    """Map normalized 'INITIAL+SURNAME' usernames → firm lawyer id.
+
+    e.g. 'Pablo Ismael Acevedo López' → {'PACEVEDO': id, 'PISMAEL': id, 'PLOPEZ': id};
+    the Excel's 'PACEVEDO' then resolves to Pablo. First match wins on collisions.
+    """
+    idx: dict[str, int] = {}
+    for l in db.query(Lawyer).filter(Lawyer.is_firm_lawyer.is_(True)).all():
+        toks = _norm(l.name).split()
+        if not toks:
+            continue
+        ini = toks[0][0]
+        for tok in toks[1:]:
+            idx.setdefault(ini + tok, l.id)
+    return idx
+
+
+def _match_renovador(renovador: Optional[str], idx: dict) -> Optional[int]:
+    if not renovador:
+        return None
+    return idx.get(_norm(renovador))
 
 
 def _period_bounds(periodo: Optional[str]) -> tuple[date, date]:
@@ -156,6 +187,7 @@ async def create_renovacion(
         cliente_rut=normalize_rut(body.cliente_rut),
         cliente_nombre=body.cliente_nombre,
         lawyer_id=abogado.id,
+        renovador_raw=abogado.name,
         fecha_desde=desde,
         fecha_hasta=hasta,
         monto_cuota=body.monto_cuota,
@@ -213,6 +245,157 @@ async def resumen_renovaciones(
         count=len(rows),
         total_cuotas=sum(r.monto_cuota for r in rows),
         total_anual=sum(r.total for r in rows),
+    )
+
+
+class ImportResult(BaseModel):
+    total_leidas: int
+    creadas: int
+    vinculadas: int          # created linked to a system lawyer
+    como_texto: int          # created with the renovador as text only
+    omitidas_duplicadas: int
+    errores: int
+
+
+@router.post("/importar", response_model=ImportResult)
+async def importar_excel(
+    archivo: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    admin_rut: str = Depends(require_admin),
+):
+    """Bulk-import renovaciones from the firm's Excel. Maps each renovador to a
+    system lawyer where possible (keeps the raw name otherwise), skips duplicates
+    (same contrato + RUT + fecha), and reports a summary."""
+    data = await archivo.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="El archivo está vacío")
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
+    except Exception:
+        raise HTTPException(status_code=415, detail="No se pudo leer el archivo (usa un .xlsx)")
+
+    admin = db.query(Lawyer).filter(Lawyer.rut == admin_rut).first()
+    idx = _build_renovador_index(db)
+    existing = {
+        (r.numero_contrato, r.cliente_rut, r.fecha_desde)
+        for r in db.query(
+            Renovacion.numero_contrato, Renovacion.cliente_rut, Renovacion.fecha_desde
+        ).all()
+    }
+
+    total = creadas = vinculadas = como_texto = dup = err = 0
+    seen: set = set()
+    nuevos: list[Renovacion] = []
+
+    for ws in wb.worksheets:
+        if "TOTAL" in _norm(ws.title):  # skip the summary sheet
+            continue
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if not row or len(row) < 8:
+                continue
+            nombre = row[1]
+            if not nombre or not str(nombre).strip() or _norm(nombre) == "NOMBRE":
+                continue
+            total += 1
+            desde = row[4]
+            if not isinstance(desde, datetime):
+                err += 1
+                continue
+            desde = desde.date()
+            contrato = str(row[2]).strip() if row[2] is not None else ""
+            if not contrato:
+                err += 1
+                continue
+            rut = normalize_rut(str(row[0])) if row[0] is not None else ""
+            try:
+                cuotas = int(row[3]) if row[3] else CUOTAS_RENOVACION
+            except (ValueError, TypeError):
+                cuotas = CUOTAS_RENOVACION
+            if cuotas <= 0 or cuotas > 60:
+                cuotas = CUOTAS_RENOVACION
+            hasta = row[5].date() if isinstance(row[5], datetime) else desde + relativedelta(years=1)
+            try:
+                monto = int(row[7]) if row[7] else MONTO_DEFAULT
+            except (ValueError, TypeError):
+                monto = MONTO_DEFAULT
+            if monto <= 0 or monto > 1_000_000:
+                monto = MONTO_DEFAULT
+            renovador = str(row[6]).strip() if row[6] else None
+            lawyer_id = _match_renovador(renovador, idx)
+
+            key = (contrato, rut, desde)
+            if key in existing or key in seen:
+                dup += 1
+                continue
+            seen.add(key)
+            nuevos.append(Renovacion(
+                numero_contrato=contrato, cliente_rut=rut, cliente_nombre=str(nombre).strip(),
+                lawyer_id=lawyer_id, renovador_raw=renovador,
+                fecha_desde=desde, fecha_hasta=hasta,
+                monto_cuota=monto, cuotas=cuotas, total=monto * cuotas,
+                created_by_rut=admin_rut, created_by_name=admin.name if admin else None,
+            ))
+            creadas += 1
+            if lawyer_id:
+                vinculadas += 1
+            else:
+                como_texto += 1
+
+    wb.close()
+    if nuevos:
+        db.bulk_save_objects(nuevos)
+        db.commit()
+    return ImportResult(
+        total_leidas=total, creadas=creadas, vinculadas=vinculadas,
+        como_texto=como_texto, omitidas_duplicadas=dup, errores=err,
+    )
+
+
+class RecaudacionMes(BaseModel):
+    mes: int
+    count: int
+    recaudacion: int         # sum of monthly cuotas started that month
+    proyeccion_anual: int    # recaudacion × 12
+
+
+class RecaudacionAnual(BaseModel):
+    anio: int
+    meses: List[RecaudacionMes]
+    total_count: int
+    total_recaudacion: int
+    total_proyeccion: int
+
+
+@router.get("/recaudacion", response_model=RecaudacionAnual)
+async def recaudacion(
+    anio: Optional[int] = Query(None, description="Año (default: actual)"),
+    db: Session = Depends(get_db),
+    _lawyer: dict = Depends(get_current_lawyer),
+):
+    """Monthly + annual recaudación for a year (mirrors the TOTALES sheet)."""
+    if anio is None:
+        anio = datetime.utcnow().year
+    rows = (
+        db.query(Renovacion)
+        .filter(Renovacion.fecha_desde >= date(anio, 1, 1), Renovacion.fecha_desde < date(anio + 1, 1, 1))
+        .all()
+    )
+    agg = {m: [0, 0] for m in range(1, 13)}  # mes → [count, recaudacion]
+    for r in rows:
+        a = agg[r.fecha_desde.month]
+        a[0] += 1
+        a[1] += r.monto_cuota
+    meses = [
+        RecaudacionMes(mes=m, count=agg[m][0], recaudacion=agg[m][1], proyeccion_anual=agg[m][1] * 12)
+        for m in range(1, 13)
+    ]
+    return RecaudacionAnual(
+        anio=anio,
+        meses=meses,
+        total_count=sum(x.count for x in meses),
+        total_recaudacion=sum(x.recaudacion for x in meses),
+        total_proyeccion=sum(x.proyeccion_anual for x in meses),
     )
 
 
