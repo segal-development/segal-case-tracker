@@ -68,7 +68,7 @@ def test_tipos_lists_catalog(client, db, admin, tipo):
     assert any(t["code"] == "pleno_prescripcion" and t["valor_bruto"] == 8077 for t in r.json())
 
 
-def test_create_snapshots_value_and_requires_evidence(client, db, admin, tipo):
+def test_create_snapshots_value(client, db, admin, tipo):
     r = _create(client, _h(ADMIN_RUT), tipo.id)
     assert r.status_code == 201
     body = r.json()
@@ -77,22 +77,24 @@ def test_create_snapshots_value_and_requires_evidence(client, db, admin, tipo):
     assert body["tiene_evidencia"] is True
 
 
-def test_create_without_evidence_is_422(client, db, admin, tipo):
-    # No files → FastAPI rejects the required UploadFile.
+def test_create_without_evidence_ok(client, db, admin, tipo):
+    # Evidence is optional now — creating without a file succeeds.
     r = client.post("/api/v1/hitos", headers=_h(ADMIN_RUT),
                     data={"hito_tipo_id": tipo.id, "fecha_hito": "2026-07-15"})
-    assert r.status_code == 422
+    assert r.status_code == 201
+    assert r.json()["tiene_evidencia"] is False
 
 
-def test_approve_blocked_without_evidence(client, db, admin, lawyer, tipo):
-    # A hito with no evidence (built directly) can never be approved.
+def test_approve_without_evidence_ok(client, db, admin, lawyer, tipo):
+    # A hito with no evidence can now be approved (evidence no longer mandatory).
     h = Hito(lawyer_id=lawyer.id, hito_tipo_id=tipo.id, valor_bruto=8077,
              fecha_hito=date(2026, 7, 15), estado=HITO_PENDIENTE)
     db.add(h)
     db.commit()
     db.refresh(h)
     r = client.post(f"/api/v1/hitos/{h.id}/aprobar", headers=_h(ADMIN_RUT))
-    assert r.status_code == 409
+    assert r.status_code == 200
+    assert r.json()["estado"] == "aprobado"
 
 
 def test_admin_approves_and_resumen_totals(client, db, admin, lawyer, tipo):

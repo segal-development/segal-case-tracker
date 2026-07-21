@@ -143,11 +143,11 @@ async def create_hito(
     etapa_sysgal: Optional[str] = Form(None),
     tramite_sysgal: Optional[str] = Form(None),
     lawyer_id: Optional[int] = Form(None),  # admins may register for another lawyer
-    evidencia: UploadFile = File(...),  # PJUD capture — MANDATORY (sin evidencia no se paga)
+    evidencia: Optional[UploadFile] = File(None),  # PJUD capture — optional
     db: Session = Depends(get_db),
     current_lawyer: dict = Depends(get_current_lawyer),
 ):
-    """Register a hito with its mandatory PJUD evidence capture."""
+    """Register a hito. PJUD evidence is optional."""
     actor = _resolve_lawyer(db, current_lawyer)
     if actor is None:
         raise HTTPException(status_code=401, detail="No se pudo resolver el abogado")
@@ -168,25 +168,27 @@ async def create_hito(
             raise HTTPException(status_code=404, detail="Abogado no encontrado")
         target_lawyer_id = lawyer_id
 
-    data = await evidencia.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="La evidencia está vacía")
-    if len(data) > _MAX_EVIDENCE_BYTES:
-        raise HTTPException(status_code=413, detail="La evidencia supera el tamaño máximo (15 MB)")
-    content_type = evidencia.content_type or "application/octet-stream"
-    if content_type not in _ALLOWED_EVIDENCE:
-        raise HTTPException(
-            status_code=415,
-            detail="Formato de evidencia no permitido (usa PNG, JPG, WEBP o PDF)",
-        )
+    # Evidence is optional. If provided, validate + store it.
+    storage_uri = ev_filename = ev_content_type = None
+    data = await evidencia.read() if evidencia is not None else b""
+    if data:
+        if len(data) > _MAX_EVIDENCE_BYTES:
+            raise HTTPException(status_code=413, detail="La evidencia supera el tamaño máximo (15 MB)")
+        content_type = evidencia.content_type or "application/octet-stream"
+        if content_type not in _ALLOWED_EVIDENCE:
+            raise HTTPException(
+                status_code=415,
+                detail="Formato de evidencia no permitido (usa PNG, JPG, WEBP o PDF)",
+            )
+        from app.config import settings
+        from app.services.storage_service import get_storage_backend
 
-    from app.config import settings
-    from app.services.storage_service import get_storage_backend
-
-    digest = hashlib.sha256(data).hexdigest()[:16]
-    ext = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "application/pdf": "pdf"}.get(content_type, "bin")
-    key = f"hitos/evidencia/{target_lawyer_id}/{digest}.{ext}"
-    storage_uri = get_storage_backend(settings).upload(data, key, content_type=content_type)
+        digest = hashlib.sha256(data).hexdigest()[:16]
+        ext = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "application/pdf": "pdf"}.get(content_type, "bin")
+        key = f"hitos/evidencia/{target_lawyer_id}/{digest}.{ext}"
+        storage_uri = get_storage_backend(settings).upload(data, key, content_type=content_type)
+        ev_filename = evidencia.filename
+        ev_content_type = content_type
 
     hito = Hito(
         lawyer_id=target_lawyer_id,
@@ -199,8 +201,8 @@ async def create_hito(
         etapa_sysgal=etapa_sysgal or tipo.etapa_tramite,
         tramite_sysgal=tramite_sysgal,
         evidencia_storage_key=storage_uri,
-        evidencia_filename=evidencia.filename,
-        evidencia_content_type=content_type,
+        evidencia_filename=ev_filename,
+        evidencia_content_type=ev_content_type,
         estado=HITO_PENDIENTE,
         created_by_rut=actor.rut,
         created_by_name=actor.name,
@@ -249,13 +251,10 @@ async def aprobar_hito(
     db: Session = Depends(get_db),
     admin_rut: str = Depends(require_admin),
 ):
-    """Approve a hito (admin only). Blocked when it has no evidence."""
+    """Approve a hito (admin only)."""
     hito = db.query(Hito).filter(Hito.id == hito_id).first()
     if hito is None:
         raise HTTPException(status_code=404, detail="Hito no encontrado")
-    if not hito.tiene_evidencia:
-        # Firm rule: PJUD prevalece · sin evidencia no se paga.
-        raise HTTPException(status_code=409, detail="No se puede aprobar sin evidencia de PJUD")
     if cierre_svc.is_cerrado(db, cierre_svc.periodo_de_fecha(hito.fecha_hito)):
         raise HTTPException(status_code=409, detail="El período de ese hito está cerrado")
 
