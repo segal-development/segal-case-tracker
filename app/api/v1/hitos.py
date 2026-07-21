@@ -8,6 +8,7 @@ without evidence ("sin evidencia no se paga").
 import hashlib
 import io
 import logging
+import unicodedata
 from datetime import date, datetime
 from typing import List, Optional
 
@@ -328,6 +329,207 @@ async def resumen_hitos(
             r["pendientes"] += 1
     result = sorted(by_lawyer.values(), key=lambda x: x["total_bruto"], reverse=True)
     return [HitoResumenRow(**r) for r in result]
+
+
+# --------------------------------------------------------------------------- #
+# Excel import (SISTEMA DE HITOS.xlsx — hojas HITOS JUNIOR / HITOS PLENO)
+# --------------------------------------------------------------------------- #
+class HitoHojaInfo(BaseModel):
+    nombre: str
+    filas: int
+
+
+class HitoImportResult(BaseModel):
+    total_leidas: int
+    creadas: int
+    aprobados: int
+    pendientes: int
+    omitidas_duplicadas: int
+    errores: int  # rows skipped (no lawyer match, bad date, unknown pleno tipo)
+
+
+def _norm(s) -> str:
+    return unicodedata.normalize("NFKD", str(s or "")).encode("ascii", "ignore").decode().upper().strip()
+
+
+def _cell(row, i):
+    return row[i] if row is not None and i < len(row) else None
+
+
+def _is_hito_row(row) -> bool:
+    ab = _cell(row, 1)
+    return bool(ab and str(ab).strip() and _norm(ab) not in ("ABOGADO AT", "ABOGADO"))
+
+
+def _open_hito_wb(data: bytes):
+    if not data:
+        raise HTTPException(status_code=400, detail="El archivo está vacío")
+    try:
+        import openpyxl
+        return openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
+    except Exception:
+        raise HTTPException(status_code=415, detail="No se pudo leer el archivo (usa un .xlsx)")
+
+
+def _hito_sheets(wb, hoja: Optional[str]):
+    """Only the HITOS sheets (skip PARÁMETROS, VARIABLES BONO, etc.)."""
+    sheets = [ws for ws in wb.worksheets if "HITO" in _norm(ws.title)]
+    if hoja:
+        sheets = [ws for ws in sheets if _norm(ws.title) == _norm(hoja)]
+    return sheets
+
+
+def _match_lawyer_by_name(name: str, lawyers) -> Optional[Lawyer]:
+    """Match an Excel abogado name to a firm lawyer: all Excel name tokens must
+    appear in the lawyer's full name (e.g. 'Gonzalo Calderón' → 'GONZALO ... CALDERÓN ...')."""
+    toks = set(t for t in _norm(name).split() if len(t) > 1)
+    if not toks:
+        return None
+    for l in lawyers:
+        if toks <= set(_norm(l.name).split()):
+            return l
+    return None
+
+
+def _match_pleno_tipo(text: str, pleno_tipos) -> Optional[HitoTipo]:
+    n = _norm(text)
+    if not n:
+        return None
+    for t in pleno_tipos:
+        lt = _norm(t.label)
+        if n == lt or n in lt or lt in n:
+            return t
+    ntok = set(n.split())
+    best, best_k = None, 0
+    for t in pleno_tipos:
+        k = len(ntok & set(_norm(t.label).split()))
+        if k > best_k:
+            best, best_k = t, k
+    return best if best_k >= 2 else None
+
+
+@router.post("/importar/hojas", response_model=List[HitoHojaInfo])
+async def listar_hojas_hitos(
+    archivo: UploadFile = File(...),
+    _admin_rut: str = Depends(require_admin),
+):
+    """List the HITOS sheets of an uploaded SISTEMA DE HITOS.xlsx (name + row count)."""
+    wb = _open_hito_wb(await archivo.read())
+    out = [
+        HitoHojaInfo(nombre=ws.title, filas=sum(1 for r in ws.iter_rows(values_only=True) if _is_hito_row(r)))
+        for ws in _hito_sheets(wb, None)
+    ]
+    wb.close()
+    return out
+
+
+@router.post("/importar", response_model=HitoImportResult)
+async def importar_hitos(
+    archivo: UploadFile = File(...),
+    hoja: Optional[str] = Query(None, description="Hoja a importar (default: todas las HITOS)"),
+    db: Session = Depends(get_db),
+    admin_rut: str = Depends(require_admin),
+):
+    """Bulk-import hitos from SISTEMA DE HITOS.xlsx. JUNIOR and PLENO sheets have
+    different columns; nivel comes from the sheet name. Maps abogado by name and
+    (pleno) tipo by its label; skips duplicates and rows it can't resolve."""
+    wb = _open_hito_wb(await archivo.read())
+    sheets = _hito_sheets(wb, hoja)
+    if hoja and not sheets:
+        wb.close()
+        raise HTTPException(status_code=404, detail=f"La hoja '{hoja}' no existe en el archivo")
+
+    admin = db.query(Lawyer).filter(Lawyer.rut == admin_rut).first()
+    lawyers = db.query(Lawyer).filter(Lawyer.is_firm_lawyer.is_(True)).all()
+    tipos = db.query(HitoTipo).all()
+    junior_tipo = next((t for t in tipos if t.nivel == "junior"), None)
+    pleno_tipos = [t for t in tipos if t.nivel == "pleno"]
+    existing = {
+        (h.lawyer_id, h.rol_causa, h.fecha_hito, h.hito_tipo_id)
+        for h in db.query(Hito.lawyer_id, Hito.rol_causa, Hito.fecha_hito, Hito.hito_tipo_id).all()
+    }
+
+    total = creadas = aprobados = pendientes = dup = err = 0
+    seen: set = set()
+    nuevos: list[Hito] = []
+
+    for ws in sheets:
+        is_junior = "JUNIOR" in _norm(ws.title)
+        for row in ws.iter_rows(values_only=True):
+            if not _is_hito_row(row):
+                continue
+            total += 1
+            fecha = _cell(row, 2)
+            if not isinstance(fecha, datetime):
+                err += 1
+                continue
+            lawyer = _match_lawyer_by_name(_cell(row, 1), lawyers)
+            if lawyer is None:
+                err += 1
+                continue
+
+            if is_junior:
+                procedimiento = _cell(row, 3)
+                rut = _cell(row, 4)
+                descripcion = _cell(row, 5)
+                tipo = junior_tipo
+            else:  # pleno
+                procedimiento = None
+                rut = _cell(row, 3)
+                descripcion = None
+                tipo = _match_pleno_tipo(_cell(row, 5), pleno_tipos)
+            etapa = _cell(row, 6)
+            tramite = _cell(row, 7)
+            aprobado = _norm(_cell(row, 8)) in ("SI", "SÍ", "S")
+            if tipo is None:
+                err += 1
+                continue
+
+            try:
+                valor = int(_cell(row, 9)) if _cell(row, 9) else tipo.valor_bruto
+            except (ValueError, TypeError):
+                valor = tipo.valor_bruto
+            if valor <= 0:
+                valor = tipo.valor_bruto
+
+            rol_causa = (str(rut).strip()[:50] if rut is not None else None)
+            key = (lawyer.id, rol_causa, fecha.date(), tipo.id)
+            if key in existing or key in seen:
+                dup += 1
+                continue
+            seen.add(key)
+            estado = HITO_APROBADO if aprobado else HITO_PENDIENTE
+            nuevos.append(Hito(
+                lawyer_id=lawyer.id,
+                hito_tipo_id=tipo.id,
+                valor_bruto=valor,
+                fecha_hito=fecha.date(),
+                rol_causa=rol_causa,
+                procedimiento=(str(procedimiento).strip()[:100] if procedimiento else None),
+                descripcion=(str(descripcion).strip()[:500] if descripcion else None),
+                etapa_sysgal=(str(etapa).strip()[:100] if etapa else None),
+                tramite_sysgal=(str(tramite).strip()[:255] if tramite else None),
+                estado=estado,
+                created_by_rut=admin_rut,
+                created_by_name=admin.name if admin else None,
+                aprobado_by_rut=admin_rut if aprobado else None,
+                aprobado_by_name=(admin.name if admin else None) if aprobado else None,
+                aprobado_at=datetime.utcnow() if aprobado else None,
+            ))
+            creadas += 1
+            if aprobado:
+                aprobados += 1
+            else:
+                pendientes += 1
+
+    wb.close()
+    if nuevos:
+        db.bulk_save_objects(nuevos)
+        db.commit()
+    return HitoImportResult(
+        total_leidas=total, creadas=creadas, aprobados=aprobados, pendientes=pendientes,
+        omitidas_duplicadas=dup, errores=err,
+    )
 
 
 @router.get("/{hito_id}/evidencia")

@@ -122,3 +122,64 @@ def test_lawyer_lists_only_own(client, db, admin, lawyer, tipo):
     r = client.get("/api/v1/hitos", headers=_h(LAWYER_RUT))
     assert r.status_code == 200
     assert {x["lawyer_id"] for x in r.json()} == {lawyer.id}  # only their own
+
+
+_XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def _hitos_xlsx():
+    import io
+    import openpyxl
+    from datetime import datetime as dt
+    wb = openpyxl.Workbook()
+    js = wb.active
+    js.title = "HITOS JUNIOR"
+    js.append(["HITOS H1 · ABOGADO JUNIOR"])                  # title row
+    js.append(["Evidencia obligatoria: ..."])                # subtitle
+    js.append([])                                            # blank
+    js.append(["#", "Abogado AT", "Fecha registro", "PROCEDIMIENTO", "ROL causa",
+               "Descripción", "ETAPA Sysgal", "TRAMITE Sysgal", "Aprobado", "Valor hito"])
+    js.append([1, "Gonzalo Calderón", dt(2026, 7, 2), "RECURSO", "18.795.509-2", "DOC OK", "M1 BAJA", "Escrito", "SÍ", 2423])
+    js.append([2, "Gonzalo Calderón", dt(2026, 7, 3), "EXHIBICION", "10.185.055-2", "OK", "M1 BAJA", "Escrito", "NO", 2423])
+    p = wb.create_sheet("PARÁMETROS")  # must be skipped
+    p.append(["no", "importar"])
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def test_importar_hitos_hojas_y_mapeo(client, db, admin):
+    jt = HitoTipo(code="junior_h1", label="Conversión preventiva → M1 Alta", nivel="junior", valor_bruto=2423, orden=1)
+    lw = Lawyer(rut="19280895-2", name="Gonzalo Javier Calderón Maturana", role="lawyer", is_firm_lawyer=True)
+    db.add_all([jt, lw])
+    db.commit()
+    data = _hitos_xlsx()
+
+    # hojas: only the HITOS sheet (skips PARÁMETROS)
+    hojas = client.post("/api/v1/hitos/importar/hojas", headers=_h(ADMIN_RUT),
+                        files={"archivo": ("h.xlsx", data, _XLSX_MIME)}).json()
+    assert [h["nombre"] for h in hojas] == ["HITOS JUNIOR"]
+    assert hojas[0]["filas"] == 2
+
+    # import → maps abogado by name, estado from Aprobado SÍ/NO
+    r = client.post("/api/v1/hitos/importar", headers=_h(ADMIN_RUT),
+                    files={"archivo": ("h.xlsx", data, _XLSX_MIME)}).json()
+    assert r["creadas"] == 2
+    assert r["aprobados"] == 1
+    assert r["pendientes"] == 1
+
+    # re-upload dedups
+    r2 = client.post("/api/v1/hitos/importar", headers=_h(ADMIN_RUT),
+                     files={"archivo": ("h.xlsx", data, _XLSX_MIME)}).json()
+    assert r2["creadas"] == 0
+    assert r2["omitidas_duplicadas"] == 2
+
+    hitos = client.get("/api/v1/hitos?periodo=2026-07", headers=_h(ADMIN_RUT)).json()
+    assert len(hitos) == 2
+    assert {h["lawyer_id"] for h in hitos} == {lw.id}
+
+
+def test_importar_hitos_requires_admin(client, db, lawyer):
+    r = client.post("/api/v1/hitos/importar", headers=_h(LAWYER_RUT),
+                    files={"archivo": ("h.xlsx", _hitos_xlsx(), _XLSX_MIME)})
+    assert r.status_code == 403
