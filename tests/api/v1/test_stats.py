@@ -423,13 +423,22 @@ class TestAdminDashboardStats:
         assert quality["with_litigantes"] == 2
 
     def test_sin_asignar(self, db, lawyer, court):
-        assigned = _make_case(db, lawyer, court, "C-6008-2025")
-        _seed_litigantes(db, assigned)  # firm-side abogado present
-        _make_case(db, lawyer, court, "C-6009-2025")  # orphan: no litigantes
+        # A firm case (a firm-side abogado present) → assigned, not sin_asignar.
+        firm_case = _make_case(db, lawyer, court, "C-6008-2025")
+        _seed_litigantes(db, firm_case)
+        # A monitored case whose only abogado is external (not a firm lawyer):
+        # NOT the firm's caseload → must NOT inflate sin_asignar (the old bug).
+        external = _make_case(db, lawyer, court, "C-6009-2025")
+        db.add(CaseLitigante(
+            case_id=external.id, participante="AB.DDO", rut="88888888-8",
+            persona_type="NATURAL", nombre="Externo", natural_key=f"{external.id}-ext",
+        ))
+        # An orphan with no litigantes at all → also not firm caseload.
+        _make_case(db, lawyer, court, "C-6010-2025")
         db.commit()
         quality = admin_dashboard_stats(db, ACCOUNT_RUT)["quality"]
-        assert quality["total_cases"] == 2
-        assert quality["sin_asignar"] == 1
+        assert quality["total_cases"] == 3          # sync/coverage still span all monitored cases
+        assert quality["sin_asignar"] == 0          # only the firm case, and it's assigned
 
     def test_empty_for_unknown_account(self, db):
         result = admin_dashboard_stats(db, "99999999-9")

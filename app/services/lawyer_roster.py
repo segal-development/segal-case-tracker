@@ -740,23 +740,23 @@ def admin_dashboard_stats(db: Session, account_rut: str) -> dict:
             .scalar() or 0
         )
 
-    # sin_asignar: civil cases with no firm-side abogado resolvable
+    # sin_asignar: cases in the firm's REAL caseload with no firm-side abogado
+    # resolvable. Scoped to the firm's own cases (not the ~15k monitored
+    # universe) and checking ANY firm lawyer, not just this account — so the
+    # badge flags real unassigned firm work, not the ~13k monitored cases where
+    # the firm simply isn't a litigating party.
+    firm_ruts = firm_lawyer_ruts(db)
+    firm_ids = _firm_case_ids(db, firm_ruts)
     by_case = _abogado_litigantes_by_case(db)
     assigned: set[int] = set()
-    for cid, litigantes in by_case.items():
-        account_side: Optional[frozenset] = None
-        for lit in litigantes:
-            if normalize_rut(lit.rut) == account_rut_norm:
-                if lit.participante in DEMANDANTE_ABOGADO:
-                    account_side = DEMANDANTE_ABOGADO
-                elif lit.participante in DEMANDADO_ABOGADO:
-                    account_side = DEMANDADO_ABOGADO
+    for cid in firm_ids:
+        for lit in by_case.get(cid, []):
+            if normalize_rut(lit.rut) in firm_ruts and lit.participante in (
+                DEMANDANTE_ABOGADO | DEMANDADO_ABOGADO
+            ):
+                assigned.add(cid)
                 break
-        if account_side is not None and any(
-            lit.participante in account_side for lit in litigantes
-        ):
-            assigned.add(cid)
-    sin_asignar = len(set(case_ids) - assigned)
+    sin_asignar = len(firm_ids - assigned)
 
     return {
         "sync": {
