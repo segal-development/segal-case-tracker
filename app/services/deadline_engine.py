@@ -462,7 +462,7 @@ class DeadlineEngine:
 
         # Step 8: write denormalized Case columns.
         case.procedural_state = proc_state.value
-        case.semaforo = semaforo
+        case.semaforo = cls._apply_semaforo_override(case, semaforo)
         case.abandono_disponible = abandono
         case.prescripcion_cumplida = prescripcion_cumplida
         case.prescripcion_fecha = prescripcion_fecha
@@ -547,6 +547,27 @@ class DeadlineEngine:
     # ------------------------------------------------------------------
     # Semáforo computation
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _apply_semaforo_override(case: Case, computed: str) -> str:
+        """Honor a manual liberación override until a NEWER movement supersedes it.
+
+        A liberación (auditor + dirección dual sign-off) pins the case's semáforo
+        to a chosen range. It holds while no case activity arrived after it; once a
+        newer movement lands (last_movement_at > override_at) the override is
+        cleared and the computed color resumes — "el semáforo se sigue moviendo".
+        """
+        override = getattr(case, "semaforo_override", None)
+        if not override:
+            return computed
+        ov_at = getattr(case, "semaforo_override_at", None)
+        last_mv = getattr(case, "last_movement_at", None)
+        if ov_at is not None and last_mv is not None and last_mv > ov_at:
+            case.semaforo_override = None
+            case.semaforo_override_at = None
+            case.semaforo_override_by = None
+            return computed
+        return override
 
     @classmethod
     def _compute_semaforo(

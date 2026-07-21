@@ -74,6 +74,13 @@ class Case(Base):
     en_apremio = Column(Boolean, nullable=False, server_default=text("false"), default=False)
     consulta_reserved = Column(Boolean, nullable=False, server_default=text("false"), default=False)  # True when consulta_by_rol returns None (case not in public consulta)
 
+    # Manual semáforo override (liberación de causa — auditor + dirección dual
+    # sign-off). Pins the color to a chosen range until a NEWER movement
+    # supersedes it (then the engine clears it and resumes computing).
+    semaforo_override = Column(String(10), nullable=True)
+    semaforo_override_at = Column(DateTime, nullable=True)
+    semaforo_override_by = Column(String(255), nullable=True)
+
     # Prescripción (statute of limitations) — populated by DeadlineEngine.recompute_case
     titulo_tipo = Column(String(30), nullable=True)   # input: pagare|letra|cheque|escritura_publica|sentencia|otro
     titulo_fecha = Column(Date, nullable=True)         # input: title's key date
