@@ -257,23 +257,67 @@ class ImportResult(BaseModel):
     errores: int
 
 
+class HojaInfo(BaseModel):
+    nombre: str
+    filas: int
+
+
+def _open_workbook(data: bytes):
+    if not data:
+        raise HTTPException(status_code=400, detail="El archivo está vacío")
+    try:
+        import openpyxl
+        return openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
+    except Exception:
+        raise HTTPException(status_code=415, detail="No se pudo leer el archivo (usa un .xlsx)")
+
+
+def _is_data_row(row) -> bool:
+    return bool(
+        row and len(row) > 1 and row[1] and str(row[1]).strip() and _norm(row[1]) != "NOMBRE"
+    )
+
+
+def _importable_sheets(wb, hoja: Optional[str]):
+    """Non-summary sheets, optionally narrowed to a single chosen sheet."""
+    sheets = [ws for ws in wb.worksheets if "TOTAL" not in _norm(ws.title)]
+    if hoja:
+        sheets = [ws for ws in sheets if _norm(ws.title) == _norm(hoja)]
+    return sheets
+
+
+@router.post("/importar/hojas", response_model=List[HojaInfo])
+async def listar_hojas(
+    archivo: UploadFile = File(...),
+    _admin_rut: str = Depends(require_admin),
+):
+    """List the importable sheets of an uploaded Excel (name + data-row count),
+    so the UI can offer a per-sheet (e.g. per-year) selection before importing."""
+    wb = _open_workbook(await archivo.read())
+    out = []
+    for ws in _importable_sheets(wb, None):
+        filas = sum(1 for row in ws.iter_rows(min_row=2, values_only=True) if _is_data_row(row))
+        out.append(HojaInfo(nombre=ws.title, filas=filas))
+    wb.close()
+    return out
+
+
 @router.post("/importar", response_model=ImportResult)
 async def importar_excel(
     archivo: UploadFile = File(...),
+    hoja: Optional[str] = Query(None, description="Nombre de la hoja a importar (default: todas)"),
     db: Session = Depends(get_db),
     admin_rut: str = Depends(require_admin),
 ):
     """Bulk-import renovaciones from the firm's Excel. Maps each renovador to a
     system lawyer where possible (keeps the raw name otherwise), skips duplicates
-    (same contrato + RUT + fecha), and reports a summary."""
-    data = await archivo.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="El archivo está vacío")
-    try:
-        import openpyxl
-        wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
-    except Exception:
-        raise HTTPException(status_code=415, detail="No se pudo leer el archivo (usa un .xlsx)")
+    (same contrato + RUT + fecha), and reports a summary. If ``hoja`` is given,
+    only that sheet is imported; otherwise all non-summary sheets."""
+    wb = _open_workbook(await archivo.read())
+    sheets = _importable_sheets(wb, hoja)
+    if hoja and not sheets:
+        wb.close()
+        raise HTTPException(status_code=404, detail=f"La hoja '{hoja}' no existe en el archivo")
 
     admin = db.query(Lawyer).filter(Lawyer.rut == admin_rut).first()
     idx = _build_renovador_index(db)
@@ -288,9 +332,7 @@ async def importar_excel(
     seen: set = set()
     nuevos: list[Renovacion] = []
 
-    for ws in wb.worksheets:
-        if "TOTAL" in _norm(ws.title):  # skip the summary sheet
-            continue
+    for ws in sheets:
         for row in ws.iter_rows(min_row=2, values_only=True):
             if not row or len(row) < 8:
                 continue
