@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_lawyer, get_db, require_admin
 from app.models.hito import Hito, HitoTipo, HITO_APROBADO, HITO_PENDIENTE, HITO_RECHAZADO
 from app.models.lawyer import Lawyer
+from app.services import bono_cierre_service as cierre_svc
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -151,6 +152,9 @@ async def create_hito(
     if actor is None:
         raise HTTPException(status_code=401, detail="No se pudo resolver el abogado")
 
+    if cierre_svc.is_cerrado(db, cierre_svc.periodo_de_fecha(fecha_hito)):
+        raise HTTPException(status_code=409, detail="El período de ese hito está cerrado")
+
     tipo = db.query(HitoTipo).filter(HitoTipo.id == hito_tipo_id, HitoTipo.activo.is_(True)).first()
     if tipo is None:
         raise HTTPException(status_code=404, detail="Tipo de hito no encontrado")
@@ -252,6 +256,8 @@ async def aprobar_hito(
     if not hito.tiene_evidencia:
         # Firm rule: PJUD prevalece · sin evidencia no se paga.
         raise HTTPException(status_code=409, detail="No se puede aprobar sin evidencia de PJUD")
+    if cierre_svc.is_cerrado(db, cierre_svc.periodo_de_fecha(hito.fecha_hito)):
+        raise HTTPException(status_code=409, detail="El período de ese hito está cerrado")
 
     admin = db.query(Lawyer).filter(Lawyer.rut == admin_rut).first()
     hito.estado = HITO_APROBADO
