@@ -32,7 +32,11 @@ class Renovacion(Base):
     cliente_rut = Column(String(20), nullable=False, index=True)  # normalized
     cliente_nombre = Column(String(255), nullable=False)
 
-    lawyer_id = Column(Integer, ForeignKey("lawyers.id"), nullable=False, index=True)  # abogado renovador
+    # The handling lawyer. Nullable: manual entries always set it, but imported
+    # historical rows may be done by cobranza/sales staff who aren't system
+    # lawyers — those keep only ``renovador_raw`` (the original name/username).
+    lawyer_id = Column(Integer, ForeignKey("lawyers.id"), nullable=True, index=True)
+    renovador_raw = Column(String(100), nullable=True)  # original renovador name/username
 
     fecha_desde = Column(Date, nullable=False, index=True)  # renewal date
     fecha_hasta = Column(Date, nullable=False)  # desde + 1 year

@@ -128,6 +128,87 @@ def test_list_filter_and_resumen(client, admin, abogado):
     assert res["total_anual"] == 50000 * 12
 
 
+def _make_xlsx(rows):
+    import io
+    import openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "AÑO2026"
+    ws.append(["RUT", "NOMBRE", "N° CONTRATO", "CUOTAS", "DESDE", "HASTA", "RENOVADOR", "VALOR"])
+    for r in rows:
+        ws.append(r)
+    tot = wb.create_sheet("TOTALES 2025")  # must be skipped
+    tot.append(["ignore", "me"])
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+_XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def test_importar_excel_maps_and_dedups(client, admin, abogado):
+    from datetime import datetime as dt
+    rows = [
+        ["17098014-k", "Cliente Uno", "C-100", 12, dt(2026, 1, 5), dt(2027, 1, 5), "EVENEGAS", 20000],
+        ["12345678-5", "Cliente Dos", "C-101", 12, dt(2026, 2, 10), dt(2027, 2, 10), "MVERA", 25000],
+        ["", "", "", "", "", "", "", ""],  # blank → skipped
+    ]
+    data = _make_xlsx(rows)
+    r = client.post(
+        "/api/v1/renovaciones/importar", headers=_h(ADMIN_RUT),
+        files={"archivo": ("reno.xlsx", data, _XLSX_MIME)},
+    )
+    assert r.status_code == 200
+    b = r.json()
+    assert b["total_leidas"] == 2
+    assert b["creadas"] == 2
+    assert b["vinculadas"] == 1   # EVENEGAS → Eduardo Venegas
+    assert b["como_texto"] == 1   # MVERA has no system lawyer
+
+    # re-upload of the same file dedups everything
+    r2 = client.post(
+        "/api/v1/renovaciones/importar", headers=_h(ADMIN_RUT),
+        files={"archivo": ("reno.xlsx", data, _XLSX_MIME)},
+    )
+    assert r2.json()["creadas"] == 0
+    assert r2.json()["omitidas_duplicadas"] == 2
+
+    # linked row shows the system lawyer; text-only row shows the raw renovador
+    enero = client.get("/api/v1/renovaciones?periodo=2026-01", headers=_h(ADMIN_RUT)).json()
+    assert enero[0]["renovador"] == "Eduardo Venegas"
+    febrero = client.get("/api/v1/renovaciones?periodo=2026-02", headers=_h(ADMIN_RUT)).json()
+    assert febrero[0]["renovador"] == "MVERA"
+    assert febrero[0]["lawyer_id"] is None
+
+
+def test_importar_requires_admin(client, abogado):
+    data = _make_xlsx([])
+    r = client.post(
+        "/api/v1/renovaciones/importar", headers=_h(LAWYER_RUT),
+        files={"archivo": ("reno.xlsx", data, _XLSX_MIME)},
+    )
+    assert r.status_code == 403
+
+
+def test_recaudacion_by_year(client, admin, abogado):
+    for fecha in ("2026-01-05", "2026-01-20", "2026-02-01"):
+        client.post("/api/v1/renovaciones", headers=_h(ADMIN_RUT), json={
+            "numero_contrato": f"R-{fecha}", "cliente_rut": "12345678-5",
+            "cliente_nombre": "Cliente", "lawyer_id": abogado.id,
+            "monto_cuota": 25000, "fecha_desde": fecha,
+        })
+    rec = client.get("/api/v1/renovaciones/recaudacion?anio=2026", headers=_h(ADMIN_RUT)).json()
+    assert rec["anio"] == 2026
+    assert len(rec["meses"]) == 12
+    enero = rec["meses"][0]
+    assert enero["mes"] == 1 and enero["count"] == 2
+    assert enero["recaudacion"] == 50000
+    assert enero["proyeccion_anual"] == 600000  # 50000 × 12
+    assert rec["total_recaudacion"] == 75000
+    assert rec["total_count"] == 3
+
+
 def test_delete_permissions(client, admin, abogado, db):
     reno = client.post("/api/v1/renovaciones", headers=_h(ADMIN_RUT), json={
         "numero_contrato": "C-del", "cliente_rut": "12345678-5",
