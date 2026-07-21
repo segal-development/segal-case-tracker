@@ -228,6 +228,22 @@ def test_import_unknown_sheet_404(client, admin, abogado):
     assert r.status_code == 404
 
 
+def test_importar_trunca_campos_largos(client, admin, abogado):
+    """A junk RUT cell (e.g. a name) must not crash the import — it's truncated
+    to the column limit (Postgres enforces VARCHAR length; the real file has these)."""
+    from datetime import datetime as dt
+    long_rut = "EDISONDANILOGALLEGOSGRANDO-N"  # 28 chars, a name in the RUT column
+    rows = [[long_rut, "Cliente Largo", "C-LARGO", 12, dt(2026, 5, 1), dt(2027, 5, 1), "EVENEGAS", 20000]]
+    r = client.post(
+        "/api/v1/renovaciones/importar", headers=_h(ADMIN_RUT),
+        files={"archivo": ("reno.xlsx", _make_xlsx(rows), _XLSX_MIME)},
+    )
+    assert r.status_code == 200
+    assert r.json()["creadas"] == 1
+    row = client.get("/api/v1/renovaciones?periodo=2026-05", headers=_h(ADMIN_RUT)).json()[0]
+    assert len(row["cliente_rut"]) <= 20
+
+
 def test_importar_requires_admin(client, abogado):
     data = _make_xlsx([])
     r = client.post(
