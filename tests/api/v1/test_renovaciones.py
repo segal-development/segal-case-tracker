@@ -182,6 +182,52 @@ def test_importar_excel_maps_and_dedups(client, admin, abogado):
     assert febrero[0]["lawyer_id"] is None
 
 
+def test_listar_hojas_and_import_single_sheet(client, admin, abogado):
+    from datetime import datetime as dt
+    import io
+    import openpyxl
+    wb = openpyxl.Workbook()
+    a25 = wb.active
+    a25.title = "AÑO2025"
+    a25.append(["RUT", "NOMBRE", "N° CONTRATO", "CUOTAS", "DESDE", "HASTA", "RENOVADOR", "VALOR"])
+    a25.append(["12345678-5", "Cliente 25", "C-25", 12, dt(2025, 3, 1), dt(2026, 3, 1), "EVENEGAS", 20000])
+    a26 = wb.create_sheet("AÑO 2026")
+    a26.append(["RUT", "NOMBRE", "N° CONTRATO", "CUOTAS", "DESDE", "HASTA", "RENOVADOR", "VALOR"])
+    a26.append(["12345678-5", "Cliente 26a", "C-26a", 12, dt(2026, 3, 1), dt(2027, 3, 1), "EVENEGAS", 25000])
+    a26.append(["12345678-5", "Cliente 26b", "C-26b", 12, dt(2026, 4, 1), dt(2027, 4, 1), "MVERA", 25000])
+    tot = wb.create_sheet("TOTALES 2025")
+    tot.append(["x", "y"])
+    buf = io.BytesIO()
+    wb.save(buf)
+    data = buf.getvalue()
+
+    # the sheets endpoint lists importable sheets + row counts (skips TOTALES)
+    hojas = client.post(
+        "/api/v1/renovaciones/importar/hojas", headers=_h(ADMIN_RUT),
+        files={"archivo": ("reno.xlsx", data, _XLSX_MIME)},
+    ).json()
+    by_name = {h["nombre"]: h["filas"] for h in hojas}
+    assert by_name == {"AÑO2025": 1, "AÑO 2026": 2}
+    assert "TOTALES 2025" not in by_name
+
+    # import only AÑO 2026 → 2 rows, not the 2025 one
+    r = client.post(
+        "/api/v1/renovaciones/importar?hoja=AÑO%202026", headers=_h(ADMIN_RUT),
+        files={"archivo": ("reno.xlsx", data, _XLSX_MIME)},
+    ).json()
+    assert r["creadas"] == 2
+    assert client.get("/api/v1/renovaciones?periodo=2025-03", headers=_h(ADMIN_RUT)).json() == []
+
+
+def test_import_unknown_sheet_404(client, admin, abogado):
+    data = _make_xlsx([])
+    r = client.post(
+        "/api/v1/renovaciones/importar?hoja=NoExiste", headers=_h(ADMIN_RUT),
+        files={"archivo": ("reno.xlsx", data, _XLSX_MIME)},
+    )
+    assert r.status_code == 404
+
+
 def test_importar_requires_admin(client, abogado):
     data = _make_xlsx([])
     r = client.post(
