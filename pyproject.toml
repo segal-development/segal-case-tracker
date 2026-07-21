@@ -28,6 +28,7 @@ tzlocal = ">=5.2,<5.4"  # 5.4.2 ships a broken wheel (no package dir); pin below
 pyyaml = "^6.0.1"
 holidays = "^0.58"
 python-docx = "^1.1.2"
+openpyxl = "^3.1.5"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0.0"

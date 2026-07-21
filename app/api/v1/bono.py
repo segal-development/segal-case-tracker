@@ -5,11 +5,13 @@ complaints, renewals) per lawyer; the system computes V1–V4 and assembles the
 liquidación (Fijo + Hitos aprobados + V1 + V3_neta + V2). All endpoints are
 admin-only — payroll data. The math lives in ``app.services.bono_calc``.
 """
+import io
 import logging
 from datetime import date, datetime
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -97,6 +99,13 @@ class NivelIn(BaseModel):
     nivel: Optional[str] = None  # "junior" | "pleno" | null (removes from bonus)
 
 
+class RosterRow(BaseModel):
+    lawyer_id: int
+    nombre: str
+    nivel: Optional[str] = None
+    is_active: bool
+
+
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
@@ -168,6 +177,97 @@ def _build_row(lawyer: Lawyer, var: Optional[BonoVariables], hitos_aprobados: in
 
 
 # --------------------------------------------------------------------------- #
+# Excel export (RRHH)
+# --------------------------------------------------------------------------- #
+def _build_liquidacion_workbook(data: LiquidacionResponse):
+    """Render the liquidación as an .xlsx mirroring the LIQUIDACIÓN MENSUAL sheet."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Liquidación"
+
+    headers = [
+        "Abogado", "Nivel", "Fijo mensual bruto", "Hitos H1 aprobados",
+        "V1 Retención", "V3 neta (Cumpl.−Reclamos)", "V2 Renovación",
+        "Total bono gestión bruto", "TOTAL BRUTO",
+    ]
+    money_cols = list(range(3, 10))  # C..I
+    clp_fmt = '#,##0'
+
+    ink = Font(name="Calibri", size=11)
+    bold = Font(name="Calibri", size=11, bold=True)
+    white_bold = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    head_fill = PatternFill("solid", fgColor="1F2A44")
+    total_fill = PatternFill("solid", fgColor="EEF1F6")
+    thin = Side(style="thin", color="D6DAE3")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    right = Alignment(horizontal="right")
+    center = Alignment(horizontal="center")
+
+    # Title + note
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
+    c = ws.cell(row=1, column=1, value=f"LIQUIDACIÓN MENSUAL · {data.periodo}")
+    c.font = Font(name="Calibri", size=14, bold=True)
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=len(headers))
+    note = ws.cell(
+        row=2, column=1,
+        value="Valores brutos (afectos a semana corrida). RRHH aplica SC en la liquidación final.",
+    )
+    note.font = Font(name="Calibri", size=10, italic=True, color="6B7280")
+
+    header_row = 4
+    for j, h in enumerate(headers, start=1):
+        cell = ws.cell(row=header_row, column=j, value=h)
+        cell.font = white_bold
+        cell.fill = head_fill
+        cell.border = border
+        cell.alignment = center if j <= 2 else right
+
+    r = header_row + 1
+    for row in data.rows:
+        values = [
+            row.lawyer_nombre, row.nivel, row.fijo, row.hitos_aprobados,
+            row.v1_bruto, row.v3_neta, row.v2_bruto,
+            row.total_bono_gestion, row.total_bruto,
+        ]
+        for j, v in enumerate(values, start=1):
+            cell = ws.cell(row=r, column=j, value=v)
+            cell.font = ink
+            cell.border = border
+            if j in money_cols:
+                cell.number_format = clp_fmt
+                cell.alignment = right
+            elif j == 2:
+                cell.alignment = center
+        r += 1
+
+    # Total área
+    t = data.totales
+    total_values = [
+        "TOTAL ÁREA", "", t.fijo, t.hitos_aprobados,
+        t.v1_bruto, t.v3_neta, t.v2_bruto, t.total_bono_gestion, t.total_bruto,
+    ]
+    for j, v in enumerate(total_values, start=1):
+        cell = ws.cell(row=r, column=j, value=v)
+        cell.font = bold
+        cell.fill = total_fill
+        cell.border = border
+        if j in money_cols:
+            cell.number_format = clp_fmt
+            cell.alignment = right
+
+    # Column widths
+    widths = [30, 10, 18, 18, 16, 24, 16, 22, 18]
+    for j, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(j)].width = w
+    ws.freeze_panes = ws.cell(row=header_row + 1, column=1)
+    return wb
+
+
+# --------------------------------------------------------------------------- #
 # Endpoints
 # --------------------------------------------------------------------------- #
 @router.get("/parametros", response_model=BonoParametros)
@@ -185,13 +285,9 @@ async def get_parametros(_admin_rut: str = Depends(require_admin)):
     )
 
 
-@router.get("/liquidacion", response_model=LiquidacionResponse)
-async def get_liquidacion(
-    periodo: Optional[str] = Query(None, description="Mes YYYY-MM (default: mes actual)"),
-    db: Session = Depends(get_db),
-    _admin_rut: str = Depends(require_admin),
-):
-    """Full monthly liquidación for every bonus lawyer (nivel set), with totals."""
+def _liquidacion_data(db: Session, periodo: Optional[str]) -> LiquidacionResponse:
+    """Build the full liquidación (rows + totals) for a period. Shared by the
+    JSON endpoint and the RRHH Excel export."""
     periodo, start, end = _period_bounds(periodo)
     lawyers = (
         db.query(Lawyer)
@@ -216,6 +312,40 @@ async def get_liquidacion(
         total_bruto=sum(r.total_bruto for r in rows),
     )
     return LiquidacionResponse(periodo=periodo, rows=rows, totales=totales)
+
+
+@router.get("/liquidacion", response_model=LiquidacionResponse)
+async def get_liquidacion(
+    periodo: Optional[str] = Query(None, description="Mes YYYY-MM (default: mes actual)"),
+    db: Session = Depends(get_db),
+    _admin_rut: str = Depends(require_admin),
+):
+    """Full monthly liquidación for every bonus lawyer (nivel set), with totals."""
+    return _liquidacion_data(db, periodo)
+
+
+@router.get("/liquidacion/export")
+async def export_liquidacion(
+    periodo: Optional[str] = Query(None, description="Mes YYYY-MM (default: mes actual)"),
+    db: Session = Depends(get_db),
+    _admin_rut: str = Depends(require_admin),
+):
+    """Excel (.xlsx) of the monthly liquidación for RRHH to process payroll.
+
+    Mirrors the firm's LIQUIDACIÓN MENSUAL sheet. All values are gross (afectos a
+    semana corrida) — RRHH applies SC in their final liquidación.
+    """
+    data = _liquidacion_data(db, periodo)
+    wb = _build_liquidacion_workbook(data)
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    filename = f"liquidacion_{data.periodo}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.put("/variables/{lawyer_id}", response_model=BonoRow)
@@ -277,6 +407,24 @@ async def upsert_variables(
     _p, start, end = _period_bounds(periodo)
     hitos = _hitos_aprobados_map(db, start, end).get(lawyer_id, 0)
     return _build_row(lawyer, var, hitos)
+
+
+@router.get("/roster", response_model=List[RosterRow])
+async def get_roster(
+    db: Session = Depends(get_db),
+    _admin_rut: str = Depends(require_admin),
+):
+    """All firm lawyers with their bonus nivel, to assign/adjust who is in the bono."""
+    lawyers = (
+        db.query(Lawyer)
+        .filter(Lawyer.is_firm_lawyer.is_(True))
+        .order_by(Lawyer.name)
+        .all()
+    )
+    return [
+        RosterRow(lawyer_id=l.id, nombre=l.name, nivel=l.nivel, is_active=bool(l.is_active))
+        for l in lawyers
+    ]
 
 
 @router.put("/nivel/{lawyer_id}", response_model=dict)
