@@ -17,9 +17,11 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, require_admin
 from app.models.bono import BonoVariables
+from app.models.bono_cierre import BonoCierre, CIERRE_ABIERTO, CIERRE_CERRADO
 from app.models.hito import Hito, HITO_APROBADO
 from app.models.lawyer import Lawyer
 from app.services import bono_calc
+from app.services import bono_cierre_service as cierre_svc
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -93,6 +95,10 @@ class LiquidacionResponse(BaseModel):
     periodo: str
     rows: List[BonoRow]
     totales: BonoTotales
+    cerrado: bool = False
+    cerrado_by: Optional[str] = None
+    cerrado_at: Optional[datetime] = None
+    sin_verificar: int = 0  # nivel lawyers without a "Verificado DJ" this period
 
 
 class NivelIn(BaseModel):
@@ -311,7 +317,17 @@ def _liquidacion_data(db: Session, periodo: Optional[str]) -> LiquidacionRespons
         total_bono_gestion=sum(r.total_bono_gestion for r in rows),
         total_bruto=sum(r.total_bruto for r in rows),
     )
-    return LiquidacionResponse(periodo=periodo, rows=rows, totales=totales)
+    cierre = cierre_svc.get_cierre(db, periodo)
+    cerrado = bool(cierre and cierre.estado == CIERRE_CERRADO)
+    return LiquidacionResponse(
+        periodo=periodo,
+        rows=rows,
+        totales=totales,
+        cerrado=cerrado,
+        cerrado_by=cierre.cerrado_by_name if cerrado else None,
+        cerrado_at=cierre.cerrado_at if cerrado else None,
+        sin_verificar=sum(1 for r in rows if not r.verificado_dj),
+    )
 
 
 @router.get("/liquidacion", response_model=LiquidacionResponse)
@@ -358,6 +374,8 @@ async def upsert_variables(
 ):
     """Enter/update the manual bonus inputs for a lawyer/period (Dirección Jurídica)."""
     periodo, _start, _end = _period_bounds(periodo)
+    if cierre_svc.is_cerrado(db, periodo):
+        raise HTTPException(status_code=409, detail="El período está cerrado; reábrelo para editar")
     lawyer = db.query(Lawyer).filter(Lawyer.id == lawyer_id).first()
     if lawyer is None:
         raise HTTPException(status_code=404, detail="Abogado no encontrado")
@@ -443,3 +461,57 @@ async def set_nivel(
     lawyer.nivel = body.nivel
     db.commit()
     return {"lawyer_id": lawyer_id, "nivel": lawyer.nivel}
+
+
+class CierreResponse(BaseModel):
+    periodo: str
+    cerrado: bool
+    cerrado_by: Optional[str] = None
+    cerrado_at: Optional[datetime] = None
+
+
+@router.post("/cierre", response_model=CierreResponse)
+async def cerrar_periodo(
+    periodo: str = Query(..., description="Mes YYYY-MM"),
+    db: Session = Depends(get_db),
+    admin_rut: str = Depends(require_admin),
+):
+    """Close a bonus período — freezes its variables and hitos (payroll can't
+    change after the fact). Idempotent: closing an already-closed period is a
+    no-op. The caller (UI) warns about unverified rows before calling."""
+    periodo, _s, _e = _period_bounds(periodo)
+    admin = db.query(Lawyer).filter(Lawyer.rut == admin_rut).first()
+    cierre = cierre_svc.get_cierre(db, periodo)
+    if cierre is None:
+        cierre = BonoCierre(periodo=periodo)
+        db.add(cierre)
+    cierre.estado = CIERRE_CERRADO
+    cierre.cerrado_by_rut = admin_rut
+    cierre.cerrado_by_name = admin.name if admin else None
+    cierre.cerrado_at = datetime.utcnow()
+    db.commit()
+    db.refresh(cierre)
+    return CierreResponse(
+        periodo=periodo, cerrado=True,
+        cerrado_by=cierre.cerrado_by_name, cerrado_at=cierre.cerrado_at,
+    )
+
+
+@router.post("/reabrir", response_model=CierreResponse)
+async def reabrir_periodo(
+    periodo: str = Query(..., description="Mes YYYY-MM"),
+    db: Session = Depends(get_db),
+    admin_rut: str = Depends(require_admin),
+):
+    """Reopen a closed período (admin), so its variables can be edited again."""
+    periodo, _s, _e = _period_bounds(periodo)
+    cierre = cierre_svc.get_cierre(db, periodo)
+    if cierre is None or cierre.estado != CIERRE_CERRADO:
+        raise HTTPException(status_code=409, detail="El período no está cerrado")
+    admin = db.query(Lawyer).filter(Lawyer.rut == admin_rut).first()
+    cierre.estado = CIERRE_ABIERTO
+    cierre.reabierto_by_rut = admin_rut
+    cierre.reabierto_by_name = admin.name if admin else None
+    cierre.reabierto_at = datetime.utcnow()
+    db.commit()
+    return CierreResponse(periodo=periodo, cerrado=False)

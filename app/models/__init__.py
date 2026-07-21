@@ -25,6 +25,7 @@ from app.models.credential_audit_event import CredentialAuditEvent
 from app.models.hito import Hito, HitoTipo
 from app.models.liberacion import LiberacionRequest
 from app.models.bono import BonoVariables
+from app.models.bono_cierre import BonoCierre
 
 __all__ = [
     "Lawyer",
@@ -53,4 +54,5 @@ __all__ = [
     "HitoTipo",
     "LiberacionRequest",
     "BonoVariables",
+    "BonoCierre",
 ]

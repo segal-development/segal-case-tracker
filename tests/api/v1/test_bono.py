@@ -8,7 +8,7 @@ from datetime import date
 import pytest
 
 from app.core.security import create_access_token
-from app.models.hito import Hito, HitoTipo, HITO_APROBADO
+from app.models.hito import Hito, HitoTipo, HITO_APROBADO, HITO_PENDIENTE
 from app.models.lawyer import Lawyer
 
 ADMIN_RUT = "16021492-9"
@@ -161,6 +161,77 @@ def test_export_liquidacion_xlsx(client, admin, junior):
 def test_export_requires_admin(client, junior):
     r = client.get("/api/v1/bono/liquidacion/export?periodo=2026-07", headers=_h(LAWYER_RUT))
     assert r.status_code == 403
+
+
+def test_cierre_freezes_variables_and_reabrir_unlocks(client, admin, junior):
+    # can edit while open
+    r = client.put(
+        f"/api/v1/bono/variables/{junior.id}?periodo=2026-07",
+        headers=_h(ADMIN_RUT), json={"clientes_m2": 100, "clientes_activos": 90},
+    )
+    assert r.status_code == 200
+
+    # close the period
+    c = client.post("/api/v1/bono/cierre?periodo=2026-07", headers=_h(ADMIN_RUT))
+    assert c.status_code == 200
+    assert c.json()["cerrado"] is True
+
+    # liquidación reports it closed
+    liq = client.get("/api/v1/bono/liquidacion?periodo=2026-07", headers=_h(ADMIN_RUT)).json()
+    assert liq["cerrado"] is True
+    assert liq["cerrado_by"] == "Carla Admin"
+
+    # editing a closed period is blocked
+    blocked = client.put(
+        f"/api/v1/bono/variables/{junior.id}?periodo=2026-07",
+        headers=_h(ADMIN_RUT), json={"clientes_m2": 50, "clientes_activos": 10},
+    )
+    assert blocked.status_code == 409
+
+    # reopen → editable again
+    ro = client.post("/api/v1/bono/reabrir?periodo=2026-07", headers=_h(ADMIN_RUT))
+    assert ro.status_code == 200
+    assert ro.json()["cerrado"] is False
+    again = client.put(
+        f"/api/v1/bono/variables/{junior.id}?periodo=2026-07",
+        headers=_h(ADMIN_RUT), json={"clientes_m2": 50, "clientes_activos": 10},
+    )
+    assert again.status_code == 200
+
+
+def test_closed_period_blocks_hito_approval(client, admin, junior, db):
+    tipo = HitoTipo(code="j_p", label="Presc", nivel="junior", valor_bruto=8_077, orden=1)
+    db.add(tipo)
+    db.commit()
+    db.refresh(tipo)
+    h = Hito(
+        lawyer_id=junior.id, hito_tipo_id=tipo.id, valor_bruto=8_077,
+        fecha_hito=date(2026, 7, 15), estado=HITO_PENDIENTE, evidencia_storage_key="x",
+    )
+    db.add(h)
+    db.commit()
+    db.refresh(h)
+
+    client.post("/api/v1/bono/cierre?periodo=2026-07", headers=_h(ADMIN_RUT))
+    r = client.post(f"/api/v1/hitos/{h.id}/aprobar", headers=_h(ADMIN_RUT))
+    assert r.status_code == 409
+    assert "cerrado" in r.json()["detail"].lower()
+
+
+def test_reabrir_open_period_is_409(client, admin):
+    r = client.post("/api/v1/bono/reabrir?periodo=2026-07", headers=_h(ADMIN_RUT))
+    assert r.status_code == 409
+
+
+def test_cierre_requires_admin(client, junior):
+    r = client.post("/api/v1/bono/cierre?periodo=2026-07", headers=_h(LAWYER_RUT))
+    assert r.status_code == 403
+
+
+def test_sin_verificar_count(client, admin, junior):
+    liq = client.get("/api/v1/bono/liquidacion?periodo=2026-08", headers=_h(ADMIN_RUT)).json()
+    # junior has no row for 2026-08 → not verified → counted
+    assert liq["sin_verificar"] >= 1
 
 
 def test_liquidacion_includes_approved_hitos(client, admin, junior, db):
