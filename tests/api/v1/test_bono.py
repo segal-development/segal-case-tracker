@@ -69,6 +69,17 @@ def test_set_nivel_and_liquidacion_includes_only_nivel_lawyers(client, admin, db
     assert row["fijo"] == 1_363_354
 
 
+def test_roster_lists_firm_lawyers_with_nivel(client, admin, junior, db):
+    extra = Lawyer(rut="33333333-3", name="Aaa Sin Nivel", role="lawyer")  # firm lawyer, no nivel
+    db.add(extra)
+    db.commit()
+    r = client.get("/api/v1/bono/roster", headers=_h(ADMIN_RUT))
+    assert r.status_code == 200
+    body = {row["lawyer_id"]: row for row in r.json()}
+    assert body[junior.id]["nivel"] == "junior"
+    assert body[extra.id]["nivel"] is None  # assignable from the UI
+
+
 def test_set_nivel_rejects_bad_value(client, admin, junior):
     r = client.put(f"/api/v1/bono/nivel/{junior.id}", headers=_h(ADMIN_RUT), json={"nivel": "senior"})
     assert r.status_code == 400
@@ -123,6 +134,33 @@ def test_upsert_rejects_lawyer_without_nivel(client, admin, db):
         json={"clientes_m2": 10, "clientes_activos": 5},
     )
     assert r.status_code == 409
+
+
+def test_export_liquidacion_xlsx(client, admin, junior):
+    client.put(
+        f"/api/v1/bono/variables/{junior.id}?periodo=2026-07",
+        headers=_h(ADMIN_RUT),
+        json={"clientes_m2": 100, "clientes_activos": 90, "renovaciones": 2},
+    )
+    r = client.get("/api/v1/bono/liquidacion/export?periodo=2026-07", headers=_h(ADMIN_RUT))
+    assert r.status_code == 200
+    assert "spreadsheetml" in r.headers["content-type"]
+    assert "liquidacion_2026-07.xlsx" in r.headers["content-disposition"]
+
+    import io
+    from openpyxl import load_workbook
+
+    wb = load_workbook(io.BytesIO(r.content))
+    ws = wb.active
+    flat = [c.value for row in ws.iter_rows() for c in row]
+    assert "Fernanda Arroyo" in flat
+    assert 6462 * 90 in flat  # V1 bruto lands in a cell
+    assert any(str(v).startswith("TOTAL ÁREA") for v in flat if v)
+
+
+def test_export_requires_admin(client, junior):
+    r = client.get("/api/v1/bono/liquidacion/export?periodo=2026-07", headers=_h(LAWYER_RUT))
+    assert r.status_code == 403
 
 
 def test_liquidacion_includes_approved_hitos(client, admin, junior, db):
