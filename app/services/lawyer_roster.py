@@ -674,7 +674,7 @@ def admin_dashboard_stats(db: Session, account_rut: str) -> dict:
     from app.models.document import Document
 
     empty = {
-        "sync": {"last_checked_at": None, "checked_24h": 0, "pending_detail": 0, "stale_30d": 0},
+        "sync": {"last_checked_at": None, "checked_1h": 0, "checked_24h": 0, "movements_1h": 0, "pending_detail": 0, "stale_30d": 0},
         "documents": {"stored": 0, "pending": 0, "failed": 0, "unavailable": 0},
         "quality": {
             "total_cases": 0, "with_semaforo": 0, "with_movements": 0,
@@ -688,6 +688,7 @@ def admin_dashboard_stats(db: Session, account_rut: str) -> dict:
         return empty
 
     now = datetime.utcnow()
+    cutoff_1h = now - timedelta(hours=1)
     cutoff_24h = now - timedelta(hours=24)
     cutoff_30d = now - timedelta(days=30)
 
@@ -703,12 +704,14 @@ def admin_dashboard_stats(db: Session, account_rut: str) -> dict:
     total_cases = len(cases)
 
     last_checked_at: Optional[datetime] = None
-    checked_24h = pending_detail = stale_30d = with_semaforo = 0
+    checked_1h = checked_24h = pending_detail = stale_30d = with_semaforo = 0
     for c in cases:
         lc = c.last_detail_checked_at
         if lc is not None:
             if last_checked_at is None or lc > last_checked_at:
                 last_checked_at = lc
+            if lc >= cutoff_1h:
+                checked_1h += 1
             if lc >= cutoff_24h:
                 checked_24h += 1
             if c.last_movement_at is None or c.last_movement_at < cutoff_30d:
@@ -717,6 +720,12 @@ def admin_dashboard_stats(db: Session, account_rut: str) -> dict:
             pending_detail += 1
         if c.semaforo is not None:
             with_semaforo += 1
+
+    # New movements captured in the last hour — live "the scrape is finding stuff"
+    # signal, useful while a sync run is churning through doc-heavy cases.
+    movements_1h = int(
+        db.query(func.count(Movement.id)).filter(Movement.created_at >= cutoff_1h).scalar() or 0
+    )
 
     doc_counts = {"stored": 0, "pending": 0, "failed": 0, "unavailable": 0}
     with_movements = with_litigantes = 0
@@ -761,7 +770,9 @@ def admin_dashboard_stats(db: Session, account_rut: str) -> dict:
     return {
         "sync": {
             "last_checked_at": last_checked_at.isoformat() if last_checked_at else None,
+            "checked_1h": checked_1h,
             "checked_24h": checked_24h,
+            "movements_1h": movements_1h,
             "pending_detail": pending_detail,
             "stale_30d": stale_30d,
         },
