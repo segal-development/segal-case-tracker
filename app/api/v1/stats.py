@@ -244,7 +244,9 @@ async def get_my_stats(
 
 class AdminSync(BaseModel):
     last_checked_at: str | None
+    checked_1h: int = 0
     checked_24h: int
+    movements_1h: int = 0
     pending_detail: int
     stale_30d: int
 

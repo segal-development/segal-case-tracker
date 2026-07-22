@@ -386,6 +386,19 @@ class TestAdminDashboardStats:
         assert sync["checked_24h"] == 1
         assert sync["last_checked_at"] is not None
 
+    def test_checked_1h_rate(self, db, lawyer, court):
+        from datetime import timedelta
+        recent = _make_case(db, lawyer, court, "C-6100-2025")
+        old = _make_case(db, lawyer, court, "C-6101-2025")
+        _seed_litigantes(db, recent)
+        _seed_litigantes(db, old)
+        recent.last_detail_checked_at = datetime.utcnow()
+        old.last_detail_checked_at = datetime.utcnow() - timedelta(hours=3)
+        db.commit()
+        sync = admin_dashboard_stats(db, ACCOUNT_RUT)["sync"]
+        assert sync["checked_1h"] == 1   # only the one checked within the hour
+        assert sync["checked_24h"] == 2  # both within 24h
+
     def test_with_semaforo_count(self, db, lawyer, court):
         c1 = _make_case(db, lawyer, court, "C-6003-2025", semaforo="rojo")
         c2 = _make_case(db, lawyer, court, "C-6004-2025", semaforo=None)
