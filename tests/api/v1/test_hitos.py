@@ -183,3 +183,19 @@ def test_importar_hitos_requires_admin(client, db, lawyer):
     r = client.post("/api/v1/hitos/importar", headers=_h(LAWYER_RUT),
                     files={"archivo": ("h.xlsx", _hitos_xlsx(), _XLSX_MIME)})
     assert r.status_code == 403
+
+
+def test_abogados_selector_lists_firm_lawyers(client, db, admin, lawyer):
+    r = client.get("/api/v1/hitos/abogados", headers=_h(ADMIN_RUT))
+    assert r.status_code == 200
+    names = {a["nombre"] for a in r.json()}
+    assert "Benjamín Lawyer" in names and "Carla Admin" in names
+
+
+def test_admin_deletes_hito(client, db, admin, lawyer, tipo):
+    hid = _create(client, _h(ADMIN_RUT), tipo.id, lawyer_id=lawyer.id).json()["id"]
+    forbidden = client.delete(f"/api/v1/hitos/{hid}", headers=_h(LAWYER_RUT))
+    assert forbidden.status_code == 403           # non-admin cannot delete
+    ok = client.delete(f"/api/v1/hitos/{hid}", headers=_h(ADMIN_RUT))
+    assert ok.status_code == 204                  # admin can
+    assert client.get("/api/v1/hitos?periodo=2026-07", headers=_h(ADMIN_RUT)).json() == []
