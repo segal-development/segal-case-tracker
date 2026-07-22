@@ -408,6 +408,42 @@ def _match_pleno_tipo(text: str, pleno_tipos) -> Optional[HitoTipo]:
     return best if best_k >= 2 else None
 
 
+class HitoAbogado(BaseModel):
+    lawyer_id: int
+    nombre: str
+
+
+@router.get("/abogados", response_model=List[HitoAbogado])
+async def list_hito_abogados(
+    db: Session = Depends(get_db),
+    _lawyer: dict = Depends(get_current_lawyer),
+):
+    """Firm lawyers for the hito 'abogado' selector (admins register for another)."""
+    lawyers = (
+        db.query(Lawyer)
+        .filter(Lawyer.is_firm_lawyer.is_(True))
+        .order_by(Lawyer.name)
+        .all()
+    )
+    return [HitoAbogado(lawyer_id=l.id, nombre=l.name) for l in lawyers]
+
+
+@router.delete("/{hito_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_hito(
+    hito_id: int,
+    db: Session = Depends(get_db),
+    _admin_rut: str = Depends(require_admin),
+):
+    """Delete a hito (admin only) — e.g. one registered for the wrong lawyer."""
+    hito = db.query(Hito).filter(Hito.id == hito_id).first()
+    if hito is None:
+        raise HTTPException(status_code=404, detail="Hito no encontrado")
+    if cierre_svc.is_cerrado(db, cierre_svc.periodo_de_fecha(hito.fecha_hito)):
+        raise HTTPException(status_code=409, detail="El período de ese hito está cerrado")
+    db.delete(hito)
+    db.commit()
+
+
 @router.post("/importar/hojas", response_model=List[HitoHojaInfo])
 async def listar_hojas_hitos(
     archivo: UploadFile = File(...),
