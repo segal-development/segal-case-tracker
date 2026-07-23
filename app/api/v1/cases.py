@@ -735,7 +735,7 @@ class GenerateDocumentRequest(BaseModel):
     extensible; unsupported values are rejected by FastAPI with a 422.
     """
 
-    document_type: Literal["escrito_oposicion"]
+    document_type: Literal["escrito_oposicion", "abandono_3anios"]
 
 
 @router.post("/{case_id}/documents/generate")
@@ -806,17 +806,36 @@ async def generate_case_document(
             ),
         )
 
-    docx_bytes = build_escrito_oposicion(
-        case=case,
-        litigantes=litigantes,
-        court_name=court_name,
-        acting_lawyer_name=acting_lawyer_name,
-        acting_lawyer_rut=acting_lawyer_rut,
-        firm_side=firm_side,
+    from app.services.document_templates import (
+        TEMPLATE_REGISTRY,
+        is_template_document,
+        render_template_document,
     )
 
     safe_rol = re.sub(r"[^A-Za-z0-9]+", "_", case.rol or "sin_rol").strip("_") or "sin_rol"
-    filename = f"oposicion_excepciones_{safe_rol}.docx"
+
+    if is_template_document(body.document_type):
+        # Template-based: render the firm's own .docx model filling {{ variables }}.
+        docx_bytes = render_template_document(
+            document_type=body.document_type,
+            case=case,
+            litigantes=litigantes,
+            court_name=court_name,
+            acting_lawyer_name=acting_lawyer_name,
+            acting_lawyer_rut=acting_lawyer_rut,
+            acting_lawyer_email=acting_lawyer.email if acting_lawyer else None,
+        )
+        filename = f"{TEMPLATE_REGISTRY[body.document_type].filename_prefix}_{safe_rol}.docx"
+    else:
+        docx_bytes = build_escrito_oposicion(
+            case=case,
+            litigantes=litigantes,
+            court_name=court_name,
+            acting_lawyer_name=acting_lawyer_name,
+            acting_lawyer_rut=acting_lawyer_rut,
+            firm_side=firm_side,
+        )
+        filename = f"oposicion_excepciones_{safe_rol}.docx"
 
     # Persist a provenance record + the rendered bytes (req #3, slice 2).
     # A storage hiccup must NEVER block the download: on failure we record the
