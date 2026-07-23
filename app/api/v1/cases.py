@@ -735,7 +735,12 @@ class GenerateDocumentRequest(BaseModel):
     extensible; unsupported values are rejected by FastAPI with a 422.
     """
 
-    document_type: Literal["escrito_oposicion", "abandono_3anios"]
+    document_type: Literal[
+        "escrito_oposicion",
+        "abandono_3anios",
+        "prescripcion_cuotas",
+        "objeta_remate",
+    ]
 
 
 @router.post("/{case_id}/documents/generate")

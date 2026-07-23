@@ -98,3 +98,92 @@ def test_registry_maps_document_to_its_recommendation():
 )
 def test_derive_sjl(court, expected):
     assert _derive_sjl(court) == expected
+
+
+def _render_type(document_type, case, litigantes, court_name, **lawyer):
+    data = render_template_document(
+        document_type=document_type,
+        case=case,
+        litigantes=litigantes,
+        court_name=court_name,
+        acting_lawyer_name=lawyer.get("name"),
+        acting_lawyer_rut=lawyer.get("rut"),
+        acting_lawyer_email=lawyer.get("email"),
+    )
+    text = "\n".join(p.text for p in Document(io.BytesIO(data)).paragraphs)
+    return data, text
+
+
+# The .docx templates were built from real filings; these litmus values from the
+# source cases must NEVER survive into a rendered document (data-hygiene guard).
+_SOURCE_CASE_LEAKS = [
+    "NELSON", "1,85%", "169.636", "5.572.062", "farroyo", "bhervas",
+    "31-08-2022", "ITAU", "SANDRA", "BENJAMIN", "RICARDO", "15º Juzgado",
+    "C-18599", "C-20862",
+]
+
+
+def test_prescripcion_renders_and_prompts_non_derivable_facts():
+    case = SimpleNamespace(
+        rol="C-777-2026", plaintiff="CAJA DE COMPENSACIÓN",
+        defendant="MARÍA SOTO", last_movement_at=None,
+    )
+    lits = [
+        _lit("DTE.", "CAJA DE COMPENSACIÓN LOS HÉROES", "81111000-0"),
+        _lit("DDO.", "MARÍA SOTO PÉREZ", "17222333-8"),
+    ]
+    data, text = _render_type(
+        "prescripcion_cuotas", case, lits, "11º Juzgado Civil de Santiago",
+        name="ABOGADA TEST", rut="16111222-4", email="abg@segal.cl",
+    )
+    assert len(data) > 5000
+    # Derivable header/parties/patrocinio fill in.
+    assert "C-777-2026" in text
+    assert "S.J.L. Civil de Santiago (11°)" in text
+    assert "MARÍA SOTO PÉREZ" in text
+    assert "17.222.333-8" in text  # ejecutado rut formatted
+    assert "81.111.000-0" in text  # ejecutante rut formatted
+    assert "abg@segal.cl" in text  # notificación email
+    # Pagaré facts (none derivable from PJUD) become visible prompts.
+    assert "«INDICAR MONTO DEMANDADO (CAPITAL)»" in text
+    assert "«INDICAR TASA DE INTERÉS»" in text
+    assert "«INDICAR N° DE CUOTAS»" in text
+    assert "«INDICAR SALDO ADEUDADO»" in text
+    assert "«INDICAR REPRESENTANTE Y DOMICILIO DEL EJECUTANTE»" in text
+    # No raw placeholder and no figure from the source filing.
+    assert re.search(r"\{\{.*?\}\}", text) is None
+    for leak in _SOURCE_CASE_LEAKS:
+        assert leak not in text, f"source-case value leaked: {leak}"
+
+
+def test_objeta_remate_renders_all_derivable():
+    case = SimpleNamespace(
+        rol="C-555-2026", plaintiff="BANCO DE PRUEBA",
+        defendant="PEDRO DÍAZ", last_movement_at=None,
+    )
+    lits = [
+        _lit("DTE.", "BANCO DE PRUEBA S.A.", "97000000-3"),
+        _lit("DDO.", "PEDRO DÍAZ ROJAS", "16111222-4"),
+    ]
+    data, text = _render_type(
+        "objeta_remate", case, lits, "5º Juzgado Civil de Santiago",
+        name="ABOGADO TEST", rut="17222333-8", email="abg@segal.cl",
+    )
+    assert len(data) > 5000
+    assert "C-555-2026" in text
+    assert "S.J.L. Civil de Santiago (5°)" in text
+    assert "BANCO DE PRUEBA S.A." in text  # ejecutante in header + body clause
+    assert "ABOGADO TEST" in text
+    # Header + fixed-clause body: no prompts, no leftover source data.
+    assert re.search(r"\{\{.*?\}\}", text) is None
+    for leak in _SOURCE_CASE_LEAKS:
+        assert leak not in text, f"source-case value leaked: {leak}"
+
+
+def test_new_templates_are_registered():
+    for dt, rec in (
+        ("prescripcion_cuotas", "oponer_excepciones"),
+        ("objeta_remate", "objetar_remate"),
+    ):
+        assert is_template_document(dt) is True
+        assert TEMPLATE_REGISTRY[dt].recommendation_code == rec

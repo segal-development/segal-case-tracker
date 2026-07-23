@@ -126,6 +126,40 @@ def _abandono_context(
     return ctx
 
 
+def _objeta_remate_context(
+    case, litigantes, court_name, lawyer_name, lawyer_rut, lawyer_email
+) -> dict:
+    """Objeta bases de remate (cuaderno de apremio). Header + abogado; el cuerpo
+    (cláusulas objetadas) es texto fijo — nada más que derivar."""
+    return _common_context(case, litigantes, court_name, lawyer_name, lawyer_rut, lawyer_email)
+
+
+def _prescripcion_context(
+    case, litigantes, court_name, lawyer_name, lawyer_rut, lawyer_email
+) -> dict:
+    """Excepción de prescripción de la acción ejecutiva (art. 464 N°17), pagaré
+    en cuotas. Monto/profesión no son derivables → «INDICAR …»."""
+    ctx = _common_context(case, litigantes, court_name, lawyer_name, lawyer_rut, lawyer_email)
+    ejecutante, _ejecutado = resolve_parties(litigantes)
+    ctx["ejecutante_rut"] = (
+        (format_rut(ejecutante.rut) or ejecutante.rut)
+        if ejecutante and ejecutante.rut else _prompt("RUT DEL EJECUTANTE")
+    )
+    ctx["ejecutado_profesion"] = _prompt("PROFESIÓN DEL EJECUTADO")
+    ctx["monto_demanda"] = _prompt("MONTO DEMANDADO (CAPITAL)")
+    # LOS HECHOS narrative: facts of the specific pagaré. None are derivable from
+    # PJUD data — each is a visible prompt so no other debtor's figures leak in.
+    ctx["ejecutante_representacion"] = _prompt("REPRESENTANTE Y DOMICILIO DEL EJECUTANTE")
+    ctx["tasa_interes"] = _prompt("TASA DE INTERÉS")
+    ctx["numero_cuotas"] = _prompt("N° DE CUOTAS")
+    ctx["monto_cuota"] = _prompt("MONTO POR CUOTA")
+    ctx["fecha_primera_cuota"] = _prompt("FECHA 1ª CUOTA")
+    ctx["saldo_adeudado"] = _prompt("SALDO ADEUDADO")
+    ctx["fecha_mora"] = _prompt("FECHA DE MORA")
+    ctx["mes_demanda"] = _prompt("MES/AÑO DE LA DEMANDA")
+    return ctx
+
+
 # ---------------------------------------------------------------------------
 # Registry — document_type → template + which recommendation offers it
 # ---------------------------------------------------------------------------
@@ -147,6 +181,20 @@ TEMPLATE_REGISTRY: dict[str, TemplateSpec] = {
         recommendation_code="solicitar_abandono",
         filename_prefix="abandono_procedimiento",
         build_context=_abandono_context,
+    ),
+    "prescripcion_cuotas": TemplateSpec(
+        document_type="prescripcion_cuotas",
+        template_filename="prescripcion_cuotas.docx",
+        recommendation_code="oponer_excepciones",
+        filename_prefix="excepcion_prescripcion",
+        build_context=_prescripcion_context,
+    ),
+    "objeta_remate": TemplateSpec(
+        document_type="objeta_remate",
+        template_filename="objeta_remate.docx",
+        recommendation_code="objetar_remate",
+        filename_prefix="objeta_bases_remate",
+        build_context=_objeta_remate_context,
     ),
 }
 
