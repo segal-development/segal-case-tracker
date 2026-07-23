@@ -199,3 +199,24 @@ def test_admin_deletes_hito(client, db, admin, lawyer, tipo):
     ok = client.delete(f"/api/v1/hitos/{hid}", headers=_h(ADMIN_RUT))
     assert ok.status_code == 204                  # admin can
     assert client.get("/api/v1/hitos?periodo=2026-07", headers=_h(ADMIN_RUT)).json() == []
+
+
+def test_admin_edits_hito(client, db, admin, lawyer, tipo):
+    hid = _create(client, _h(ADMIN_RUT), tipo.id, lawyer_id=admin.id).json()["id"]
+    r = client.put(f"/api/v1/hitos/{hid}", headers=_h(ADMIN_RUT), json={
+        "hito_tipo_id": tipo.id, "lawyer_id": lawyer.id,
+        "fecha_hito": "2026-07-20", "rol_causa": "12.345.678-5", "descripcion": "editado",
+    })
+    assert r.status_code == 200
+    b = r.json()
+    assert b["lawyer_id"] == lawyer.id       # reassigned
+    assert b["fecha_hito"] == "2026-07-20"
+    assert b["descripcion"] == "editado"
+    assert b["hito_tipo_id"] == tipo.id
+
+
+def test_edit_hito_requires_admin(client, db, admin, lawyer, tipo):
+    hid = _create(client, _h(ADMIN_RUT), tipo.id, lawyer_id=lawyer.id).json()["id"]
+    r = client.put(f"/api/v1/hitos/{hid}", headers=_h(LAWYER_RUT),
+                   json={"hito_tipo_id": tipo.id, "fecha_hito": "2026-07-20"})
+    assert r.status_code == 403
