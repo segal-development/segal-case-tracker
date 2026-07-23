@@ -49,6 +49,7 @@ class HitoResponse(BaseModel):
     id: int
     lawyer_id: int
     lawyer_nombre: Optional[str] = None
+    hito_tipo_id: int
     tipo_label: str
     nivel: str
     valor_bruto: int
@@ -99,6 +100,7 @@ def _to_response(h: Hito) -> HitoResponse:
         id=h.id,
         lawyer_id=h.lawyer_id,
         lawyer_nombre=h.lawyer.name if h.lawyer else None,
+        hito_tipo_id=h.hito_tipo_id,
         tipo_label=h.tipo.label if h.tipo else "",
         nivel=h.tipo.nivel if h.tipo else "",
         valor_bruto=h.valor_bruto,
@@ -442,6 +444,53 @@ async def delete_hito(
         raise HTTPException(status_code=409, detail="El período de ese hito está cerrado")
     db.delete(hito)
     db.commit()
+
+
+class HitoUpdate(BaseModel):
+    hito_tipo_id: int
+    lawyer_id: Optional[int] = None
+    fecha_hito: date
+    rol_causa: Optional[str] = None
+    procedimiento: Optional[str] = None
+    descripcion: Optional[str] = None
+
+
+@router.put("/{hito_id}", response_model=HitoResponse)
+async def update_hito(
+    hito_id: int,
+    body: HitoUpdate,
+    db: Session = Depends(get_db),
+    _admin_rut: str = Depends(require_admin),
+):
+    """Edit a hito (admin only). Re-snapshots the value if the tipo changes.
+    Preserves ETAPA/TRAMITE and evidence; period-close blocks edits both ways."""
+    hito = db.query(Hito).filter(Hito.id == hito_id).first()
+    if hito is None:
+        raise HTTPException(status_code=404, detail="Hito no encontrado")
+    if cierre_svc.is_cerrado(db, cierre_svc.periodo_de_fecha(hito.fecha_hito)):
+        raise HTTPException(status_code=409, detail="El período de ese hito está cerrado")
+    if cierre_svc.is_cerrado(db, cierre_svc.periodo_de_fecha(body.fecha_hito)):
+        raise HTTPException(status_code=409, detail="El período de destino está cerrado")
+
+    tipo = db.query(HitoTipo).filter(HitoTipo.id == body.hito_tipo_id, HitoTipo.activo.is_(True)).first()
+    if tipo is None:
+        raise HTTPException(status_code=404, detail="Tipo de hito no encontrado")
+
+    if body.lawyer_id is not None:
+        abogado = db.query(Lawyer).filter(Lawyer.id == body.lawyer_id).first()
+        if abogado is None or not abogado.is_firm_lawyer:
+            raise HTTPException(status_code=404, detail="Abogado no encontrado en el estudio")
+        hito.lawyer_id = abogado.id
+
+    hito.hito_tipo_id = tipo.id
+    hito.valor_bruto = tipo.valor_bruto  # re-snapshot
+    hito.fecha_hito = body.fecha_hito
+    hito.rol_causa = body.rol_causa
+    hito.procedimiento = body.procedimiento
+    hito.descripcion = body.descripcion
+    db.commit()
+    db.refresh(hito)
+    return _to_response(hito)
 
 
 @router.post("/importar/hojas", response_model=List[HitoHojaInfo])
