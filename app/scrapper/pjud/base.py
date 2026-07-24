@@ -1136,14 +1136,13 @@ class PJUDBaseScraper(ABC):
             while True:
                 logger.info(f"Fetching {self.config.display_name} cases page {current_page}...")
 
+                # Resilient wrapper guarantees a non-``ERROR:`` body or raises
+                # (it retries transient PJUD ``ERROR:`` responses internally).
                 html = await self._fetch_cases_page_resilient(
                     page, rut_num, dv, tipo_causa, year,
                     fecha_desde, fecha_hasta, current_page
                 )
-                
-                if isinstance(html, str) and html.startswith('ERROR:'):
-                    raise ScrapingError(f"AJAX error: {html}")
-                
+
                 # Parse total on first page
                 if total_pages is None:
                     total_count, total_pages = self._parse_pagination_info(html)
@@ -1180,42 +1179,61 @@ class PJUDBaseScraper(ABC):
         fecha_hasta: str,
         current_page: int,
     ) -> str:
-        """Fetch one list page, tolerating a mid-fetch navigation that destroys
-        the JS execution context.
+        """Fetch one list page, tolerating the two TRANSIENT failure modes that
+        would otherwise abort the ENTIRE lawyer's sync over a single page.
 
-        On a very large caseload (e.g. ~2000 causas / 139 pages) the shared page
-        can navigate while a list-page ``$.ajax`` is in flight, which makes the
-        underlying ``page.evaluate`` reject with "Execution context was
-        destroyed". Previously that propagated out of ``get_my_cases`` and
-        aborted the ENTIRE lawyer's sync over a single transient page. Here we
-        re-establish the panel (restoring jQuery + the authenticated context) and
-        retry just that page, so one navigation no longer discards thousands of
-        already-fetched cases. Only after the retries are exhausted do we give up.
+        1. **Execution context destroyed.** On a very large caseload (e.g. ~2000
+           causas / 139 pages) the shared page can navigate while a list-page
+           ``$.ajax`` is in flight, making the underlying ``page.evaluate``
+           reject with "Execution context was destroyed".
+        2. **PJUD ``ERROR:`` body.** PJUD sometimes answers the list AJAX with an
+           ``ERROR:``-prefixed payload (e.g. ``ERROR:0``) — a transient
+           server/session hiccup, not a data problem. Observed 2026-07-23 losing
+           two big-caseload lawyers mid-pagination (page 88/117 and 41/70).
+
+        Both are recovered the same way: invalidate + reload the panel (restoring
+        jQuery + the authenticated context) and re-fetch just that page, up to 3
+        attempts, so one transient failure no longer discards thousands of
+        already-fetched cases. Unrelated exceptions propagate immediately (no
+        wasted retries). Only after the retries are exhausted do we give up.
         """
-        last_exc: Optional[Exception] = None
+        last_error: Optional[str] = None
         for attempt in range(3):
             try:
-                return await self._fetch_cases_page(
+                html = await self._fetch_cases_page(
                     page, rut_num, dv, tipo_causa, year,
                     fecha_desde, fecha_hasta, current_page
                 )
             except Exception as e:
                 if "Execution context was destroyed" not in str(e):
-                    raise
-                last_exc = e
+                    raise  # unrelated error → not retry-able, surface it
+                last_error = str(e)
                 logger.warning(
                     "list page %d: execution context destroyed by navigation "
                     "(attempt %d/3) — reloading panel and retrying",
                     current_page, attempt + 1,
                 )
-                self._panel_loaded = False
-                try:
-                    await self._ensure_panel_loaded(page)
-                except Exception:
-                    pass  # best-effort; the retried fetch surfaces a real failure
+            else:
+                # A good body is done; an ``ERROR:`` body is a transient PJUD
+                # failure → fall through to the shared panel-reload + retry.
+                if not (isinstance(html, str) and html.startswith("ERROR:")):
+                    return html
+                last_error = f"AJAX error: {html}"
+                logger.warning(
+                    "list page %d: PJUD returned %s (attempt %d/3) — "
+                    "reloading panel and retrying",
+                    current_page, html, attempt + 1,
+                )
+
+            # Shared recovery for both transient modes.
+            self._panel_loaded = False
+            try:
+                await self._ensure_panel_loaded(page)
+            except Exception:
+                pass  # best-effort; the retried fetch surfaces a real failure
         raise ScrapingError(
-            f"list page {current_page}: execution context destroyed after 3 retries"
-        ) from last_exc
+            f"list page {current_page}: failed after 3 retries ({last_error})"
+        )
 
     @abstractmethod
     async def _fetch_cases_page(
@@ -1365,14 +1383,13 @@ class PJUDBaseScraper(ABC):
         else:
             page = await self._get_page(session)
         await self._ensure_panel_loaded(page)
-        
-        html = await self._fetch_cases_page(
+
+        # Resilient wrapper: retries a transient PJUD ``ERROR:`` body / destroyed
+        # context on this single count-probe page instead of aborting outright.
+        html = await self._fetch_cases_page_resilient(
             page, rut_num, dv, tipo_causa, year, "", "", 1
         )
-        
-        if isinstance(html, str) and html.startswith('ERROR:'):
-            raise ScrapingError(f"AJAX error: {html}")
-        
+
         return self._parse_pagination_info(html)
     
     async def get_my_cases_recent(
