@@ -57,3 +57,42 @@ async def test_unrelated_error_propagates_without_retry(scraper):
     # A non-navigation error must not be retried (no wasted panel reloads).
     assert scraper._fetch_cases_page.await_count == 1
     scraper._ensure_panel_loaded.assert_not_awaited()
+
+
+# --- PJUD "ERROR:" body: a transient AJAX failure, retried like a destroyed
+#     context (regression guard for 2026-07-23, lawyers 14 & 16 lost at
+#     "AJAX error: ERROR:0" mid-pagination). ---
+
+
+@pytest.mark.asyncio
+async def test_retries_after_ajax_error_body_then_succeeds(scraper):
+    page = MagicMock()
+    # First fetch returns PJUD's transient error payload, second returns real HTML.
+    scraper._fetch_cases_page = AsyncMock(side_effect=["ERROR:0", "<html>page4</html>"])
+    result = await scraper._fetch_cases_page_resilient(page, *ARGS)
+    assert result == "<html>page4</html>"
+    assert scraper._fetch_cases_page.await_count == 2
+    # Panel was invalidated + reloaded before the retry (same recovery path).
+    assert scraper._panel_loaded is False
+    scraper._ensure_panel_loaded.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_raises_scraping_error_when_ajax_error_persists(scraper):
+    page = MagicMock()
+    scraper._fetch_cases_page = AsyncMock(side_effect=["ERROR:0", "ERROR:0", "ERROR:0"])
+    with pytest.raises(ScrapingError):
+        await scraper._fetch_cases_page_resilient(page, *ARGS)
+    assert scraper._fetch_cases_page.await_count == 3  # bounded, never returns the ERROR body
+
+
+@pytest.mark.asyncio
+async def test_good_body_returns_immediately_without_reload(scraper):
+    page = MagicMock()
+    scraper._fetch_cases_page = AsyncMock(return_value="<html>ok</html>")
+    result = await scraper._fetch_cases_page_resilient(page, *ARGS)
+    assert result == "<html>ok</html>"
+    assert scraper._fetch_cases_page.await_count == 1
+    # A healthy first fetch must not touch the panel.
+    scraper._ensure_panel_loaded.assert_not_awaited()
+    assert scraper._panel_loaded is True
