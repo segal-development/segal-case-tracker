@@ -184,6 +184,25 @@ class TestMyStatsEndpoint:
         assert data["actividad_mes"] == 0
         assert data["proyeccion_mes"] == 0
 
+    def test_scoped_to_own_cases_ignores_other_lawyers(self, authed_client, db, lawyer, court):
+        """/stats/me counts ONLY the account's own abogado-of-record cases, not
+        other firm lawyers' cases — guards the scoped (non firm-wide) refactor."""
+        mine = _make_case(db, lawyer, court, "C-9100-2025", semaforo="rojo")
+        _seed_self_litigante(db, mine)
+
+        # Another lawyer's case (account is NOT an abogado on it).
+        other = _make_case(db, lawyer, court, "C-9101-2025", semaforo="rojo")
+        db.add(CaseLitigante(
+            case_id=other.id, participante="AB.DDO", rut="22222222-2",
+            persona_type="NATURAL", nombre="Otro Abogado",
+            natural_key=f"{other.id}-other",
+        ))
+        db.commit()
+
+        data = authed_client.get("/api/v1/stats/me").json()
+        assert data["case_count"] == 1  # only C-9100, not the other lawyer's case
+        assert data["rojo"] == 1
+
     def test_unauthenticated_returns_401(self, client):
         r = client.get("/api/v1/stats/me")
         assert r.status_code == 401
