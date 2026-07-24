@@ -14,6 +14,7 @@ from typing import List, Optional
 from dateutil.relativedelta import relativedelta
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from pydantic import BaseModel, field_validator
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_lawyer, get_db, require_admin
@@ -151,10 +152,15 @@ async def list_abogados(
     db: Session = Depends(get_db),
     _lawyer: dict = Depends(get_current_lawyer),
 ):
-    """The firm's own active lawyers, for the renovación 'abogado' selector."""
+    """Active people selectable for a renovación: the firm's own lawyers PLUS
+    procuradores (role='procurador'). Procuradores are not is_firm_lawyer, so
+    they appear here but stay out of the Hitos/Bono/stats views."""
     lawyers = (
         db.query(Lawyer)
-        .filter(Lawyer.is_firm_lawyer.is_(True), Lawyer.is_active.is_(True))
+        .filter(
+            Lawyer.is_active.is_(True),
+            or_(Lawyer.is_firm_lawyer.is_(True), Lawyer.role == "procurador"),
+        )
         .order_by(Lawyer.name)
         .all()
     )
@@ -175,7 +181,7 @@ async def create_renovacion(
         raise HTTPException(status_code=400, detail="El monto debe ser mayor a 0")
 
     abogado = db.query(Lawyer).filter(Lawyer.id == body.lawyer_id).first()
-    if abogado is None or not abogado.is_firm_lawyer:
+    if abogado is None or not (abogado.is_firm_lawyer or abogado.role == "procurador"):
         raise HTTPException(status_code=404, detail="Abogado no encontrado en el estudio")
 
     desde = body.fecha_desde or date.today()

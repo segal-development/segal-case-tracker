@@ -49,6 +49,34 @@ def test_abogados_selector_only_firm_active(client, admin, abogado, db):
     assert "Sylvia Inactiva" not in names       # inactive
 
 
+def test_abogados_selector_includes_procuradores(client, admin, abogado, db):
+    """Procuradores (role='procurador', not is_firm_lawyer) are selectable for
+    renovaciones even though they stay out of the firm-lawyer views."""
+    proc = Lawyer(rut="20613995-1", name="CAMILA ANDREA CANALES COÑUENAO",
+                  role="procurador", is_firm_lawyer=False, is_active=True)
+    db.add(proc)
+    db.commit()
+    r = client.get("/api/v1/renovaciones/abogados", headers=_h(ADMIN_RUT))
+    assert r.status_code == 200
+    names = {o["nombre"] for o in r.json()}
+    assert "CAMILA ANDREA CANALES COÑUENAO" in names
+    assert "Eduardo Venegas" in names  # firm lawyers still included
+
+
+def test_create_accepts_procurador(client, admin, db):
+    proc = Lawyer(rut="19557032-9", name="CONSTANZA ANDREA CARO CORTEZ",
+                  role="procurador", is_firm_lawyer=False, is_active=True)
+    db.add(proc)
+    db.commit()
+    db.refresh(proc)
+    r = client.post("/api/v1/renovaciones", headers=_h(ADMIN_RUT), json={
+        "numero_contrato": "C-PROC", "cliente_rut": "12345678-5",
+        "cliente_nombre": "Cliente P", "lawyer_id": proc.id, "monto_cuota": 25000,
+    })
+    assert r.status_code == 201
+    assert r.json()["lawyer_nombre"] == "CONSTANZA ANDREA CARO CORTEZ"
+
+
 def test_create_derives_hasta_and_total(client, admin, abogado):
     r = client.post("/api/v1/renovaciones", headers=_h(ADMIN_RUT), json={
         "numero_contrato": "1000012345",
