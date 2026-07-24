@@ -291,6 +291,74 @@ def firm_dashboard_stats(db: Session, account_rut: str) -> dict:
     }
 
 
+def lawyer_dashboard_stats(db: Session, account_rut: str) -> dict:
+    """Per-lawyer numbers for ``/stats/me`` — WITHOUT computing the whole firm.
+
+    ``firm_dashboard_stats`` builds the entire firm's semaforo/materia/procedural
+    breakdown + a per-lawyer table, then the caller throws all of it away except
+    its single row; ``get_my_stats`` then re-ran the firm-wide litigante join a
+    SECOND time (via ``case_ids_for_abogado``) and scanned cases again for
+    actividad. That is three firm-wide passes to return ~10 numbers.
+
+    This computes only THIS lawyer's cases: ONE litigante pass to find their
+    abogado-of-record case ids + display name, then a single query bounded to
+    exactly those cases. Output matches the fields ``MyStatsResponse`` needs.
+    """
+    account_rut_norm = normalize_rut(account_rut)
+
+    # This lawyer's abogado-of-record civil case ids + display name (one pass).
+    case_ids: set[int] = set()
+    nombre = ""
+    for cid, litigantes in _abogado_litigantes_by_case(db).items():
+        for lit in litigantes:
+            if normalize_rut(lit.rut) == account_rut_norm and lit.participante in ALL_ABOGADO:
+                case_ids.add(cid)
+                if not nombre:
+                    nombre = _clean_nombre(lit.nombre)
+                break
+
+    empty = {
+        "rut": account_rut_norm, "nombre": nombre, "case_count": 0,
+        "rojo": 0, "amarillo": 0, "verde": 0, "otros": 0, "stale": 0,
+        "actividad_mes": 0, "proyeccion_mes": 0,
+    }
+    if not case_ids:
+        return empty
+
+    # Only THIS lawyer's civil cases — bounded by id, not a full-table scan.
+    cases = (
+        db.query(Case.id, Case.semaforo, Case.last_movement_at)
+        .filter(Case.competencia == "civil", Case.id.in_(case_ids))
+        .all()
+    )
+    if not cases:
+        return empty
+
+    stale_cutoff = datetime.utcnow() - timedelta(days=30)
+    sem = {"rojo": 0, "amarillo": 0, "verde": 0, "otros": 0}
+    stale = 0
+    for c in cases:
+        bucket = c.semaforo if c.semaforo in ("rojo", "amarillo", "verde") else "otros"
+        sem[bucket] += 1
+        if c.last_movement_at is None or c.last_movement_at < stale_cutoff:
+            stale += 1
+
+    actividad_mes, proyeccion_mes = _actividad_proyeccion_mes(cases)
+
+    return {
+        "rut": account_rut_norm,
+        "nombre": nombre,
+        "case_count": len(cases),
+        "rojo": sem["rojo"],
+        "amarillo": sem["amarillo"],
+        "verde": sem["verde"],
+        "otros": sem["otros"],
+        "stale": stale,
+        "actividad_mes": actividad_mes,
+        "proyeccion_mes": proyeccion_mes,
+    }
+
+
 def firm_dashboard_stats_all(db: Session) -> dict:
     """Firm-wide dashboard stats spanning EVERY study case, across ALL abogados.
 
