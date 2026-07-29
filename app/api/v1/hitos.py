@@ -171,6 +171,23 @@ async def create_hito(
             raise HTTPException(status_code=404, detail="Abogado no encontrado")
         target_lawyer_id = lawyer_id
 
+    # No duplicate: a lawyer may not register two hitos on the SAME causa.
+    # Only enforced when a rol_causa is given — a hito without a causa has
+    # nothing to dedupe against. Checked before storing evidence so a rejected
+    # duplicate never uploads a file.
+    rol_norm = (rol_causa or "").strip() or None
+    if rol_norm is not None:
+        if (
+            db.query(Hito.id)
+            .filter(Hito.lawyer_id == target_lawyer_id, Hito.rol_causa == rol_norm)
+            .first()
+            is not None
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Ya existe un hito de este abogado para esa causa",
+            )
+
     # Evidence is optional. If provided, validate + store it.
     storage_uri = ev_filename = ev_content_type = None
     data = await evidencia.read() if evidencia is not None else b""
@@ -198,7 +215,7 @@ async def create_hito(
         hito_tipo_id=tipo.id,
         valor_bruto=tipo.valor_bruto,  # snapshot
         fecha_hito=fecha_hito,
-        rol_causa=rol_causa,
+        rol_causa=rol_norm,
         procedimiento=procedimiento,
         descripcion=descripcion,
         etapa_sysgal=etapa_sysgal or tipo.etapa_tramite,
@@ -482,10 +499,29 @@ async def update_hito(
             raise HTTPException(status_code=404, detail="Abogado no encontrado en el estudio")
         hito.lawyer_id = abogado.id
 
+    # No duplicate: the resulting (abogado, causa) must not collide with ANOTHER
+    # hito. Only enforced when a rol_causa is given.
+    rol_norm = (body.rol_causa or "").strip() or None
+    if rol_norm is not None:
+        if (
+            db.query(Hito.id)
+            .filter(
+                Hito.id != hito.id,
+                Hito.lawyer_id == hito.lawyer_id,
+                Hito.rol_causa == rol_norm,
+            )
+            .first()
+            is not None
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Ya existe un hito de este abogado para esa causa",
+            )
+
     hito.hito_tipo_id = tipo.id
     hito.valor_bruto = tipo.valor_bruto  # re-snapshot
     hito.fecha_hito = body.fecha_hito
-    hito.rol_causa = body.rol_causa
+    hito.rol_causa = rol_norm
     hito.procedimiento = body.procedimiento
     hito.descripcion = body.descripcion
     db.commit()
@@ -529,9 +565,11 @@ async def importar_hitos(
     tipos = db.query(HitoTipo).all()
     junior_tipo = next((t for t in tipos if t.nivel == "junior"), None)
     pleno_tipos = [t for t in tipos if t.nivel == "pleno"]
+    # Dedup key: (abogado, causa) — strict, matching the create/edit rule. A hito
+    # without a causa (rol_causa NULL) can't collide, so those are excluded here.
     existing = {
-        (h.lawyer_id, h.rol_causa, h.fecha_hito, h.hito_tipo_id)
-        for h in db.query(Hito.lawyer_id, Hito.rol_causa, Hito.fecha_hito, Hito.hito_tipo_id).all()
+        (h.lawyer_id, h.rol_causa)
+        for h in db.query(Hito.lawyer_id, Hito.rol_causa).filter(Hito.rol_causa.isnot(None)).all()
     }
 
     total = creadas = aprobados = pendientes = dup = err = 0
@@ -577,12 +615,14 @@ async def importar_hitos(
             if valor <= 0:
                 valor = tipo.valor_bruto
 
-            rol_causa = (str(rut).strip()[:50] if rut is not None else None)
-            key = (lawyer.id, rol_causa, fecha.date(), tipo.id)
-            if key in existing or key in seen:
-                dup += 1
-                continue
-            seen.add(key)
+            rol_causa = (str(rut).strip()[:50] or None) if rut is not None else None
+            # Strict (abogado, causa) dedup; rol-less rows can't collide → always insert.
+            if rol_causa is not None:
+                key = (lawyer.id, rol_causa)
+                if key in existing or key in seen:
+                    dup += 1
+                    continue
+                seen.add(key)
             estado = HITO_APROBADO if aprobado else HITO_PENDIENTE
             nuevos.append(Hito(
                 lawyer_id=lawyer.id,
