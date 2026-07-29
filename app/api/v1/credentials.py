@@ -9,11 +9,12 @@ field can leak through.
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Depends
-from pydantic import BaseModel, ConfigDict
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_db, require_auditor
+from app.api.deps import get_current_lawyer, get_db, require_auditor, _resolve_lawyer_id
+from app.models.lawyer import Lawyer
 from app.services.credential_audit import credential_status, scan_credential_changes
 
 router = APIRouter()
@@ -64,3 +65,48 @@ def scan_credentials(
 ) -> dict:
     """Manually trigger ciphertext-fingerprint change detection (auditor-only)."""
     return {"recorded": scan_credential_changes(db)}
+
+
+class UpdateMyCredentialRequest(BaseModel):
+    """New PJUD credential submitted by the lawyer for themselves."""
+
+    password: str = Field(min_length=4, max_length=200)
+    # Which PJUD auth slot to update; defaults to the lawyer's current method.
+    auth_method: Optional[str] = None
+
+    @field_validator("auth_method")
+    @classmethod
+    def _valid_method(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in ("clave_unica", "captcha"):
+            raise ValueError("auth_method debe ser 'clave_unica' o 'captcha'")
+        return v
+
+
+@router.put("/me", status_code=200)
+def update_my_credential(
+    body: UpdateMyCredentialRequest,
+    current_lawyer: dict = Depends(get_current_lawyer),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Self-service: the authenticated lawyer updates THEIR OWN PJUD credential.
+
+    The clave is stored Fernet-encrypted (reusing the auth flow's storage) and
+    NOT validated live here — validating means a real PJUD login, which from the
+    server's datacenter IP is Shape-blocked. Instead the next scrape cycle (run
+    from the residential IP) tests it, and the supervisor credential alert
+    re-fires if it is still wrong. Resetting ``credential_alert_sent_at`` lets a
+    future failure notify again. The plaintext is never persisted, logged, or
+    returned.
+    """
+    # Imported here to avoid an import cycle at module load (auth.py is heavy).
+    from app.api.v1.auth import _store_encrypted_credentials
+
+    lawyer = db.get(Lawyer, _resolve_lawyer_id(db, current_lawyer))
+    if lawyer is None:
+        raise HTTPException(status_code=404, detail="Abogado no encontrado")
+
+    method = body.auth_method or lawyer.preferred_auth_method or "clave_unica"
+    _store_encrypted_credentials(db, lawyer, body.password, method)
+    lawyer.credential_alert_sent_at = None  # a future failure alerts again
+    db.commit()
+    return {"ok": True, "auth_method": method}
