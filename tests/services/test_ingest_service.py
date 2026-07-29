@@ -87,6 +87,21 @@ class TestIngestCasesValidPayload:
         cases = db.query(Case).all()
         assert {c.rol for c in cases} == {"C-1234-2026", "C-5678-2026"}
 
+    def test_pre_2021_cases_are_not_ingested(self, db):
+        # Year floor: pre-DETAIL_MIN_YEAR (2021) ROLs are never created.
+        # (Non-standard ROLs are already rejected upstream by the HTML parser, so
+        # the filter's fail-open only ever sees standard C-<n>-<year> ROLs here.)
+        service = IngestService(db)
+        page = _mis_causas_page([
+            _case_row("T1", "C-100-2024", "1 Juzgado Civil de Santiago", "A / B"),
+            _case_row("T2", "C-200-2015", "1 Juzgado Civil de Santiago", "C / D"),
+        ])
+        result = service.ingest_cases(lawyer_rut="11111111-1", competencia="civil", pages=[page])
+        rols = {c.rol for c in db.query(Case).all()}
+        assert "C-100-2024" in rols       # 2021+ → ingested
+        assert "C-200-2015" not in rols   # pre-2021 → skipped
+        assert result["new"] == 1
+
     def test_populates_filed_at_from_fecha_ingreso(self, db):
         service = IngestService(db)
         service.ingest_cases(

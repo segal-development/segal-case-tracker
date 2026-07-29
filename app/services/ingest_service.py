@@ -137,6 +137,20 @@ class IngestService:
             r for (r,) in self.db.query(Case.rol).filter(Case.lawyer_id == owner_id)
         }
         new_cases = [c for c in unique if c.rol.strip().upper() not in existing_rols]
+
+        # Year floor: never INGEST cases whose ROL year is below DETAIL_MIN_YEAR.
+        # The firm only works cases from that year onward; older ones would sit
+        # forever undetailed and skew coverage. Fail-open on non-standard ROLs (a
+        # ROL without a parseable -YYYY suffix is kept), mirroring the detail
+        # rotation's _year_ok.
+        from app.config import settings as _settings
+        _min_year = _settings.DETAIL_MIN_YEAR
+        if _min_year and _min_year > 0:
+            new_cases = [
+                c for c in new_cases
+                if (_rol_year(c.rol) is None) or (_rol_year(c.rol) >= _min_year)
+            ]
+
         result = {"new": 0, "existing": len(unique) - len(new_cases), "errors": []}
 
         if new_cases:
