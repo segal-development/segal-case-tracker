@@ -128,6 +128,37 @@ def test_create_rejects_non_firm_lawyer(client, admin, db):
     assert r.status_code == 404
 
 
+def test_create_rejects_duplicate_client_rut_same_period(client, admin, abogado):
+    base = {"cliente_nombre": "Cliente", "lawyer_id": abogado.id,
+            "monto_cuota": 25000, "fecha_desde": "2026-07-10"}
+    r1 = client.post("/api/v1/renovaciones", headers=_h(ADMIN_RUT), json={
+        **base, "numero_contrato": "C-A", "cliente_rut": "17.098.014-k"})
+    assert r1.status_code == 201
+    # Same client RUT (any format / any contract) in the SAME period → rejected.
+    r2 = client.post("/api/v1/renovaciones", headers=_h(ADMIN_RUT), json={
+        **base, "numero_contrato": "C-B", "cliente_rut": "17098014-K", "fecha_desde": "2026-07-25"})
+    assert r2.status_code == 409
+
+
+def test_create_allows_same_rut_different_period(client, admin, abogado):
+    # A client CAN renew again in a future period (e.g. next year).
+    base = {"cliente_nombre": "Cliente", "lawyer_id": abogado.id,
+            "monto_cuota": 25000, "cliente_rut": "17.098.014-k"}
+    assert client.post("/api/v1/renovaciones", headers=_h(ADMIN_RUT), json={
+        **base, "numero_contrato": "C-2026", "fecha_desde": "2026-07-10"}).status_code == 201
+    assert client.post("/api/v1/renovaciones", headers=_h(ADMIN_RUT), json={
+        **base, "numero_contrato": "C-2027", "fecha_desde": "2027-07-10"}).status_code == 201
+
+
+def test_create_allows_new_client_rut(client, admin, abogado):
+    base = {"cliente_nombre": "Cliente", "lawyer_id": abogado.id,
+            "monto_cuota": 25000, "fecha_desde": "2026-07-10"}
+    assert client.post("/api/v1/renovaciones", headers=_h(ADMIN_RUT), json={
+        **base, "numero_contrato": "C-A", "cliente_rut": "12345678-5"}).status_code == 201
+    assert client.post("/api/v1/renovaciones", headers=_h(ADMIN_RUT), json={
+        **base, "numero_contrato": "C-B", "cliente_rut": "11111111-1"}).status_code == 201
+
+
 def test_create_rejects_bad_amount_and_blank(client, admin, abogado):
     bad_amount = client.post("/api/v1/renovaciones", headers=_h(ADMIN_RUT), json={
         "numero_contrato": "C-3", "cliente_rut": "3-3", "cliente_nombre": "Z",
@@ -142,9 +173,10 @@ def test_create_rejects_bad_amount_and_blank(client, admin, abogado):
 
 
 def test_list_filter_and_resumen(client, admin, abogado):
-    for m in ("2026-07-05", "2026-07-20", "2026-08-01"):
+    # Distinct client RUTs — a client can't repeat within a period.
+    for i, m in enumerate(("2026-07-05", "2026-07-20", "2026-08-01")):
         client.post("/api/v1/renovaciones", headers=_h(ADMIN_RUT), json={
-            "numero_contrato": f"C-{m}", "cliente_rut": "12345678-5",
+            "numero_contrato": f"C-{m}", "cliente_rut": f"1111111{i}-1",
             "cliente_nombre": "Cliente", "lawyer_id": abogado.id,
             "monto_cuota": 25000, "fecha_desde": m,
         })
@@ -282,9 +314,10 @@ def test_importar_requires_admin(client, abogado):
 
 
 def test_recaudacion_by_year(client, admin, abogado):
-    for fecha in ("2026-01-05", "2026-01-20", "2026-02-01"):
+    # Distinct client RUTs — two in January must be different clients.
+    for i, fecha in enumerate(("2026-01-05", "2026-01-20", "2026-02-01")):
         client.post("/api/v1/renovaciones", headers=_h(ADMIN_RUT), json={
-            "numero_contrato": f"R-{fecha}", "cliente_rut": "12345678-5",
+            "numero_contrato": f"R-{fecha}", "cliente_rut": f"2222222{i}-2",
             "cliente_nombre": "Cliente", "lawyer_id": abogado.id,
             "monto_cuota": 25000, "fecha_desde": fecha,
         })
