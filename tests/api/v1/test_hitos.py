@@ -220,3 +220,68 @@ def test_edit_hito_requires_admin(client, db, admin, lawyer, tipo):
     r = client.put(f"/api/v1/hitos/{hid}", headers=_h(LAWYER_RUT),
                    json={"hito_tipo_id": tipo.id, "fecha_hito": "2026-07-20"})
     assert r.status_code == 403
+
+
+# --- No duplicate hito: (abogado, causa) strict ---
+
+
+def test_create_rejects_duplicate_lawyer_causa(client, db, admin, lawyer, tipo):
+    assert _create(client, _h(ADMIN_RUT), tipo.id, lawyer_id=lawyer.id).status_code == 201
+    # Same lawyer + same causa (C-1-2026) → rejected, regardless of tipo/fecha.
+    assert _create(client, _h(ADMIN_RUT), tipo.id, lawyer_id=lawyer.id).status_code == 409
+
+
+def test_create_allows_same_lawyer_different_causa(client, db, admin, lawyer, tipo):
+    assert _create(client, _h(ADMIN_RUT), tipo.id, lawyer_id=lawyer.id).status_code == 201
+    r = client.post("/api/v1/hitos", headers=_h(ADMIN_RUT), data={
+        "hito_tipo_id": tipo.id, "fecha_hito": "2026-07-15",
+        "rol_causa": "C-999-2026", "lawyer_id": lawyer.id,
+    }, files={"evidencia": ("cap.png", b"\x89PNG", "image/png")})
+    assert r.status_code == 201
+
+
+def test_create_allows_multiple_without_causa(client, db, admin, tipo):
+    # Hitos without a causa can't collide → both allowed.
+    base = {"hito_tipo_id": tipo.id, "fecha_hito": "2026-07-15"}
+    assert client.post("/api/v1/hitos", headers=_h(ADMIN_RUT), data=base).status_code == 201
+    assert client.post("/api/v1/hitos", headers=_h(ADMIN_RUT), data=base).status_code == 201
+
+
+def test_edit_into_duplicate_causa_rejected(client, db, admin, lawyer, tipo):
+    _create(client, _h(ADMIN_RUT), tipo.id, lawyer_id=lawyer.id)  # lawyer on C-1-2026
+    other = client.post("/api/v1/hitos", headers=_h(ADMIN_RUT), data={
+        "hito_tipo_id": tipo.id, "fecha_hito": "2026-07-15",
+        "rol_causa": "C-2-2026", "lawyer_id": lawyer.id,
+    }, files={"evidencia": ("cap.png", b"\x89PNG", "image/png")}).json()["id"]
+    # Editing the second onto the first's causa collides.
+    r = client.put(f"/api/v1/hitos/{other}", headers=_h(ADMIN_RUT), json={
+        "hito_tipo_id": tipo.id, "lawyer_id": lawyer.id,
+        "fecha_hito": "2026-07-15", "rol_causa": "C-1-2026",
+    })
+    assert r.status_code == 409
+
+
+def test_importar_dedups_same_lawyer_causa_strict(client, db, admin):
+    """Import cross-checks the strict (abogado, causa) key: same lawyer + same
+    causa on different dates collapses to one row."""
+    import io
+    import openpyxl
+    from datetime import datetime as dt
+    jt = HitoTipo(code="junior_h1", label="X", nivel="junior", valor_bruto=2423, orden=1)
+    lw = Lawyer(rut="19280895-2", name="Gonzalo Javier Calderón Maturana",
+                role="lawyer", is_firm_lawyer=True)
+    db.add_all([jt, lw])
+    db.commit()
+    wb = openpyxl.Workbook()
+    js = wb.active
+    js.title = "HITOS JUNIOR"
+    js.append(["t"]); js.append(["s"]); js.append([])
+    js.append(["#", "Abogado AT", "Fecha", "PROC", "ROL", "Desc", "ETAPA", "TRAM", "Aprob", "Valor"])
+    js.append([1, "Gonzalo Calderón", dt(2026, 7, 2), "R", "18.795.509-2", "a", "M", "E", "NO", 2423])
+    js.append([2, "Gonzalo Calderón", dt(2026, 7, 9), "R", "18.795.509-2", "b", "M", "E", "NO", 2423])
+    buf = io.BytesIO()
+    wb.save(buf)
+    r = client.post("/api/v1/hitos/importar", headers=_h(ADMIN_RUT),
+                    files={"archivo": ("h.xlsx", buf.getvalue(), _XLSX_MIME)}).json()
+    assert r["creadas"] == 1
+    assert r["omitidas_duplicadas"] == 1
