@@ -1,0 +1,446 @@
+"""Daily calendar guide — per-lawyer next-day agenda email.
+
+A daily job builds, for EACH active firm lawyer, their next-day agenda
+(procedural DEADLINES and DecisionEngine REVIEW dates) and emails it to them
+as a guide. The firm's admin ("Carla") is CC'd only when that lawyer's day
+contains an URGENT (fatal) deadline.
+
+This module performs NO new computation over cases — it is a read-only
+fan-out over columns the engine already denormalizes on ``Case``
+(``next_deadline_at``/``next_deadline_fatal``, ``next_review_at``,
+``recommended_action_code``), reusing the same helpers the calendar endpoint
+uses. SMTP transport mirrors ``supervisor_alert_service`` (stdlib smtplib +
+ssl, graceful skip when unconfigured, never raises). This runs in a plain
+sync script, so the blocking SMTP send is called directly — no event loop.
+
+Email copy is neutral Spanish (tuteo). Code identifiers/comments are English.
+"""
+
+import html
+import logging
+import smtplib
+import ssl
+from dataclasses import dataclass, field
+from datetime import date
+from email.message import EmailMessage
+from typing import Optional
+
+from app.config import settings
+from app.api.v1.calendar import _caratulado, _resolve_deadline_label
+from app.core.decision_rules import resolve_rule
+from app.models.case import Case
+from app.models.lawyer import Lawyer
+from app.services.lawyer_roster import case_ids_for_abogado
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Agenda data model
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AgendaItem:
+    """One agenda entry — either a procedural deadline or a review date."""
+
+    rol: Optional[str]
+    caratulado: str
+    court_name: Optional[str] = None
+    label: Optional[str] = None
+    fatal: bool = False
+    recommended_action: Optional[str] = None
+
+
+@dataclass
+class DayAgenda:
+    """A lawyer's deadlines and reviews for a single day."""
+
+    deadlines: list = field(default_factory=list)
+    reviews: list = field(default_factory=list)
+
+    @property
+    def has_urgent(self) -> bool:
+        return any(d.fatal for d in self.deadlines)
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.deadlines and not self.reviews
+
+
+# ---------------------------------------------------------------------------
+# Agenda building
+# ---------------------------------------------------------------------------
+
+
+def lawyer_day_agenda(db, lawyer: Lawyer, day: date) -> DayAgenda:
+    """Build ``lawyer``'s agenda (deadlines + reviews) for ``day``.
+
+    Selects the lawyer's abogado-of-record cases (litigante-derived, via
+    ``case_ids_for_abogado``), then reads the denormalized deadline/review
+    columns already written by the engine. Archived cases are excluded.
+    """
+    ids = case_ids_for_abogado(db, lawyer.rut, lawyer.rut)
+    if not ids:
+        return DayAgenda()
+
+    cases = (
+        db.query(Case)
+        .filter(Case.id.in_(list(ids)), Case.status != "archived")
+        .all()
+    )
+
+    deadlines: list[AgendaItem] = []
+    reviews: list[AgendaItem] = []
+    for case in cases:
+        court_name = case.court.name if case.court else None
+        caratulado = _caratulado(case)
+
+        if case.next_deadline_at == day:
+            deadlines.append(
+                AgendaItem(
+                    rol=case.rol,
+                    caratulado=caratulado,
+                    court_name=court_name,
+                    label=_resolve_deadline_label(db, case),
+                    fatal=bool(case.next_deadline_fatal),
+                )
+            )
+
+        if case.next_review_at == day:
+            rule = resolve_rule(case.recommended_action_code)
+            reviews.append(
+                AgendaItem(
+                    rol=case.rol,
+                    caratulado=caratulado,
+                    court_name=court_name,
+                    recommended_action=rule.action_text if rule else None,
+                )
+            )
+
+    # Deadlines: fatal first, then by rol. Reviews: by rol.
+    deadlines.sort(key=lambda i: (not i.fatal, i.rol or ""))
+    reviews.sort(key=lambda i: (i.rol or ""))
+
+    return DayAgenda(deadlines=deadlines, reviews=reviews)
+
+
+# ---------------------------------------------------------------------------
+# Email rendering
+# ---------------------------------------------------------------------------
+
+_BRAND = "SEGAL DEUDORES — DEFENSA LEGAL"
+
+
+def _deadline_html(item: AgendaItem) -> str:
+    badge = (
+        '<span style="display:inline-block; background-color:#dc2626; color:#ffffff; '
+        'font-size:11px; font-weight:bold; text-transform:uppercase; letter-spacing:0.5px; '
+        'padding:2px 8px; border-radius:4px; margin-left:8px;">URGENTE</span>'
+        if item.fatal
+        else ""
+    )
+    label = html.escape(item.label or "Plazo")
+    rol = html.escape(item.rol or "—")
+    caratulado = html.escape(item.caratulado)
+    court = (
+        f'<div style="color:#6b7280; font-size:13px; margin-top:2px;">{html.escape(item.court_name)}</div>'
+        if item.court_name else ""
+    )
+    return f"""\
+              <tr>
+                <td style="padding:12px 16px; border-bottom:1px solid #f0f1f3;">
+                  <div style="color:#111827; font-size:14px; font-weight:bold;">{label}{badge}</div>
+                  <div style="color:#374151; font-size:13px; margin-top:2px;">{rol} · {caratulado}</div>
+                  {court}
+                </td>
+              </tr>"""
+
+
+def _review_html(item: AgendaItem) -> str:
+    rol = html.escape(item.rol or "—")
+    caratulado = html.escape(item.caratulado)
+    action = (
+        f'<div style="color:#374151; font-size:13px; margin-top:2px;">{html.escape(item.recommended_action)}</div>'
+        if item.recommended_action
+        else ""
+    )
+    return f"""\
+              <tr>
+                <td style="padding:12px 16px; border-bottom:1px solid #f0f1f3;">
+                  <div style="color:#111827; font-size:14px; font-weight:bold;">{rol} · {caratulado}</div>
+                  {action}
+                </td>
+              </tr>"""
+
+
+def _section_html(title: str, rows: str) -> str:
+    return f"""\
+          <tr>
+            <td style="padding:8px 32px 0 32px;">
+              <p style="margin:0 0 8px 0; color:#0b2e4f; font-size:14px; font-weight:bold; text-transform:uppercase; letter-spacing:0.5px;">{title}</p>
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#ffffff; border:1px solid #e5e7eb; border-radius:6px;">
+{rows}
+              </table>
+            </td>
+          </tr>"""
+
+
+def render_daily_agenda_email(
+    lawyer: Lawyer, day: date, agenda: DayAgenda
+) -> tuple[str, str, str]:
+    """Render ``(subject, html_body, text_body)`` for a lawyer's day agenda.
+
+    Pure function — no I/O. Neutral Spanish, tuteo (tú/tienes). Fatal
+    deadlines carry a red "URGENTE" badge; the footer notes that fatal
+    deadlines are also copied to the coordinación.
+    """
+    raw_name = getattr(lawyer, "name", None) or "Abogado(a)"
+    name = html.escape(raw_name)
+    day_str = f"{day:%d-%m-%Y}"
+    subject = f"Tu agenda para el {day_str}"
+
+    # --- HTML sections ---
+    sections_html = ""
+    if agenda.is_empty:
+        sections_html = """\
+          <tr>
+            <td style="padding:8px 32px 0 32px; color:#374151; font-size:14px; line-height:1.6;">
+              <p style="margin:0;">No tienes plazos ni revisiones para mañana. ¡Aprovecha para ponerte al día!</p>
+            </td>
+          </tr>"""
+    else:
+        if agenda.deadlines:
+            rows = "\n".join(_deadline_html(i) for i in agenda.deadlines)
+            sections_html += _section_html("Plazos", rows)
+        if agenda.reviews:
+            rows = "\n".join(_review_html(i) for i in agenda.reviews)
+            sections_html += _section_html("Revisiones", rows)
+
+    html_body = f"""\
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{subject}</title>
+</head>
+<body style="margin:0; padding:0; background-color:#f4f5f7; font-family:Arial, Helvetica, sans-serif;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#f4f5f7; padding:24px 0;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px; width:100%; background-color:#ffffff; border-radius:8px; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,0.08);">
+          <!-- Header band -->
+          <tr>
+            <td style="background-color:#0b2e4f; padding:20px 32px;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+                <tr>
+                  <td width="48" style="vertical-align:middle;">
+                    <table role="presentation" cellpadding="0" cellspacing="0" style="background-color:#ffffff; border-radius:6px; width:40px; height:40px;">
+                      <tr>
+                        <td align="center" valign="middle" style="width:40px; height:40px; color:#0b2e4f; font-size:16px; font-weight:bold; font-family:Arial, Helvetica, sans-serif;">SD</td>
+                      </tr>
+                    </table>
+                  </td>
+                  <td style="vertical-align:middle; padding-left:12px; color:#ffffff; font-size:15px; font-weight:bold; letter-spacing:0.3px;">
+                    {_BRAND}
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- Title -->
+          <tr>
+            <td style="padding:32px 32px 8px 32px;">
+              <p style="margin:0 0 4px 0; color:#0b2e4f; font-size:13px; font-weight:bold; text-transform:uppercase; letter-spacing:0.5px;">Tu agenda del día</p>
+              <h1 style="margin:0; color:#111827; font-size:20px; line-height:1.4;">Hola {name}, esto tienes para el {day_str}</h1>
+            </td>
+          </tr>
+
+{sections_html}
+
+          <!-- Footer -->
+          <tr>
+            <td style="padding:24px 32px 32px 32px;">
+              <hr style="border:none; border-top:1px solid #e5e7eb; margin:16px 0 16px 0;">
+              <p style="margin:0 0 8px 0; color:#6b7280; font-size:12px; line-height:1.5;">
+                Los plazos marcados como <strong style="color:#dc2626;">URGENTE</strong> (fatales) se copian
+                también a la coordinación para su seguimiento.
+              </p>
+              <p style="margin:0; color:#9ca3af; font-size:12px; line-height:1.5;">
+                Este es un correo automático de Segal Deudores — Defensa Legal. No responder
+                directamente a este mensaje.
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+"""
+
+    # --- Plain-text body ---
+    lines = [
+        f"TU AGENDA — {_BRAND}",
+        "",
+        f"Hola {raw_name}, esto tienes para el {day_str}:",
+        "",
+    ]
+    if agenda.is_empty:
+        lines.append("No tienes plazos ni revisiones para mañana.")
+    else:
+        if agenda.deadlines:
+            lines.append("PLAZOS")
+            for i in agenda.deadlines:
+                tag = " [URGENTE]" if i.fatal else ""
+                label = i.label or "Plazo"
+                rol = i.rol or "—"
+                court = f" ({i.court_name})" if i.court_name else ""
+                lines.append(f"  - {label}{tag}: {rol} · {i.caratulado}{court}")
+            lines.append("")
+        if agenda.reviews:
+            lines.append("REVISIONES")
+            for i in agenda.reviews:
+                rol = i.rol or "—"
+                action = f" — {i.recommended_action}" if i.recommended_action else ""
+                lines.append(f"  - {rol} · {i.caratulado}{action}")
+            lines.append("")
+    lines.append(
+        "Los plazos marcados como URGENTE (fatales) se copian también a la "
+        "coordinación para su seguimiento."
+    )
+    text_body = "\n".join(lines) + "\n"
+
+    return subject, html_body, text_body
+
+
+# ---------------------------------------------------------------------------
+# SMTP transport
+# ---------------------------------------------------------------------------
+
+
+def _send_email(
+    to: str,
+    subject: str,
+    html_body: str,
+    text_body: str,
+    cc: Optional[list] = None,
+) -> bool:
+    """Send one email via blocking SMTP. Returns True on success, else False.
+
+    Mirrors ``supervisor_alert_service._send_smtp_sync`` config (SMTP_HOST/
+    PORT/USE_TLS/USER/PASSWORD, From = SMTP_FROM or FROM_EMAIL) but is generic
+    and synchronous — this runs in a sync script, so no event loop / executor.
+    Graceful skip when SMTP is unconfigured; never raises.
+    """
+    if not settings.SMTP_HOST:
+        logger.warning(
+            "SMTP_HOST not configured; skipping daily agenda email to %s", to
+        )
+        return False
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = settings.SMTP_FROM or settings.FROM_EMAIL
+    msg["To"] = to
+    if cc:
+        msg["Cc"] = ", ".join(cc)
+    msg.set_content(text_body)
+    msg.add_alternative(html_body, subtype="html")
+
+    try:
+        context = ssl.create_default_context()
+        with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT, timeout=10) as server:
+            if settings.SMTP_USE_TLS:
+                server.starttls(context=context)
+            if settings.SMTP_USER:
+                server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
+            server.send_message(msg)
+        logger.info("Daily agenda email sent to %s (cc=%s)", to, cc or [])
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to send daily agenda email to %s: %s", to, exc)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
+
+
+def send_daily_calendar_emails(db, target_day: date) -> dict:
+    """Send each active firm lawyer their ``target_day`` agenda.
+
+    Every active firm lawyer with a non-null email gets an email (even when
+    their agenda is empty — it is a guide). Carla (the admin) is CC'd only
+    when the lawyer's day has an urgent (fatal) deadline. Each lawyer is
+    isolated in its own try/except so one failure never stops the rest.
+    """
+    carla = (
+        db.query(Lawyer)
+        .filter(Lawyer.role == "admin", Lawyer.email.isnot(None))
+        .first()
+    )
+    carla_email = carla.email if carla else None
+
+    lawyers = (
+        db.query(Lawyer)
+        .filter(
+            Lawyer.is_firm_lawyer.is_(True),
+            Lawyer.is_active.is_(True),
+        )
+        .all()
+    )
+
+    sent = 0
+    cc_count = 0
+    skipped_no_email = 0
+    errors = 0
+
+    for lawyer in lawyers:
+        try:
+            if not lawyer.email:
+                skipped_no_email += 1
+                logger.info(
+                    "Skipping daily agenda for lawyer %s (%s): no email",
+                    getattr(lawyer, "id", None),
+                    getattr(lawyer, "rut", None),
+                )
+                continue
+
+            agenda = lawyer_day_agenda(db, lawyer, target_day)
+            subject, html_body, text_body = render_daily_agenda_email(
+                lawyer, target_day, agenda
+            )
+
+            cc = (
+                [carla_email]
+                if (agenda.has_urgent and carla_email and carla_email != lawyer.email)
+                else []
+            )
+
+            ok = _send_email(lawyer.email, subject, html_body, text_body, cc=cc)
+            if ok:
+                sent += 1
+                if cc:
+                    cc_count += 1
+            else:
+                errors += 1
+        except Exception as exc:  # noqa: BLE001
+            errors += 1
+            logger.error(
+                "Error building/sending daily agenda for lawyer %s: %s",
+                getattr(lawyer, "id", None),
+                exc,
+            )
+
+    return {
+        "sent": sent,
+        "cc_count": cc_count,
+        "skipped_no_email": skipped_no_email,
+        "errors": errors,
+        "target_day": str(target_day),
+    }
