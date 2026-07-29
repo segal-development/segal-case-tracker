@@ -45,6 +45,19 @@ export REDIS_URL="redis://localhost:6379/0"
 export GOOGLE_APPLICATION_CREDENTIALS="$(pwd)/sa-key.json"
 export ENABLE_SCHEDULER=true
 export PYTHONPATH="$(pwd)"
+# Fast detail backfill: `DOWNLOAD_PDFS=false ./scripts/start-sync-mac.sh` runs the
+# worker WITHOUT downloading PDFs (docs are the per-case bottleneck), so it powers
+# through case detail much faster — while its 4h list-sync keeps live monitoring
+# and deadline alerts running. PDFs get a dedicated pass later. Omit the var to
+# keep .env.qa's default (PDFs on).
+export DOC_DOWNLOAD_ENABLED="${DOWNLOAD_PDFS:-${DOC_DOWNLOAD_ENABLED:-true}}"
+# Backfill tuning (optional): a bigger per-cycle detail batch + shorter interval
+# makes the worker detail a large chunk near-continuously each cycle (amortizing
+# the list-sync), so coverage catches up fast WITHOUT pausing live monitoring.
+# Pass e.g. DETAIL_BATCH=200 SYNC_INTERVAL=1. Separate override names because
+# .env.qa (sourced above) already sets SYNC_INTERVAL_HOURS — these must win over it.
+export DETAIL_BATCH_SIZE="${DETAIL_BATCH:-${DETAIL_BATCH_SIZE:-30}}"
+export SYNC_INTERVAL_HOURS="${SYNC_INTERVAL:-${SYNC_INTERVAL_HOURS:-4}}"
 
 if pgrep -f 'app.workers.sync_scheduler' >/dev/null; then
   echo "  ⚠️  El worker YA está corriendo. Para reiniciarlo: pkill -f app.workers.sync_scheduler && ./scripts/start-sync-mac.sh"
