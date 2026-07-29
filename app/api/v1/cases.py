@@ -7,7 +7,7 @@ from typing import List, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import nullslast, or_, func
+from sqlalchemy import nullslast, or_, func, not_
 
 from app.api.deps import (
     get_db,
@@ -290,6 +290,19 @@ def _scoped_cases_query(
         if account_lawyer:
             allowed_ids = case_ids_for_abogado(db, account_lawyer.rut, abogado_rut)
             query = query.filter(Case.id.in_(list(allowed_ids)))
+
+    # Year floor — the firm only works cases from DETAIL_MIN_YEAR onward (the
+    # scraper never details older ones, and the UI hid them client-side via
+    # rolYearOk). Enforce it server-side so the paginated list/summary/facets all
+    # exclude pre-floor cases consistently. Exclude only ROLs that END in a
+    # 4-digit year below the floor; ROLs without a -YYYY suffix fail open (kept),
+    # mirroring sync_service._year_ok. LIKE-exclusion runs on Postgres + SQLite.
+    from app.config import settings
+    min_year = settings.DETAIL_MIN_YEAR
+    if min_year and min_year > 0:
+        old_years = [Case.rol.like(f"%-{y}") for y in range(2000, min_year)]
+        if old_years:
+            query = query.filter(not_(or_(*old_years)))
 
     return query, lawyer_id, scope
 

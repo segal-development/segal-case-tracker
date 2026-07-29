@@ -292,3 +292,28 @@ def test_summary_requires_auth(client):
 def test_facets_requires_auth(client):
     r = client.get("/api/v1/cases/facets")
     assert r.status_code == 401
+
+
+class TestYearFloor:
+    """Cases with a ROL year below DETAIL_MIN_YEAR (2021) are hidden server-side;
+    ROLs without a -YYYY suffix fail open (kept)."""
+
+    def test_pre_floor_case_excluded_from_list(self, authed_client, db, lawyer, court):
+        recent = _make_case(db, lawyer, court, "C-8001-2024")
+        _make_case(db, lawyer, court, "C-8000-2019")  # pre-2021 → hidden
+        r = authed_client.get("/api/v1/cases")
+        ids = {i["id"] for i in r.json()["items"]}
+        assert recent.id in ids
+        assert all(i["rol"] != "C-8000-2019" for i in r.json()["items"])
+
+    def test_pre_floor_case_excluded_from_summary(self, authed_client, db, lawyer, court):
+        _make_case(db, lawyer, court, "C-8002-2024")
+        _make_case(db, lawyer, court, "C-8003-2018")
+        r = authed_client.get("/api/v1/cases/summary")
+        assert r.json()["total"] == 1  # only the 2024 case
+
+    def test_non_standard_rol_fails_open(self, authed_client, db, lawyer, court):
+        kept = _make_case(db, lawyer, court, "SIN-ANIO")  # no 4-digit year → kept
+        r = authed_client.get("/api/v1/cases")
+        ids = {i["id"] for i in r.json()["items"]}
+        assert kept.id in ids
