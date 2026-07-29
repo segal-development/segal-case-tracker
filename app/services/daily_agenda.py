@@ -29,8 +29,10 @@ from app.config import settings
 from app.api.v1.calendar import _caratulado, _resolve_deadline_label
 from app.core.decision_rules import resolve_rule
 from app.models.case import Case
+from app.models.case_litigante import CaseLitigante
 from app.models.lawyer import Lawyer
 from app.services.lawyer_roster import case_ids_for_abogado
+from app.utils.rut import format_rut
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +52,8 @@ class AgendaItem:
     label: Optional[str] = None
     fatal: bool = False
     recommended_action: Optional[str] = None
+    case_id: Optional[int] = None
+    demandado_rut: Optional[str] = None
 
 
 @dataclass
@@ -73,12 +77,40 @@ class DayAgenda:
 # ---------------------------------------------------------------------------
 
 
+def _demandado_rut_by_case(db, case_ids) -> dict:
+    """Map ``case_id -> formatted RUT of the demandado (ejecutado)``.
+
+    The demandado is the litigante coded ``DDO.`` (first one wins if several
+    co-demandados). One batched query for all agenda cases — no N+1.
+    """
+    if not case_ids:
+        return {}
+    rows = (
+        db.query(CaseLitigante)
+        .filter(
+            CaseLitigante.case_id.in_(list(case_ids)),
+            CaseLitigante.participante == "DDO.",
+        )
+        .order_by(CaseLitigante.id.asc())
+        .all()
+    )
+    out: dict = {}
+    for r in rows:
+        if r.case_id in out:
+            continue  # keep the first DDO. per case
+        rut = (r.rut or "").strip()
+        if rut:
+            out[r.case_id] = format_rut(rut) or rut
+    return out
+
+
 def lawyer_day_agenda(db, lawyer: Lawyer, day: date) -> DayAgenda:
     """Build ``lawyer``'s agenda (deadlines + reviews) for ``day``.
 
     Selects the lawyer's abogado-of-record cases (litigante-derived, via
     ``case_ids_for_abogado``), then reads the denormalized deadline/review
-    columns already written by the engine. Archived cases are excluded.
+    columns already written by the engine. Archived cases are excluded. Each
+    item carries the demandado's RUT (batched, no N+1).
     """
     ids = case_ids_for_abogado(db, lawyer.rut, lawyer.rut)
     if not ids:
@@ -104,6 +136,7 @@ def lawyer_day_agenda(db, lawyer: Lawyer, day: date) -> DayAgenda:
                     court_name=court_name,
                     label=_resolve_deadline_label(db, case),
                     fatal=bool(case.next_deadline_fatal),
+                    case_id=case.id,
                 )
             )
 
@@ -115,8 +148,14 @@ def lawyer_day_agenda(db, lawyer: Lawyer, day: date) -> DayAgenda:
                     caratulado=caratulado,
                     court_name=court_name,
                     recommended_action=rule.action_text if rule else None,
+                    case_id=case.id,
                 )
             )
+
+    # Demandado RUT per case — one batched query over just the agenda cases.
+    rut_by_case = _demandado_rut_by_case(db, {i.case_id for i in deadlines + reviews})
+    for item in deadlines + reviews:
+        item.demandado_rut = rut_by_case.get(item.case_id)
 
     # Deadlines: fatal first, then by rol. Reviews: by rol.
     deadlines.sort(key=lambda i: (not i.fatal, i.rol or ""))
@@ -147,11 +186,16 @@ def _deadline_html(item: AgendaItem) -> str:
         f'<div style="color:#6b7280; font-size:13px; margin-top:2px;">{html.escape(item.court_name)}</div>'
         if item.court_name else ""
     )
+    rut = (
+        f'<div style="color:#6b7280; font-size:13px; margin-top:2px;">RUT demandado: {html.escape(item.demandado_rut)}</div>'
+        if item.demandado_rut else ""
+    )
     return f"""\
               <tr>
                 <td style="padding:12px 16px; border-bottom:1px solid #f0f1f3;">
                   <div style="color:#111827; font-size:14px; font-weight:bold;">{label}{badge}</div>
                   <div style="color:#374151; font-size:13px; margin-top:2px;">{rol} · {caratulado}</div>
+                  {rut}
                   {court}
                 </td>
               </tr>"""
@@ -160,6 +204,10 @@ def _deadline_html(item: AgendaItem) -> str:
 def _review_html(item: AgendaItem) -> str:
     rol = html.escape(item.rol or "—")
     caratulado = html.escape(item.caratulado)
+    rut = (
+        f'<div style="color:#6b7280; font-size:13px; margin-top:2px;">RUT demandado: {html.escape(item.demandado_rut)}</div>'
+        if item.demandado_rut else ""
+    )
     action = (
         f'<div style="color:#374151; font-size:13px; margin-top:2px;">{html.escape(item.recommended_action)}</div>'
         if item.recommended_action
@@ -169,6 +217,7 @@ def _review_html(item: AgendaItem) -> str:
               <tr>
                 <td style="padding:12px 16px; border-bottom:1px solid #f0f1f3;">
                   <div style="color:#111827; font-size:14px; font-weight:bold;">{rol} · {caratulado}</div>
+                  {rut}
                   {action}
                 </td>
               </tr>"""
@@ -299,14 +348,16 @@ def render_daily_agenda_email(
                 label = i.label or "Plazo"
                 rol = i.rol or "—"
                 court = f" ({i.court_name})" if i.court_name else ""
-                lines.append(f"  - {label}{tag}: {rol} · {i.caratulado}{court}")
+                rut = f" · RUT demandado: {i.demandado_rut}" if i.demandado_rut else ""
+                lines.append(f"  - {label}{tag}: {rol} · {i.caratulado}{rut}{court}")
             lines.append("")
         if agenda.reviews:
             lines.append("REVISIONES")
             for i in agenda.reviews:
                 rol = i.rol or "—"
                 action = f" — {i.recommended_action}" if i.recommended_action else ""
-                lines.append(f"  - {rol} · {i.caratulado}{action}")
+                rut = f" · RUT demandado: {i.demandado_rut}" if i.demandado_rut else ""
+                lines.append(f"  - {rol} · {i.caratulado}{rut}{action}")
             lines.append("")
     lines.append(
         "Los plazos marcados como URGENTE (fatales) se copian también a la "

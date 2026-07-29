@@ -111,6 +111,20 @@ def _seed_abogado(db, case, lawyer):
     db.commit()
 
 
+def _seed_demandado(db, case, rut, nombre="DEUDOR DDO"):
+    """Seed the demandado (DDO.) party on ``case`` with ``rut``."""
+    lit = CaseLitigante(
+        case_id=case.id,
+        participante="DDO.",
+        rut=rut,
+        persona_type="NATURAL",
+        nombre=nombre,
+        natural_key=f"{case.id}-ddo-{rut}",
+    )
+    db.add(lit)
+    db.commit()
+
+
 # ---------------------------------------------------------------------------
 # lawyer_day_agenda
 # ---------------------------------------------------------------------------
@@ -187,6 +201,30 @@ class TestLawyerDayAgenda:
 
         agenda = lawyer_day_agenda(db, lawyer, TARGET_DAY)
         assert agenda.has_urgent is False
+
+    def test_demandado_rut_populated_and_rendered(self, db, court, lawyer):
+        from app.services.daily_agenda import render_daily_agenda_email
+
+        c = _make_case(db, court, "C-8-2026", owner=lawyer, next_deadline_at=TARGET_DAY)
+        _seed_abogado(db, c, lawyer)
+        _seed_demandado(db, c, "17222333-8")
+
+        agenda = lawyer_day_agenda(db, lawyer, TARGET_DAY)
+        assert len(agenda.deadlines) == 1
+        # format_rut formats with thousands separators.
+        assert agenda.deadlines[0].demandado_rut == "17.222.333-8"
+
+        # The RUT reaches both the HTML and the plain-text email.
+        _, html_body, text_body = render_daily_agenda_email(lawyer, TARGET_DAY, agenda)
+        assert "17.222.333-8" in html_body
+        assert "RUT demandado: 17.222.333-8" in text_body
+
+    def test_demandado_rut_none_when_no_ddo(self, db, court, lawyer):
+        c = _make_case(db, court, "C-9-2026", owner=lawyer, next_deadline_at=TARGET_DAY)
+        _seed_abogado(db, c, lawyer)  # only the abogado, no DDO. party
+
+        agenda = lawyer_day_agenda(db, lawyer, TARGET_DAY)
+        assert agenda.deadlines[0].demandado_rut is None
 
 
 # ---------------------------------------------------------------------------
