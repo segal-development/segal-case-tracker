@@ -6,8 +6,8 @@ import re
 from typing import List, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from fastapi.responses import StreamingResponse
-from sqlalchemy.orm import Session
-from sqlalchemy import nullslast
+from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import nullslast, or_, func
 
 from app.api.deps import (
     get_db,
@@ -106,6 +106,24 @@ class CaseListResponse(BaseModel):
     per_page: int
     pages: int
     last_sync: Optional[datetime] = None
+
+
+class CaseSummaryResponse(BaseModel):
+    """Category totals over the scoped case set (quick-filter badges)."""
+    total: int
+    rojo: int
+    amarillo: int
+    verde: int
+    sin_seguimiento: int
+    abandono: int
+    apremio: int
+    prescripcion: int
+
+
+class CaseFacetsResponse(BaseModel):
+    """Distinct filter values present in the scoped case set."""
+    tribunals: List[str]
+    materias: List[str]
 
 
 class LitiganteResponse(BaseModel):
@@ -237,6 +255,45 @@ class CaseDetailResponse(BaseModel):
 # ENDPOINTS
 # ============================================================================
 
+
+def _scoped_cases_query(
+    db: Session,
+    current_lawyer: dict,
+    competencia: Optional[str] = None,
+    status_filter: Optional[str] = None,
+    abogado_rut: Optional[str] = None,
+):
+    """Build the scoped Case query shared by list/summary/facets.
+
+    Applies the SAME visibility scope (resolve_case_scope + apply_case_scope)
+    and the same competencia/status/abogado_rut handling as ``list_cases``.
+    Returns ``(query, lawyer_id, scope)`` so callers that need the lawyer id or
+    scope (e.g. last_sync in list_cases) don't re-resolve them.
+    """
+    lawyer_id = _resolve_lawyer_id(db, current_lawyer)
+    if not lawyer_id:
+        raise HTTPException(status_code=401, detail="Invalid token: no lawyer_id")
+
+    scope = resolve_case_scope(db, current_lawyer)
+
+    query = db.query(Case)
+    query = apply_case_scope(query, scope)
+
+    if competencia:
+        query = query.filter(Case.competencia == competencia)
+    if status_filter:
+        query = query.filter(Case.status == status_filter)
+
+    if abogado_rut:
+        from app.services.lawyer_roster import case_ids_for_abogado
+        account_lawyer = db.get(Lawyer, lawyer_id)
+        if account_lawyer:
+            allowed_ids = case_ids_for_abogado(db, account_lawyer.rut, abogado_rut)
+            query = query.filter(Case.id.in_(list(allowed_ids)))
+
+    return query, lawyer_id, scope
+
+
 @router.get("", response_model=CaseListResponse)
 async def list_cases(
     page: int = Query(1, ge=1),
@@ -244,6 +301,16 @@ async def list_cases(
     competencia: Optional[str] = Query(None, description="Filter by competencia: civil, laboral, penal"),
     status_filter: Optional[str] = Query(None, alias="status", description="Filter by status: active, closed"),
     abogado_rut: Optional[str] = Query(None, description="Filter to cases where this RUT is a firm-side abogado"),
+    q: Optional[str] = Query(None, description="Case-insensitive search over rol/plaintiff/defendant"),
+    sem: Optional[str] = Query(
+        None,
+        description=(
+            "Semáforo/category quick-filter: rojo|amarillo|verde|sin-seguimiento|"
+            "abandono|apremio|prescripcion. 'todas'/unknown are ignored."
+        ),
+    ),
+    tribunal: Optional[str] = Query(None, description="Filter by court (tribunal) name"),
+    materia: Optional[str] = Query(None, description="Filter by procedure (materia)"),
     sort_by: Optional[Literal["criticidad", "updated_at"]] = Query(
         None,
         description=(
@@ -259,29 +326,56 @@ async def list_cases(
 
     Returns cases from database (fast). Use /sync to refresh from PJUD.
     """
-    lawyer_id = _resolve_lawyer_id(db, current_lawyer)
-    if not lawyer_id:
-        raise HTTPException(status_code=401, detail="Invalid token: no lawyer_id")
+    # Scoped base query (shared with /summary and /facets). Applies visibility
+    # scope + the existing competencia/status/abogado_rut handling, and returns
+    # the resolved lawyer_id/scope for the last_sync lookup below.
+    query, lawyer_id, scope = _scoped_cases_query(
+        db,
+        current_lawyer,
+        competencia=competencia,
+        status_filter=status_filter,
+        abogado_rut=abogado_rut,
+    )
 
-    # Auditor scope: spans every study case (no single-lawyer filter). Every
-    # other role stays scoped to its own cases via lawyer_id, same as before.
-    scope = resolve_case_scope(db, current_lawyer)
+    # N+1 kill: eager-load the court so building CourtInfo per row is free.
+    query = query.options(joinedload(Case.court))
 
-    # Build query
-    query = db.query(Case)
-    query = apply_case_scope(query, scope)
+    # Free-text search over rol / plaintiff / defendant (case-insensitive).
+    if q and q.strip():
+        term = f"%{q.strip()}%"
+        query = query.filter(
+            or_(
+                Case.rol.ilike(term),
+                Case.plaintiff.ilike(term),
+                Case.defendant.ilike(term),
+            )
+        )
 
-    if competencia:
-        query = query.filter(Case.competencia == competencia)
-    if status_filter:
-        query = query.filter(Case.status == status_filter)
+    # Semáforo / category quick-filter.
+    if sem == "rojo":
+        query = query.filter(Case.semaforo == "rojo")
+    elif sem == "amarillo":
+        query = query.filter(Case.semaforo == "amarillo")
+    elif sem == "verde":
+        query = query.filter(Case.semaforo == "verde")
+    elif sem == "sin-seguimiento":
+        query = query.filter(Case.semaforo.is_(None))
+    elif sem == "abandono":
+        query = query.filter(Case.abandono_disponible.is_(True))
+    elif sem == "apremio":
+        query = query.filter(Case.en_apremio.is_(True))
+    elif sem == "prescripcion":
+        query = query.filter(Case.prescripcion_cumplida.is_(True))
+    # "todas"/None/unknown -> no filter
 
-    if abogado_rut:
-        from app.services.lawyer_roster import case_ids_for_abogado
-        account_lawyer = db.get(Lawyer, lawyer_id)
-        if account_lawyer:
-            allowed_ids = case_ids_for_abogado(db, account_lawyer.rut, abogado_rut)
-            query = query.filter(Case.id.in_(list(allowed_ids)))
+    # Tribunal filter via court_id subquery (keeps the count exact — no join dupes).
+    if tribunal:
+        court_ids = db.query(Court.id).filter(Court.name == tribunal)
+        query = query.filter(Case.court_id.in_(court_ids))
+
+    # Materia (procedure) filter.
+    if materia:
+        query = query.filter(Case.procedure == materia)
 
     # Get total count
     total = query.count()
@@ -349,8 +443,9 @@ async def list_cases(
             abandono_disponible=case.abandono_disponible or False,
             next_deadline_fatal=case.next_deadline_fatal or False,
             en_apremio=case.en_apremio or False,
+            prescripcion_cumplida=case.prescripcion_cumplida or False,
         ))
-    
+
     return CaseListResponse(
         items=items,
         total=total,
@@ -359,6 +454,85 @@ async def list_cases(
         pages=pages,
         last_sync=last_sync,
     )
+
+
+@router.get("/summary", response_model=CaseSummaryResponse)
+async def cases_summary(
+    competencia: Optional[str] = Query(None, description="Filter by competencia: civil, laboral, penal"),
+    status_filter: Optional[str] = Query(None, alias="status", description="Filter by status: active, closed"),
+    abogado_rut: Optional[str] = Query(None, description="Filter to cases where this RUT is a firm-side abogado"),
+    current_lawyer: dict = Depends(get_current_lawyer),
+    db: Session = Depends(get_db),
+):
+    """Category totals over the scoped set (respecting competencia/status/
+    abogado_rut, but NOT the quick-filters — these are the quick-filter totals).
+
+    Computed with SQL aggregates, never loading rows.
+    """
+    base, _lawyer_id, _scope = _scoped_cases_query(
+        db,
+        current_lawyer,
+        competencia=competencia,
+        status_filter=status_filter,
+        abogado_rut=abogado_rut,
+    )
+
+    # Semáforo buckets in one grouped pass.
+    sem_counts = dict(
+        base.with_entities(Case.semaforo, func.count(Case.id))
+        .group_by(Case.semaforo)
+        .all()
+    )
+
+    total = sum(sem_counts.values())
+    abandono = base.filter(Case.abandono_disponible.is_(True)).count()
+    apremio = base.filter(Case.en_apremio.is_(True)).count()
+    prescripcion = base.filter(Case.prescripcion_cumplida.is_(True)).count()
+
+    return CaseSummaryResponse(
+        total=total,
+        rojo=sem_counts.get("rojo", 0),
+        amarillo=sem_counts.get("amarillo", 0),
+        verde=sem_counts.get("verde", 0),
+        sin_seguimiento=sem_counts.get(None, 0),
+        abandono=abandono,
+        apremio=apremio,
+        prescripcion=prescripcion,
+    )
+
+
+@router.get("/facets", response_model=CaseFacetsResponse)
+async def cases_facets(
+    competencia: Optional[str] = Query(None, description="Filter by competencia: civil, laboral, penal"),
+    status_filter: Optional[str] = Query(None, alias="status", description="Filter by status: active, closed"),
+    abogado_rut: Optional[str] = Query(None, description="Filter to cases where this RUT is a firm-side abogado"),
+    current_lawyer: dict = Depends(get_current_lawyer),
+    db: Session = Depends(get_db),
+):
+    """Distinct tribunal (court) names and materias (procedures) present in the
+    scoped set, sorted alphabetically, excluding null/empty. Respects
+    competencia/status/abogado_rut, not the quick-filters.
+    """
+    base, _lawyer_id, _scope = _scoped_cases_query(
+        db,
+        current_lawyer,
+        competencia=competencia,
+        status_filter=status_filter,
+        abogado_rut=abogado_rut,
+    )
+
+    tribunal_rows = (
+        base.join(Court, Case.court_id == Court.id)
+        .with_entities(Court.name)
+        .distinct()
+        .all()
+    )
+    materia_rows = base.with_entities(Case.procedure).distinct().all()
+
+    tribunals = sorted({name for (name,) in tribunal_rows if name and name.strip()})
+    materias = sorted({proc for (proc,) in materia_rows if proc and proc.strip()})
+
+    return CaseFacetsResponse(tribunals=tribunals, materias=materias)
 
 
 @router.get("/{case_id}", response_model=CaseDetailResponse)
