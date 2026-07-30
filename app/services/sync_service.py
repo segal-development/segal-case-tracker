@@ -161,6 +161,29 @@ class NotifyBudget:
 # ============================================================================
 
 # ---------------------------------------------------------------------------
+# rol_year_ok: year floor for INGESTION (never create a Case older than
+# DETAIL_MIN_YEAR). Mirrors the detail-rotation _year_ok used in
+# _select_cases_for_detail_rotation, but applied at write time so the worker's
+# SyncService.sync_cases path stops creating pre-2021 rows — the extension path
+# (ingest_service) already filters; this closes the same gap for the worker.
+# Fail-open: a ROL whose suffix isn't a real 4-digit year is kept, never
+# silently dropped.
+# ---------------------------------------------------------------------------
+
+def rol_year_ok(rol: str) -> bool:
+    min_year = settings.DETAIL_MIN_YEAR
+    if not min_year or min_year <= 0:
+        return True
+    try:
+        last = rol.rsplit("-", 1)[-1]
+    except (AttributeError, IndexError):
+        return True
+    if len(last) != 4 or not last.isdigit():
+        return True
+    return int(last) >= min_year
+
+
+# ---------------------------------------------------------------------------
 # normalize_cell: single normalisation point used by ALL natural_key helpers
 # ---------------------------------------------------------------------------
 
@@ -680,6 +703,15 @@ class SyncService:
                     chunk_updated = 0
                     chunk_errors: List[str] = []
                     for scraped in chunk:
+                        # Year floor: never CREATE a case older than DETAIL_MIN_YEAR
+                        # (the firm only works 2021+). Existing rows still update
+                        # (harmless); only brand-new pre-2021 ROLs are skipped so the
+                        # worker stops re-ingesting the very cases the cleanup removed.
+                        if (
+                            scraped.rol.strip().upper() not in existing_by_rol
+                            and not rol_year_ok(scraped.rol)
+                        ):
+                            continue
                         try:
                             case, is_new = self._upsert_case(
                                 lawyer_id, scraped, competencia, existing_by_rol
