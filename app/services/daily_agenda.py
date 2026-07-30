@@ -361,7 +361,7 @@ def render_daily_agenda_email(
         sections_html = """\
           <tr>
             <td style="padding:8px 32px 0 32px; color:#374151; font-size:14px; line-height:1.6;">
-              <p style="margin:0;">No tienes plazos ni revisiones para mañana. ¡Aprovecha para ponerte al día!</p>
+              <p style="margin:0;">No tienes plazos ni revisiones para hoy. ¡Aprovecha para ponerte al día!</p>
             </td>
           </tr>"""
 
@@ -446,7 +446,7 @@ def render_daily_agenda_email(
             lines.append(f"  - {n.title}{tag}: {rol} · {n.caratulado}{msg}")
         lines.append("")
     if agenda.is_empty and not novedades:
-        lines.append("No tienes plazos ni revisiones para mañana.")
+        lines.append("No tienes plazos ni revisiones para hoy.")
     else:
         if agenda.deadlines:
             lines.append("PLAZOS")
