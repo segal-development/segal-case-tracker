@@ -10,7 +10,7 @@ import logging
 from datetime import date, datetime
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -27,6 +27,41 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _NIVELES = {bono_calc.JUNIOR, bono_calc.PLENO}
+
+# --- Activación AT import: name matching ----------------------------------- #
+# The "Activación AT" .xlsx identifies lawyers by an external `codabo` + name,
+# but our Lawyer model only has rut/name, so we match by name. Names in the
+# report are reordered and unaccented vs the DB (e.g. "MELISSA BUSTOS ACEVEDO"
+# vs "Melissa Denisse Acevedo Bustos"), so we compare normalized token SETS.
+
+import re as _re
+import unicodedata as _ud
+
+
+def _norm_tokens(name: object) -> set:
+    """Uppercase, accent-stripped token set of a name (drops 1-char tokens)."""
+    s = _ud.normalize("NFKD", str(name or "")).encode("ascii", "ignore").decode().upper()
+    return {t for t in _re.split(r"\s+", s) if len(t) > 1}
+
+
+def _match_lawyer(nombre: object, candidates: list):
+    """Best UNAMBIGUOUS lawyer match by shared-token count.
+
+    ``candidates`` is a list of ``(lawyer, token_set)``. Requires >=2 shared
+    tokens and no tie at the top score — otherwise returns ``None`` (reported
+    as unmatched) so a fuzzy/ambiguous name is never silently mis-assigned.
+    """
+    ft = _norm_tokens(nombre)
+    if not ft:
+        return None
+    scored = sorted(
+        ((len(ft & toks), lw) for lw, toks in candidates), key=lambda x: x[0], reverse=True
+    )
+    if not scored or scored[0][0] < 2:
+        return None
+    if len(scored) > 1 and scored[1][0] == scored[0][0]:
+        return None  # ambiguous: two lawyers tie on the top score
+    return scored[0][1]
 
 
 # --------------------------------------------------------------------------- #
@@ -425,6 +460,116 @@ async def upsert_variables(
     _p, start, end = _period_bounds(periodo)
     hitos = _hitos_aprobados_map(db, start, end).get(lawyer_id, 0)
     return _build_row(lawyer, var, hitos)
+
+
+class ImportedRow(BaseModel):
+    lawyer_id: int
+    nombre: str
+    clientes_m2: int
+    clientes_activos: int
+    v1_bruto: int
+
+
+class ImportActivacionResult(BaseModel):
+    updated: List[ImportedRow]        # lawyers whose V1 inputs were set
+    skipped_no_nivel: List[str]       # matched, but no junior/pleno nivel → not in bono
+    unmatched: List[str]              # file names with no confident lawyer match
+    total_v1: int
+
+
+@router.post("/variables/import-activacion", response_model=ImportActivacionResult)
+async def import_activacion(
+    periodo: str = Query(..., description="Mes YYYY-MM"),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    admin_rut: str = Depends(require_admin),
+):
+    """Bulk-load V1 inputs from a PJUD 'Activación AT' .xlsx.
+
+    Sets ``clientes_m2`` (col ``totcontgral``) and ``clientes_activos`` (col
+    ``tothiscartera``) per lawyer, matched by name. ONLY nivel-set lawyers are
+    updated (matched Seniors without nivel are reported as skipped); every other
+    bonus input on the row is preserved. Blocked when the period is closed.
+    """
+    periodo, start, end = _period_bounds(periodo)
+    if cierre_svc.is_cerrado(db, periodo):
+        raise HTTPException(status_code=409, detail="El período está cerrado; reábrelo para editar")
+
+    import openpyxl
+
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(await file.read()), read_only=True, data_only=True)
+        ws = wb[wb.sheetnames[0]]
+        rows = list(ws.iter_rows(values_only=True))
+    except Exception:
+        raise HTTPException(status_code=400, detail="No se pudo leer el archivo (¿es un .xlsx?)")
+    if not rows:
+        raise HTTPException(status_code=400, detail="El archivo está vacío")
+
+    header = [str(c).strip().lower() if c is not None else "" for c in rows[0]]
+    try:
+        i_nom = header.index("nomabo")
+        i_f = header.index("totcontgral")
+        i_i = header.index("tothiscartera")
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="El archivo no parece un 'Activación AT' (faltan columnas nomabo/totcontgral/tothiscartera)",
+        )
+
+    firm = db.query(Lawyer).filter(Lawyer.is_firm_lawyer.is_(True)).all()
+    candidates = [(lw, _norm_tokens(lw.name)) for lw in firm]
+    admin = db.query(Lawyer).filter(Lawyer.rut == admin_rut).first()
+
+    updated: List[ImportedRow] = []
+    skipped: List[str] = []
+    unmatched: List[str] = []
+    for r in rows[1:]:
+        nombre = r[i_nom] if i_nom < len(r) else None
+        if not nombre:
+            continue
+        f_val = int(r[i_f] or 0) if i_f < len(r) else 0
+        i_val = int(r[i_i] or 0) if i_i < len(r) else 0
+        lw = _match_lawyer(nombre, candidates)
+        if lw is None:
+            unmatched.append(str(nombre))
+            continue
+        if lw.nivel not in _NIVELES:
+            skipped.append(str(nombre))
+            continue
+
+        var = (
+            db.query(BonoVariables)
+            .filter(BonoVariables.lawyer_id == lw.id, BonoVariables.periodo == periodo)
+            .first()
+        )
+        if var is None:
+            var = BonoVariables(
+                lawyer_id=lw.id, periodo=periodo, nivel=lw.nivel, created_by_rut=admin_rut
+            )
+            db.add(var)
+        var.nivel = lw.nivel
+        # Only the two V1 inputs are touched — every other input is preserved.
+        var.clientes_m2 = f_val
+        var.clientes_activos = i_val
+        var.updated_by_rut = admin_rut
+        var.updated_by_name = admin.name if admin else None
+
+        v1 = bono_calc.compute(lw.nivel, clientes_m2=f_val, clientes_activos=i_val)["v1_bruto"]
+        updated.append(
+            ImportedRow(
+                lawyer_id=lw.id, nombre=lw.name,
+                clientes_m2=f_val, clientes_activos=i_val, v1_bruto=v1,
+            )
+        )
+
+    db.commit()
+    return ImportActivacionResult(
+        updated=updated,
+        skipped_no_nivel=skipped,
+        unmatched=unmatched,
+        total_v1=sum(u.v1_bruto for u in updated),
+    )
 
 
 @router.get("/roster", response_model=List[RosterRow])
