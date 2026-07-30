@@ -21,13 +21,14 @@ import logging
 import smtplib
 import ssl
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timedelta
 from email.message import EmailMessage
 from typing import Optional
 
 from app.config import settings
 from app.api.v1.calendar import _caratulado, _resolve_deadline_label
 from app.core.decision_rules import resolve_rule
+from app.models.alert import Alert
 from app.models.case import Case
 from app.models.case_litigante import CaseLitigante
 from app.models.lawyer import Lawyer
@@ -165,6 +166,67 @@ def lawyer_day_agenda(db, lawyer: Lawyer, day: date) -> DayAgenda:
 
 
 # ---------------------------------------------------------------------------
+# Novedades ("Requiere atención") — actionable alerts from the last N days
+# ---------------------------------------------------------------------------
+
+# Days of alert history to include in the digest ("últimos 5 días para atrás").
+NOVEDADES_DIAS = 5
+
+
+@dataclass
+class Novedad:
+    """One actionable alert to surface in the daily digest."""
+
+    title: str
+    message: Optional[str]
+    rol: Optional[str]
+    caratulado: str
+    fatal: bool = False
+    court_name: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+
+def lawyer_novedades(db, lawyer: Lawyer, since: datetime) -> list:
+    """Actionable alerts for ``lawyer`` created since ``since`` (most recent first).
+
+    Mirrors the "Requiere atención" feed of the Novedades screen: alerts whose
+    ``type`` is in ``ACTIONABLE_ALERT_TYPES`` (causa a ROJO, plazo fatal, plazo
+    agregado, cambio de estado…), scoped per-recipient (``Alert.lawyer_id``),
+    joined to the case for rol/caratulado/tribunal. Archived cases excluded.
+    """
+    # Local import: keeps the single source of truth in the alerts API without
+    # a module-level coupling from this service.
+    from app.api.v1.alerts import ACTIONABLE_ALERT_TYPES
+
+    rows = (
+        db.query(Alert, Case)
+        .join(Case, Alert.case_id == Case.id)
+        .filter(
+            Alert.lawyer_id == lawyer.id,
+            Alert.type.in_(ACTIONABLE_ALERT_TYPES),
+            Alert.created_at >= since,
+            Case.status != "archived",
+        )
+        .order_by(Alert.created_at.desc())
+        .all()
+    )
+    out: list[Novedad] = []
+    for alert, case in rows:
+        out.append(
+            Novedad(
+                title=alert.title,
+                message=alert.message,
+                rol=case.rol,
+                caratulado=_caratulado(case),
+                fatal=(alert.type == "deadline_fatal"),
+                court_name=case.court.name if case.court else None,
+                created_at=alert.created_at,
+            )
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Email rendering
 # ---------------------------------------------------------------------------
 
@@ -223,6 +285,36 @@ def _review_html(item: AgendaItem) -> str:
               </tr>"""
 
 
+def _novedad_html(n: "Novedad") -> str:
+    badge = (
+        '<span style="display:inline-block; background-color:#dc2626; color:#ffffff; '
+        'font-size:11px; font-weight:bold; text-transform:uppercase; letter-spacing:0.5px; '
+        'padding:2px 8px; border-radius:4px; margin-left:8px;">URGENTE</span>'
+        if n.fatal
+        else ""
+    )
+    title = html.escape(n.title or "Novedad")
+    rol = html.escape(n.rol or "—")
+    caratulado = html.escape(n.caratulado)
+    message = (
+        f'<div style="color:#374151; font-size:13px; margin-top:2px;">{html.escape(n.message)}</div>'
+        if n.message else ""
+    )
+    court = (
+        f'<div style="color:#6b7280; font-size:13px; margin-top:2px;">{html.escape(n.court_name)}</div>'
+        if n.court_name else ""
+    )
+    return f"""\
+              <tr>
+                <td style="padding:12px 16px; border-bottom:1px solid #f0f1f3;">
+                  <div style="color:#111827; font-size:14px; font-weight:bold;">{title}{badge}</div>
+                  <div style="color:#374151; font-size:13px; margin-top:2px;">{rol} · {caratulado}</div>
+                  {message}
+                  {court}
+                </td>
+              </tr>"""
+
+
 def _section_html(title: str, rows: str) -> str:
     return f"""\
           <tr>
@@ -236,35 +328,42 @@ def _section_html(title: str, rows: str) -> str:
 
 
 def render_daily_agenda_email(
-    lawyer: Lawyer, day: date, agenda: DayAgenda
+    lawyer: Lawyer, day: date, agenda: DayAgenda, novedades: Optional[list] = None
 ) -> tuple[str, str, str]:
     """Render ``(subject, html_body, text_body)`` for a lawyer's day agenda.
 
     Pure function — no I/O. Neutral Spanish, tuteo (tú/tienes). Fatal
     deadlines carry a red "URGENTE" badge; the footer notes that fatal
-    deadlines are also copied to the coordinación.
+    deadlines are also copied to the coordinación. ``novedades`` (actionable
+    alerts from the last few days) render as a leading "Requiere atención"
+    section above the agenda.
     """
     raw_name = getattr(lawyer, "name", None) or "Abogado(a)"
     name = html.escape(raw_name)
     day_str = f"{day:%d-%m-%Y}"
     subject = f"Tu agenda para el {day_str}"
+    novedades = novedades or []
 
-    # --- HTML sections ---
+    # --- HTML sections: novedades first (they need attention), then agenda ---
     sections_html = ""
-    if agenda.is_empty:
+    if novedades:
+        rows = "\n".join(_novedad_html(n) for n in novedades)
+        sections_html += _section_html(
+            f"Requiere atención (últimos {NOVEDADES_DIAS} días)", rows
+        )
+    if agenda.deadlines:
+        rows = "\n".join(_deadline_html(i) for i in agenda.deadlines)
+        sections_html += _section_html("Plazos", rows)
+    if agenda.reviews:
+        rows = "\n".join(_review_html(i) for i in agenda.reviews)
+        sections_html += _section_html("Revisiones", rows)
+    if agenda.is_empty and not novedades:
         sections_html = """\
           <tr>
             <td style="padding:8px 32px 0 32px; color:#374151; font-size:14px; line-height:1.6;">
               <p style="margin:0;">No tienes plazos ni revisiones para mañana. ¡Aprovecha para ponerte al día!</p>
             </td>
           </tr>"""
-    else:
-        if agenda.deadlines:
-            rows = "\n".join(_deadline_html(i) for i in agenda.deadlines)
-            sections_html += _section_html("Plazos", rows)
-        if agenda.reviews:
-            rows = "\n".join(_review_html(i) for i in agenda.reviews)
-            sections_html += _section_html("Revisiones", rows)
 
     html_body = f"""\
 <!DOCTYPE html>
@@ -338,7 +437,15 @@ def render_daily_agenda_email(
         f"Hola {raw_name}, esto tienes para el {day_str}:",
         "",
     ]
-    if agenda.is_empty:
+    if novedades:
+        lines.append(f"REQUIERE ATENCIÓN (últimos {NOVEDADES_DIAS} días)")
+        for n in novedades:
+            tag = " [URGENTE]" if n.fatal else ""
+            rol = n.rol or "—"
+            msg = f" — {n.message}" if n.message else ""
+            lines.append(f"  - {n.title}{tag}: {rol} · {n.caratulado}{msg}")
+        lines.append("")
+    if agenda.is_empty and not novedades:
         lines.append("No tienes plazos ni revisiones para mañana.")
     else:
         if agenda.deadlines:
@@ -363,6 +470,79 @@ def render_daily_agenda_email(
         "Los plazos marcados como URGENTE (fatales) se copian también a la "
         "coordinación para su seguimiento."
     )
+    text_body = "\n".join(lines) + "\n"
+
+    return subject, html_body, text_body
+
+
+def render_novedades_digest(day: date, grouped: list) -> tuple[str, str, str]:
+    """Render Carla's consolidated firm-wide novedades digest.
+
+    ``grouped`` is a list of ``(lawyer_name, [Novedad, ...])`` — one section per
+    lawyer that has novedades. Pure function; neutral Spanish.
+    """
+    day_str = f"{day:%d-%m-%Y}"
+    total = sum(len(novs) for _, novs in grouped)
+    subject = f"Novedades del estudio — {day_str} ({total})"
+
+    sections_html = ""
+    for lawyer_name, novs in grouped:
+        rows = "\n".join(_novedad_html(n) for n in novs)
+        sections_html += _section_html(html.escape(lawyer_name), rows)
+
+    html_body = f"""\
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{subject}</title>
+</head>
+<body style="margin:0; padding:0; background-color:#f4f5f7; font-family:Arial, Helvetica, sans-serif;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#f4f5f7; padding:24px 0;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px; width:100%; background-color:#ffffff; border-radius:8px; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,0.08);">
+          <tr>
+            <td style="background-color:#0b2e4f; padding:20px 32px; color:#ffffff; font-size:15px; font-weight:bold; letter-spacing:0.3px;">
+              {_BRAND}
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:32px 32px 8px 32px;">
+              <p style="margin:0 0 4px 0; color:#0b2e4f; font-size:13px; font-weight:bold; text-transform:uppercase; letter-spacing:0.5px;">Resumen del estudio</p>
+              <h1 style="margin:0; color:#111827; font-size:20px; line-height:1.4;">Novedades del {day_str} · {total} en total</h1>
+            </td>
+          </tr>
+
+{sections_html}
+
+          <tr>
+            <td style="padding:24px 32px 32px 32px;">
+              <hr style="border:none; border-top:1px solid #e5e7eb; margin:16px 0 16px 0;">
+              <p style="margin:0; color:#9ca3af; font-size:12px; line-height:1.5;">
+                Resumen consolidado de las novedades ("Requiere atención") de los últimos {NOVEDADES_DIAS} días,
+                agrupadas por abogado. Correo automático de {_BRAND}.
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+"""
+
+    lines = [f"NOVEDADES DEL ESTUDIO — {day_str} ({total})", ""]
+    for lawyer_name, novs in grouped:
+        lines.append(lawyer_name.upper())
+        for n in novs:
+            tag = " [URGENTE]" if n.fatal else ""
+            rol = n.rol or "—"
+            msg = f" — {n.message}" if n.message else ""
+            lines.append(f"  - {n.title}{tag}: {rol} · {n.caratulado}{msg}")
+        lines.append("")
     text_body = "\n".join(lines) + "\n"
 
     return subject, html_body, text_body
@@ -451,8 +631,20 @@ def send_daily_calendar_emails(db, target_day: date) -> dict:
     skipped_no_email = 0
     errors = 0
 
+    # Novedades window: actionable alerts from the last NOVEDADES_DIAS days. Built
+    # per lawyer for their own email AND collected here for Carla's consolidated
+    # digest (grouped by lawyer), sent once after the loop.
+    since = datetime.utcnow() - timedelta(days=NOVEDADES_DIAS)
+    digest_groups: list = []
+
     for lawyer in lawyers:
         try:
+            # Build novedades BEFORE the no-email skip so a lawyer without an
+            # inbox still shows up in Carla's firm-wide digest.
+            novedades = lawyer_novedades(db, lawyer, since)
+            if novedades:
+                digest_groups.append((lawyer.name or lawyer.rut or "Abogado(a)", novedades))
+
             if not lawyer.email:
                 skipped_no_email += 1
                 logger.info(
@@ -464,7 +656,7 @@ def send_daily_calendar_emails(db, target_day: date) -> dict:
 
             agenda = lawyer_day_agenda(db, lawyer, target_day)
             subject, html_body, text_body = render_daily_agenda_email(
-                lawyer, target_day, agenda
+                lawyer, target_day, agenda, novedades
             )
 
             cc = (
@@ -488,10 +680,26 @@ def send_daily_calendar_emails(db, target_day: date) -> dict:
                 exc,
             )
 
+    # Carla's consolidated firm-wide novedades digest (one email, grouped by
+    # lawyer). Sent only when there is at least one novedad across the firm.
+    carla_digest_sent = False
+    if carla_email and digest_groups:
+        try:
+            d_subject, d_html, d_text = render_novedades_digest(target_day, digest_groups)
+            if _send_email(carla_email, d_subject, d_html, d_text):
+                carla_digest_sent = True
+            else:
+                errors += 1
+        except Exception as exc:  # noqa: BLE001
+            errors += 1
+            logger.error("Error building/sending Carla's novedades digest: %s", exc)
+
     return {
         "sent": sent,
         "cc_count": cc_count,
         "skipped_no_email": skipped_no_email,
         "errors": errors,
+        "carla_digest_sent": carla_digest_sent,
+        "novedades_lawyers": len(digest_groups),
         "target_day": str(target_day),
     }
