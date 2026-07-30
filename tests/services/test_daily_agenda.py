@@ -289,5 +289,123 @@ class TestSendDailyCalendarEmails:
             "cc_count": 1,
             "skipped_no_email": 1,
             "errors": 0,
+            "carla_digest_sent": False,  # no novedades → no digest
+            "novedades_lawyers": 0,
             "target_day": str(TARGET_DAY),
         }
+
+
+# ---------------------------------------------------------------------------
+# Novedades ("Requiere atención") + Carla digest
+# ---------------------------------------------------------------------------
+from app.models.alert import Alert
+from app.services.daily_agenda import (
+    DayAgenda,
+    Novedad,
+    lawyer_novedades,
+    render_daily_agenda_email,
+    render_novedades_digest,
+)
+
+_NOW = datetime.utcnow()
+_SINCE = _NOW - timedelta(days=5)
+
+
+def _make_alert(db, recipient, case, *, atype="semaforo_rojo",
+                title="Causa pasó a ROJO", message="Próximo plazo: 2026-08-10",
+                created_at=None):
+    a = Alert(
+        lawyer_id=recipient.id, case_id=case.id, type=atype,
+        title=title, message=message, created_at=created_at or _NOW,
+    )
+    db.add(a)
+    db.commit()
+    db.refresh(a)
+    return a
+
+
+class TestLawyerNovedades:
+    def test_actionable_alert_in_window_included(self, db, court, lawyer):
+        c = _make_case(db, court, "C-900-2026", owner=lawyer)
+        _make_alert(db, lawyer, c, created_at=_NOW - timedelta(days=1))
+        novs = lawyer_novedades(db, lawyer, _SINCE)
+        assert len(novs) == 1
+        assert novs[0].rol == "C-900-2026"
+        assert novs[0].title == "Causa pasó a ROJO"
+
+    def test_out_of_window_excluded(self, db, court, lawyer):
+        c = _make_case(db, court, "C-901-2026", owner=lawyer)
+        _make_alert(db, lawyer, c, created_at=_NOW - timedelta(days=10))
+        assert lawyer_novedades(db, lawyer, _SINCE) == []
+
+    def test_non_actionable_type_excluded(self, db, court, lawyer):
+        c = _make_case(db, court, "C-902-2026", owner=lawyer)
+        _make_alert(db, lawyer, c, atype="new_movement")
+        assert lawyer_novedades(db, lawyer, _SINCE) == []
+
+    def test_archived_case_excluded(self, db, court, lawyer):
+        c = _make_case(db, court, "C-903-2026", owner=lawyer, status="archived")
+        _make_alert(db, lawyer, c)
+        assert lawyer_novedades(db, lawyer, _SINCE) == []
+
+    def test_scoped_to_recipient(self, db, court, lawyer, carla):
+        c = _make_case(db, court, "C-904-2026", owner=lawyer)
+        _make_alert(db, carla, c)  # alert addressed to a DIFFERENT recipient
+        assert lawyer_novedades(db, lawyer, _SINCE) == []
+
+    def test_deadline_fatal_flagged(self, db, court, lawyer):
+        c = _make_case(db, court, "C-905-2026", owner=lawyer)
+        _make_alert(db, lawyer, c, atype="deadline_fatal", title="Plazo fatal")
+        assert lawyer_novedades(db, lawyer, _SINCE)[0].fatal is True
+
+
+class TestNovedadesRendering:
+    def test_lawyer_email_has_requiere_atencion_section(self, lawyer):
+        novs = [Novedad(title="Causa pasó a ROJO", message="Próximo plazo: 2026-08-10",
+                        rol="C-1-2026", caratulado="BANCO/DEUDOR")]
+        _s, html_body, text_body = render_daily_agenda_email(lawyer, TARGET_DAY, DayAgenda(), novs)
+        assert "Requiere atención" in html_body
+        assert "Causa pasó a ROJO" in html_body and "C-1-2026" in html_body
+        assert "REQUIERE ATENCIÓN" in text_body
+
+    def test_empty_agenda_no_novedades_still_shows_nothing_message(self, lawyer):
+        _s, html_body, _t = render_daily_agenda_email(lawyer, TARGET_DAY, DayAgenda(), [])
+        assert "No tienes plazos ni revisiones" in html_body
+
+    def test_digest_groups_by_lawyer(self):
+        grouped = [
+            ("Ana Firma", [Novedad(title="Causa a ROJO", message=None, rol="C-1", caratulado="X")]),
+            ("Beto", [Novedad(title="Plazo fatal", message=None, rol="C-2", caratulado="Y", fatal=True)]),
+        ]
+        subject, html_body, _t = render_novedades_digest(TARGET_DAY, grouped)
+        assert "Ana Firma" in html_body and "Beto" in html_body
+        assert "(2)" in subject
+        assert "URGENTE" in html_body  # fatal badge rendered
+
+
+class TestCarlaDigest:
+    def test_carla_gets_consolidated_digest_and_lawyer_sees_novedad(
+        self, db, court, carla, lawyer, monkeypatch
+    ):
+        c = _make_case(db, court, "C-950-2026", owner=lawyer)
+        _seed_abogado(db, c, lawyer)
+        _make_alert(db, lawyer, c)  # recent → in window
+
+        calls = []
+
+        def _fake_send(to, subject, html_body, text_body, cc=None):
+            calls.append((to, subject, html_body))
+            return True
+
+        monkeypatch.setattr(daily_agenda, "_send_email", _fake_send)
+
+        summary = send_daily_calendar_emails(db, TARGET_DAY)
+
+        assert summary["novedades_lawyers"] == 1
+        assert summary["carla_digest_sent"] is True
+        # Carla got a SEPARATE digest email (not just a CC)
+        carla_digests = [s for to, s, _ in calls if to == "carla@segal.cl"]
+        assert any("Novedades del estudio" in s for s in carla_digests)
+        # The lawyer's own agenda email carries the novedad section
+        ana_html = next(h for to, _s, h in calls if to == "ana@segal.cl")
+        assert "Requiere atención" in ana_html
