@@ -251,3 +251,122 @@ def test_liquidacion_includes_approved_hitos(client, admin, junior, db):
     row = next(x for x in liq["rows"] if x["lawyer_id"] == junior.id)
     assert row["hitos_aprobados"] == 8_077
     assert row["total_bruto"] == row["fijo"] + 8_077 + row["total_bono_gestion"]
+
+
+# --- Import Activación AT ---------------------------------------------------- #
+import io
+
+from openpyxl import Workbook
+
+from app.api.v1.bono import _match_lawyer, _norm_tokens
+
+
+def _acti_xlsx(rows):
+    """Build an in-memory 'Activación AT' .xlsx. rows: (nomabo, totcontgral, tothiscartera).
+
+    Columns are located by NAME in the endpoint, so order here is irrelevant as
+    long as the three named headers exist.
+    """
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["codabo", "nomabo", "totcontcartera", "totcontgral", "tothiscartera"])
+    for nom, f, i in rows:
+        ws.append([1, nom, 0, f, i])
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _post_acti(client, rows, periodo="2026-07"):
+    return client.post(
+        f"/api/v1/bono/variables/import-activacion?periodo={periodo}",
+        headers=_h(ADMIN_RUT),
+        files={"file": ("acti.xlsx", _acti_xlsx(rows),
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+
+
+def test_match_lawyer_reordered_and_accented():
+    fern = Lawyer(rut="1-9", name="Fernanda Arroyo Diaz", nivel="junior")
+    pablo = Lawyer(rut="2-7", name="Pablo Ismael Acevedo López")
+    cands = [(fern, _norm_tokens(fern.name)), (pablo, _norm_tokens(pablo.name))]
+    # reordered + missing accent in the file name still matches
+    assert _match_lawyer("PABLO LOPEZ ACEVEDO", cands) is pablo
+    # only one shared token → ambiguous/insufficient → no match
+    assert _match_lawyer("PABLO SOLANO", cands) is None
+
+
+def test_import_sets_v1_inputs_and_computes(client, admin, junior):
+    # junior fixture = "Fernanda Arroyo". 34/40 = 85% → $8.000 × 34 = 272_000
+    r = _post_acti(client, [("FERNANDA ARROYO DIAZ", 40, 34)])
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["updated"]) == 1
+    up = body["updated"][0]
+    assert up["clientes_m2"] == 40 and up["clientes_activos"] == 34
+    assert up["v1_bruto"] == 8000 * 34
+    assert body["total_v1"] == 8000 * 34
+    # and it lands in the liquidación
+    liq = client.get("/api/v1/bono/liquidacion?periodo=2026-07", headers=_h(ADMIN_RUT)).json()
+    row = next(x for x in liq["rows"] if x["lawyer_id"] == junior.id)
+    assert row["v1_bruto"] == 8000 * 34
+
+
+def test_import_preserves_other_inputs(client, admin, junior):
+    # pre-set renovaciones via the normal upsert
+    client.put(
+        f"/api/v1/bono/variables/{junior.id}?periodo=2026-07",
+        headers=_h(ADMIN_RUT),
+        json={"renovaciones": 3},
+    )
+    _post_acti(client, [("FERNANDA ARROYO DIAZ", 40, 34)])
+    liq = client.get("/api/v1/bono/liquidacion?periodo=2026-07", headers=_h(ADMIN_RUT)).json()
+    row = next(x for x in liq["rows"] if x["lawyer_id"] == junior.id)
+    assert row["v1_bruto"] == 8000 * 34
+    assert row["v2_bruto"] == 3 * 10_400  # renovaciones untouched
+
+
+def test_import_skips_matched_lawyer_without_nivel(client, admin, db):
+    senior = Lawyer(rut="55555555-5", name="Melissa Denisse Acevedo Bustos", role="lawyer")
+    db.add(senior)
+    db.commit()
+    r = _post_acti(client, [("MELISSA BUSTOS ACEVEDO", 45, 34)])
+    body = r.json()
+    assert body["updated"] == []
+    assert "MELISSA BUSTOS ACEVEDO" in body["skipped_no_nivel"]
+
+
+def test_import_reports_unmatched(client, admin, junior):
+    r = _post_acti(client, [("QUIEN SABE PERSONA", 10, 8)])
+    body = r.json()
+    assert body["updated"] == []
+    assert "QUIEN SABE PERSONA" in body["unmatched"]
+
+
+def test_import_blocked_when_period_closed(client, admin, junior):
+    client.post("/api/v1/bono/cierre?periodo=2026-07", headers=_h(ADMIN_RUT))
+    r = _post_acti(client, [("FERNANDA ARROYO DIAZ", 40, 34)])
+    assert r.status_code == 409
+
+
+def test_import_rejects_wrong_columns(client, admin):
+    wb = Workbook(); ws = wb.active
+    ws.append(["foo", "bar", "baz"]); ws.append([1, 2, 3])
+    buf = io.BytesIO(); wb.save(buf)
+    r = client.post(
+        "/api/v1/bono/variables/import-activacion?periodo=2026-07",
+        headers=_h(ADMIN_RUT),
+        files={"file": ("bad.xlsx", buf.getvalue(),
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+    assert r.status_code == 400
+
+
+def test_import_requires_admin(client, junior):
+    r = client.post(
+        "/api/v1/bono/variables/import-activacion?periodo=2026-07",
+        headers=_h(LAWYER_RUT),
+        files={"file": ("acti.xlsx", _acti_xlsx([("FERNANDA ARROYO DIAZ", 40, 34)]),
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+    assert r.status_code == 403
