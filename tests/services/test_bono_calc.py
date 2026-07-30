@@ -9,25 +9,37 @@ from app.services import bono_calc as bc
 
 
 # --- V1: $/cliente by activation tramo -------------------------------------- #
+# Modelo V11 (§9.2): tabla V1 ÚNICA para todos los niveles; umbral 65%.
 @pytest.mark.parametrize("nivel,pct,expected", [
-    ("junior", 0.80, 6462), ("pleno", 0.80, 6462),
-    ("junior", 0.95, 6462), ("pleno", 0.95, 6462),
-    ("junior", 0.75, 5162), ("pleno", 0.75, 5169),  # only tramo that differs by nivel
-    ("junior", 0.79, 5162), ("pleno", 0.79, 5169),
-    ("junior", 0.70, 3877), ("pleno", 0.70, 3877),
-    ("junior", 0.65, 1938), ("pleno", 0.65, 1938),
+    ("junior", 0.80, 8000), ("pleno", 0.80, 8000),
+    ("junior", 0.95, 8000), ("pleno", 0.95, 8000),
+    ("junior", 0.75, 6400), ("pleno", 0.75, 6400),  # V11: sin split por nivel
+    ("junior", 0.79, 6400), ("pleno", 0.79, 6400),
+    ("junior", 0.70, 4800), ("pleno", 0.70, 4800),
+    ("junior", 0.65, 2400), ("pleno", 0.65, 2400),
     ("junior", 0.649, 0), ("pleno", 0.0, 0),
 ])
 def test_valor_cliente_v1(nivel, pct, expected):
     assert bc.valor_cliente_v1(nivel, pct) == expected
 
 
+def test_v1_matches_v11_liquidacion_examples():
+    """Pin the exact tramos used in the V11 liquidación examples (§7.2)."""
+    assert bc.valor_cliente_v1("junior", 0.670) == 2400   # Calderón, 65–69%
+    assert bc.valor_cliente_v1("pleno", 0.716) == 4800    # Sandy, 70–74%
+    assert bc.valor_cliente_v1("senior", 0.750) == 6400   # Pablo, 75–79%
+    # V1 bruto = tramo × clientes activos (Sandy: 4800 × 53 = 254_400)
+    sandy = bc.compute("pleno", clientes_m2=74, clientes_activos=53)
+    assert sandy["v1_valor_cliente"] == 4800
+    assert sandy["v1_bruto"] == 254_400
+
+
 def test_v1_bruto_is_valor_times_activos():
-    # 90 activos / 100 M-2 = 90% → ≥80% tramo → 6462 × 90
+    # 90 activos / 100 M-2 = 90% → ≥80% tramo → 8000 × 90
     b = bc.compute("junior", clientes_m2=100, clientes_activos=90)
     assert b["v1_pct_activacion"] == 0.90
-    assert b["v1_valor_cliente"] == 6462
-    assert b["v1_bruto"] == 6462 * 90
+    assert b["v1_valor_cliente"] == 8000
+    assert b["v1_bruto"] == 8000 * 90
 
 
 def test_v1_zero_when_no_m2():
@@ -74,17 +86,17 @@ def test_v2_renovaciones():
 def test_liquidacion_junior_full():
     b = bc.compute(
         "junior",
-        clientes_m2=100, clientes_activos=90,       # V1: 6462×90 = 581_580
+        clientes_m2=100, clientes_activos=90,       # V1: 8000×90 = 720_000
         causas_asignadas=100, causas_cumplidas=95,  # 95% → 100000
         renovaciones=2,                             # V2: 20_800
         hitos_aprobados=8_077,
     )
     assert b["fijo"] == 1_105_354
-    assert b["v1_bruto"] == 581_580
+    assert b["v1_bruto"] == 720_000
     assert b["v3_neta"] == 100_000
     assert b["v2_bruto"] == 20_800
-    assert b["total_bono_gestion"] == 581_580 + 100_000 + 20_800
-    assert b["total_bruto"] == 1_105_354 + 8_077 + 581_580 + 100_000 + 20_800
+    assert b["total_bono_gestion"] == 720_000 + 100_000 + 20_800
+    assert b["total_bruto"] == 1_105_354 + 8_077 + 720_000 + 100_000 + 20_800
 
 
 def test_liquidacion_pleno_fijo():

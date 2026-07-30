@@ -97,7 +97,7 @@ def test_upsert_variables_computes_bonus(client, admin, junior):
     )
     assert r.status_code == 200
     body = r.json()
-    assert body["v1_bruto"] == 6462 * 90
+    assert body["v1_bruto"] == 8000 * 90
     assert body["v3_neta"] == 100_000
     assert body["v2_bruto"] == 20_800
     assert body["has_row"] is True
@@ -109,7 +109,7 @@ def test_upsert_variables_computes_bonus(client, admin, junior):
         headers=_h(ADMIN_RUT),
         json={"clientes_m2": 100, "clientes_activos": 80},
     )
-    assert r2.json()["v1_bruto"] == 6462 * 80  # 80% still ≥80% tramo
+    assert r2.json()["v1_bruto"] == 8000 * 80  # 80% still ≥80% tramo
     liq = client.get("/api/v1/bono/liquidacion?periodo=2026-07", headers=_h(ADMIN_RUT)).json()
     assert sum(1 for row in liq["rows"] if row["lawyer_id"] == junior.id) == 1
 
@@ -154,7 +154,7 @@ def test_export_liquidacion_xlsx(client, admin, junior):
     ws = wb.active
     flat = [c.value for row in ws.iter_rows() for c in row]
     assert "Fernanda Arroyo" in flat
-    assert 6462 * 90 in flat  # V1 bruto lands in a cell
+    assert 8000 * 90 in flat  # V1 bruto lands in a cell
     assert any(str(v).startswith("TOTAL ÁREA") for v in flat if v)
 
 
