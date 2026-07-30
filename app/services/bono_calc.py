@@ -11,8 +11,9 @@ Monthly total per lawyer:
 Formulas (verbatim from the sheet):
   V1  Retención  = clientes_activos × $/cliente(tramo de %activación)
                    %activación = activos / M-2 total
-                   $/cliente:  ≥80%→6462 · ≥75%→5162(J)/5169(P) · ≥70%→3877
-                               ≥65%→1938 · <65%→0
+                   $/cliente (V11, tabla única todos los niveles):
+                               ≥80%→8000 · ≥75%→6400 · ≥70%→4800
+                               ≥65%→2400 · <65%→0
   V3  Cumplimiento = V3_tramo × MAX(0, 1 − %V4)
                    %cumpl = causas con mov. útil / causas asignadas
                    V3_tramo:   ≥90%→100000(J)/80769(P) · ≥80%→80000(J)/64615(P) · <80%→0
@@ -42,15 +43,21 @@ def _round_clp(x: float) -> int:
 
 
 def valor_cliente_v1(nivel: str, pct_activacion: float) -> int:
-    """$/cliente by activation-rate tramo (only the 75–79% tramo differs by nivel)."""
+    """$/cliente activado by activation-rate tramo.
+
+    Modelo V11 (Bono Fidelización, sección 9.2): tabla V1 ÚNICA para todos los
+    niveles (Junior, Pleno y Senior) — el antiguo split del tramo 75–79% por
+    nivel se eliminó. Umbral 65%. ``nivel`` se conserva en la firma por
+    compatibilidad de los llamadores, pero ya no altera el valor.
+    """
     if pct_activacion >= 0.80:
-        return 6462
+        return 8000
     if pct_activacion >= 0.75:
-        return 5169 if nivel == PLENO else 5162
+        return 6400
     if pct_activacion >= 0.70:
-        return 3877
+        return 4800
     if pct_activacion >= 0.65:
-        return 1938
+        return 2400
     return 0
 
 
