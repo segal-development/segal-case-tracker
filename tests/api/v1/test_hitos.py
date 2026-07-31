@@ -311,3 +311,56 @@ def test_importar_dedups_same_lawyer_rut_and_causa(client, db, admin):
     r = _import_two_junior_rows(client, db, "C-100-2026", "C-100-2026")
     assert r["creadas"] == 1
     assert r["omitidas_duplicadas"] == 1
+
+
+# --- Detector foundation: estado 'sugerido' + provenance (Fase 1, Slice 1) ---
+from app.models.hito import HITO_SUGERIDO, ORIGEN_MANUAL, ORIGEN_DETECTOR
+
+
+def test_manual_hito_defaults_origen_manual(db, lawyer, tipo):
+    """A hito created without an explicit origen defaults to 'manual'."""
+    h = Hito(lawyer_id=lawyer.id, hito_tipo_id=tipo.id, valor_bruto=tipo.valor_bruto,
+             fecha_hito=date(2026, 7, 15))
+    db.add(h)
+    db.commit()
+    db.refresh(h)
+    assert h.origen == ORIGEN_MANUAL
+    assert h.estado == HITO_PENDIENTE
+
+
+def test_detector_provenance_fields_persist(db, lawyer, tipo):
+    """A detector candidate carries origen/regla_code/confianza + estado 'sugerido'."""
+    h = Hito(lawyer_id=lawyer.id, hito_tipo_id=tipo.id, valor_bruto=tipo.valor_bruto,
+             fecha_hito=date(2026, 7, 15), estado=HITO_SUGERIDO, origen=ORIGEN_DETECTOR,
+             regla_code="prescripcion", confianza="alta")
+    db.add(h)
+    db.commit()
+    db.refresh(h)
+    assert h.estado == "sugerido"
+    assert h.origen == "detector"
+    assert h.regla_code == "prescripcion"
+    assert h.confianza == "alta"
+
+
+def test_sugerido_hito_can_be_approved(client, db, admin, lawyer, tipo):
+    """Carla confirms a suggested candidate → it becomes aprobado (counts for the bono)."""
+    h = Hito(lawyer_id=lawyer.id, hito_tipo_id=tipo.id, valor_bruto=tipo.valor_bruto,
+             fecha_hito=date(2026, 7, 15), estado=HITO_SUGERIDO, origen=ORIGEN_DETECTOR)
+    db.add(h)
+    db.commit()
+    db.refresh(h)
+    r = client.post(f"/api/v1/hitos/{h.id}/aprobar", headers=_h(ADMIN_RUT))
+    assert r.status_code == 200
+    assert r.json()["estado"] == "aprobado"
+
+
+def test_sugerido_hito_not_counted_until_approved(client, db, admin, lawyer, tipo):
+    """A suggested hito is NOT an approved hito — it must not count before confirmation."""
+    h = Hito(lawyer_id=lawyer.id, hito_tipo_id=tipo.id, valor_bruto=tipo.valor_bruto,
+             fecha_hito=date(2026, 7, 15), estado=HITO_SUGERIDO, origen=ORIGEN_DETECTOR)
+    db.add(h)
+    db.commit()
+    r = client.get("/api/v1/hitos/resumen?periodo=2026-07", headers=_h(ADMIN_RUT))
+    row = next((x for x in r.json() if x["lawyer_id"] == lawyer.id), None)
+    # sugerido never contributes to 'aprobados'
+    assert row is None or row["aprobados"] == 0

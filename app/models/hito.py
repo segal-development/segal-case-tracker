@@ -50,9 +50,14 @@ class HitoTipo(Base):
 
 
 # Hito approval states.
+HITO_SUGERIDO = "sugerido"   # auto-detected candidate, awaiting admin confirmation
 HITO_PENDIENTE = "pendiente"
 HITO_APROBADO = "aprobado"
 HITO_RECHAZADO = "rechazado"
+
+# Provenance of a hito row.
+ORIGEN_MANUAL = "manual"      # hand-entered (form or Excel import)
+ORIGEN_DETECTOR = "detector"  # created by the PJUD hito detector
 
 
 class Hito(Base):
@@ -85,6 +90,15 @@ class Hito(Base):
     evidencia_content_type = Column(String(100), nullable=True)
 
     estado = Column(String(20), nullable=False, server_default=HITO_PENDIENTE, default=HITO_PENDIENTE)
+
+    # Detector provenance. For manual hitos: origen='manual', the rest NULL. For
+    # auto-detected candidates: origen='detector' + the movement that triggered it,
+    # the rule that fired, and the classifier confidence (alta|media|baja).
+    origen = Column(String(20), nullable=False, server_default=ORIGEN_MANUAL, default=ORIGEN_MANUAL)
+    movement_id = Column(Integer, ForeignKey("movements.id"), nullable=True, index=True)
+    regla_code = Column(String(50), nullable=True)
+    confianza = Column(String(10), nullable=True)
+
     created_by_rut = Column(String(20), nullable=True)
     created_by_name = Column(String(255), nullable=True)
     aprobado_by_rut = Column(String(20), nullable=True)
