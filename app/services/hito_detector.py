@@ -16,10 +16,14 @@ declarativas y se amplían sin tocar la lógica.
 from __future__ import annotations
 
 import io
+import logging
 import re
 import unicodedata
 from dataclasses import dataclass
+from datetime import date
 from typing import Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 def _norm(t: Optional[str]) -> str:
@@ -168,3 +172,167 @@ def evaluar_movimiento(
     if not cl.es_candidato:
         return None
     return DeteccionResultado(regla.hito_tipo_code, regla.code, cl.confianza, cl.frase)
+
+
+# --------------------------------------------------------------------------- #
+# Orquestación (DB + GCS) — Slice 3
+# --------------------------------------------------------------------------- #
+from app.models.case import Case
+from app.models.document import Document
+from app.models.hito import HITO_SUGERIDO, ORIGEN_DETECTOR, Hito, HitoTipo
+from app.models.lawyer import Lawyer
+from app.models.movement import Movement
+
+
+@dataclass
+class DeteccionResumen:
+    periodo: str
+    cerrado: bool
+    creados: int          # hitos sugeridos creados
+    ya_existe: int        # movimientos que ya tenían un hito (idempotencia)
+    rechazados: int       # regla matcheó pero la resolución no fue favorable
+    sin_pdf: int          # candidato sin PDF stored → sin evidencia, se salta
+    sin_atribucion: int   # causa no atribuible a un abogado del estudio
+
+
+def _period_bounds(periodo: str) -> Tuple[date, date]:
+    """('YYYY-MM') → (primer día, primer día del mes siguiente)."""
+    y, m = int(periodo[:4]), int(periodo[5:7])
+    start = date(y, m, 1)
+    end = date(y + (m == 12), (m % 12) + 1, 1)
+    return start, end
+
+
+class HitoDetectorService:
+    """Detecta hitos candidatos sobre los movimientos de un período abierto.
+
+    Recorre las RESOLUCIONES con ``movement_date`` en el mes (nunca por
+    ``created_at`` — ver ventana temporal en docs/guia-metricas-hitos.md), matchea
+    la regla, baja el PDF de GCS, clasifica el resultado y crea el hito en estado
+    ``sugerido`` con la evidencia PJUD adjunta, atribuido al abogado de récord.
+    """
+
+    def __init__(self, db, storage=None):
+        self.db = db
+        self._storage = storage
+
+    def _storage_backend(self):
+        if self._storage is None:
+            from app.config import settings
+            from app.services.storage_service import get_storage_backend
+
+            self._storage = get_storage_backend(settings)
+        return self._storage
+
+    def _mapa_case_lawyer(self) -> dict:
+        """case_id → lawyer_id del abogado de récord (litigante), primer abogado gana."""
+        from app.services.lawyer_roster import case_ids_for_abogado
+
+        mapa: dict = {}
+        lawyers = (
+            self.db.query(Lawyer)
+            .filter(Lawyer.is_firm_lawyer.is_(True), Lawyer.is_active.is_(True))
+            .all()
+        )
+        for lw in lawyers:
+            for cid in case_ids_for_abogado(self.db, lw.rut, lw.rut):
+                mapa.setdefault(cid, lw.id)
+        return mapa
+
+    def _doc_stored(self, movement_id: int):
+        return (
+            self.db.query(Document)
+            .filter(
+                Document.movement_id == movement_id,
+                Document.status == "stored",
+                Document.gcs_path.isnot(None),
+            )
+            .first()
+        )
+
+    def _texto(self, doc) -> str:
+        try:
+            return extraer_texto_pdf(self._storage_backend().retrieve(doc.gcs_path))
+        except Exception:  # noqa: BLE001 — un PDF ilegible degrada, no rompe
+            return ""
+
+    def detectar(self, periodo: str) -> DeteccionResumen:
+        from app.services import bono_cierre_service as cierre_svc
+
+        start, end = _period_bounds(periodo)
+        if cierre_svc.is_cerrado(self.db, periodo):
+            return DeteccionResumen(periodo, True, 0, 0, 0, 0, 0)
+
+        case_lawyer = self._mapa_case_lawyer()
+        tipos = {
+            t.code: t
+            for t in self.db.query(HitoTipo)
+            .filter(HitoTipo.code.in_(tuple({r.hito_tipo_code for r in REGLAS})))
+            .all()
+        }
+        ya = {
+            mid
+            for (mid,) in self.db.query(Hito.movement_id).filter(Hito.movement_id.isnot(None)).all()
+        }
+
+        # Solo RESOLUCIONES del período (por movement_date), en causas no archivadas.
+        movs = (
+            self.db.query(Movement)
+            .join(Case, Movement.case_id == Case.id)
+            .filter(
+                Movement.movement_date >= start,
+                Movement.movement_date < end,
+                Movement.procedure.ilike("%resoluci%"),
+                Case.status != "archived",
+            )
+            .all()
+        )
+
+        creados = ya_existe = rechazados = sin_pdf = sin_atrib = 0
+        for mv in movs:
+            regla = regla_para_movimiento(mv.stage, mv.procedure)
+            if regla is None:
+                continue
+            if mv.id in ya:
+                ya_existe += 1
+                continue
+            lawyer_id = case_lawyer.get(mv.case_id)
+            if lawyer_id is None:
+                sin_atrib += 1
+                continue
+            doc = self._doc_stored(mv.id)
+            if doc is None:
+                sin_pdf += 1  # sin captura PJud → sin hito (regla del estudio)
+                continue
+            det = evaluar_movimiento(mv.stage, mv.procedure, self._texto(doc))
+            if det is None:
+                rechazados += 1
+                continue
+            tipo = tipos.get(det.hito_tipo_code)
+            if tipo is None:
+                continue
+            rol = mv.case.rol if mv.case else None
+            desc = " · ".join(x for x in (rol, det.frase) if x) or None
+            self.db.add(
+                Hito(
+                    lawyer_id=lawyer_id,
+                    hito_tipo_id=tipo.id,
+                    valor_bruto=tipo.valor_bruto,
+                    fecha_hito=mv.movement_date.date(),
+                    case_id=mv.case_id,
+                    movement_id=mv.id,
+                    estado=HITO_SUGERIDO,
+                    origen=ORIGEN_DETECTOR,
+                    regla_code=det.regla_code,
+                    confianza=det.confianza,
+                    descripcion=(desc[:500] if desc else None),
+                    evidencia_storage_key=doc.gcs_path,
+                    evidencia_filename=doc.filename,
+                    evidencia_content_type=doc.content_type,
+                    created_by_name="Detector PJUD",
+                )
+            )
+            creados += 1
+
+        self.db.commit()
+        return DeteccionResumen(periodo, False, creados, ya_existe, rechazados, sin_pdf, sin_atrib)
