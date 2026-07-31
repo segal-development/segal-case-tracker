@@ -374,22 +374,24 @@ class TestNovedadesRendering:
 
     def test_digest_groups_by_lawyer(self):
         grouped = [
-            ("Ana Firma", [Novedad(title="Causa a ROJO", message=None, rol="C-1", caratulado="X")]),
-            ("Beto", [Novedad(title="Plazo fatal", message=None, rol="C-2", caratulado="Y", fatal=True)]),
+            ("Ana Firma", [Novedad(title="Plazo fatal en C-1", message=None, rol="C-1", caratulado="X", fatal=True)]),
+            ("Beto", [Novedad(title="Plazo fatal en C-2", message=None, rol="C-2", caratulado="Y", fatal=True)]),
         ]
         subject, html_body, _t = render_novedades_digest(TARGET_DAY, grouped)
         assert "Ana Firma" in html_body and "Beto" in html_body
+        assert "Plazos fatales del estudio" in subject
         assert "(2)" in subject
         assert "URGENTE" in html_body  # fatal badge rendered
 
 
 class TestCarlaDigest:
-    def test_carla_gets_consolidated_digest_and_lawyer_sees_novedad(
+    def test_digest_is_urgent_only_but_lawyer_sees_all(
         self, db, court, carla, lawyer, monkeypatch
     ):
-        c = _make_case(db, court, "C-950-2026", owner=lawyer)
-        _seed_abogado(db, c, lawyer)
-        _make_alert(db, lawyer, c)  # recent → in window
+        c1 = _make_case(db, court, "C-950-2026", owner=lawyer)
+        c2 = _make_case(db, court, "C-951-2026", owner=lawyer)
+        _make_alert(db, lawyer, c1, atype="deadline_fatal", title="Plazo fatal en causa C-950-2026")
+        _make_alert(db, lawyer, c2, atype="semaforo_rojo", title="Causa C-951-2026 pasó a ROJO")
 
         calls = []
 
@@ -398,14 +400,34 @@ class TestCarlaDigest:
             return True
 
         monkeypatch.setattr(daily_agenda, "_send_email", _fake_send)
-
         summary = send_daily_calendar_emails(db, TARGET_DAY)
 
-        assert summary["novedades_lawyers"] == 1
         assert summary["carla_digest_sent"] is True
-        # Carla got a SEPARATE digest email (not just a CC)
-        carla_digests = [s for to, s, _ in calls if to == "carla@segal.cl"]
-        assert any("Novedades del estudio" in s for s in carla_digests)
-        # The lawyer's own agenda email carries the novedad section
+        assert summary["novedades_lawyers"] == 1
+        # The lawyer's OWN email carries BOTH novedades (urgent + rojo)
         ana_html = next(h for to, _s, h in calls if to == "ana@segal.cl")
         assert "Requiere atención" in ana_html
+        assert "C-950-2026" in ana_html and "C-951-2026" in ana_html
+        # Carla's digest carries ONLY the urgent (fatal) one
+        c_subj, c_html = next((s, h) for to, s, h in calls if to == "carla@segal.cl")
+        assert "Plazos fatales del estudio" in c_subj
+        assert "C-950-2026" in c_html
+        assert "C-951-2026" not in c_html
+
+    def test_no_digest_when_only_non_urgent(self, db, court, carla, lawyer, monkeypatch):
+        c = _make_case(db, court, "C-960-2026", owner=lawyer)
+        _make_alert(db, lawyer, c, atype="semaforo_rojo")  # not fatal
+
+        recipients = []
+
+        def _fake_send(to, subject, html_body, text_body, cc=None):
+            recipients.append(to)
+            return True
+
+        monkeypatch.setattr(daily_agenda, "_send_email", _fake_send)
+        summary = send_daily_calendar_emails(db, TARGET_DAY)
+
+        assert summary["carla_digest_sent"] is False
+        assert summary["novedades_lawyers"] == 0
+        assert "ana@segal.cl" in recipients        # lawyer still emailed
+        assert "carla@segal.cl" not in recipients  # but NO digest

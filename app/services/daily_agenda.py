@@ -476,14 +476,15 @@ def render_daily_agenda_email(
 
 
 def render_novedades_digest(day: date, grouped: list) -> tuple[str, str, str]:
-    """Render Carla's consolidated firm-wide novedades digest.
+    """Render Carla's consolidated firm-wide digest of URGENT novedades.
 
     ``grouped`` is a list of ``(lawyer_name, [Novedad, ...])`` — one section per
-    lawyer that has novedades. Pure function; neutral Spanish.
+    lawyer. By contract the caller passes ONLY urgent (fatal) novedades, so this
+    stays tight for the coordinación. Pure function; neutral Spanish.
     """
     day_str = f"{day:%d-%m-%Y}"
     total = sum(len(novs) for _, novs in grouped)
-    subject = f"Novedades del estudio — {day_str} ({total})"
+    subject = f"Plazos fatales del estudio — {day_str} ({total})"
 
     sections_html = ""
     for lawyer_name, novs in grouped:
@@ -510,8 +511,8 @@ def render_novedades_digest(day: date, grouped: list) -> tuple[str, str, str]:
           </tr>
           <tr>
             <td style="padding:32px 32px 8px 32px;">
-              <p style="margin:0 0 4px 0; color:#0b2e4f; font-size:13px; font-weight:bold; text-transform:uppercase; letter-spacing:0.5px;">Resumen del estudio</p>
-              <h1 style="margin:0; color:#111827; font-size:20px; line-height:1.4;">Novedades del {day_str} · {total} en total</h1>
+              <p style="margin:0 0 4px 0; color:#0b2e4f; font-size:13px; font-weight:bold; text-transform:uppercase; letter-spacing:0.5px;">Urgentes del estudio</p>
+              <h1 style="margin:0; color:#111827; font-size:20px; line-height:1.4;">Plazos fatales del {day_str} · {total} urgente(s)</h1>
             </td>
           </tr>
 
@@ -521,8 +522,9 @@ def render_novedades_digest(day: date, grouped: list) -> tuple[str, str, str]:
             <td style="padding:24px 32px 32px 32px;">
               <hr style="border:none; border-top:1px solid #e5e7eb; margin:16px 0 16px 0;">
               <p style="margin:0; color:#9ca3af; font-size:12px; line-height:1.5;">
-                Resumen consolidado de las novedades ("Requiere atención") de los últimos {NOVEDADES_DIAS} días,
-                agrupadas por abogado. Correo automático de {_BRAND}.
+                Solo los plazos fatales (urgentes) de los últimos {NOVEDADES_DIAS} días, agrupados por
+                abogado. El resto de las novedades le llega a cada abogado en su propio correo. Correo
+                automático de {_BRAND}.
               </p>
             </td>
           </tr>
@@ -534,7 +536,7 @@ def render_novedades_digest(day: date, grouped: list) -> tuple[str, str, str]:
 </html>
 """
 
-    lines = [f"NOVEDADES DEL ESTUDIO — {day_str} ({total})", ""]
+    lines = [f"PLAZOS FATALES DEL ESTUDIO — {day_str} ({total})", ""]
     for lawyer_name, novs in grouped:
         lines.append(lawyer_name.upper())
         for n in novs:
@@ -642,8 +644,13 @@ def send_daily_calendar_emails(db, target_day: date) -> dict:
             # Build novedades BEFORE the no-email skip so a lawyer without an
             # inbox still shows up in Carla's firm-wide digest.
             novedades = lawyer_novedades(db, lawyer, since)
-            if novedades:
-                digest_groups.append((lawyer.name or lawyer.rut or "Abogado(a)", novedades))
+            # Carla's consolidated digest carries ONLY urgent (fatal) novedades —
+            # she asked to keep it tight (a plazo fatal is the only thing she needs
+            # from every lawyer). The lawyer's OWN email below still gets the FULL
+            # "Requiere atención" set, urgent or not.
+            urgentes = [n for n in novedades if n.fatal]
+            if urgentes:
+                digest_groups.append((lawyer.name or lawyer.rut or "Abogado(a)", urgentes))
 
             if not lawyer.email:
                 skipped_no_email += 1
