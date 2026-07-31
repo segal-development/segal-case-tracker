@@ -240,6 +240,19 @@ def test_create_allows_same_lawyer_different_causa(client, db, admin, lawyer, ti
     assert r.status_code == 201
 
 
+def test_create_same_client_rut_different_causa_allowed(client, db, admin, lawyer, tipo):
+    """rol_causa stores the client RUT; the causa lives in descripcion (a ROL).
+    Same client on DIFFERENT causas is allowed; the SAME causa is a duplicate."""
+    common = {"hito_tipo_id": tipo.id, "fecha_hito": "2026-07-15",
+              "rol_causa": "12.345.678-5", "lawyer_id": lawyer.id}
+    r1 = client.post("/api/v1/hitos", headers=_h(ADMIN_RUT), data={**common, "descripcion": "C-100-2026"})
+    assert r1.status_code == 201
+    r2 = client.post("/api/v1/hitos", headers=_h(ADMIN_RUT), data={**common, "descripcion": "C-200-2026"})
+    assert r2.status_code == 201  # same client, different causa → allowed
+    r3 = client.post("/api/v1/hitos", headers=_h(ADMIN_RUT), data={**common, "descripcion": "C-100-2026"})
+    assert r3.status_code == 409  # same client + same causa → duplicate
+
+
 def test_create_allows_multiple_without_causa(client, db, admin, tipo):
     # Hitos without a causa can't collide → both allowed.
     base = {"hito_tipo_id": tipo.id, "fecha_hito": "2026-07-15"}
@@ -261,9 +274,9 @@ def test_edit_into_duplicate_causa_rejected(client, db, admin, lawyer, tipo):
     assert r.status_code == 409
 
 
-def test_importar_dedups_same_lawyer_causa_strict(client, db, admin):
-    """Import cross-checks the strict (abogado, causa) key: same lawyer + same
-    causa on different dates collapses to one row."""
+def _import_two_junior_rows(client, db, desc1, desc2, rut="18.795.509-2"):
+    """Import two junior rows for the same lawyer + same client RUT, with the given
+    descripciones (the causa lives in descripcion). Returns the import summary."""
     import io
     import openpyxl
     from datetime import datetime as dt
@@ -277,11 +290,24 @@ def test_importar_dedups_same_lawyer_causa_strict(client, db, admin):
     js.title = "HITOS JUNIOR"
     js.append(["t"]); js.append(["s"]); js.append([])
     js.append(["#", "Abogado AT", "Fecha", "PROC", "ROL", "Desc", "ETAPA", "TRAM", "Aprob", "Valor"])
-    js.append([1, "Gonzalo Calderón", dt(2026, 7, 2), "R", "18.795.509-2", "a", "M", "E", "NO", 2423])
-    js.append([2, "Gonzalo Calderón", dt(2026, 7, 9), "R", "18.795.509-2", "b", "M", "E", "NO", 2423])
+    js.append([1, "Gonzalo Calderón", dt(2026, 7, 2), "R", rut, desc1, "M", "E", "NO", 2423])
+    js.append([2, "Gonzalo Calderón", dt(2026, 7, 9), "R", rut, desc2, "M", "E", "NO", 2423])
     buf = io.BytesIO()
     wb.save(buf)
-    r = client.post("/api/v1/hitos/importar", headers=_h(ADMIN_RUT),
-                    files={"archivo": ("h.xlsx", buf.getvalue(), _XLSX_MIME)}).json()
+    return client.post("/api/v1/hitos/importar", headers=_h(ADMIN_RUT),
+                       files={"archivo": ("h.xlsx", buf.getvalue(), _XLSX_MIME)}).json()
+
+
+def test_importar_same_client_different_causa_both_kept(client, db, admin):
+    """Same lawyer + same client RUT but DIFFERENT causa (ROL en descripcion) → both
+    rows are kept (a lawyer can work the same client on several causas)."""
+    r = _import_two_junior_rows(client, db, "C-100-2026", "C-200-2026")
+    assert r["creadas"] == 2
+    assert r["omitidas_duplicadas"] == 0
+
+
+def test_importar_dedups_same_lawyer_rut_and_causa(client, db, admin):
+    """Same lawyer + same RUT + SAME causa → the second row is a real duplicate."""
+    r = _import_two_junior_rows(client, db, "C-100-2026", "C-100-2026")
     assert r["creadas"] == 1
     assert r["omitidas_duplicadas"] == 1
