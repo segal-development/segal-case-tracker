@@ -8,6 +8,7 @@ without evidence ("sin evidencia no se paga").
 import hashlib
 import io
 import logging
+import re
 import unicodedata
 from datetime import date, datetime
 from typing import List, Optional
@@ -21,6 +22,24 @@ from app.api.deps import get_current_lawyer, get_db, require_admin
 from app.models.hito import Hito, HitoTipo, HITO_APROBADO, HITO_PENDIENTE, HITO_RECHAZADO
 from app.models.lawyer import Lawyer
 from app.services import bono_cierre_service as cierre_svc
+
+# A ROL like "C-9960-2026" embedded anywhere in the free-text descripcion.
+_ROL_RE = re.compile(r"[A-Za-z]+-\d+-\d{4}")
+
+
+def _causa_key(descripcion: Optional[str]) -> Optional[str]:
+    """Causa identifier used for hito dedup.
+
+    ``rol_causa`` stores the CLIENT RUT, so a lawyer could legitimately earn hitos
+    for the same client across DIFFERENT causas. The distinguishing causa lives in
+    ``descripcion`` (a ROL like ``C-9960-2026``), so dedup keys on
+    ``(lawyer, rol_causa, _causa_key(descripcion))``: the ROL when present, else the
+    normalized free text. ``None`` for empty descripcion.
+    """
+    if not descripcion:
+        return None
+    m = _ROL_RE.search(descripcion)
+    return (m.group(0).upper() if m else descripcion.strip().upper()[:120]) or None
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -171,18 +190,20 @@ async def create_hito(
             raise HTTPException(status_code=404, detail="Abogado no encontrado")
         target_lawyer_id = lawyer_id
 
-    # No duplicate: a lawyer may not register two hitos on the SAME causa.
-    # Only enforced when a rol_causa is given — a hito without a causa has
-    # nothing to dedupe against. Checked before storing evidence so a rejected
-    # duplicate never uploads a file.
+    # No duplicate on the SAME causa: a lawyer may repeat the same client
+    # (rol_causa = RUT) across DIFFERENT causas, so the block is keyed on
+    # (abogado, RUT, causa) — the causa is derived from descripcion (see
+    # _causa_key). Only enforced when a rol_causa is given. Checked before storing
+    # evidence so a rejected duplicate never uploads a file.
     rol_norm = (rol_causa or "").strip() or None
     if rol_norm is not None:
-        if (
-            db.query(Hito.id)
+        causa = _causa_key(descripcion)
+        prior = (
+            db.query(Hito.descripcion)
             .filter(Hito.lawyer_id == target_lawyer_id, Hito.rol_causa == rol_norm)
-            .first()
-            is not None
-        ):
+            .all()
+        )
+        if any(_causa_key(d) == causa for (d,) in prior):
             raise HTTPException(
                 status_code=409,
                 detail="Ya existe un hito de este abogado para esa causa",
@@ -499,20 +520,21 @@ async def update_hito(
             raise HTTPException(status_code=404, detail="Abogado no encontrado en el estudio")
         hito.lawyer_id = abogado.id
 
-    # No duplicate: the resulting (abogado, causa) must not collide with ANOTHER
-    # hito. Only enforced when a rol_causa is given.
+    # No duplicate: the resulting (abogado, RUT, causa) must not collide with
+    # ANOTHER hito. Same client on a DIFFERENT causa is allowed (see _causa_key).
     rol_norm = (body.rol_causa or "").strip() or None
     if rol_norm is not None:
-        if (
-            db.query(Hito.id)
+        causa = _causa_key(body.descripcion)
+        prior = (
+            db.query(Hito.descripcion)
             .filter(
                 Hito.id != hito.id,
                 Hito.lawyer_id == hito.lawyer_id,
                 Hito.rol_causa == rol_norm,
             )
-            .first()
-            is not None
-        ):
+            .all()
+        )
+        if any(_causa_key(d) == causa for (d,) in prior):
             raise HTTPException(
                 status_code=409,
                 detail="Ya existe un hito de este abogado para esa causa",
@@ -565,11 +587,14 @@ async def importar_hitos(
     tipos = db.query(HitoTipo).all()
     junior_tipo = next((t for t in tipos if t.nivel == "junior"), None)
     pleno_tipos = [t for t in tipos if t.nivel == "pleno"]
-    # Dedup key: (abogado, causa) — strict, matching the create/edit rule. A hito
-    # without a causa (rol_causa NULL) can't collide, so those are excluded here.
+    # Dedup key: (abogado, RUT, causa) — matching the create/edit rule. Same client
+    # (rol_causa = RUT) on a DIFFERENT causa (see _causa_key) is NOT a duplicate. A
+    # hito without a rol_causa can't collide, so those are excluded here.
     existing = {
-        (h.lawyer_id, h.rol_causa)
-        for h in db.query(Hito.lawyer_id, Hito.rol_causa).filter(Hito.rol_causa.isnot(None)).all()
+        (h.lawyer_id, h.rol_causa, _causa_key(h.descripcion))
+        for h in db.query(Hito.lawyer_id, Hito.rol_causa, Hito.descripcion)
+        .filter(Hito.rol_causa.isnot(None))
+        .all()
     }
 
     total = creadas = aprobados = pendientes = dup = err = 0
@@ -615,10 +640,12 @@ async def importar_hitos(
             if valor <= 0:
                 valor = tipo.valor_bruto
 
+            desc_norm = (str(descripcion).strip()[:500] if descripcion else None)
             rol_causa = (str(rut).strip()[:50] or None) if rut is not None else None
-            # Strict (abogado, causa) dedup; rol-less rows can't collide → always insert.
+            # (abogado, RUT, causa) dedup — same client on a different causa is NOT a
+            # duplicate. Rol-less rows can't collide → always insert.
             if rol_causa is not None:
-                key = (lawyer.id, rol_causa)
+                key = (lawyer.id, rol_causa, _causa_key(desc_norm))
                 if key in existing or key in seen:
                     dup += 1
                     continue
@@ -631,7 +658,7 @@ async def importar_hitos(
                 fecha_hito=fecha.date(),
                 rol_causa=rol_causa,
                 procedimiento=(str(procedimiento).strip()[:100] if procedimiento else None),
-                descripcion=(str(descripcion).strip()[:500] if descripcion else None),
+                descripcion=desc_norm,
                 etapa_sysgal=(str(etapa).strip()[:100] if etapa else None),
                 tramite_sysgal=(str(tramite).strip()[:255] if tramite else None),
                 estado=estado,
