@@ -451,3 +451,23 @@ def test_reimport_hoja_sin_rut_no_duplica(client, db, admin):
     # en total sigue habiendo 2, no 4
     hitos = client.get("/api/v1/hitos?periodo=2026-07", headers=_h(ADMIN_RUT)).json()
     assert len([h for h in hitos if h["lawyer_id"] == lw.id]) == 2
+
+
+def test_importar_acepta_fecha_en_texto(client, db, admin):
+    """Filas con la fecha como TEXTO ('7/14/2026') ahora se importan (no se pierden)."""
+    import io, openpyxl
+    t = HitoTipo(code="pleno_prescripcion", label="Prescripción terminada (sentencia firme)",
+                 nivel="pleno", valor_bruto=10000, orden=1)
+    lw = Lawyer(rut="15999888-7", name="Luis Felipe Contreras Gonzalez", role="lawyer", is_firm_lawyer=True)
+    db.add_all([t, lw]); db.commit()
+    wb = openpyxl.Workbook(); ws = wb.active; ws.title = "LCONTRERAS"
+    ws.append(["HITOS H1 · PLENO"]); ws.append(["sub"]); ws.append([])
+    ws.append(["#", "Abogado AT", "Fecha", "RUT", "ROL causa", "Tipo de hito", "ETAPA", "TRAMITE", "Aprobado", "Valor"])
+    ws.append([1, "Luis Contreras", "7/14/2026", "9.111.222-3", "C-100-2026", "Prescripción terminada (sentencia firme)", "E", "F", "SÍ", 10000])
+    ws.append([2, "Luis Contreras", "7/17/2026", "9.333.444-5", "C-200-2026", "Prescripción terminada (sentencia firme)", "E", "F", "SÍ", 10000])
+    buf = io.BytesIO(); wb.save(buf)
+    r = client.post("/api/v1/hitos/importar?hoja=LCONTRERAS", headers=_h(ADMIN_RUT),
+                    files={"archivo": ("t.xlsx", buf.getvalue(), _XLSX_MIME)}).json()
+    assert r["creadas"] == 2 and r["errores"] == 0
+    hitos = client.get("/api/v1/hitos?periodo=2026-07", headers=_h(ADMIN_RUT)).json()
+    assert len([h for h in hitos if h["lawyer_id"] == lw.id]) == 2

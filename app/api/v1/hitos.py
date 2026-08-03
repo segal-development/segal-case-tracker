@@ -400,6 +400,29 @@ def _cell(row, i):
     return row[i] if row is not None and i < len(row) else None
 
 
+def _parse_fecha(value):
+    """Return a ``date`` from an Excel cell that may be a real datetime OR text.
+
+    RRHH files often have the fecha column formatted as TEXT ("7/14/2026",
+    "14/07/2026", "2026-07-14"), which the import used to reject as an error —
+    silently dropping those rows. Tries the file's apparent M/D/Y first, then
+    D/M/Y and ISO. Returns ``None`` if unparseable.
+    """
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if not value:
+        return None
+    s = str(value).strip()
+    for fmt in ("%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%m/%d/%y", "%d/%m/%y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
 def _is_hito_row(row) -> bool:
     ab = _cell(row, 1)
     return bool(ab and str(ab).strip() and _norm(ab) not in ("ABOGADO AT", "ABOGADO"))
@@ -701,7 +724,7 @@ async def importar_hitos(
         estado = HITO_APROBADO if aprobado else HITO_PENDIENTE
         nuevos.append(Hito(
             lawyer_id=lawyer.id, hito_tipo_id=tipo.id, valor_bruto=valor,
-            fecha_hito=fecha.date(), rol_causa=rol_causa,
+            fecha_hito=fecha, rol_causa=rol_causa,
             procedimiento=(str(procedimiento).strip()[:100] if procedimiento else None),
             descripcion=desc_norm,
             etapa_sysgal=(str(etapa).strip()[:100] if etapa else None),
@@ -730,8 +753,8 @@ async def importar_hitos(
                 if not ab or _norm(ab) in ("ABOGADO AT", "ABOGADO"):
                     continue
                 total += 1
-                fecha = g(row, "fecha")
-                if not isinstance(fecha, datetime):
+                fecha = _parse_fecha(g(row, "fecha"))
+                if fecha is None:
                     err += 1
                     continue
                 lawyer = _match_lawyer_by_name(ab, lawyers)
@@ -760,8 +783,8 @@ async def importar_hitos(
             if not _is_hito_row(row):
                 continue
             total += 1
-            fecha = _cell(row, 2)
-            if not isinstance(fecha, datetime):
+            fecha = _parse_fecha(_cell(row, 2))
+            if fecha is None:
                 err += 1
                 continue
             lawyer = _match_lawyer_by_name(_cell(row, 1), lawyers)
