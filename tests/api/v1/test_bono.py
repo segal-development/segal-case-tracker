@@ -397,3 +397,30 @@ def test_avance_semanal_rechaza_suma_mayor_a_100(client, admin, junior):
         json={"cumpl_sem1": 60, "cumpl_sem2": 60},
     )
     assert r.status_code == 400
+
+
+def test_meta_cumplimiento_se_guarda_y_expone(client, admin, junior):
+    """Carla carga la meta del mes a mano; se guarda y aparece junto a lo que llevan."""
+    r = client.put(
+        f"/api/v1/bono/variables/{junior.id}?periodo=2026-08",
+        headers=_h(ADMIN_RUT),
+        json={"cumpl_sem1": 30, "cumpl_sem2": 25, "meta_cumplimiento": 90},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["cumpl_total"] == 55        # lo que llevan
+    assert body["meta_cumplimiento"] == 90  # la meta cargada
+    # la meta NO altera V3 (55% < 80% → sigue $0)
+    assert body["v3_neta"] == 0
+    liq = client.get("/api/v1/bono/liquidacion?periodo=2026-08", headers=_h(ADMIN_RUT)).json()
+    row = next(x for x in liq["rows"] if x["lawyer_id"] == junior.id)
+    assert row["meta_cumplimiento"] == 90
+
+
+def test_meta_fuera_de_rango_rechaza(client, admin, junior):
+    r = client.put(
+        f"/api/v1/bono/variables/{junior.id}?periodo=2026-08",
+        headers=_h(ADMIN_RUT),
+        json={"meta_cumplimiento": 150},
+    )
+    assert r.status_code == 400

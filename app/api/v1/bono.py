@@ -85,6 +85,7 @@ class BonoVariablesIn(BaseModel):
     cumpl_sem3: float = 0.0
     cumpl_sem4: float = 0.0
     cumpl_sem5: float = 0.0
+    meta_cumplimiento: float = 0.0
     reclamos_leve: int = 0
     reclamos_medio: int = 0
     reclamos_grave: int = 0
@@ -109,6 +110,7 @@ class BonoRow(BaseModel):
     cumpl_sem4: float = 0.0
     cumpl_sem5: float = 0.0
     cumpl_total: float = 0.0  # suma de semanas (= % cumplimiento del mes)
+    meta_cumplimiento: float = 0.0  # meta del mes (referencia; no altera V3)
     reclamos_leve: int
     reclamos_medio: int
     reclamos_grave: int
@@ -226,6 +228,7 @@ def _build_row(lawyer: Lawyer, var: Optional[BonoVariables], hitos_aprobados: in
         cumpl_sem4=semanas[3],
         cumpl_sem5=semanas[4],
         cumpl_total=cumpl_total,
+        meta_cumplimiento=float(getattr(var, "meta_cumplimiento", 0) or 0) if var else 0.0,
         fijo=b["fijo"],
         v1_pct_activacion=b["v1_pct_activacion"],
         v1_valor_cliente=b["v1_valor_cliente"],
@@ -458,6 +461,8 @@ async def upsert_variables(
             raise HTTPException(status_code=400, detail=f"El % de la semana {i} debe estar entre 0 y 100")
     if sum(semanas) > 100.0001:
         raise HTTPException(status_code=400, detail="La suma de las semanas no puede superar 100%")
+    if body.meta_cumplimiento < 0 or body.meta_cumplimiento > 100:
+        raise HTTPException(status_code=400, detail="La meta debe estar entre 0 y 100%")
 
     admin = db.query(Lawyer).filter(Lawyer.rut == admin_rut).first()
     var = (
@@ -483,6 +488,7 @@ async def upsert_variables(
     var.cumpl_sem3 = body.cumpl_sem3
     var.cumpl_sem4 = body.cumpl_sem4
     var.cumpl_sem5 = body.cumpl_sem5
+    var.meta_cumplimiento = body.meta_cumplimiento
     var.reclamos_leve = body.reclamos_leve
     var.reclamos_medio = body.reclamos_medio
     var.reclamos_grave = body.reclamos_grave
