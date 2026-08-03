@@ -660,14 +660,15 @@ async def importar_hitos(
     tipos = db.query(HitoTipo).all()
     junior_tipo = next((t for t in tipos if t.nivel == "junior"), None)
     pleno_tipos = [t for t in tipos if t.nivel == "pleno"]
-    # Dedup key: (abogado, RUT, causa) — matching the create/edit rule. Same client
-    # (rol_causa = RUT) on a DIFFERENT causa (see _causa_key) is NOT a duplicate. A
-    # hito without a rol_causa can't collide, so those are excluded here.
+    # Dedup key: (abogado, RUT, causa). Mismo cliente (RUT) en causas DISTINTAS no es
+    # duplicado. Se dedupea si hay RUT O una causa (ROL en descripción) — así las
+    # hojas SIN columna RUT (solo ROL) también quedan protegidas contra recargas.
     existing = {
         (h.lawyer_id, h.rol_causa, _causa_key(h.descripcion))
         for h in db.query(Hito.lawyer_id, Hito.rol_causa, Hito.descripcion)
-        .filter(Hito.rol_causa.isnot(None))
+        .filter((Hito.rol_causa.isnot(None)) | (Hito.descripcion.isnot(None)))
         .all()
+        if h.rol_causa is not None or _causa_key(h.descripcion) is not None
     }
 
     total = creadas = aprobados = pendientes = dup = err = 0
@@ -689,8 +690,11 @@ async def importar_hitos(
         # dos hitos del mismo cliente en causas distintas.
         desc_src = descripcion if descripcion else rol
         desc_norm = (str(desc_src).strip()[:500] if desc_src else None)
-        if rol_causa is not None:
-            key = (lawyer.id, rol_causa, _causa_key(desc_norm))
+        causa = _causa_key(desc_norm)
+        # Dedupea si hay RUT O causa (ROL). Así protege también las hojas sin RUT
+        # (rol_causa None) que traen el ROL en la descripción.
+        if rol_causa is not None or causa is not None:
+            key = (lawyer.id, rol_causa, causa)
             if key in existing or key in seen:
                 return "dup"
             seen.add(key)

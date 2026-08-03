@@ -429,3 +429,25 @@ def test_importar_formato_nuevo_hoja_por_abogado(client, db, admin):
     # el ROL cayó en descripcion (para dedup por causa)
     hitos = client.get("/api/v1/hitos?periodo=2026-07", headers=_h(ADMIN_RUT)).json()
     assert {h["descripcion"] for h in hitos} == {"C-1062-2026", "C-1089-2026"}
+
+
+def test_reimport_hoja_sin_rut_no_duplica(client, db, admin):
+    """Recargar una hoja SIN columna RUT (solo ROL) NO debe duplicar (dedup por ROL)."""
+    t = HitoTipo(code="pleno_excepcion_dilatoria", label="Excepción dilatoria acogida",
+                 nivel="pleno", valor_bruto=808, orden=1)
+    lw = Lawyer(rut="15111222-3", name="Sandy Elizabeth Quijada Norambuena",
+                role="lawyer", is_firm_lawyer=True)
+    db.add_all([t, lw]); db.commit()
+    data = _tabla_plenos_xlsx()  # SQUIJADA: sin columna RUT, ROL en col "ROL causa"
+
+    r1 = client.post("/api/v1/hitos/importar?hoja=SQUIJADA", headers=_h(ADMIN_RUT),
+                     files={"archivo": ("t.xlsx", data, _XLSX_MIME)}).json()
+    assert r1["creadas"] == 2
+    # segunda carga del MISMO archivo → 0 nuevas, 2 duplicadas
+    r2 = client.post("/api/v1/hitos/importar?hoja=SQUIJADA", headers=_h(ADMIN_RUT),
+                     files={"archivo": ("t.xlsx", data, _XLSX_MIME)}).json()
+    assert r2["creadas"] == 0
+    assert r2["omitidas_duplicadas"] == 2
+    # en total sigue habiendo 2, no 4
+    hitos = client.get("/api/v1/hitos?periodo=2026-07", headers=_h(ADMIN_RUT)).json()
+    assert len([h for h in hitos if h["lawyer_id"] == lw.id]) == 2
