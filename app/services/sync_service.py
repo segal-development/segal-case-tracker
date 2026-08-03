@@ -67,7 +67,7 @@ from app.scrapper.pjud.exceptions import (
     ShapeChallengeError,
 )
 from app.services.shape_cooldown import get_shape_cooldown
-from app.services.deadline_engine import DeadlineEngine, SemaforoTransition
+from app.services.deadline_engine import DeadlineEngine, SemaforoTransition, _today_chile
 
 
 @dataclass
@@ -169,6 +169,23 @@ class NotifyBudget:
 # Fail-open: a ROL whose suffix isn't a real 4-digit year is kept, never
 # silently dropped.
 # ---------------------------------------------------------------------------
+
+def _plazo_texto(next_deadline_at) -> str:
+    """Frase del plazo para las alertas: distingue PRÓXIMO (futuro) de VENCIDO (pasado).
+
+    Un ``next_deadline_at`` en el pasado NO es un "próximo plazo": es una acción
+    vencida pendiente (por eso la causa sigue ROJA). Etiquetarlo como vencido evita
+    la confusión de mostrar una fecha ya pasada como si viniera.
+    """
+    if not next_deadline_at:
+        return "Sin próximo plazo activo registrado."
+    fecha = next_deadline_at.date() if hasattr(next_deadline_at, "date") else next_deadline_at
+    hoy = _today_chile()
+    if fecha < hoy:
+        dias = (hoy - fecha).days
+        return f"Plazo vencido: {fecha} (hace {dias} día{'s' if dias != 1 else ''})."
+    return f"Próximo plazo: {fecha}."
+
 
 def rol_year_ok(rol: str) -> bool:
     min_year = settings.DETAIL_MIN_YEAR
@@ -1518,11 +1535,7 @@ def emit_deadline_alerts(
     _budget = budget if budget is not None else NotifyBudget.from_settings()
 
     tribunal = case.court.name if case.court else "tribunal no especificado"
-    plazo_txt = (
-        f"Próximo plazo: {case.next_deadline_at}."
-        if case.next_deadline_at
-        else "Sin próximo plazo activo registrado."
-    )
+    plazo_txt = _plazo_texto(case.next_deadline_at)
 
     events: list[tuple[str, str, str]] = []
     if transition.entered_rojo:
