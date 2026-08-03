@@ -11,6 +11,7 @@ from datetime import datetime
 from sqlalchemy import (
     Column,
     Integer,
+    Float,
     String,
     Boolean,
     DateTime,
@@ -38,9 +39,17 @@ class BonoVariables(Base):
     clientes_m2 = Column(Integer, nullable=False, server_default=text("0"), default=0)
     clientes_activos = Column(Integer, nullable=False, server_default=text("0"), default=0)
 
-    # V3 — cumplimiento mensual
+    # V3 — cumplimiento mensual.
+    # Legacy: un solo cociente cumplidas/asignadas (se conserva para historial,
+    # ya NO se edita). Nuevo: avance de cartera cargado por SEMANA (puntos de %,
+    # ej. 7.5 = 7,5%); el % de cumplimiento del mes es la SUMA de las semanas.
     causas_asignadas = Column(Integer, nullable=False, server_default=text("0"), default=0)
     causas_cumplidas = Column(Integer, nullable=False, server_default=text("0"), default=0)
+    cumpl_sem1 = Column(Float, nullable=False, server_default=text("0"), default=0.0)
+    cumpl_sem2 = Column(Float, nullable=False, server_default=text("0"), default=0.0)
+    cumpl_sem3 = Column(Float, nullable=False, server_default=text("0"), default=0.0)
+    cumpl_sem4 = Column(Float, nullable=False, server_default=text("0"), default=0.0)
+    cumpl_sem5 = Column(Float, nullable=False, server_default=text("0"), default=0.0)
 
     # V4 — reclamos (counts by severity)
     reclamos_leve = Column(Integer, nullable=False, server_default=text("0"), default=0)

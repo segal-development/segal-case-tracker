@@ -370,3 +370,30 @@ def test_import_requires_admin(client, junior):
                         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
     )
     assert r.status_code == 403
+
+
+def test_avance_semanal_alimenta_v3(client, admin, junior):
+    """Carla carga % por semana → suman el cumplimiento → V3 refleja el tramo."""
+    r = client.put(
+        f"/api/v1/bono/variables/{junior.id}?periodo=2026-08",
+        headers=_h(ADMIN_RUT),
+        json={"cumpl_sem1": 30, "cumpl_sem2": 30, "cumpl_sem3": 20, "cumpl_sem4": 12},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["cumpl_total"] == 92          # suma de semanas
+    assert body["v3_pct_cumplimiento"] == 0.92
+    assert body["v3_neta"] == 100_000         # junior ≥90%
+    # persistió: reaparece en la liquidación
+    liq = client.get("/api/v1/bono/liquidacion?periodo=2026-08", headers=_h(ADMIN_RUT)).json()
+    row = next(x for x in liq["rows"] if x["lawyer_id"] == junior.id)
+    assert row["cumpl_sem2"] == 30 and row["v3_neta"] == 100_000
+
+
+def test_avance_semanal_rechaza_suma_mayor_a_100(client, admin, junior):
+    r = client.put(
+        f"/api/v1/bono/variables/{junior.id}?periodo=2026-08",
+        headers=_h(ADMIN_RUT),
+        json={"cumpl_sem1": 60, "cumpl_sem2": 60},
+    )
+    assert r.status_code == 400
