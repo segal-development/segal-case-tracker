@@ -179,6 +179,29 @@ def _period_bounds(periodo: Optional[str]) -> tuple[str, date, date]:
     return f"{y:04d}-{m:02d}", start, end
 
 
+def _renovaciones_map(db: Session, start: date, end: date) -> dict[int, int]:
+    """Count of renovaciones per lawyer whose fecha_desde falls in the period.
+
+    Feeds V2 directly from the Renovaciones module (no manual re-entry). NOTE: the
+    Renovacion model has no 'primera cuota pagada' flag yet, so this counts every
+    renovación of the month; the pago-condition would be a later addition."""
+    from app.models.renovacion import Renovacion
+
+    rows = (
+        db.query(Renovacion.lawyer_id)
+        .filter(
+            Renovacion.lawyer_id.isnot(None),
+            Renovacion.fecha_desde >= start,
+            Renovacion.fecha_desde < end,
+        )
+        .all()
+    )
+    out: dict[int, int] = {}
+    for (lid,) in rows:
+        out[lid] = out.get(lid, 0) + 1
+    return out
+
+
 def _hitos_aprobados_map(db: Session, start: date, end: date) -> dict[int, int]:
     """Sum of approved hito gross value per lawyer for the period."""
     rows = (
@@ -196,8 +219,14 @@ def _hitos_aprobados_map(db: Session, start: date, end: date) -> dict[int, int]:
     return out
 
 
-def _build_row(lawyer: Lawyer, var: Optional[BonoVariables], hitos_aprobados: int) -> BonoRow:
+def _build_row(
+    lawyer: Lawyer, var: Optional[BonoVariables], hitos_aprobados: int,
+    renovaciones_auto: Optional[int] = None,
+) -> BonoRow:
     nivel = (var.nivel if var else None) or lawyer.nivel or bono_calc.JUNIOR
+    # V2: renovaciones se cuentan automáticamente del módulo (renovaciones_auto);
+    # el campo manual var.renovaciones queda como fallback si no se pasó el conteo.
+    renovaciones = renovaciones_auto if renovaciones_auto is not None else (var.renovaciones if var else 0)
     inputs = dict(
         clientes_m2=var.clientes_m2 if var else 0,
         clientes_activos=var.clientes_activos if var else 0,
@@ -206,7 +235,7 @@ def _build_row(lawyer: Lawyer, var: Optional[BonoVariables], hitos_aprobados: in
         reclamos_leve=var.reclamos_leve if var else 0,
         reclamos_medio=var.reclamos_medio if var else 0,
         reclamos_grave=var.reclamos_grave if var else 0,
-        renovaciones=var.renovaciones if var else 0,
+        renovaciones=renovaciones,
     )
     semanas = [
         float(getattr(var, f"cumpl_sem{i}", 0) or 0) if var else 0.0 for i in range(1, 6)
@@ -364,12 +393,16 @@ def _liquidacion_data(db: Session, periodo: Optional[str]) -> LiquidacionRespons
         .all()
     )
     hitos_map = _hitos_aprobados_map(db, start, end)
+    renov_map = _renovaciones_map(db, start, end)
     vars_map = {
         v.lawyer_id: v
         for v in db.query(BonoVariables).filter(BonoVariables.periodo == periodo).all()
     }
 
-    rows = [_build_row(lw, vars_map.get(lw.id), hitos_map.get(lw.id, 0)) for lw in lawyers]
+    rows = [
+        _build_row(lw, vars_map.get(lw.id), hitos_map.get(lw.id, 0), renov_map.get(lw.id, 0))
+        for lw in lawyers
+    ]
     totales = BonoTotales(
         fijo=sum(r.fijo for r in rows),
         hitos_aprobados=sum(r.hitos_aprobados for r in rows),
@@ -501,7 +534,8 @@ async def upsert_variables(
 
     _p, start, end = _period_bounds(periodo)
     hitos = _hitos_aprobados_map(db, start, end).get(lawyer_id, 0)
-    return _build_row(lawyer, var, hitos)
+    renov = _renovaciones_map(db, start, end).get(lawyer_id, 0)
+    return _build_row(lawyer, var, hitos, renov)
 
 
 class ImportedRow(BaseModel):
