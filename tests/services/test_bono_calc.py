@@ -105,3 +105,40 @@ def test_liquidacion_pleno_fijo():
 
 def test_unknown_nivel_defaults_junior():
     assert bc.compute("otro")["fijo"] == 1_105_354
+
+
+# --- V3 desde avance semanal (suma de semanas) ------------------------------ #
+def test_v3_desde_semanas_suma_a_tramo():
+    # 4 semanas que suman 92% → tramo ≥90% (junior 100000)
+    b = bc.compute("junior", cumpl_semanas=[30, 30, 20, 12])
+    assert b["v3_pct_cumplimiento"] == pytest.approx(0.92)
+    assert b["v3_tramo_bruto"] == 100000
+    assert b["v3_neta"] == 100000
+
+
+def test_v3_semanas_bajo_umbral_paga_cero():
+    # suman 65% → <80% → tramo 0
+    b = bc.compute("pleno", cumpl_semanas=[20, 20, 15, 10])
+    assert b["v3_pct_cumplimiento"] == pytest.approx(0.65)
+    assert b["v3_tramo_bruto"] == 0
+    assert b["v3_neta"] == 0
+
+
+def test_v3_semanas_con_penalizacion_v4():
+    # 82% → tramo ≥80% junior 80000; 1 grave = -30% → 56000
+    b = bc.compute("junior", cumpl_semanas=[40, 42], reclamos_grave=1)
+    assert b["v3_tramo_bruto"] == 80000
+    assert b["v3_neta"] == 56000
+
+
+def test_v3_fallback_a_cociente_legacy_sin_semanas():
+    # sin semanas → usa causas_cumplidas/asignadas (compat histórica)
+    b = bc.compute("junior", causas_asignadas=100, causas_cumplidas=95)
+    assert b["v3_pct_cumplimiento"] == pytest.approx(0.95)
+    assert b["v3_neta"] == 100000
+
+
+def test_v3_semanas_tienen_prioridad_sobre_legacy():
+    # si hay semanas, ignoran el cociente legacy
+    b = bc.compute("junior", cumpl_semanas=[50, 45], causas_asignadas=100, causas_cumplidas=10)
+    assert b["v3_pct_cumplimiento"] == pytest.approx(0.95)  # 95% de semanas, no 10%

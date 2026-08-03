@@ -97,13 +97,19 @@ def compute(
     clientes_activos: int = 0,
     causas_asignadas: int = 0,
     causas_cumplidas: int = 0,
+    cumpl_semanas: "list[float] | None" = None,
     reclamos_leve: int = 0,
     reclamos_medio: int = 0,
     reclamos_grave: int = 0,
     renovaciones: int = 0,
     hitos_aprobados: int = 0,
 ) -> BonoBreakdown:
-    """Full V1–V4 + liquidación breakdown for one lawyer/period."""
+    """Full V1–V4 + liquidación breakdown for one lawyer/period.
+
+    ``cumpl_semanas``: avance de cartera por semana en PUNTOS de % (ej. [7.5, 13, 20]);
+    el % de cumplimiento del mes es su suma (65 → 0.65). Si no hay semanas cargadas,
+    se cae al cociente legacy causas_cumplidas/causas_asignadas.
+    """
     nivel = PLENO if nivel == PLENO else JUNIOR  # anything not "pleno" is junior
 
     # V1 — retención
@@ -111,8 +117,12 @@ def compute(
     valor_cli = valor_cliente_v1(nivel, pct_act)
     v1 = clientes_activos * valor_cli
 
-    # V3 — cumplimiento, minus V4 penalties
-    pct_cumpl = (causas_cumplidas / causas_asignadas) if causas_asignadas > 0 else 0.0
+    # V3 — cumplimiento (suma de semanas si hay; si no, cociente legacy), minus V4.
+    semanas_total = sum(cumpl_semanas) if cumpl_semanas else 0.0
+    if semanas_total > 0:
+        pct_cumpl = semanas_total / 100.0
+    else:
+        pct_cumpl = (causas_cumplidas / causas_asignadas) if causas_asignadas > 0 else 0.0
     v3_tramo = tramo_v3(nivel, pct_cumpl)
     pct_v4 = (
         reclamos_leve * V4_PESO_LEVE

@@ -79,6 +79,12 @@ class BonoVariablesIn(BaseModel):
     clientes_activos: int = 0
     causas_asignadas: int = 0
     causas_cumplidas: int = 0
+    # Avance de cartera por semana (puntos de %, ej. 7.5). Suman el % de V3.
+    cumpl_sem1: float = 0.0
+    cumpl_sem2: float = 0.0
+    cumpl_sem3: float = 0.0
+    cumpl_sem4: float = 0.0
+    cumpl_sem5: float = 0.0
     reclamos_leve: int = 0
     reclamos_medio: int = 0
     reclamos_grave: int = 0
@@ -97,6 +103,12 @@ class BonoRow(BaseModel):
     clientes_activos: int
     causas_asignadas: int
     causas_cumplidas: int
+    cumpl_sem1: float = 0.0
+    cumpl_sem2: float = 0.0
+    cumpl_sem3: float = 0.0
+    cumpl_sem4: float = 0.0
+    cumpl_sem5: float = 0.0
+    cumpl_total: float = 0.0  # suma de semanas (= % cumplimiento del mes)
     reclamos_leve: int
     reclamos_medio: int
     reclamos_grave: int
@@ -194,7 +206,13 @@ def _build_row(lawyer: Lawyer, var: Optional[BonoVariables], hitos_aprobados: in
         reclamos_grave=var.reclamos_grave if var else 0,
         renovaciones=var.renovaciones if var else 0,
     )
-    b = bono_calc.compute(nivel, hitos_aprobados=hitos_aprobados, **inputs)
+    semanas = [
+        float(getattr(var, f"cumpl_sem{i}", 0) or 0) if var else 0.0 for i in range(1, 6)
+    ]
+    cumpl_total = round(sum(semanas), 4)
+    b = bono_calc.compute(
+        nivel, hitos_aprobados=hitos_aprobados, cumpl_semanas=semanas, **inputs
+    )
     return BonoRow(
         lawyer_id=lawyer.id,
         lawyer_nombre=lawyer.name,
@@ -202,6 +220,12 @@ def _build_row(lawyer: Lawyer, var: Optional[BonoVariables], hitos_aprobados: in
         has_row=var is not None,
         verificado_dj=bool(var.verificado_dj) if var else False,
         **inputs,
+        cumpl_sem1=semanas[0],
+        cumpl_sem2=semanas[1],
+        cumpl_sem3=semanas[2],
+        cumpl_sem4=semanas[3],
+        cumpl_sem5=semanas[4],
+        cumpl_total=cumpl_total,
         fijo=b["fijo"],
         v1_pct_activacion=b["v1_pct_activacion"],
         v1_valor_cliente=b["v1_valor_cliente"],
@@ -427,6 +451,13 @@ async def upsert_variables(
         raise HTTPException(status_code=400, detail="Clientes activos no puede superar a los M-2")
     if body.causas_cumplidas > body.causas_asignadas and body.causas_asignadas > 0:
         raise HTTPException(status_code=400, detail="Causas cumplidas no puede superar a las asignadas")
+    # Avance semanal: cada semana entre 0 y 100 puntos de %; el total no supera 100.
+    semanas = [body.cumpl_sem1, body.cumpl_sem2, body.cumpl_sem3, body.cumpl_sem4, body.cumpl_sem5]
+    for i, s in enumerate(semanas, 1):
+        if s < 0 or s > 100:
+            raise HTTPException(status_code=400, detail=f"El % de la semana {i} debe estar entre 0 y 100")
+    if sum(semanas) > 100.0001:
+        raise HTTPException(status_code=400, detail="La suma de las semanas no puede superar 100%")
 
     admin = db.query(Lawyer).filter(Lawyer.rut == admin_rut).first()
     var = (
@@ -447,6 +478,11 @@ async def upsert_variables(
     var.clientes_activos = body.clientes_activos
     var.causas_asignadas = body.causas_asignadas
     var.causas_cumplidas = body.causas_cumplidas
+    var.cumpl_sem1 = body.cumpl_sem1
+    var.cumpl_sem2 = body.cumpl_sem2
+    var.cumpl_sem3 = body.cumpl_sem3
+    var.cumpl_sem4 = body.cumpl_sem4
+    var.cumpl_sem5 = body.cumpl_sem5
     var.reclamos_leve = body.reclamos_leve
     var.reclamos_medio = body.reclamos_medio
     var.reclamos_grave = body.reclamos_grave
