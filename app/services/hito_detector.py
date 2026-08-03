@@ -188,11 +188,15 @@ from app.models.movement import Movement
 class DeteccionResumen:
     periodo: str
     cerrado: bool
-    creados: int          # hitos sugeridos creados
+    creados: int          # hitos sugeridos creados (0 en dry_run — ver would_create)
     ya_existe: int        # movimientos que ya tenían un hito (idempotencia)
     rechazados: int       # regla matcheó pero la resolución no fue favorable
     sin_pdf: int          # candidato sin PDF stored → sin evidencia, se salta
     sin_atribucion: int   # causa no atribuible a un abogado del estudio
+    dry_run: bool = False
+    would_create: int = 0  # candidatos que se crearían (== creados fuera de dry_run)
+    # Desglose de would_create por confianza — para calibrar en el shadow-run.
+    por_confianza: Optional[dict] = None
 
 
 def _period_bounds(periodo: str) -> Tuple[date, date]:
@@ -256,12 +260,16 @@ class HitoDetectorService:
         except Exception:  # noqa: BLE001 — un PDF ilegible degrada, no rompe
             return ""
 
-    def detectar(self, periodo: str) -> DeteccionResumen:
+    def detectar(self, periodo: str, dry_run: bool = False) -> DeteccionResumen:
+        """Detecta candidatos del período. Con ``dry_run=True`` NO persiste nada
+        (shadow-run): cuenta lo que se crearía y lo desglosa por confianza, para
+        medir precisión antes del go-live sin ensuciar la liquidación."""
         from app.services import bono_cierre_service as cierre_svc
 
         start, end = _period_bounds(periodo)
         if cierre_svc.is_cerrado(self.db, periodo):
-            return DeteccionResumen(periodo, True, 0, 0, 0, 0, 0)
+            return DeteccionResumen(periodo, True, 0, 0, 0, 0, 0, dry_run=dry_run,
+                                    por_confianza={})
 
         case_lawyer = self._mapa_case_lawyer()
         tipos = {
@@ -289,6 +297,7 @@ class HitoDetectorService:
         )
 
         creados = ya_existe = rechazados = sin_pdf = sin_atrib = 0
+        por_confianza: dict = {"alta": 0, "media": 0, "baja": 0}
         for mv in movs:
             regla = regla_para_movimiento(mv.stage, mv.procedure)
             if regla is None:
@@ -310,6 +319,11 @@ class HitoDetectorService:
                 continue
             tipo = tipos.get(det.hito_tipo_code)
             if tipo is None:
+                continue
+            por_confianza[det.confianza] = por_confianza.get(det.confianza, 0) + 1
+            if dry_run:
+                # Shadow-run: contamos el candidato pero NO lo persistimos.
+                creados += 1
                 continue
             rol = mv.case.rol if mv.case else None
             desc = " · ".join(x for x in (rol, det.frase) if x) or None
@@ -334,5 +348,12 @@ class HitoDetectorService:
             )
             creados += 1
 
-        self.db.commit()
-        return DeteccionResumen(periodo, False, creados, ya_existe, rechazados, sin_pdf, sin_atrib)
+        if dry_run:
+            self.db.rollback()  # asegura que nada quede persistido
+        else:
+            self.db.commit()
+        return DeteccionResumen(
+            periodo, False, (0 if dry_run else creados), ya_existe, rechazados,
+            sin_pdf, sin_atrib, dry_run=dry_run, would_create=creados,
+            por_confianza=por_confianza,
+        )

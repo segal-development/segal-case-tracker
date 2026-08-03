@@ -131,3 +131,27 @@ def test_no_atribuible_se_salta(db, esc, monkeypatch):
     db.commit()
     res = _run(db, monkeypatch)
     assert res.creados == 0 and res.sin_atribucion == 1
+
+
+# --- Shadow-run / dry-run (Slice 5) ---------------------------------------- #
+
+def test_dry_run_no_persiste_pero_cuenta(db, esc, monkeypatch):
+    res = _run_dry(db, monkeypatch)
+    assert res.dry_run is True
+    assert res.creados == 0            # nada se creó
+    assert res.would_create == 1       # pero se habría creado 1
+    assert res.por_confianza["alta"] == 1
+    # y confirmamos que la DB quedó limpia
+    assert db.query(Hito).filter(Hito.origen == "detector").count() == 0
+
+
+def test_dry_run_desglosa_por_confianza(db, esc, monkeypatch):
+    # sin firmeza → confianza media
+    res = _run_dry(db, monkeypatch, texto="Ha lugar a la excepción de prescripción.")
+    assert res.would_create == 1
+    assert res.por_confianza["media"] == 1 and res.por_confianza["alta"] == 0
+
+
+def _run_dry(db, monkeypatch, texto=FAVORABLE, periodo=PERIODO):
+    monkeypatch.setattr(hito_detector, "extraer_texto_pdf", lambda b: texto)
+    return HitoDetectorService(db, storage=FakeStorage()).detectar(periodo, dry_run=True)

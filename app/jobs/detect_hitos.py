@@ -8,6 +8,7 @@ Shape), classifies favorable resolutions, and creates hitos in estado
 ``sugerido`` (origen=detector) for the admin (Carla) to confirm. Targets TODAY's
 period in America/Santiago; closed periods are skipped by the service.
 """
+import argparse
 import logging
 
 from app.core.database import SessionLocal
@@ -19,11 +20,20 @@ logger = logging.getLogger(__name__)
 
 
 def main() -> None:
-    periodo = f"{_today_chile():%Y-%m}"
+    parser = argparse.ArgumentParser(description="Detector de hitos desde PJUD.")
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Shadow-run: NO crea hitos, solo reporta cuántos/cuáles se crearían.",
+    )
+    parser.add_argument("--periodo", help="YYYY-MM (por defecto: mes actual en Chile).")
+    args = parser.parse_args()
+
+    periodo = args.periodo or f"{_today_chile():%Y-%m}"
     db = SessionLocal()
     try:
-        resumen = HitoDetectorService(db).detectar(periodo)
-        logger.info("detector de hitos: %s", resumen)
+        resumen = HitoDetectorService(db).detectar(periodo, dry_run=args.dry_run)
+        etiqueta = "SHADOW-RUN (dry)" if args.dry_run else "detector de hitos"
+        logger.info("%s: %s", etiqueta, resumen)
     finally:
         db.close()
 
