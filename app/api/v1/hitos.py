@@ -415,12 +415,84 @@ def _open_hito_wb(data: bytes):
         raise HTTPException(status_code=415, detail="No se pudo leer el archivo (usa un .xlsx)")
 
 
+# Column headers → field, matched by WHOLE WORD (so "RUT" doesn't hit "bRUTo").
+_COL_KEYS = {
+    "abogado": ["ABOGADO"], "fecha": ["FECHA"], "rut": ["RUT"], "rol": ["ROL"],
+    "tipo": ["TIPO DE HITO", "TIPO"], "proc": ["PROCEDIMIENTO"], "desc": ["DESCRIPCION"],
+    "etapa": ["ETAPA"], "tramite": ["TRAMITE"], "aprobado": ["APROBADO"], "valor": ["VALOR"],
+}
+
+
+def _resolve_hito_columns(ws):
+    """Find the header row of a hito sheet and map field → column index by header
+    NAME (robust to layout differences: with/without RUT, any sheet name). Returns
+    ``(header_row_index, cols)`` or ``(None, None)`` if no hito header is found."""
+    for ri, row in enumerate(ws.iter_rows(min_row=1, max_row=10, values_only=True)):
+        headers = [_norm(c) for c in row]
+        cols: dict = {}
+        for field, keys in _COL_KEYS.items():
+            for i, h in enumerate(headers):
+                if h and i not in cols.values() and any(
+                    re.search(r"\b" + re.escape(k) + r"\b", h) for k in keys
+                ):
+                    cols[field] = i
+                    break
+        # A real header row has 'abogado' + several other fields in distinct columns.
+        if "abogado" in cols and len(cols) >= 4:
+            return ri, cols
+    return None, None
+
+
+def _sheet_is_hito(ws) -> bool:
+    """True for a sheet the importer can read: NEW format (resolvable header with
+    tipo+aprobado, any sheet name) or OLD format (name contains 'HITO')."""
+    if "HITO" in _norm(ws.title):
+        return True
+    _ri, cols = _resolve_hito_columns(ws)
+    return bool(cols and "tipo" in cols and "aprobado" in cols)
+
+
 def _hito_sheets(wb, hoja: Optional[str]):
-    """Only the HITOS sheets (skip PARÁMETROS, VARIABLES BONO, etc.)."""
-    sheets = [ws for ws in wb.worksheets if "HITO" in _norm(ws.title)]
+    """Importable sheets — by header/structure, NOT by name (skips PARÁMETROS,
+    VARIABLES BONO, LIQUIDACIÓN, HISTORIAL, which have no hito header)."""
+    sheets = [ws for ws in wb.worksheets if _sheet_is_hito(ws)]
     if hoja:
         sheets = [ws for ws in sheets if _norm(ws.title) == _norm(hoja)]
     return sheets
+
+
+def _count_hito_rows(ws) -> int:
+    """Data-row count for a hito sheet, for both formats (new header-based / old)."""
+    header_row, cols = _resolve_hito_columns(ws)
+    if cols and "tipo" in cols and "aprobado" in cols:
+        ab_i = cols["abogado"]
+        return sum(
+            1
+            for ri, row in enumerate(ws.iter_rows(values_only=True))
+            if ri > header_row
+            and ab_i < len(row)
+            and row[ab_i]
+            and _norm(row[ab_i]) not in ("ABOGADO AT", "ABOGADO")
+        )
+    return sum(1 for r in ws.iter_rows(values_only=True) if _is_hito_row(r))
+
+
+def _match_tipo_any(text, tipos) -> Optional[HitoTipo]:
+    """Match a 'Tipo de hito' cell against ALL hito tipos by label (nivel-agnostic)."""
+    n = _norm(text)
+    if not n:
+        return None
+    for t in tipos:
+        lt = _norm(t.label)
+        if n == lt or n in lt or lt in n:
+            return t
+    ntok = set(n.split())
+    best, best_k = None, 0
+    for t in tipos:
+        k = len(ntok & set(_norm(t.label).split()))
+        if k > best_k:
+            best, best_k = t, k
+    return best if best_k >= 2 else None
 
 
 def _match_lawyer_by_name(name: str, lawyers) -> Optional[Lawyer]:
@@ -562,10 +634,7 @@ async def listar_hojas_hitos(
 ):
     """List the HITOS sheets of an uploaded SISTEMA DE HITOS.xlsx (name + row count)."""
     wb = _open_hito_wb(await archivo.read())
-    out = [
-        HitoHojaInfo(nombre=ws.title, filas=sum(1 for r in ws.iter_rows(values_only=True) if _is_hito_row(r)))
-        for ws in _hito_sheets(wb, None)
-    ]
+    out = [HitoHojaInfo(nombre=ws.title, filas=_count_hito_rows(ws)) for ws in _hito_sheets(wb, None)]
     wb.close()
     return out
 
@@ -605,7 +674,83 @@ async def importar_hitos(
     seen: set = set()
     nuevos: list[Hito] = []
 
+    def _add(lawyer, tipo, fecha, *, rut, rol, procedimiento, descripcion,
+             etapa, tramite, aprobado, valor_cell=None) -> str:
+        """Dedup + build a Hito. Returns 'dup' | 'ok'. rol_causa = client RUT;
+        the causa (ROL) goes to descripcion (matches the create/edit/dedup rule)."""
+        try:
+            valor = int(valor_cell) if valor_cell else tipo.valor_bruto
+        except (ValueError, TypeError):
+            valor = tipo.valor_bruto
+        if valor <= 0:
+            valor = tipo.valor_bruto
+        rol_causa = (str(rut).strip()[:50] or None) if rut is not None else None
+        # descripcion = ROL de la causa (o el texto libre viejo); es lo que distingue
+        # dos hitos del mismo cliente en causas distintas.
+        desc_src = descripcion if descripcion else rol
+        desc_norm = (str(desc_src).strip()[:500] if desc_src else None)
+        if rol_causa is not None:
+            key = (lawyer.id, rol_causa, _causa_key(desc_norm))
+            if key in existing or key in seen:
+                return "dup"
+            seen.add(key)
+        estado = HITO_APROBADO if aprobado else HITO_PENDIENTE
+        nuevos.append(Hito(
+            lawyer_id=lawyer.id, hito_tipo_id=tipo.id, valor_bruto=valor,
+            fecha_hito=fecha.date(), rol_causa=rol_causa,
+            procedimiento=(str(procedimiento).strip()[:100] if procedimiento else None),
+            descripcion=desc_norm,
+            etapa_sysgal=(str(etapa).strip()[:100] if etapa else None),
+            tramite_sysgal=(str(tramite).strip()[:255] if tramite else None),
+            estado=estado, created_by_rut=admin_rut,
+            created_by_name=admin.name if admin else None,
+            aprobado_by_rut=admin_rut if aprobado else None,
+            aprobado_by_name=(admin.name if admin else None) if aprobado else None,
+            aprobado_at=datetime.utcnow() if aprobado else None,
+        ))
+        return "ok"
+
     for ws in sheets:
+        header_row, cols = _resolve_hito_columns(ws)
+        new_format = bool(cols and "tipo" in cols and "aprobado" in cols)
+
+        if new_format:
+            # Header-based: cualquier layout (con/sin RUT), cualquier nombre de hoja.
+            def g(row, field):
+                i = cols.get(field)
+                return row[i] if i is not None and i < len(row) else None
+            for ri, row in enumerate(ws.iter_rows(values_only=True)):
+                if ri <= header_row:
+                    continue
+                ab = g(row, "abogado")
+                if not ab or _norm(ab) in ("ABOGADO AT", "ABOGADO"):
+                    continue
+                total += 1
+                fecha = g(row, "fecha")
+                if not isinstance(fecha, datetime):
+                    err += 1
+                    continue
+                lawyer = _match_lawyer_by_name(ab, lawyers)
+                tipo = _match_tipo_any(g(row, "tipo"), tipos)
+                if lawyer is None or tipo is None:
+                    err += 1
+                    continue
+                res = _add(
+                    lawyer, tipo, fecha, rut=g(row, "rut"), rol=g(row, "rol"),
+                    procedimiento=g(row, "proc"), descripcion=g(row, "desc"),
+                    etapa=g(row, "etapa"), tramite=g(row, "tramite"),
+                    aprobado=_norm(g(row, "aprobado")) in ("SI", "SÍ", "S"),
+                    valor_cell=g(row, "valor"),
+                )
+                if res == "dup":
+                    dup += 1
+                    continue
+                creadas += 1
+                aprobados += 1 if _norm(g(row, "aprobado")) in ("SI", "SÍ", "S") else 0
+                pendientes += 0 if _norm(g(row, "aprobado")) in ("SI", "SÍ", "S") else 1
+            continue
+
+        # OLD format (hojas 'HITOS JUNIOR/PLENO'): posición fija por nivel.
         is_junior = "JUNIOR" in _norm(ws.title)
         for row in ws.iter_rows(values_only=True):
             if not _is_hito_row(row):
@@ -619,64 +764,28 @@ async def importar_hitos(
             if lawyer is None:
                 err += 1
                 continue
-
             if is_junior:
-                procedimiento = _cell(row, 3)
-                rut = _cell(row, 4)
-                descripcion = _cell(row, 5)
-                tipo = junior_tipo
-            else:  # pleno
-                procedimiento = None
-                rut = _cell(row, 3)
-                descripcion = None
+                procedimiento, rut, descripcion, tipo = (
+                    _cell(row, 3), _cell(row, 4), _cell(row, 5), junior_tipo
+                )
+            else:
+                procedimiento, rut, descripcion = None, _cell(row, 3), None
                 tipo = _match_pleno_tipo(_cell(row, 5), pleno_tipos)
-            etapa = _cell(row, 6)
-            tramite = _cell(row, 7)
             aprobado = _norm(_cell(row, 8)) in ("SI", "SÍ", "S")
             if tipo is None:
                 err += 1
                 continue
-
-            try:
-                valor = int(_cell(row, 9)) if _cell(row, 9) else tipo.valor_bruto
-            except (ValueError, TypeError):
-                valor = tipo.valor_bruto
-            if valor <= 0:
-                valor = tipo.valor_bruto
-
-            desc_norm = (str(descripcion).strip()[:500] if descripcion else None)
-            rol_causa = (str(rut).strip()[:50] or None) if rut is not None else None
-            # (abogado, RUT, causa) dedup — same client on a different causa is NOT a
-            # duplicate. Rol-less rows can't collide → always insert.
-            if rol_causa is not None:
-                key = (lawyer.id, rol_causa, _causa_key(desc_norm))
-                if key in existing or key in seen:
-                    dup += 1
-                    continue
-                seen.add(key)
-            estado = HITO_APROBADO if aprobado else HITO_PENDIENTE
-            nuevos.append(Hito(
-                lawyer_id=lawyer.id,
-                hito_tipo_id=tipo.id,
-                valor_bruto=valor,
-                fecha_hito=fecha.date(),
-                rol_causa=rol_causa,
-                procedimiento=(str(procedimiento).strip()[:100] if procedimiento else None),
-                descripcion=desc_norm,
-                etapa_sysgal=(str(etapa).strip()[:100] if etapa else None),
-                tramite_sysgal=(str(tramite).strip()[:255] if tramite else None),
-                estado=estado,
-                created_by_rut=admin_rut,
-                created_by_name=admin.name if admin else None,
-                aprobado_by_rut=admin_rut if aprobado else None,
-                aprobado_by_name=(admin.name if admin else None) if aprobado else None,
-                aprobado_at=datetime.utcnow() if aprobado else None,
-            ))
+            res = _add(
+                lawyer, tipo, fecha, rut=rut, rol=None, procedimiento=procedimiento,
+                descripcion=descripcion, etapa=_cell(row, 6), tramite=_cell(row, 7),
+                aprobado=aprobado, valor_cell=_cell(row, 9),
+            )
+            if res == "dup":
+                dup += 1
+                continue
             creadas += 1
-            if aprobado:
-                aprobados += 1
-            else:
-                pendientes += 1
+            aprobados += 1 if aprobado else 0
+            pendientes += 0 if aprobado else 1
 
     wb.close()
     if nuevos:

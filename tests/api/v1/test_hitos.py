@@ -380,3 +380,52 @@ def test_list_expone_origen_confianza_de_sugeridos(client, db, admin, lawyer, ti
     # filtro por estado=sugerido
     sug = client.get("/api/v1/hitos?periodo=2026-07&estado=sugerido", headers=_h(ADMIN_RUT)).json()
     assert all(x["estado"] == "sugerido" for x in sug) and len(sug) == 1
+
+
+# --- Import formato nuevo: hojas por nombre de abogado, layout con/sin RUT ---
+def _tabla_plenos_xlsx():
+    """Mimica TABLA PLENOS: hoja nombrada por abogado (no 'HITOS'), título +
+    subtítulo, header en fila 4, SIN columna RUT (solo ROL causa)."""
+    import io, openpyxl
+    from datetime import datetime as dt
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "SQUIJADA"                                   # nombre = código abogado
+    ws.append(["HITOS H1 · ABOGADO PLENO"])                 # título
+    ws.append(["Solo por resultado favorable"])            # subtítulo
+    ws.append([])
+    ws.append(["#", "Abogado AT", "Fecha registro", "ROL causa", "Tipo de hito",
+               "ETAPA Sysgal", "TRAMITE Sysgal", "Aprobado", "Valor hito"])
+    ws.append([1, "Sandy Quijada", dt(2026, 7, 7), "C-1062-2026",
+               "Excepción dilatoria acogida", "INGRESO EXC", "Fallo", "SÍ", 808])
+    ws.append([2, "Sandy Quijada", dt(2026, 7, 9), "C-1089-2026",
+               "Excepción dilatoria acogida", "INGRESO EXC", "Fallo", "NO", 808])
+    # una hoja no-hito que debe ignorarse
+    p = wb.create_sheet("PARÁMETROS"); p.append(["config", "x"])
+    buf = io.BytesIO(); wb.save(buf)
+    return buf.getvalue()
+
+
+def test_importar_formato_nuevo_hoja_por_abogado(client, db, admin):
+    HitoTipo.__table__  # noqa
+    t = HitoTipo(code="pleno_excepcion_dilatoria", label="Excepción dilatoria acogida",
+                 nivel="pleno", valor_bruto=808, orden=1)
+    lw = Lawyer(rut="15111222-3", name="Sandy Elizabeth Quijada Norambuena",
+                role="lawyer", is_firm_lawyer=True)
+    db.add_all([t, lw]); db.commit()
+    data = _tabla_plenos_xlsx()
+
+    # hojas: solo SQUIJADA (PARÁMETROS se ignora), reconocida pese al nombre
+    hojas = client.post("/api/v1/hitos/importar/hojas", headers=_h(ADMIN_RUT),
+                        files={"archivo": ("t.xlsx", data, _XLSX_MIME)}).json()
+    assert [h["nombre"] for h in hojas] == ["SQUIJADA"]
+    assert hojas[0]["filas"] == 2
+
+    # importar la hoja seleccionada
+    r = client.post("/api/v1/hitos/importar?hoja=SQUIJADA", headers=_h(ADMIN_RUT),
+                    files={"archivo": ("t.xlsx", data, _XLSX_MIME)}).json()
+    assert r["creadas"] == 2
+    assert r["aprobados"] == 1 and r["pendientes"] == 1
+    # el ROL cayó en descripcion (para dedup por causa)
+    hitos = client.get("/api/v1/hitos?periodo=2026-07", headers=_h(ADMIN_RUT)).json()
+    assert {h["descripcion"] for h in hitos} == {"C-1062-2026", "C-1089-2026"}
