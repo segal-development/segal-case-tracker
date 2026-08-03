@@ -44,7 +44,27 @@ ACTIONABLE_ALERT_TYPES = frozenset(
     }
 )
 
+# Alertas cuyo texto/relevancia depende del plazo de la causa. Una causa cuyo
+# plazo venció hace mucho ya no es "acción del día" → sale del feed accionable (B).
+DEADLINE_ALERT_TYPES = frozenset({"semaforo_rojo", "deadline_fatal", "deadline_added"})
+# Un plazo vencido hace más de esto deja de aparecer en "Requiere atención".
+STALE_DEADLINE_DAYS = 30
+
 AlertCategory = Literal["actionable", "activity", "all"]
+
+
+def _relabel_plazo(message: Optional[str], case: Optional[Case]) -> Optional[str]:
+    """(A) Al mostrar: si el plazo de la causa ya venció, 'Próximo plazo' → 'Plazo
+    vencido' en el texto de la alerta (las alertas viejas guardan el texto congelado)."""
+    if not message or case is None or case.next_deadline_at is None:
+        return message
+    from app.services.deadline_engine import _today_chile
+
+    nd = case.next_deadline_at
+    fecha = nd.date() if hasattr(nd, "date") else nd
+    if fecha < _today_chile() and "Próximo plazo" in message:
+        return message.replace("Próximo plazo", "Plazo vencido")
+    return message
 
 
 def _apply_category_filter(query, category: AlertCategory):
@@ -116,7 +136,7 @@ def _build_alert_item(alert: Alert, case: Optional[Case]) -> AlertItem:
         id=alert.id,
         type=alert.type,
         title=alert.title,
-        message=alert.message,
+        message=_relabel_plazo(alert.message, case),
         case_id=alert.case_id,
         created_at=alert.created_at,
         read=bool(alert.read),
@@ -160,6 +180,23 @@ async def list_alerts(
     base_query = _apply_category_filter(
         db.query(Alert).filter(Alert.lawyer_id == lawyer_id), category
     )
+
+    # (B) En "Requiere atención": excluir alertas de plazo cuya causa tiene un plazo
+    # vencido hace más de STALE_DEADLINE_DAYS — ruido histórico, no acción del día.
+    if category == "actionable":
+        from datetime import timedelta
+        from app.services.deadline_engine import _today_chile
+
+        cutoff = _today_chile() - timedelta(days=STALE_DEADLINE_DAYS)
+        stale_cases = (
+            db.query(Case.id).filter(Case.next_deadline_at < cutoff).subquery()
+        )
+        base_query = base_query.filter(
+            ~(
+                Alert.type.in_(DEADLINE_ALERT_TYPES)
+                & Alert.case_id.in_(db.query(stale_cases.c.id))
+            )
+        )
 
     unread_count = base_query.filter(Alert.read.is_(False)).count()
 

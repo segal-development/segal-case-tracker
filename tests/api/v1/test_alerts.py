@@ -360,3 +360,56 @@ class TestMarkAllAlertsRead:
             "/api/v1/alerts/read-all?category=bogus", headers=_headers(SANDY_RUT)
         )
         assert resp.status_code == 422
+
+
+# --- Plazo vencido: relabel (A) + filtro de muy-viejas (B) ------------------ #
+from datetime import date, timedelta as _td
+
+
+def _case_con_plazo(db, court, rol, plazo_date):
+    obj = Case(lawyer_id=1, court_id=court.id, rol=rol, status="active", competencia="civil",
+               plaintiff="D", defendant="D", next_deadline_at=plazo_date,
+               created_at=datetime.utcnow(), updated_at=datetime.utcnow())
+    db.add(obj); db.commit(); db.refresh(obj)
+    return obj
+
+
+class TestPlazoVencido:
+    def test_relabel_proximo_a_vencido_cuando_paso(self, client, db, sandy, court):
+        c = _case_con_plazo(db, court, "C-100-2026", date.today() - _td(days=5))
+        _make_alert(db, sandy.id, c.id, type="semaforo_rojo",
+                    title="ROJO")
+        # forzamos el mensaje con "Próximo plazo"
+        a = db.query(Alert).filter(Alert.case_id == c.id).first()
+        a.message = "La causa C-100-2026 pasó a estado ROJO. Próximo plazo: 2026-04-07."
+        db.commit()
+        r = client.get("/api/v1/alerts?category=all", headers=_headers(SANDY_RUT)).json()
+        item = next(x for x in r["items"] if x["case_id"] == c.id)
+        assert "Plazo vencido" in item["message"]
+        assert "Próximo plazo" not in item["message"]
+
+    def test_no_relabel_cuando_plazo_futuro(self, client, db, sandy, court):
+        c = _case_con_plazo(db, court, "C-101-2026", date.today() + _td(days=10))
+        _make_alert(db, sandy.id, c.id, type="semaforo_rojo")
+        a = db.query(Alert).filter(Alert.case_id == c.id).first()
+        a.message = "Próximo plazo: 2027-01-01."; db.commit()
+        r = client.get("/api/v1/alerts?category=all", headers=_headers(SANDY_RUT)).json()
+        item = next(x for x in r["items"] if x["case_id"] == c.id)
+        assert "Próximo plazo" in item["message"]
+
+    def test_muy_vencida_sale_de_requiere_atencion(self, client, db, sandy, court):
+        vieja = _case_con_plazo(db, court, "C-200-2026", date.today() - _td(days=90))
+        reciente = _case_con_plazo(db, court, "C-201-2026", date.today() - _td(days=5))
+        _make_alert(db, sandy.id, vieja.id, type="semaforo_rojo")
+        _make_alert(db, sandy.id, reciente.id, type="semaforo_rojo")
+        r = client.get("/api/v1/alerts?category=actionable", headers=_headers(SANDY_RUT)).json()
+        ids = {x["case_id"] for x in r["items"]}
+        assert reciente.id in ids       # 5 días vencida → sigue
+        assert vieja.id not in ids      # 90 días vencida → fuera
+
+    def test_muy_vencida_sigue_en_actividad_all(self, client, db, sandy, court):
+        vieja = _case_con_plazo(db, court, "C-202-2026", date.today() - _td(days=90))
+        _make_alert(db, sandy.id, vieja.id, type="semaforo_rojo")
+        # el filtro B es solo del feed accionable; en 'all' no se aplica
+        r = client.get("/api/v1/alerts?category=all", headers=_headers(SANDY_RUT)).json()
+        assert vieja.id in {x["case_id"] for x in r["items"]}
