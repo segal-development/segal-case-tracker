@@ -50,6 +50,9 @@ class BonoVariables(Base):
     cumpl_sem3 = Column(Float, nullable=False, server_default=text("0"), default=0.0)
     cumpl_sem4 = Column(Float, nullable=False, server_default=text("0"), default=0.0)
     cumpl_sem5 = Column(Float, nullable=False, server_default=text("0"), default=0.0)
+    # Meta del mes (puntos de %) que carga Carla a mano; se compara con lo que
+    # llevan (suma de semanas). Es referencia visual — NO altera el cálculo de V3.
+    meta_cumplimiento = Column(Float, nullable=False, server_default=text("0"), default=0.0)
 
     # V4 — reclamos (counts by severity)
     reclamos_leve = Column(Integer, nullable=False, server_default=text("0"), default=0)
