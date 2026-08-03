@@ -364,6 +364,86 @@ def _build_liquidacion_workbook(data: LiquidacionResponse):
     return wb
 
 
+def _add_detalle_sheets(wb, db: Session, start: date, end: date, rows_by_lawyer: dict):
+    """Add DETAIL sheets to the RRHH workbook so they see WHAT is being paid:
+    'Detalle Hitos' (every approved hito) + 'Detalle Renovaciones' (each counted).
+
+    ``rows_by_lawyer``: lawyer_id → BonoRow, only nivel lawyers (those in the bono).
+    """
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    from app.models.renovacion import Renovacion
+
+    white_bold = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    head_fill = PatternFill("solid", fgColor="1F2A44")
+    right = Alignment(horizontal="right")
+    clp = "#,##0"
+
+    def _sheet(title, headers, widths, money_cols):
+        ws = wb.create_sheet(title)
+        for j, h in enumerate(headers, start=1):
+            c = ws.cell(row=1, column=j, value=h)
+            c.font = white_bold
+            c.fill = head_fill
+        for j, w in enumerate(widths, start=1):
+            ws.column_dimensions[get_column_letter(j)].width = w
+        ws.freeze_panes = ws.cell(row=2, column=1)
+        return ws, money_cols
+
+    lawyer_ids = list(rows_by_lawyer.keys())
+    lawyer_name = {lid: r.lawyer_nombre for lid, r in rows_by_lawyer.items()}
+
+    # --- Detalle Hitos: cada hito aprobado del período (lo que suma "Hitos H1") ---
+    ws_h, hmoney = _sheet(
+        "Detalle Hitos",
+        ["Abogado", "Fecha", "Tipo de hito", "RUT/ROL", "Causa (ROL)", "Valor bruto"],
+        [30, 12, 34, 16, 18, 14], {6},
+    )
+    hitos = (
+        db.query(Hito)
+        .filter(Hito.fecha_hito >= start, Hito.fecha_hito < end,
+                Hito.estado == HITO_APROBADO, Hito.lawyer_id.in_(lawyer_ids))
+        .order_by(Hito.lawyer_id, Hito.fecha_hito)
+        .all()
+    )
+    r = 2
+    for h in hitos:
+        vals = [lawyer_name.get(h.lawyer_id, ""), h.fecha_hito,
+                h.tipo.label if h.tipo else "", h.rol_causa or "",
+                h.descripcion or "", h.valor_bruto]
+        for j, v in enumerate(vals, start=1):
+            cell = ws_h.cell(row=r, column=j, value=v)
+            if j in hmoney:
+                cell.number_format = clp
+                cell.alignment = right
+        r += 1
+
+    # --- Detalle Renovaciones: cada renovación contada (lo que suma V2) ---
+    ws_r, rmoney = _sheet(
+        "Detalle Renovaciones",
+        ["Abogado", "Fecha", "N° contrato", "Cliente", "RUT cliente", "Bono ($)"],
+        [30, 12, 16, 30, 16, 12], {6},
+    )
+    renovs = (
+        db.query(Renovacion)
+        .filter(Renovacion.fecha_desde >= start, Renovacion.fecha_desde < end,
+                Renovacion.lawyer_id.in_(lawyer_ids))
+        .order_by(Renovacion.lawyer_id, Renovacion.fecha_desde)
+        .all()
+    )
+    r = 2
+    for rn in renovs:
+        vals = [lawyer_name.get(rn.lawyer_id, ""), rn.fecha_desde, rn.numero_contrato,
+                rn.cliente_nombre, rn.cliente_rut, bono_calc.V2_POR_RENOVACION]
+        for j, v in enumerate(vals, start=1):
+            cell = ws_r.cell(row=r, column=j, value=v)
+            if j in rmoney:
+                cell.number_format = clp
+                cell.alignment = right
+        r += 1
+
+
 # --------------------------------------------------------------------------- #
 # Endpoints
 # --------------------------------------------------------------------------- #
@@ -446,8 +526,10 @@ async def export_liquidacion(
     Mirrors the firm's LIQUIDACIÓN MENSUAL sheet. All values are gross (afectos a
     semana corrida) — RRHH applies SC in their final liquidación.
     """
+    per, start, end = _period_bounds(periodo)
     data = _liquidacion_data(db, periodo)
     wb = _build_liquidacion_workbook(data)
+    _add_detalle_sheets(wb, db, start, end, {r.lawyer_id: r for r in data.rows})
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)

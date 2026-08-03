@@ -446,3 +446,32 @@ def test_v2_cuenta_renovaciones_del_modulo(client, db, admin, junior):
     row = next(x for x in liq["rows"] if x["lawyer_id"] == junior.id)
     assert row["renovaciones"] == 3               # solo las de julio
     assert row["v2_bruto"] == 3 * 10_400          # V2 automático
+
+
+def test_export_incluye_hojas_de_detalle(client, db, admin, junior):
+    """El Excel de RRHH trae hojas aparte con el detalle: hitos + renovaciones."""
+    from datetime import date as _date
+    from app.models.renovacion import Renovacion
+    tipo = HitoTipo(code="j_det", label="Conversión preventiva", nivel="junior", valor_bruto=3000, orden=1)
+    db.add(tipo); db.commit(); db.refresh(tipo)
+    db.add(Hito(lawyer_id=junior.id, hito_tipo_id=tipo.id, valor_bruto=3000,
+                fecha_hito=_date(2026, 7, 5), estado=HITO_APROBADO,
+                rol_causa="12.345.678-5", descripcion="C-100-2026"))
+    db.add(Renovacion(numero_contrato="R1", cliente_rut="9.999.999-9", cliente_nombre="Cliente X",
+                      lawyer_id=junior.id, fecha_desde=_date(2026, 7, 8), fecha_hasta=_date(2027, 7, 8),
+                      monto_cuota=25000, cuotas=12, total=300000))
+    db.commit()
+
+    r = client.get("/api/v1/bono/liquidacion/export?periodo=2026-07", headers=_h(ADMIN_RUT))
+    assert r.status_code == 200
+    import io
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(r.content))
+    assert "Detalle Hitos" in wb.sheetnames
+    assert "Detalle Renovaciones" in wb.sheetnames
+    # el hito aparece en su hoja
+    hflat = [c.value for row in wb["Detalle Hitos"].iter_rows() for c in row]
+    assert "C-100-2026" in hflat and 3000 in hflat
+    # la renovación aparece con su bono
+    rflat = [c.value for row in wb["Detalle Renovaciones"].iter_rows() for c in row]
+    assert "Cliente X" in rflat and 10_400 in rflat
