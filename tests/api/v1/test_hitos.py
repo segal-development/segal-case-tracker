@@ -364,3 +364,19 @@ def test_sugerido_hito_not_counted_until_approved(client, db, admin, lawyer, tip
     row = next((x for x in r.json() if x["lawyer_id"] == lawyer.id), None)
     # sugerido never contributes to 'aprobados'
     assert row is None or row["aprobados"] == 0
+
+
+def test_list_expone_origen_confianza_de_sugeridos(client, db, admin, lawyer, tipo):
+    """La lista muestra estado 'sugerido' + origen/confianza para el badge del front."""
+    h = Hito(lawyer_id=lawyer.id, hito_tipo_id=tipo.id, valor_bruto=tipo.valor_bruto,
+             fecha_hito=date(2026, 7, 15), estado=HITO_SUGERIDO, origen=ORIGEN_DETECTOR,
+             regla_code="prescripcion", confianza="alta")
+    db.add(h)
+    db.commit()
+    # sin filtro: aparece con sus campos
+    body = client.get("/api/v1/hitos?periodo=2026-07", headers=_h(ADMIN_RUT)).json()
+    row = next(x for x in body if x["estado"] == "sugerido")
+    assert row["origen"] == "detector" and row["confianza"] == "alta"
+    # filtro por estado=sugerido
+    sug = client.get("/api/v1/hitos?periodo=2026-07&estado=sugerido", headers=_h(ADMIN_RUT)).json()
+    assert all(x["estado"] == "sugerido" for x in sug) and len(sug) == 1

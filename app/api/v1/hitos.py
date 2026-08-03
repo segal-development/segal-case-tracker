@@ -80,6 +80,8 @@ class HitoResponse(BaseModel):
     tramite_sysgal: Optional[str] = None
     tiene_evidencia: bool
     estado: str
+    origen: str = "manual"          # manual | detector
+    confianza: Optional[str] = None  # alta | media | baja (solo detector)
     created_by_name: Optional[str] = None
     aprobado_by_name: Optional[str] = None
     aprobado_at: Optional[datetime] = None
@@ -131,6 +133,8 @@ def _to_response(h: Hito) -> HitoResponse:
         tramite_sysgal=h.tramite_sysgal,
         tiene_evidencia=h.tiene_evidencia,
         estado=h.estado,
+        origen=h.origen,
+        confianza=h.confianza,
         created_by_name=h.created_by_name,
         aprobado_by_name=h.aprobado_by_name,
         aprobado_at=h.aprobado_at,
