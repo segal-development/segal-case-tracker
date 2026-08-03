@@ -99,7 +99,7 @@ def test_upsert_variables_computes_bonus(client, admin, junior):
     body = r.json()
     assert body["v1_bruto"] == 8000 * 90
     assert body["v3_neta"] == 100_000
-    assert body["v2_bruto"] == 20_800
+    assert body["v2_bruto"] == 0  # V2 ahora se cuenta del módulo de renovaciones (0 acá)
     assert body["has_row"] is True
     assert body["verificado_dj"] is True
 
@@ -313,17 +313,17 @@ def test_import_sets_v1_inputs_and_computes(client, admin, junior):
 
 
 def test_import_preserves_other_inputs(client, admin, junior):
-    # pre-set renovaciones via the normal upsert
+    # pre-set el avance semanal (V3) vía el upsert normal
     client.put(
         f"/api/v1/bono/variables/{junior.id}?periodo=2026-07",
         headers=_h(ADMIN_RUT),
-        json={"renovaciones": 3},
+        json={"cumpl_sem1": 50, "cumpl_sem2": 45},
     )
     _post_acti(client, [("FERNANDA ARROYO DIAZ", 40, 34)])
     liq = client.get("/api/v1/bono/liquidacion?periodo=2026-07", headers=_h(ADMIN_RUT)).json()
     row = next(x for x in liq["rows"] if x["lawyer_id"] == junior.id)
-    assert row["v1_bruto"] == 8000 * 34
-    assert row["v2_bruto"] == 3 * 10_400  # renovaciones untouched
+    assert row["v1_bruto"] == 8000 * 34   # import setea V1
+    assert row["cumpl_total"] == 95       # y NO pisa el avance semanal previo
 
 
 def test_import_skips_matched_lawyer_without_nivel(client, admin, db):
@@ -424,3 +424,25 @@ def test_meta_fuera_de_rango_rechaza(client, admin, junior):
         json={"meta_cumplimiento": 150},
     )
     assert r.status_code == 400
+
+
+def test_v2_cuenta_renovaciones_del_modulo(client, db, admin, junior):
+    """V2 se cuenta automáticamente de las renovaciones del módulo (no del campo manual)."""
+    from datetime import date as _date
+    from app.models.renovacion import Renovacion
+    for i in range(3):  # 3 renovaciones de julio para este abogado
+        db.add(Renovacion(
+            numero_contrato=f"C{i}", cliente_rut=f"1111111{i}-1", cliente_nombre="X",
+            lawyer_id=junior.id, fecha_desde=_date(2026, 7, 10), fecha_hasta=_date(2027, 7, 10),
+            monto_cuota=25000, cuotas=12, total=300000,
+        ))
+    # una de OTRO mes → no cuenta
+    db.add(Renovacion(numero_contrato="Cjun", cliente_rut="9999999-9", cliente_nombre="Y",
+                      lawyer_id=junior.id, fecha_desde=_date(2026, 6, 1), fecha_hasta=_date(2027, 6, 1),
+                      monto_cuota=25000, cuotas=12, total=300000))
+    db.commit()
+
+    liq = client.get("/api/v1/bono/liquidacion?periodo=2026-07", headers=_h(ADMIN_RUT)).json()
+    row = next(x for x in liq["rows"] if x["lawyer_id"] == junior.id)
+    assert row["renovaciones"] == 3               # solo las de julio
+    assert row["v2_bruto"] == 3 * 10_400          # V2 automático
