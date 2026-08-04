@@ -471,3 +471,76 @@ def test_importar_acepta_fecha_en_texto(client, db, admin):
     assert r["creadas"] == 2 and r["errores"] == 0
     hitos = client.get("/api/v1/hitos?periodo=2026-07", headers=_h(ADMIN_RUT)).json()
     assert len([h for h in hitos if h["lawyer_id"] == lw.id]) == 2
+
+
+# --------------------------------------------------------------------------- #
+# Bulk actions (aprobar-lote / rechazar-lote / eliminar-lote)
+# --------------------------------------------------------------------------- #
+def _pending(db, lawyer, tipo, n, fecha=date(2026, 7, 15)):
+    """Create n pending hitos for a lawyer; return their ids."""
+    ids = []
+    for _ in range(n):
+        h = Hito(lawyer_id=lawyer.id, hito_tipo_id=tipo.id, valor_bruto=8077,
+                 fecha_hito=fecha, estado=HITO_PENDIENTE)
+        db.add(h)
+        db.commit()
+        db.refresh(h)
+        ids.append(h.id)
+    return ids
+
+
+def test_bulk_approve_sets_all_aprobado(client, db, admin, lawyer, tipo):
+    ids = _pending(db, lawyer, tipo, 3)
+    r = client.post("/api/v1/hitos/aprobar-lote", headers=_h(ADMIN_RUT), json={"ids": ids})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["procesados"] == 3
+    assert sorted(body["ids"]) == sorted(ids)
+    for i in ids:
+        assert db.get(Hito, i).estado == "aprobado"
+
+
+def test_bulk_reject_sets_all_rechazado(client, db, admin, lawyer, tipo):
+    ids = _pending(db, lawyer, tipo, 3)
+    r = client.post("/api/v1/hitos/rechazar-lote", headers=_h(ADMIN_RUT), json={"ids": ids})
+    assert r.status_code == 200
+    assert r.json()["procesados"] == 3
+    for i in ids:
+        assert db.get(Hito, i).estado == "rechazado"
+
+
+def test_bulk_delete_removes_them(client, db, admin, lawyer, tipo):
+    ids = _pending(db, lawyer, tipo, 3)
+    r = client.post("/api/v1/hitos/eliminar-lote", headers=_h(ADMIN_RUT), json={"ids": ids})
+    assert r.status_code == 200
+    assert r.json()["procesados"] == 3
+    assert db.query(Hito).filter(Hito.id.in_(ids)).count() == 0
+
+
+def test_bulk_approve_blocked_when_period_closed(client, db, admin, lawyer, tipo):
+    from app.models.bono_cierre import BonoCierre, CIERRE_CERRADO
+    ids = _pending(db, lawyer, tipo, 2)
+    db.add(BonoCierre(periodo="2026-07", estado=CIERRE_CERRADO))
+    db.commit()
+    r = client.post("/api/v1/hitos/aprobar-lote", headers=_h(ADMIN_RUT), json={"ids": ids})
+    assert r.status_code == 409
+    assert r.json()["detail"] == "El período de ese hito está cerrado"
+    # nothing was approved
+    for i in ids:
+        assert db.get(Hito, i).estado == HITO_PENDIENTE
+
+
+def test_bulk_approve_requires_admin(client, db, admin, lawyer, tipo):
+    ids = _pending(db, lawyer, tipo, 2)
+    r = client.post("/api/v1/hitos/aprobar-lote", headers=_h(LAWYER_RUT), json={"ids": ids})
+    assert r.status_code == 403  # require_admin
+
+
+def test_bulk_approve_skips_nonexistent_ids(client, db, admin, lawyer, tipo):
+    ids = _pending(db, lawyer, tipo, 2)
+    r = client.post("/api/v1/hitos/aprobar-lote", headers=_h(ADMIN_RUT),
+                    json={"ids": ids + [999998, 999999]})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["procesados"] == 2  # only the real ones
+    assert sorted(body["ids"]) == sorted(ids)

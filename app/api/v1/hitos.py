@@ -100,6 +100,15 @@ class RechazoBody(BaseModel):
     motivo: Optional[str] = None
 
 
+class HitoBulkIds(BaseModel):
+    ids: list[int]
+
+
+class HitoBulkResult(BaseModel):
+    procesados: int
+    ids: list[int]  # the ids actually acted on
+
+
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
@@ -334,6 +343,78 @@ async def rechazar_hito(
     db.commit()
     db.refresh(hito)
     return _to_response(hito)
+
+
+# --------------------------------------------------------------------------- #
+# Bulk actions (mirror the single-item aprobar / rechazar / delete)
+# --------------------------------------------------------------------------- #
+@router.post("/aprobar-lote", response_model=HitoBulkResult)
+async def aprobar_hitos_lote(
+    body: HitoBulkIds,
+    db: Session = Depends(get_db),
+    admin_rut: str = Depends(require_admin),
+):
+    """Approve every existing hito in ``ids`` (admin only). Skips ids that don't
+    exist; a closed period blocks the whole batch with the same 409 as the
+    single endpoint."""
+    hitos = db.query(Hito).filter(Hito.id.in_(body.ids)).all()
+    admin = db.query(Lawyer).filter(Lawyer.rut == admin_rut).first()
+    now = datetime.utcnow()
+    acted: list[int] = []
+    for hito in hitos:
+        if cierre_svc.is_cerrado(db, cierre_svc.periodo_de_fecha(hito.fecha_hito)):
+            raise HTTPException(status_code=409, detail="El período de ese hito está cerrado")
+        hito.estado = HITO_APROBADO
+        hito.aprobado_by_rut = admin_rut
+        hito.aprobado_by_name = admin.name if admin else None
+        hito.aprobado_at = now
+        hito.rechazo_motivo = None
+        acted.append(hito.id)
+    db.commit()
+    return HitoBulkResult(procesados=len(acted), ids=acted)
+
+
+@router.post("/rechazar-lote", response_model=HitoBulkResult)
+async def rechazar_hitos_lote(
+    body: HitoBulkIds,
+    db: Session = Depends(get_db),
+    admin_rut: str = Depends(require_admin),
+):
+    """Reject every existing hito in ``ids`` (admin only). Skips ids that don't exist."""
+    hitos = db.query(Hito).filter(Hito.id.in_(body.ids)).all()
+    admin = db.query(Lawyer).filter(Lawyer.rut == admin_rut).first()
+    now = datetime.utcnow()
+    acted: list[int] = []
+    for hito in hitos:
+        hito.estado = HITO_RECHAZADO
+        hito.aprobado_by_rut = admin_rut
+        hito.aprobado_by_name = admin.name if admin else None
+        hito.aprobado_at = now
+        hito.rechazo_motivo = None
+        acted.append(hito.id)
+    db.commit()
+    return HitoBulkResult(procesados=len(acted), ids=acted)
+
+
+@router.post("/eliminar-lote", response_model=HitoBulkResult)
+async def eliminar_hitos_lote(
+    body: HitoBulkIds,
+    db: Session = Depends(get_db),
+    _admin_rut: str = Depends(require_admin),
+):
+    """Delete every existing hito in ``ids`` (admin only). POST so the id list
+    travels in the body. Skips ids that don't exist; a closed period blocks the
+    whole batch with the same 409 as the single endpoint."""
+    hitos = db.query(Hito).filter(Hito.id.in_(body.ids)).all()
+    acted: list[int] = []
+    for hito in hitos:
+        if cierre_svc.is_cerrado(db, cierre_svc.periodo_de_fecha(hito.fecha_hito)):
+            raise HTTPException(status_code=409, detail="El período de ese hito está cerrado")
+        acted.append(hito.id)
+    for hito in hitos:
+        db.delete(hito)
+    db.commit()
+    return HitoBulkResult(procesados=len(acted), ids=acted)
 
 
 @router.get("/resumen", response_model=List[HitoResumenRow])
