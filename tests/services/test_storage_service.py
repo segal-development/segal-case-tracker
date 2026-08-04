@@ -193,6 +193,50 @@ class TestStorageService:
 
         assert doc.stored_at is not None
 
+    def test_upload_populates_size_and_content_type_local_backend(self, tmp_path):
+        """upload() must populate size_bytes + content_type from the uploaded bytes.
+
+        Uses the real LocalStorageBackend (DOC_STORAGE_BACKEND=local) so no GCS
+        credentials are required.
+        """
+        from app.services.storage_service import LocalStorageBackend, StorageService
+
+        backend = LocalStorageBackend(str(tmp_path))
+        svc = StorageService(backend)
+
+        doc = _make_doc()
+        doc.content_type = None
+        doc.size_bytes = None
+        doc.filename = None
+
+        data = b"%PDF-1.4 fake pdf content"
+        svc.upload(doc, data)
+
+        assert doc.size_bytes == len(data)
+        assert doc.content_type == "application/pdf"
+        # filename derived from the storage key basename (readable, deterministic)
+        assert doc.filename is not None
+        assert doc.filename.endswith(".pdf")
+
+    def test_upload_does_not_overwrite_existing_content_type_and_filename(self, tmp_path):
+        """content_type/filename already set must be preserved; size_bytes always refreshed."""
+        from app.services.storage_service import LocalStorageBackend, StorageService
+
+        backend = LocalStorageBackend(str(tmp_path))
+        svc = StorageService(backend)
+
+        doc = _make_doc()
+        doc.content_type = "application/x-custom"
+        doc.filename = "already_named.pdf"
+        doc.size_bytes = None
+
+        data = b"%PDF bytes here"
+        svc.upload(doc, data)
+
+        assert doc.size_bytes == len(data)
+        assert doc.content_type == "application/x-custom", "existing content_type must not be overwritten"
+        assert doc.filename == "already_named.pdf", "existing filename must not be overwritten"
+
     def test_signed_url_returns_none_when_gcs_path_is_none(self):
         from app.services.storage_service import StorageService
 

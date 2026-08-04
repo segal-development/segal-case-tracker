@@ -430,6 +430,104 @@ class TestSelectCasesForDetailRotation:
             "reserved case must come before public case when reserved_first=True"
         )
 
+    def test_pending_docs_first_prioritizes_cases_with_more_pending_docs(self, db, monkeypatch):
+        """DETAIL_PENDING_DOCS_FIRST=True places the case with MORE pending documents first.
+
+        Both cases share a NULL last_detail_checked_at so the ONLY differentiator
+        is the count of status='pending' documents — the case with more pending
+        docs must lead the rotation (PDF-backfill priority).
+        """
+        from app.services import sync_service
+        from app.services.sync_service import _select_cases_for_detail_rotation
+        from app.models.document import Document
+
+        monkeypatch.setattr(sync_service.settings, "DETAIL_PENDING_DOCS_FIRST", True)
+
+        lawyer = Lawyer(rut="00000012-2", name="Lawyer Backfill", is_active=True)
+        db.add(lawyer)
+        db.flush()
+
+        court = db.query(Court).first()
+        if not court:
+            court = Court(code="BF-COURT", name="Backfill Court", region="RM", type="civil")
+            db.add(court)
+            db.flush()
+
+        c_few = Case(
+            lawyer_id=lawyer.id, court_id=court.id, rol="C-FEW-DOCS", competencia="civil",
+            status="active", last_detail_checked_at=None,
+        )
+        c_many = Case(
+            lawyer_id=lawyer.id, court_id=court.id, rol="C-MANY-DOCS", competencia="civil",
+            status="active", last_detail_checked_at=None,
+        )
+        db.add_all([c_few, c_many])
+        db.flush()
+
+        # c_few: 1 pending doc; c_many: 3 pending docs (+ 1 already stored, ignored)
+        db.add(Document(case_id=c_few.id, doc_type="resolution", status="pending"))
+        for _ in range(3):
+            db.add(Document(case_id=c_many.id, doc_type="resolution", status="pending"))
+        db.add(Document(case_id=c_many.id, doc_type="resolution", status="stored"))
+        db.commit()
+
+        api_cases = [_make_api_case("C-FEW-DOCS"), _make_api_case("C-MANY-DOCS")]
+        result = _select_cases_for_detail_rotation(db, lawyer.id, "civil", api_cases, batch_size=10)
+
+        rols = [ac.rol for ac in result]
+        assert len(rols) == 2
+        assert rols.index("C-MANY-DOCS") < rols.index("C-FEW-DOCS"), (
+            "case with more pending documents must come first when DETAIL_PENDING_DOCS_FIRST=True"
+        )
+
+    def test_pending_docs_first_false_ignores_pending_doc_counts(self, db, monkeypatch):
+        """DETAIL_PENDING_DOCS_FIRST=False (default) leaves ordering unaffected by doc counts.
+
+        With the flag off, the existing filed_at DESC tiebreak decides order —
+        the pending-doc count must NOT influence rotation.
+        """
+        from app.services import sync_service
+        from app.services.sync_service import _select_cases_for_detail_rotation
+        from app.models.document import Document
+
+        monkeypatch.setattr(sync_service.settings, "DETAIL_PENDING_DOCS_FIRST", False)
+
+        lawyer = Lawyer(rut="00000013-3", name="Lawyer NoBackfill", is_active=True)
+        db.add(lawyer)
+        db.flush()
+
+        court = db.query(Court).first()
+        if not court:
+            court = Court(code="NBF-COURT", name="No Backfill Court", region="RM", type="civil")
+            db.add(court)
+            db.flush()
+
+        # c_newer has FEWER pending docs but a more recent filed_at → must lead
+        # when the flag is off (filed_at DESC), proving doc counts are ignored.
+        c_newer = Case(
+            lawyer_id=lawyer.id, court_id=court.id, rol="C-NB-NEWER", competencia="civil",
+            status="active", last_detail_checked_at=None, filed_at=datetime(2024, 6, 1),
+        )
+        c_older = Case(
+            lawyer_id=lawyer.id, court_id=court.id, rol="C-NB-OLDER", competencia="civil",
+            status="active", last_detail_checked_at=None, filed_at=datetime(2022, 1, 1),
+        )
+        db.add_all([c_newer, c_older])
+        db.flush()
+
+        db.add(Document(case_id=c_newer.id, doc_type="resolution", status="pending"))
+        for _ in range(3):
+            db.add(Document(case_id=c_older.id, doc_type="resolution", status="pending"))
+        db.commit()
+
+        api_cases = [_make_api_case("C-NB-NEWER"), _make_api_case("C-NB-OLDER")]
+        result = _select_cases_for_detail_rotation(db, lawyer.id, "civil", api_cases, batch_size=10)
+
+        rols = [ac.rol for ac in result]
+        assert rols.index("C-NB-NEWER") < rols.index("C-NB-OLDER"), (
+            "with flag off, filed_at DESC decides order regardless of pending-doc count"
+        )
+
     def test_reserved_first_false_preserves_existing_order(self, db):
         """reserved_first=False (default) leaves sort order unchanged — NULL still first."""
         from app.services.sync_service import _select_cases_for_detail_rotation

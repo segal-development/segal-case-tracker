@@ -213,6 +213,17 @@ class StorageService:
         # when the doc actually became "stored".
         doc.stored_at = datetime.utcnow()
 
+        # File metadata — populate from the uploaded bytes / storage key so the
+        # Document row is not left with NULL size/content_type/filename. Set
+        # idempotently on the reconcile path too (key already existed) so a
+        # re-sync backfills metadata on rows persisted before this was added.
+        doc.size_bytes = len(data)
+        if not doc.content_type:
+            doc.content_type = content_type
+        if not doc.filename:
+            # Readable, deterministic name derived from the storage key basename.
+            doc.filename = key.rsplit("/", 1)[-1]
+
     def retrieve(self, storage_uri: str) -> bytes:
         """Return raw bytes for the stored document.
 
