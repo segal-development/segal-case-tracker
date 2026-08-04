@@ -475,3 +475,35 @@ def test_export_incluye_hojas_de_detalle(client, db, admin, junior):
     # la renovación aparece con su bono
     rflat = [c.value for row in wb["Detalle Renovaciones"].iter_rows() for c in row]
     assert "Cliente X" in rflat and 10_400 in rflat
+
+
+def test_export_resumen_renovaciones_cuenta_todos(client, db, admin, junior):
+    """El resumen (tipo tabla dinámica) cuenta renovaciones por persona, incluidos
+    los renovadores sin matchear a un abogado, con fila TOTAL."""
+    from datetime import date as _date
+    from app.models.renovacion import Renovacion
+    for i in range(2):  # 2 matcheadas al abogado
+        db.add(Renovacion(numero_contrato=f"M{i}", cliente_rut=f"1010101{i}-1", cliente_nombre="X",
+                          lawyer_id=junior.id, fecha_desde=_date(2026, 7, 3), fecha_hasta=_date(2027, 7, 3),
+                          monto_cuota=25000, cuotas=12, total=300000))
+    # una SIN abogado (renovador_raw crudo) → igual aparece en el resumen
+    db.add(Renovacion(numero_contrato="U1", cliente_rut="2020202-2", cliente_nombre="Y",
+                      lawyer_id=None, renovador_raw="CCARO", fecha_desde=_date(2026, 7, 4),
+                      fecha_hasta=_date(2027, 7, 4), monto_cuota=25000, cuotas=12, total=300000))
+    # una de junio → no cuenta
+    db.add(Renovacion(numero_contrato="Jun", cliente_rut="3030303-3", cliente_nombre="Z",
+                      lawyer_id=junior.id, fecha_desde=_date(2026, 6, 1), fecha_hasta=_date(2027, 6, 1),
+                      monto_cuota=25000, cuotas=12, total=300000))
+    db.commit()
+
+    r = client.get("/api/v1/bono/liquidacion/export?periodo=2026-07", headers=_h(ADMIN_RUT))
+    assert r.status_code == 200
+    import io
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(r.content))
+    assert "Resumen Renovaciones" in wb.sheetnames
+    ws = wb["Resumen Renovaciones"]
+    counts = {row[0].value: row[1].value for row in ws.iter_rows(min_row=2) if row[0].value}
+    assert counts[junior.name] == 2          # matcheadas
+    assert counts["CCARO"] == 1              # sin matchear, por renovador_raw
+    assert counts["TOTAL"] == 3              # solo julio

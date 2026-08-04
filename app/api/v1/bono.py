@@ -419,6 +419,41 @@ def _add_detalle_sheets(wb, db: Session, start: date, end: date, rows_by_lawyer:
                 cell.alignment = right
         r += 1
 
+    # --- Resumen Renovaciones: cantidad por persona (TODAS las del período,
+    #     incluidos procuradores y renovadores sin matchear a un abogado), tipo
+    #     tabla dinámica, para reconciliar cuánto pagar de V2. ---
+    all_renovs = (
+        db.query(Renovacion)
+        .filter(Renovacion.fecha_desde >= start, Renovacion.fecha_desde < end)
+        .all()
+    )
+    matched_ids = {rn.lawyer_id for rn in all_renovs if rn.lawyer_id is not None}
+    lw_info = {
+        lw.id: lw.name + (" (proc.)" if lw.role == "procurador" else "")
+        for lw in db.query(Lawyer).filter(Lawyer.id.in_(matched_ids)).all()
+    } if matched_ids else {}
+    counts: dict[str, int] = {}
+    for rn in all_renovs:
+        if rn.lawyer_id is not None:
+            label = lw_info.get(rn.lawyer_id, f"#{rn.lawyer_id}")
+        else:
+            label = (rn.renovador_raw or "").strip() or "(sin asignar)"
+        counts[label] = counts.get(label, 0) + 1
+
+    ws_sum, _ = _sheet("Resumen Renovaciones", ["Abogado", "Cantidad"], [42, 12], set())
+    total_font = Font(name="Calibri", size=11, bold=True)
+    r = 2
+    for label in sorted(counts, key=str.lower):
+        ws_sum.cell(row=r, column=1, value=label)
+        cell = ws_sum.cell(row=r, column=2, value=counts[label])
+        cell.alignment = right
+        r += 1
+    lbl = ws_sum.cell(row=r, column=1, value="TOTAL")
+    val = ws_sum.cell(row=r, column=2, value=sum(counts.values()))
+    lbl.font = total_font
+    val.font = total_font
+    val.alignment = right
+
     # --- Detalle Renovaciones: cada renovación contada (lo que suma V2) ---
     ws_r, rmoney = _sheet(
         "Detalle Renovaciones",
