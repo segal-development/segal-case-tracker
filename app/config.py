@@ -150,6 +150,7 @@ class Settings(BaseSettings):
     DETAIL_BATCH_SIZE: int = 30    # Cases per scheduled rotation batch
     DETAIL_FETCH_DELAY: float = 2.0  # Seconds between consecutive detail fetches
     DETAIL_MIN_YEAR: int = 2021    # Only detail-scrape cases with ROL year >= this (0 = all)
+    DETAIL_PENDING_DOCS_FIRST: bool = False  # when true, detail rotation prioritizes cases with the most pending documents (PDF backfill)
 
     # Notifications
     NOTIFY_MAX_PER_SYNC: int = 25           # Max notifications dispatched per sync_movements call

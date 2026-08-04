@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, List, Optional, Tuple, Awaitable, TypeVar
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, func
+from sqlalchemy import and_, func, select
 from sqlalchemy.exc import OperationalError
 
 logger = logging.getLogger(__name__)
@@ -58,6 +58,7 @@ from app.models.case_litigante import CaseLitigante
 from app.models.case_notificacion import CaseNotificacion
 from app.models.case_escrito import CaseEscrito
 from app.models.case_exhorto import CaseExhorto
+from app.models.document import Document
 from app.services.notification_service import NotificationService
 from app.services.document_persistence import DocumentPersistenceService
 from app.scrapper.pjud.exceptions import (
@@ -1423,6 +1424,20 @@ def _select_cases_for_detail_rotation(
         Case.last_detail_checked_at.asc().nullsfirst(),
         Case.filed_at.desc(),
     ])
+    # PDF backfill: when enabled, prioritize cases with the most pending
+    # documents so re-scraping (which re-captures fresh PJUD tokens and
+    # downloads PDFs inline) drains the pending-PDF backlog fastest. This is
+    # the dominant backfill signal, so it goes FIRST — ahead of reserved/
+    # last_detail/filed. A correlated scalar subquery keeps it portable across
+    # Postgres and SQLite (no LEFT JOIN + GROUP BY needed).
+    if settings.DETAIL_PENDING_DOCS_FIRST:
+        pending_docs = (
+            select(func.count(Document.id))
+            .where(Document.case_id == Case.id, Document.status == "pending")
+            .correlate(Case)
+            .scalar_subquery()
+        )
+        order_clauses.insert(0, pending_docs.desc())
     db_cases = (
         db.query(Case)
         .filter(Case.lawyer_id == lawyer_id, Case.competencia == competencia)
