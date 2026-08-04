@@ -242,6 +242,27 @@ def test_importar_excel_maps_and_dedups(client, admin, abogado):
     assert febrero[0]["lawyer_id"] is None
 
 
+def test_importar_matchea_username_de_procurador(client, admin, abogado, db):
+    """El índice incluye procuradores: 'MVERA' → María José Vera Pichunante.
+    Antes caía como texto crudo porque el índice solo tenía firm lawyers."""
+    from datetime import datetime as dt
+    db.add(Lawyer(rut="20568122-1", name="MARÍA JOSÉ VERA PICHUNANTE",
+                  role="procurador", is_firm_lawyer=False, is_active=True))
+    db.commit()
+    rows = [
+        ["12345678-5", "Cliente Dos", "C-200", 12, dt(2026, 2, 10), dt(2027, 2, 10), "MVERA", 25000],
+    ]
+    r = client.post(
+        "/api/v1/renovaciones/importar", headers=_h(ADMIN_RUT),
+        files={"archivo": ("reno.xlsx", _make_xlsx(rows), _XLSX_MIME)},
+    )
+    assert r.status_code == 200
+    assert r.json()["vinculadas"] == 1
+    febrero = client.get("/api/v1/renovaciones?periodo=2026-02", headers=_h(ADMIN_RUT)).json()
+    assert febrero[0]["renovador"] == "MARÍA JOSÉ VERA PICHUNANTE"
+    assert febrero[0]["lawyer_id"] is not None
+
+
 def test_listar_hojas_and_import_single_sheet(client, admin, abogado):
     from datetime import datetime as dt
     import io

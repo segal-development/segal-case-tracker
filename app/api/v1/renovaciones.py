@@ -109,13 +109,25 @@ def _norm(s) -> str:
 
 
 def _build_renovador_index(db: Session) -> dict:
-    """Map normalized 'INITIAL+SURNAME' usernames → firm lawyer id.
+    """Map normalized 'INITIAL+SURNAME' usernames → lawyer id.
 
     e.g. 'Pablo Ismael Acevedo López' → {'PACEVEDO': id, 'PISMAEL': id, 'PLOPEZ': id};
     the Excel's 'PACEVEDO' then resolves to Pablo. First match wins on collisions.
+
+    Includes the same population that can be picked for a renovación: firm
+    lawyers PLUS procuradores. Firm lawyers are indexed first so they win any
+    collision (a procurador never shadows a firm lawyer's username). Without
+    procuradores here their usernames (e.g. 'MVERA' → María José Vera) never
+    matched on import and landed as raw renovador names.
     """
     idx: dict[str, int] = {}
-    for l in db.query(Lawyer).filter(Lawyer.is_firm_lawyer.is_(True)).all():
+    lawyers = (
+        db.query(Lawyer)
+        .filter(or_(Lawyer.is_firm_lawyer.is_(True), Lawyer.role == "procurador"))
+        .order_by(Lawyer.is_firm_lawyer.desc())
+        .all()
+    )
+    for l in lawyers:
         toks = _norm(l.name).split()
         if not toks:
             continue
