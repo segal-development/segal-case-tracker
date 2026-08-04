@@ -49,10 +49,11 @@ def test_v1_zero_when_no_m2():
 
 # --- V3: tramo by compliance ------------------------------------------------ #
 @pytest.mark.parametrize("nivel,pct,expected", [
-    ("junior", 0.90, 100000), ("pleno", 0.90, 80769),
-    ("junior", 0.80, 80000), ("pleno", 0.80, 64615),
+    # Pleno unificado con junior: mismo tramo para ambos niveles.
+    ("junior", 0.90, 100000), ("pleno", 0.90, 100000),
+    ("junior", 0.80, 80000), ("pleno", 0.80, 80000),
     ("junior", 0.799, 0), ("pleno", 0.799, 0),
-    ("junior", 1.0, 100000), ("pleno", 1.0, 80769),
+    ("junior", 1.0, 100000), ("pleno", 1.0, 100000),
 ])
 def test_tramo_v3(nivel, pct, expected):
     assert bc.tramo_v3(nivel, pct) == expected

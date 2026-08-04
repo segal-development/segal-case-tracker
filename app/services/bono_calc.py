@@ -16,7 +16,7 @@ Formulas (verbatim from the sheet):
                                ≥65%→2400 · <65%→0
   V3  Cumplimiento = V3_tramo × MAX(0, 1 − %V4)
                    %cumpl = causas con mov. útil / causas asignadas
-                   V3_tramo:   ≥90%→100000(J)/80769(P) · ≥80%→80000(J)/64615(P) · <80%→0
+                   V3_tramo:   ≥90%→100000 · 80–89,99%→80000 · <80%→0 (J y P igual)
   V4  Reclamos   %V4 = leves×5% + medios×15% + graves×30%
   V2  Renovación = renovaciones × $10.400
 """
@@ -62,11 +62,13 @@ def valor_cliente_v1(nivel: str, pct_activacion: float) -> int:
 
 
 def tramo_v3(nivel: str, pct_cumplimiento: float) -> int:
-    """V3 gross tramo by compliance-rate."""
+    """V3 gross tramo by compliance-rate. Same scale for Junior and Pleno
+    (confirmed 2026-08: pleno unified with junior, dropping the old ×0.8077
+    pleno factor of 80769/64615). ``nivel`` kept for signature compatibility."""
     if pct_cumplimiento >= 0.90:
-        return 80769 if nivel == PLENO else 100000
+        return 100000
     if pct_cumplimiento >= 0.80:
-        return 64615 if nivel == PLENO else 80000
+        return 80000
     return 0
 
 
