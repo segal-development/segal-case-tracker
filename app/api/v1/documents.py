@@ -14,12 +14,13 @@ GET /api/v1/documents/{document_id}/download
 """
 
 import logging
+from datetime import date, datetime
 from typing import AsyncIterator, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import func, text as sql_text
+from sqlalchemy import DateTime, func, text as sql_text
 from sqlalchemy.orm import Session
 
 from app.api.deps import (
@@ -32,6 +33,7 @@ from app.api.deps import (
 from app.config import settings
 from app.models.document import Document
 from app.models.case import Case
+from app.models.movement import Movement
 from app.scrapper.pjud.civil import CivilScraper
 from app.scrapper.pjud.browser import BrowserFactory
 from app.scrapper.pjud.exceptions import DocumentTokenExpiredError, ScrapingError
@@ -70,6 +72,7 @@ class DocumentSearchHit(BaseModel):
     case_rol: str
     doc_type: Optional[str] = None
     filename: Optional[str] = None
+    fecha: Optional[date] = None
     snippet: str
     download_url: str
 
@@ -95,11 +98,24 @@ def _sqlite_snippet(texto: str, q: str, width: int = 200) -> str:
     return f"{prefix}{snip}{suffix}"
 
 
+def _as_date(value) -> Optional[date]:
+    """Coerce a datetime/date/None search value into a ``date`` (or None)."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    return value
+
+
 @router.get("/search", response_model=List[DocumentSearchHit])
 async def search_documents(
     q: str = Query(..., min_length=2, description="Search query (min 2 chars)"),
     case_id: Optional[int] = Query(None, description="Restrict to a single case"),
     limit: int = Query(30, ge=1, le=100, description="Max results (cap 100)"),
+    orden: str = Query(
+        "relevancia",
+        description='Ordering: "relevancia" (default) or "reciente" (newest first)',
+    ),
     current_lawyer: dict = Depends(get_current_lawyer),
     db: Session = Depends(get_db),
 ) -> List[DocumentSearchHit]:
@@ -110,6 +126,15 @@ async def search_documents(
     endpoints (auditor/admin see everything; a regular lawyer sees the cases
     they are an abogado-of-record litigante on).
 
+    Each hit carries a ``fecha`` — the document's own ``document_date`` when
+    present, otherwise the linked movement's ``movement_date`` (LEFT JOIN, so
+    docs without a movement are not dropped), or ``null`` when neither exists.
+
+    ``orden`` controls ordering:
+      - ``"relevancia"`` (default): PG ``ts_rank`` DESC / SQLite by id.
+      - ``"reciente"``: by ``fecha`` DESC, NULLs last.
+    Any other value is clamped to ``"relevancia"``.
+
     Dialect-aware:
       - PostgreSQL: Spanish ``to_tsvector @@ websearch_to_tsquery`` match,
         ordered by ``ts_rank``, snippet from ``ts_headline``.
@@ -118,6 +143,15 @@ async def search_documents(
     """
     scope = resolve_case_scope(db, current_lawyer)
     dialect = db.get_bind().dialect.name
+
+    # Clamp unknown ordering values to the default ("relevancia").
+    if orden != "reciente":
+        orden = "relevancia"
+
+    # Document date = own document_date, else linked movement's movement_date.
+    fecha_expr = func.coalesce(
+        Document.document_date, Movement.movement_date, type_=DateTime()
+    )
 
     if dialect == "postgresql":
         cfg = sql_text("'spanish'")  # inline regconfig literal (NOT interpolated q)
@@ -130,15 +164,20 @@ async def search_documents(
             "MaxWords=30, MinWords=12, ShortWord=2",
         )
         query = (
-            db.query(Document, Case.rol, headline.label("snippet"))
+            db.query(Document, Case.rol, headline.label("snippet"), fecha_expr.label("fecha"))
             .join(Case, Case.id == Document.case_id)
+            .outerjoin(Movement, Document.movement_id == Movement.id)
             .filter(Document.texto.isnot(None))
             .filter(tsvector.op("@@")(tsquery))
         )
         query = apply_case_scope(query, scope)
         if case_id is not None:
             query = query.filter(Document.case_id == case_id)
-        rows = query.order_by(func.ts_rank(tsvector, tsquery).desc()).limit(limit).all()
+        if orden == "reciente":
+            query = query.order_by(fecha_expr.desc().nullslast())
+        else:
+            query = query.order_by(func.ts_rank(tsvector, tsquery).desc())
+        rows = query.limit(limit).all()
 
         return [
             DocumentSearchHit(
@@ -147,23 +186,30 @@ async def search_documents(
                 case_rol=rol,
                 doc_type=doc.doc_type,
                 filename=doc.filename,
+                fecha=_as_date(fecha),
                 snippet=snippet or "",
                 download_url=f"/api/v1/documents/{doc.id}/download",
             )
-            for doc, rol, snippet in rows
+            for doc, rol, snippet, fecha in rows
         ]
 
     # SQLite / fallback: case-insensitive LIKE (value is bound, not interpolated).
     query = (
-        db.query(Document, Case.rol)
+        db.query(Document, Case.rol, fecha_expr.label("fecha"))
         .join(Case, Case.id == Document.case_id)
+        .outerjoin(Movement, Document.movement_id == Movement.id)
         .filter(Document.texto.isnot(None))
         .filter(func.lower(Document.texto).like(f"%{q.lower()}%"))
     )
     query = apply_case_scope(query, scope)
     if case_id is not None:
         query = query.filter(Document.case_id == case_id)
-    rows = query.order_by(Document.id).limit(limit).all()
+    if orden == "reciente":
+        # Emulate NULLS LAST: null dates sort after non-null, then newest first.
+        query = query.order_by((fecha_expr.is_(None)).asc(), fecha_expr.desc())
+    else:
+        query = query.order_by(Document.id)
+    rows = query.limit(limit).all()
 
     return [
         DocumentSearchHit(
@@ -172,10 +218,11 @@ async def search_documents(
             case_rol=rol,
             doc_type=doc.doc_type,
             filename=doc.filename,
+            fecha=_as_date(fecha),
             snippet=_sqlite_snippet(doc.texto or "", q),
             download_url=f"/api/v1/documents/{doc.id}/download",
         )
-        for doc, rol in rows
+        for doc, rol, fecha in rows
     ]
 
 
