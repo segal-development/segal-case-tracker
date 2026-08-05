@@ -97,6 +97,27 @@ def test_periodo_cerrado_no_detecta(db, esc, monkeypatch):
     assert db.query(Hito).filter(Hito.origen == "detector").count() == 0
 
 
+class RaisingStorage:
+    def retrieve(self, path):
+        raise AssertionError("no debería bajar de GCS cuando documents.texto está presente")
+
+
+def test_usa_documents_texto_sin_bajar_de_gcs(db, esc, monkeypatch):
+    """Con el texto ya extraído (FTS backfill), el detector lo usa desde la
+    columna y NO baja de GCS ni re-extrae el PDF."""
+    esc["doc"].texto = FAVORABLE
+    db.commit()
+
+    def _boom(_b):
+        raise AssertionError("no debería re-extraer cuando documents.texto está presente")
+    monkeypatch.setattr(hito_detector, "extraer_texto_pdf", _boom)
+
+    res = HitoDetectorService(db, storage=RaisingStorage()).detectar(PERIODO)
+    assert res.creados == 1
+    h = db.query(Hito).filter(Hito.origen == "detector").one()
+    assert h.estado == HITO_SUGERIDO and h.confianza == "alta"
+
+
 def test_resolucion_rechazada_no_crea(db, esc, monkeypatch):
     res = _run(db, monkeypatch, texto="No ha lugar a la excepción. Se rechaza.")
     assert res.creados == 0 and res.rechazados == 1
