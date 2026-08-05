@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.segal.syncstation</string>
+
+  <!-- Sync worker via run-worker-foreground.sh, which EXECs the worker so this
+       job process IS the worker. Foreground + KeepAlive → launchd keeps it alive
+       and restarts it on crash or reboot (fixes the old reaping problem, where a
+       nohup child died when the launcher script exited). The Cloud SQL proxy has
+       its own agent (com.segal.sqlproxy); the wrapper waits for it. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/marcelo/Projects/segal-case-tracker/scripts/run-worker-foreground.sh</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>/Users/marcelo</string>
+    <!-- PDF backfill (moderate pace): prioritize cases with the most pending
+         docs, larger batch, shorter cycle. Remove these 3 keys once the
+         pending-PDF backlog is drained to return to normal monitoring cadence. -->
+    <key>DETAIL_PENDING_DOCS_FIRST</key>
+    <string>true</string>
+    <key>DETAIL_BATCH</key>
+    <string>80</string>
+    <key>SYNC_INTERVAL</key>
+    <string>2</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>15</integer>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/segal-worker.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/segal-worker.log</string>
+</dict>
+</plist>

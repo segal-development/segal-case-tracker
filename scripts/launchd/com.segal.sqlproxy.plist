@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.segal.sqlproxy</string>
+
+  <!-- Cloud SQL Auth Proxy for the QA DB on 127.0.0.1:5433, in the FOREGROUND so
+       launchd manages it directly. KeepAlive restarts it on crash or reboot. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/cloud-sql-proxy</string>
+    <string>grupo-segal:us-central1:casetracker-segal-qa-db</string>
+    <string>--port</string>
+    <string>5433</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <!-- HOME (not a service-account key): the proxy authenticates with the user's
+         gcloud Application Default Credentials (~/.config/gcloud/...), which have
+         the cloudsql permission. sa-key.json is GCS-only and 403s on Cloud SQL. -->
+    <key>HOME</key>
+    <string>/Users/marcelo</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/segal-sqlproxy.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/segal-sqlproxy.log</string>
+</dict>
+</plist>
