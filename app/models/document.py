@@ -40,6 +40,12 @@ class Document(Base):
     # Status: pending → (download) → stored | failed | unavailable
     status = Column(String(20), nullable=False, server_default="pending")
 
+    # Full-text search (Slice 1): extracted PDF text + when it was extracted.
+    # A Spanish GIN index over to_tsvector('spanish', coalesce(texto,'')) is
+    # created on PostgreSQL by migration 044 (SQLite falls back to LIKE).
+    texto = Column(Text, nullable=True)
+    text_extracted_at = Column(DateTime, nullable=True)
+
     # Timestamps
     document_date = Column(DateTime, nullable=True)  # Date on document
     downloaded_at = Column(DateTime, default=datetime.utcnow)

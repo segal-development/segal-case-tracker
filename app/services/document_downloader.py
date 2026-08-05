@@ -109,6 +109,16 @@ class DocumentDownloader:
                     ),
                 )
                 storage_service.upload(doc, pdf_bytes)
+                # Extract full-text for search (Slice 1) — non-fatal: a failure
+                # here must never break the download/store of the document.
+                try:
+                    from app.services.pdf_text import extraer_texto_pdf
+                    doc.texto = extraer_texto_pdf(pdf_bytes) or None
+                    doc.text_extracted_at = datetime.utcnow()
+                except Exception:
+                    logger.warning(
+                        "text extraction failed for doc %s", doc.id, exc_info=True
+                    )
                 db.commit()
                 logger.info(
                     "DocumentDownloader: stored doc %s (%d bytes) → %s",

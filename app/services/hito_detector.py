@@ -15,7 +15,6 @@ declarativas y se amplían sin tocar la lógica.
 """
 from __future__ import annotations
 
-import io
 import logging
 import re
 import unicodedata
@@ -107,17 +106,10 @@ def regla_para_movimiento(stage: Optional[str], procedure: Optional[str]) -> Opt
     return None
 
 
-def extraer_texto_pdf(data: bytes) -> str:
-    """Extrae el texto de un PDF. Devuelve '' si es escaneado/ilegible. Nunca lanza."""
-    if not data:
-        return ""
-    try:
-        from pypdf import PdfReader
-
-        reader = PdfReader(io.BytesIO(data))
-        return "\n".join((page.extract_text() or "") for page in reader.pages)
-    except Exception:
-        return ""
+# Text extraction moved to app.services.pdf_text so the FTS pipeline can reuse
+# it without importing this (heavier) detector module. Re-exported here so the
+# public API of hito_detector is unchanged.
+from app.services.pdf_text import extraer_texto_pdf  # noqa: E402,F401
 
 
 @dataclass

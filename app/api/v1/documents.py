@@ -14,10 +14,12 @@ GET /api/v1/documents/{document_id}/download
 """
 
 import logging
-from typing import AsyncIterator
+from typing import AsyncIterator, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import RedirectResponse, StreamingResponse
+from pydantic import BaseModel
+from sqlalchemy import func, text as sql_text
 from sqlalchemy.orm import Session
 
 from app.api.deps import (
@@ -50,6 +52,131 @@ def _pdf_stream(data: bytes) -> AsyncIterator[bytes]:
 def _get_storage_service() -> StorageService:
     """Dependency: return a StorageService backed by the configured backend."""
     return StorageService(get_storage_backend(settings))
+
+
+# ---------------------------------------------------------------------------
+# GET /search — full-text search over extracted document text
+# ---------------------------------------------------------------------------
+#
+# NOTE: this route MUST be registered BEFORE ``/{document_id}`` so that the
+# literal path segment "search" is not captured as a document id.
+
+
+class DocumentSearchHit(BaseModel):
+    """One full-text search result."""
+
+    document_id: int
+    case_id: int
+    case_rol: str
+    doc_type: Optional[str] = None
+    filename: Optional[str] = None
+    snippet: str
+    download_url: str
+
+
+def _sqlite_snippet(texto: str, q: str, width: int = 200) -> str:
+    """Build a ~``width``-char window around the first case-insensitive match.
+
+    Used on SQLite (tests), where there is no ``ts_headline``. On PostgreSQL
+    the snippet comes from ``ts_headline`` instead.
+    """
+    if not texto:
+        return ""
+    low = texto.lower()
+    idx = low.find(q.lower())
+    if idx == -1:
+        return texto[:width].strip()
+    half = max(0, (width - len(q)) // 2)
+    start = max(0, idx - half)
+    end = min(len(texto), idx + len(q) + half)
+    snip = texto[start:end].strip()
+    prefix = "…" if start > 0 else ""
+    suffix = "…" if end < len(texto) else ""
+    return f"{prefix}{snip}{suffix}"
+
+
+@router.get("/search", response_model=List[DocumentSearchHit])
+async def search_documents(
+    q: str = Query(..., min_length=2, description="Search query (min 2 chars)"),
+    case_id: Optional[int] = Query(None, description="Restrict to a single case"),
+    limit: int = Query(30, ge=1, le=100, description="Max results (cap 100)"),
+    current_lawyer: dict = Depends(get_current_lawyer),
+    db: Session = Depends(get_db),
+) -> List[DocumentSearchHit]:
+    """Full-text search over extracted document text.
+
+    Only documents whose ``texto`` has been extracted (``texto IS NOT NULL``)
+    are searchable. Results are scoped exactly like the other document
+    endpoints (auditor/admin see everything; a regular lawyer sees the cases
+    they are an abogado-of-record litigante on).
+
+    Dialect-aware:
+      - PostgreSQL: Spanish ``to_tsvector @@ websearch_to_tsquery`` match,
+        ordered by ``ts_rank``, snippet from ``ts_headline``.
+      - SQLite (tests): case-insensitive ``LIKE`` scan, ordered by id, snippet
+        built in Python.
+    """
+    scope = resolve_case_scope(db, current_lawyer)
+    dialect = db.get_bind().dialect.name
+
+    if dialect == "postgresql":
+        cfg = sql_text("'spanish'")  # inline regconfig literal (NOT interpolated q)
+        tsvector = func.to_tsvector(cfg, func.coalesce(Document.texto, ""))
+        tsquery = func.websearch_to_tsquery(cfg, q)  # q -> bound param
+        headline = func.ts_headline(
+            cfg,
+            Document.texto,
+            tsquery,
+            "MaxWords=30, MinWords=12, ShortWord=2",
+        )
+        query = (
+            db.query(Document, Case.rol, headline.label("snippet"))
+            .join(Case, Case.id == Document.case_id)
+            .filter(Document.texto.isnot(None))
+            .filter(tsvector.op("@@")(tsquery))
+        )
+        query = apply_case_scope(query, scope)
+        if case_id is not None:
+            query = query.filter(Document.case_id == case_id)
+        rows = query.order_by(func.ts_rank(tsvector, tsquery).desc()).limit(limit).all()
+
+        return [
+            DocumentSearchHit(
+                document_id=doc.id,
+                case_id=doc.case_id,
+                case_rol=rol,
+                doc_type=doc.doc_type,
+                filename=doc.filename,
+                snippet=snippet or "",
+                download_url=f"/api/v1/documents/{doc.id}/download",
+            )
+            for doc, rol, snippet in rows
+        ]
+
+    # SQLite / fallback: case-insensitive LIKE (value is bound, not interpolated).
+    query = (
+        db.query(Document, Case.rol)
+        .join(Case, Case.id == Document.case_id)
+        .filter(Document.texto.isnot(None))
+        .filter(func.lower(Document.texto).like(f"%{q.lower()}%"))
+    )
+    query = apply_case_scope(query, scope)
+    if case_id is not None:
+        query = query.filter(Document.case_id == case_id)
+    rows = query.order_by(Document.id).limit(limit).all()
+
+    return [
+        DocumentSearchHit(
+            document_id=doc.id,
+            case_id=doc.case_id,
+            case_rol=rol,
+            doc_type=doc.doc_type,
+            filename=doc.filename,
+            snippet=_sqlite_snippet(doc.texto or "", q),
+            download_url=f"/api/v1/documents/{doc.id}/download",
+        )
+        for doc, rol in rows
+    ]
 
 
 # ---------------------------------------------------------------------------
