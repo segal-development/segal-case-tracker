@@ -247,6 +247,11 @@ class HitoDetectorService:
         )
 
     def _texto(self, doc) -> str:
+        # Prefer the text already extracted by the FTS backfill (documents.texto)
+        # — avoids a GCS download + re-parse per candidate. Fall back to
+        # downloading only for docs not yet backfilled.
+        if getattr(doc, "texto", None):
+            return doc.texto
         try:
             return extraer_texto_pdf(self._storage_backend().retrieve(doc.gcs_path))
         except Exception:  # noqa: BLE001 — un PDF ilegible degrada, no rompe
