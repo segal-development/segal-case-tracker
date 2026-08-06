@@ -394,6 +394,55 @@ def _add_detalle_sheets(wb, db: Session, start: date, end: date, rows_by_lawyer:
     lawyer_ids = list(rows_by_lawyer.keys())
     lawyer_name = {lid: r.lawyer_nombre for lid, r in rows_by_lawyer.items()}
 
+    pct_frac = "0.0%"      # para fracciones (0.85 → 85,0%)
+    pct_pts = '0.0"%"'     # para puntos ya en % (7.5 → 7,5%)
+
+    # --- Detalle V1: cómo se calcula la retención (clientes activos × $/cliente) ---
+    ws_v1, _ = _sheet(
+        "Detalle V1",
+        ["Abogado", "Nivel", "Clientes M-2", "Activos", "% Activación", "$/Cliente", "V1 bruto"],
+        [30, 10, 13, 10, 13, 12, 14], set(),
+    )
+    r = 2
+    for row in rows_by_lawyer.values():
+        ws_v1.cell(row=r, column=1, value=row.lawyer_nombre)
+        ws_v1.cell(row=r, column=2, value=row.nivel)
+        for col, val, fmt in (
+            (3, row.clientes_m2, None), (4, row.clientes_activos, None),
+            (5, row.v1_pct_activacion, pct_frac), (6, row.v1_valor_cliente, clp),
+            (7, row.v1_bruto, clp),
+        ):
+            cell = ws_v1.cell(row=r, column=col, value=val)
+            cell.alignment = right
+            if fmt:
+                cell.number_format = fmt
+        r += 1
+
+    # --- Detalle V3: cómo se calcula el cumplimiento (semanas → tramo × (1−%V4)) ---
+    ws_v3, _ = _sheet(
+        "Detalle V3",
+        ["Abogado", "Nivel", "Sem 1", "Sem 2", "Sem 3", "Sem 4", "Sem 5",
+         "Total", "Meta", "Tramo bruto", "% V4", "V3 neta"],
+        [30, 10, 8, 8, 8, 8, 8, 9, 9, 13, 8, 13], set(),
+    )
+    r = 2
+    for row in rows_by_lawyer.values():
+        ws_v3.cell(row=r, column=1, value=row.lawyer_nombre)
+        ws_v3.cell(row=r, column=2, value=row.nivel)
+        semanas = [row.cumpl_sem1, row.cumpl_sem2, row.cumpl_sem3, row.cumpl_sem4,
+                   row.cumpl_sem5, row.cumpl_total, row.meta_cumplimiento]
+        for j, val in enumerate(semanas, start=3):
+            cell = ws_v3.cell(row=r, column=j, value=val)
+            cell.number_format = pct_pts
+            cell.alignment = right
+        for col, val, fmt in (
+            (10, row.v3_tramo_bruto, clp), (11, row.v4_pct, pct_frac), (12, row.v3_neta, clp),
+        ):
+            cell = ws_v3.cell(row=r, column=col, value=val)
+            cell.number_format = fmt
+            cell.alignment = right
+        r += 1
+
     # --- Detalle Hitos: cada hito aprobado del período (lo que suma "Hitos H1") ---
     ws_h, hmoney = _sheet(
         "Detalle Hitos",
