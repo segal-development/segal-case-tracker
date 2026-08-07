@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.deps import get_db
 from app.api.v1.router import api_router
+from app.api.sysgal.causas import router as sysgal_causas_router
 from app.config import settings
 
 
@@ -45,6 +46,10 @@ app.add_middleware(
 
 # Routes
 app.include_router(api_router, prefix="/api/v1")
+
+# External read-only API for the Sysgal CRM. Mounted SEPARATELY (own prefix,
+# own auth) so it is fully isolated from the internal /api/v1 app.
+app.include_router(sysgal_causas_router, prefix="/api/sysgal/v1", tags=["sysgal"])
 
 
 @app.get("/health")
