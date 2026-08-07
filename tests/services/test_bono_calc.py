@@ -49,14 +49,22 @@ def test_v1_zero_when_no_m2():
 
 # --- V3: tramo by compliance ------------------------------------------------ #
 @pytest.mark.parametrize("nivel,pct,expected", [
-    # Pleno unificado con junior: mismo tramo para ambos niveles.
-    ("junior", 0.90, 100000), ("pleno", 0.90, 100000),
-    ("junior", 0.80, 80000), ("pleno", 0.80, 80000),
+    # Pleno con escala separada (×0.8077 del junior): 80769 / 64615 (V7.1).
+    ("junior", 0.90, 100000), ("pleno", 0.90, 80769),
+    ("junior", 0.80, 80000), ("pleno", 0.80, 64615),
     ("junior", 0.799, 0), ("pleno", 0.799, 0),
-    ("junior", 1.0, 100000), ("pleno", 1.0, 100000),
+    ("junior", 1.0, 100000), ("pleno", 1.0, 80769),
 ])
 def test_tramo_v3(nivel, pct, expected):
     assert bc.tramo_v3(nivel, pct) == expected
+
+
+def test_v3_pleno_escala_separada_en_compute():
+    # Pleno 100% cumpl → tramo 80769 (no 100000); 1 grave = -30% → 56538.
+    b = bc.compute("pleno", causas_asignadas=10, causas_cumplidas=10)
+    assert b["v3_tramo_bruto"] == 80769
+    b2 = bc.compute("pleno", causas_asignadas=10, causas_cumplidas=10, reclamos_grave=1)
+    assert b2["v3_neta"] == 56538  # 80769 × 0.70
 
 
 # --- V4: penalty on V3 ------------------------------------------------------ #
