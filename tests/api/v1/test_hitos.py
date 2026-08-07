@@ -11,7 +11,9 @@ from datetime import date
 import pytest
 
 from app.core.security import create_access_token
-from app.models.hito import Hito, HitoTipo, HITO_PENDIENTE
+from app.models.hito import (
+    Hito, HitoTipo, HITO_APROBADO, HITO_PENDIENTE, HITO_RECHAZADO,
+)
 from app.models.lawyer import Lawyer
 
 ADMIN_RUT = "16021492-9"
@@ -108,6 +110,43 @@ def test_admin_approves_and_resumen_totals(client, db, admin, lawyer, tipo):
     row = next(x for x in r.json() if x["lawyer_id"] == lawyer.id)
     assert row["aprobados"] == 1
     assert row["total_bruto"] == 8077
+
+
+def _add_hito(db, lawyer_id, tipo_id, fecha, estado=HITO_PENDIENTE):
+    db.add(Hito(lawyer_id=lawyer_id, hito_tipo_id=tipo_id, valor_bruto=8077,
+                fecha_hito=fecha, estado=estado))
+    db.commit()
+
+
+def test_stats_mensual_cuenta_ingresados_por_mes(client, db, admin, lawyer, tipo):
+    other = Lawyer(rut="18248270-6", name="Otra Abogada", role="lawyer")
+    db.add(other); db.commit(); db.refresh(other)
+    # lawyer: 2 en junio, 3 en julio (mezcla de estados → cuenta TODOS los ingresados)
+    _add_hito(db, lawyer.id, tipo.id, date(2026, 6, 10), HITO_APROBADO)
+    _add_hito(db, lawyer.id, tipo.id, date(2026, 6, 20), HITO_RECHAZADO)
+    _add_hito(db, lawyer.id, tipo.id, date(2026, 7, 5), HITO_PENDIENTE)
+    _add_hito(db, lawyer.id, tipo.id, date(2026, 7, 15), HITO_APROBADO)
+    _add_hito(db, lawyer.id, tipo.id, date(2026, 7, 25), HITO_APROBADO)
+    # other: 1 en julio
+    _add_hito(db, other.id, tipo.id, date(2026, 7, 9), HITO_PENDIENTE)
+
+    r = client.get("/api/v1/hitos/stats/mensual?desde=2026-06&hasta=2026-07",
+                   headers=_h(ADMIN_RUT))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["meses"] == ["2026-06", "2026-07"]
+    assert body["totales_por_mes"] == {"2026-06": 2, "2026-07": 4}  # proyección
+    assert body["total_general"] == 6
+    # ordenado por total desc → lawyer (5) antes que other (1)
+    top = body["abogados"][0]
+    assert top["lawyer_id"] == lawyer.id
+    assert top["por_mes"] == {"2026-06": 2, "2026-07": 3}
+    assert top["total"] == 5
+
+
+def test_stats_mensual_requires_admin(client, db, lawyer, tipo):
+    r = client.get("/api/v1/hitos/stats/mensual", headers=_h(LAWYER_RUT))
+    assert r.status_code == 403
 
 
 def test_regular_lawyer_cannot_approve(client, db, admin, lawyer, tipo):
