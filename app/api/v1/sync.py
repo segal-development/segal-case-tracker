@@ -6,7 +6,7 @@ GET  /sync/status   - Get last sync status
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from sqlalchemy.orm import Session
@@ -227,24 +227,54 @@ async def get_sync_status(
     lawyer_id = _resolve_lawyer_id(db, current_lawyer)
 
     sync_service = SyncService(db)
-    last_sync = sync_service.get_last_sync(lawyer_id, competencia)
-    needs_sync = sync_service.needs_sync(lawyer_id, competencia)
 
     from sqlalchemy import func
     from app.models.case import Case
 
-    last_activity = (
-        db.query(func.max(Case.last_detail_checked_at))
-        .filter(Case.lawyer_id == lawyer_id)
-        .scalar()
-    )
+    # Admin/auditor are transversal roles: they have no caseload of their own, so
+    # scoping this indicator to their (empty) cartera returns "sin datos" even
+    # while the firm is actively syncing. For them, report FIRM-WIDE activity —
+    # the same whole-study view the rest of the app gives these roles.
+    sub = current_lawyer.get("sub") or current_lawyer.get("lawyer_id")
+    me = None
+    if sub is not None:
+        if isinstance(sub, int) or (isinstance(sub, str) and str(sub).isdigit()):
+            me = db.query(Lawyer).filter(Lawyer.id == int(sub)).first()
+        else:
+            me = db.query(Lawyer).filter(Lawyer.rut == sub).first()
+    is_transversal = me is not None and me.role in ("admin", "auditor")
+
+    activity_q = db.query(func.max(Case.last_detail_checked_at))
+    if not is_transversal:
+        activity_q = activity_q.filter(Case.lawyer_id == lawyer_id)
+    last_activity = activity_q.scalar()
+
+    if is_transversal:
+        # Most recent sync across the whole firm for this competencia.
+        last_sync = (
+            db.query(SyncHistory)
+            .filter(
+                SyncHistory.competencia == competencia,
+                SyncHistory.status.in_(["completed", "partial"]),
+            )
+            .order_by(SyncHistory.completed_at.desc())
+            .first()
+        )
+        needs_sync = (
+            last_sync is None
+            or last_sync.completed_at is None
+            or (datetime.utcnow() - last_sync.completed_at) > timedelta(hours=4)
+        )
+    else:
+        last_sync = sync_service.get_last_sync(lawyer_id, competencia)
+        needs_sync = sync_service.needs_sync(lawyer_id, competencia)
 
     if not last_sync:
         return SyncStatusResponse(
             last_sync=None,
             last_activity=last_activity,
             status=None,
-            needs_sync=True,
+            needs_sync=needs_sync,
         )
 
     return SyncStatusResponse(
