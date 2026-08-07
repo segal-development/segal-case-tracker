@@ -158,6 +158,33 @@ def test_export_liquidacion_xlsx(client, admin, junior):
     assert any(str(v).startswith("TOTAL ÁREA") for v in flat if v)
 
 
+def test_export_incluye_cuadratura(client, admin, junior):
+    client.put(
+        f"/api/v1/bono/variables/{junior.id}?periodo=2026-07",
+        headers=_h(ADMIN_RUT),
+        json={"clientes_m2": 100, "clientes_activos": 90, "renovaciones": 2},
+    )
+    r = client.get("/api/v1/bono/liquidacion/export?periodo=2026-07", headers=_h(ADMIN_RUT))
+    assert r.status_code == 200
+
+    import io
+    from openpyxl import load_workbook
+
+    wb = load_workbook(io.BytesIO(r.content))
+    assert "CUADRATURA" in wb.sheetnames
+    ws = wb["CUADRATURA"]
+    flat = [c.value for row in ws.iter_rows() for c in row]
+    # Full 16-column layout present (even the columns we don't compute).
+    for h in ("Bono Hito", "Bono Retención Cliente", "Bono Tramitación",
+              "Bono Recupero Cliente", "Bono Senior", "Semana Corrida"):
+        assert h in flat
+    # Our junior's rut/name + computed concepts land.
+    assert LAWYER_RUT in flat            # column A
+    assert "Fernanda Arroyo" in flat     # column B
+    assert 8000 * 90 in flat             # V1 → Bono Retención (D)
+    assert any(str(v) == "TOTALES" for v in flat if v)
+
+
 def test_export_requires_admin(client, junior):
     r = client.get("/api/v1/bono/liquidacion/export?periodo=2026-07", headers=_h(LAWYER_RUT))
     assert r.status_code == 403

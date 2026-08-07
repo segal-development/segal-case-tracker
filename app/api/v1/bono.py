@@ -364,6 +364,120 @@ def _build_liquidacion_workbook(data: LiquidacionResponse):
     return wb
 
 
+# CUADRATURA columns, in the exact order of the firm's reconciliation sheet
+# (A..P). Only the 4 marked (*) come from our bono engine; the rest belong to
+# comp structures we don't model (seniors, procuradores, redactores, producción,
+# etc.) and are left blank for RRHH to fill/reconcile.
+_CUADRATURA_HEADERS = [
+    "Rut", "Nombre",
+    "Bono Hito",                          # C * hitos aprobados
+    "Bono Retención Cliente",             # D * V1
+    "Bono Tramitación",                   # E * V3 neta
+    "Bono Recupero Cliente",              # F * V2
+    "Bono Fidelización Procurador",       # G
+    "Renovaciones Procuradores y Senior", # H
+    "Bono Senior",                        # I
+    "Promedio de causas",                 # J
+    "Insolvencias",                       # K
+    "Causas Terminadas",                  # L
+    "Redacciones",                        # M
+    "Bono de producción",                 # N
+    "Bono Reemplazo",                     # O
+    "Semana Corrida",                     # P
+]
+
+
+def _add_cuadratura_sheet(wb, data: "LiquidacionResponse", rut_by_id: dict):
+    """Add the CUADRATURA reconciliation sheet mirroring the firm's layout.
+
+    Same 16-column shape (Rut, Nombre, + 14 bonus concepts) and TOTALES row.
+    We only populate the 4 concepts our engine computes — Bono Hito (C),
+    Retención/V1 (D), Tramitación/V3 (E), Recupero/V2 (F) — for the junior/pleno
+    lawyers in the liquidación. Columns G–P and the non-junior/pleno people
+    (seniors, procuradores, redactores) are NOT in our system, so RRHH fills
+    those to complete the cuadratura.
+    """
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    ws = wb.create_sheet("CUADRATURA")
+    clp_fmt = "#,##0"
+    money_cols = list(range(3, 17))  # C..P (only C..F carry values; rest formatted, empty)
+    filled_cols = {3, 4, 5, 6}       # C..F = the concepts we compute
+
+    ink = Font(name="Calibri", size=11)
+    bold = Font(name="Calibri", size=11, bold=True)
+    white_bold = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    head_fill = PatternFill("solid", fgColor="1F2A44")
+    total_fill = PatternFill("solid", fgColor="EEF1F6")
+    thin = Side(style="thin", color="D6DAE3")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    right = Alignment(horizontal="right")
+    center = Alignment(horizontal="center")
+
+    # Row 1: note (kept out of the paste area — original CUADRATURA starts at row 2).
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(_CUADRATURA_HEADERS))
+    note = ws.cell(
+        row=1, column=1,
+        value=(
+            f"CUADRATURA · {data.periodo} — columnas C–F (Hito, Retención, Tramitación, "
+            "Recupero) calculadas por el sistema para junior/pleno; el resto lo completa RRHH."
+        ),
+    )
+    note.font = Font(name="Calibri", size=10, italic=True, color="6B7280")
+
+    # Row 2: headers.
+    header_row = 2
+    for j, h in enumerate(_CUADRATURA_HEADERS, start=1):
+        cell = ws.cell(row=header_row, column=j, value=h)
+        cell.font = white_bold
+        cell.fill = head_fill
+        cell.border = border
+        cell.alignment = center if j <= 2 else right
+
+    # Data rows — one per junior/pleno lawyer in the liquidación.
+    r = header_row + 1
+    for row in data.rows:
+        ws.cell(row=r, column=1, value=rut_by_id.get(row.lawyer_id, "")).font = ink
+        ws.cell(row=r, column=2, value=row.lawyer_nombre).font = ink
+        ws.cell(row=r, column=3, value=row.hitos_aprobados)
+        ws.cell(row=r, column=4, value=row.v1_bruto)
+        ws.cell(row=r, column=5, value=row.v3_neta)
+        ws.cell(row=r, column=6, value=row.v2_bruto)
+        for j in range(1, len(_CUADRATURA_HEADERS) + 1):
+            cell = ws.cell(row=r, column=j)
+            cell.font = ink
+            cell.border = border
+            if j in money_cols:
+                cell.number_format = clp_fmt
+                cell.alignment = right
+            elif j == 1:
+                cell.alignment = center
+        r += 1
+
+    # TOTALES row — sum only the columns we fill (C..F).
+    t = data.totales
+    ws.cell(row=r, column=2, value="TOTALES")
+    ws.cell(row=r, column=3, value=t.hitos_aprobados)
+    ws.cell(row=r, column=4, value=t.v1_bruto)
+    ws.cell(row=r, column=5, value=t.v3_neta)
+    ws.cell(row=r, column=6, value=t.v2_bruto)
+    for j in range(1, len(_CUADRATURA_HEADERS) + 1):
+        cell = ws.cell(row=r, column=j)
+        cell.font = bold
+        cell.fill = total_fill
+        cell.border = border
+        if j in money_cols:
+            cell.number_format = clp_fmt
+            cell.alignment = right
+
+    widths = [12, 30, 14, 20, 16, 20, 24, 26, 14, 18, 14, 18, 14, 18, 16, 16]
+    for j, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(j)].width = w
+    ws.freeze_panes = ws.cell(row=header_row + 1, column=3)
+    return ws
+
+
 def _add_detalle_sheets(wb, db: Session, start: date, end: date, rows_by_lawyer: dict):
     """Add DETAIL sheets to the RRHH workbook so they see WHAT is being paid:
     'Detalle Hitos' (every approved hito) + 'Detalle Renovaciones' (each counted).
@@ -613,6 +727,12 @@ async def export_liquidacion(
     per, start, end = _period_bounds(periodo)
     data = _liquidacion_data(db, periodo)
     wb = _build_liquidacion_workbook(data)
+    # CUADRATURA needs RUTs (LiquidacionRow only carries id/name) — map them here.
+    rut_by_id = {
+        lw.id: lw.rut
+        for lw in db.query(Lawyer).filter(Lawyer.id.in_([r.lawyer_id for r in data.rows]))
+    }
+    _add_cuadratura_sheet(wb, data, rut_by_id)
     _add_detalle_sheets(wb, db, start, end, {r.lawyer_id: r for r in data.rows})
     buf = io.BytesIO()
     wb.save(buf)
