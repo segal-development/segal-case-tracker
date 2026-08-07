@@ -507,3 +507,26 @@ def test_export_resumen_renovaciones_cuenta_todos(client, db, admin, junior):
     assert counts[junior.name] == 2          # matcheadas
     assert counts["CCARO"] == 1              # sin matchear, por renovador_raw
     assert counts["TOTAL"] == 3              # solo julio
+
+
+def test_export_incluye_detalle_v1_v3(client, db, admin, junior):
+    """El Excel de RRHH trae hojas Detalle V1 y Detalle V3 (cómo se calcula cada una)."""
+    client.put(
+        f"/api/v1/bono/variables/{junior.id}?periodo=2026-07",
+        headers=_h(ADMIN_RUT),
+        json={
+            "clientes_m2": 100, "clientes_activos": 90,
+            "cumpl_sem1": 20, "cumpl_sem2": 20, "cumpl_sem3": 20,
+            "cumpl_sem4": 20, "cumpl_sem5": 15, "meta_cumplimiento": 90,
+        },
+    )
+    r = client.get("/api/v1/bono/liquidacion/export?periodo=2026-07", headers=_h(ADMIN_RUT))
+    assert r.status_code == 200
+    import io
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(r.content))
+    assert "Detalle V1" in wb.sheetnames and "Detalle V3" in wb.sheetnames
+    v1 = [c.value for row in wb["Detalle V1"].iter_rows() for c in row]
+    assert 90 in v1 and 8000 * 90 in v1            # clientes activos + V1 bruto
+    v3 = [c.value for row in wb["Detalle V3"].iter_rows() for c in row]
+    assert 95 in v3                                 # cumpl_total = 20+20+20+20+15

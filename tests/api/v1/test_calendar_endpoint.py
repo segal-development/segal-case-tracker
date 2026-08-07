@@ -486,9 +486,12 @@ class TestAbogadoRutScoping:
         app.dependency_overrides.pop(get_current_lawyer, None)
 
     def _two_cases(self, db, lawyer, court):
-        from datetime import date, timedelta
+        from datetime import timedelta
 
-        due = date.today() + timedelta(days=3)
+        # Use the frozen TODAY (not the real date.today()) so the seeded deadline
+        # stays inside the endpoint's [TODAY, TODAY+30] window regardless of the
+        # calendar date — else the test fails once real-today drifts past TODAY+27.
+        due = TODAY + timedelta(days=3)
         mine = _make_case(db, lawyer, court, "C-1-2026",
                           next_deadline_at=due, next_deadline_fatal=True, semaforo="rojo")
         _seed_litigante(db, mine, "99999999-9", "Abogada Carla")
