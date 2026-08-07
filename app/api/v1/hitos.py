@@ -456,6 +456,94 @@ async def resumen_hitos(
     return [HitoResumenRow(**r) for r in result]
 
 
+class HitoMensualAbogado(BaseModel):
+    lawyer_id: int
+    lawyer_nombre: str
+    por_mes: dict[str, int]  # "YYYY-MM" -> cantidad ingresada ese mes
+    total: int
+
+
+class HitoStatsMensual(BaseModel):
+    meses: List[str]                 # columnas del rango, ordenadas
+    abogados: List[HitoMensualAbogado]
+    totales_por_mes: dict[str, int]  # todos los abogados por mes (la "proyección")
+    total_general: int
+
+
+def _parse_month(value: str, field: str) -> tuple[int, int]:
+    try:
+        y, m = (int(x) for x in value.split("-"))
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(status_code=400, detail=f"{field} inválido (usa YYYY-MM)")
+    if not (1 <= m <= 12):
+        raise HTTPException(status_code=400, detail=f"{field} inválido (mes 1–12)")
+    return y, m
+
+
+@router.get("/stats/mensual", response_model=HitoStatsMensual)
+async def stats_mensual_hitos(
+    desde: Optional[str] = Query(None, description="Mes inicial YYYY-MM (default: 11 meses atrás)"),
+    hasta: Optional[str] = Query(None, description="Mes final YYYY-MM (default: mes actual)"),
+    db: Session = Depends(get_db),
+    _admin_rut: str = Depends(require_admin),
+):
+    """Hitos INGRESADOS por mes, por abogado + total general (proyección).
+
+    Cuenta TODOS los hitos ingresados (cualquier estado) agrupados por el mes de
+    ``fecha_hito`` — la misma base que usa el bono. Refleja la actividad/movimientos
+    de cada abogado. Rango por defecto: los últimos 12 meses (incluye meses en 0
+    para que las columnas sean estables). Ordenado por total de hitos desc."""
+    now = datetime.utcnow()
+    hy, hm = _parse_month(hasta, "hasta") if hasta else (now.year, now.month)
+    if desde:
+        dy, dm = _parse_month(desde, "desde")
+    else:
+        # ventana de 12 meses inclusive → 11 meses hacia atrás desde 'hasta'
+        idx = hy * 12 + (hm - 1) - 11
+        dy, dm = idx // 12, idx % 12 + 1
+    if (dy, dm) > (hy, hm):
+        raise HTTPException(status_code=400, detail="'desde' no puede ser posterior a 'hasta'")
+
+    start = date(dy, dm, 1)
+    end = date(hy + (hm == 12), (hm % 12) + 1, 1)
+
+    # Meses del rango (columnas estables, incluso los que no tienen hitos).
+    meses: List[str] = []
+    yy, mm = dy, dm
+    while (yy, mm) <= (hy, hm):
+        meses.append(f"{yy:04d}-{mm:02d}")
+        yy, mm = (yy + (mm == 12), (mm % 12) + 1)
+
+    rows = (
+        db.query(Hito)
+        .filter(Hito.fecha_hito >= start, Hito.fecha_hito < end)
+        .all()
+    )
+    by_lawyer: dict[int, dict] = {}
+    totales_por_mes: dict[str, int] = {m: 0 for m in meses}
+    for h in rows:
+        mk = f"{h.fecha_hito.year:04d}-{h.fecha_hito.month:02d}"
+        if mk not in totales_por_mes:
+            continue  # defensivo; el filtro ya acota al rango
+        r = by_lawyer.setdefault(
+            h.lawyer_id,
+            {"lawyer_id": h.lawyer_id,
+             "lawyer_nombre": h.lawyer.name if h.lawyer else "",
+             "por_mes": {m: 0 for m in meses}, "total": 0},
+        )
+        r["por_mes"][mk] += 1
+        r["total"] += 1
+        totales_por_mes[mk] += 1
+
+    abogados = sorted(by_lawyer.values(), key=lambda x: x["total"], reverse=True)
+    return HitoStatsMensual(
+        meses=meses,
+        abogados=[HitoMensualAbogado(**a) for a in abogados],
+        totales_por_mes=totales_por_mes,
+        total_general=sum(totales_por_mes.values()),
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Excel import (SISTEMA DE HITOS.xlsx — hojas HITOS JUNIOR / HITOS PLENO)
 # --------------------------------------------------------------------------- #
