@@ -15,7 +15,7 @@ from dateutil.relativedelta import relativedelta
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from pydantic import BaseModel, field_validator
 from sqlalchemy import or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.api.deps import get_current_lawyer, get_db, require_admin
 from app.models.lawyer import Lawyer
@@ -68,10 +68,18 @@ class AbogadoOption(BaseModel):
     nombre: str
 
 
+class RenovacionAbogadoRow(BaseModel):
+    lawyer_id: Optional[int] = None
+    lawyer_nombre: str
+    cantidad: int
+    total: int  # sum of r.total (anual = cuota × 12) for this lawyer
+
+
 class RenovacionResumen(BaseModel):
     count: int
     total_cuotas: int  # sum of monthly cuotas (monthly recaudación base)
     total_anual: int   # sum of totals (cuota × 12)
+    por_abogado: List[RenovacionAbogadoRow] = []  # breakdown per lawyer, total desc
 
 
 # --------------------------------------------------------------------------- #
@@ -278,13 +286,34 @@ async def resumen_renovaciones(
     start, end = _period_bounds(periodo)
     rows = (
         db.query(Renovacion)
+        .options(joinedload(Renovacion.lawyer))
         .filter(Renovacion.fecha_desde >= start, Renovacion.fecha_desde < end)
         .all()
     )
+
+    # Breakdown per lawyer: cantidad + total (anual). Renovaciones sin abogado
+    # del sistema se agrupan por su renovador_raw; si tampoco hay, "Sin asignar".
+    by_ab: dict = {}
+    for r in rows:
+        if r.lawyer_id:
+            key = ("id", r.lawyer_id)
+            nombre = r.lawyer.name if r.lawyer else f"Abogado #{r.lawyer_id}"
+        else:
+            raw = (r.renovador_raw or "").strip()
+            key = ("raw", raw.lower())
+            nombre = raw or "Sin asignar"
+        e = by_ab.setdefault(
+            key, {"lawyer_id": r.lawyer_id, "lawyer_nombre": nombre, "cantidad": 0, "total": 0}
+        )
+        e["cantidad"] += 1
+        e["total"] += r.total
+    por_abogado = sorted(by_ab.values(), key=lambda x: x["total"], reverse=True)
+
     return RenovacionResumen(
         count=len(rows),
         total_cuotas=sum(r.monto_cuota for r in rows),
         total_anual=sum(r.total for r in rows),
+        por_abogado=[RenovacionAbogadoRow(**e) for e in por_abogado],
     )
 
 
