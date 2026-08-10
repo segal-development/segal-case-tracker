@@ -367,3 +367,41 @@ def test_delete_permissions(client, admin, abogado, db):
     # admin → 204
     ok = client.delete(f"/api/v1/renovaciones/{reno['id']}", headers=_h(ADMIN_RUT))
     assert ok.status_code == 204
+
+
+def test_resumen_incluye_por_abogado(client, db, admin):
+    """El resumen mensual trae el desglose por abogado (cantidad + total anual),
+    ordenado por total desc, e incluye renovaciones sin abogado como 'Sin asignar'."""
+    from app.models.renovacion import Renovacion
+
+    a = Lawyer(rut="70000000-1", name="Ana Abogada", role="lawyer", is_firm_lawyer=True)
+    b = Lawyer(rut="70000000-2", name="Beto Abogado", role="lawyer", is_firm_lawyer=True)
+    db.add_all([a, b])
+    db.commit()
+    db.refresh(a)
+    db.refresh(b)
+
+    def mk(lawyer_id, monto, day, renovador_raw=None):
+        db.add(Renovacion(
+            numero_contrato=f"C-{day}-{monto}", cliente_rut="1-9", cliente_nombre="Cliente",
+            lawyer_id=lawyer_id, renovador_raw=renovador_raw,
+            fecha_desde=date(2026, 7, day), fecha_hasta=date(2027, 7, day),
+            monto_cuota=monto, cuotas=12, total=monto * 12,
+        ))
+
+    mk(a.id, 25000, 5)                       # Ana: 2 renovaciones → total 600.000
+    mk(a.id, 25000, 10)
+    mk(b.id, 40000, 12)                      # Beto: 1 → total 480.000
+    mk(None, 10000, 15, renovador_raw="")    # sin abogado → "Sin asignar" 120.000
+    db.commit()
+
+    r = client.get("/api/v1/renovaciones/resumen?periodo=2026-07", headers=_h(ADMIN_RUT))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["count"] == 4
+    pa = body["por_abogado"]
+    # Ordenado por total desc: Ana (600k) > Beto (480k) > Sin asignar (120k)
+    assert [x["lawyer_nombre"] for x in pa] == ["Ana Abogada", "Beto Abogado", "Sin asignar"]
+    assert pa[0]["cantidad"] == 2 and pa[0]["total"] == 600_000
+    assert pa[1]["cantidad"] == 1 and pa[1]["total"] == 480_000
+    assert pa[2]["lawyer_id"] is None and pa[2]["total"] == 120_000
