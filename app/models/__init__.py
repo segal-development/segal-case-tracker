@@ -28,6 +28,7 @@ from app.models.bono import BonoVariables
 from app.models.bono_cierre import BonoCierre
 from app.models.renovacion import Renovacion
 from app.models.sysgal_api_key import SysgalApiKey
+from app.models.redaccion_api_key import RedaccionApiKey
 
 __all__ = [
     "Lawyer",
@@ -59,4 +60,5 @@ __all__ = [
     "BonoCierre",
     "Renovacion",
     "SysgalApiKey",
+    "RedaccionApiKey",
 ]

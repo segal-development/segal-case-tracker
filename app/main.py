@@ -10,6 +10,8 @@ from app.api.sysgal.causas import router as sysgal_causas_router
 from app.api.sysgal.plazos import router as sysgal_plazos_router
 from app.api.sysgal.novedades import router as sysgal_novedades_router
 from app.api.sysgal.buscar import router as sysgal_buscar_router
+from app.api.redaccion.buscar import router as redaccion_buscar_router
+from app.api.redaccion.detalle import router as redaccion_detalle_router
 from app.config import settings
 
 
@@ -56,6 +58,12 @@ app.include_router(sysgal_causas_router, prefix="/api/sysgal/v1", tags=["sysgal"
 app.include_router(sysgal_plazos_router, prefix="/api/sysgal/v1", tags=["sysgal"])
 app.include_router(sysgal_novedades_router, prefix="/api/sysgal/v1", tags=["sysgal"])
 app.include_router(sysgal_buscar_router, prefix="/api/sysgal/v1", tags=["sysgal"])
+
+# External read-only API for the Redaccion (document-drafters) system. Mounted
+# SEPARATELY (own prefix /api/redaccion/v1, own auth RedaccionApiKey) so it is
+# fully isolated from BOTH the internal /api/v1 app and the Sysgal API.
+app.include_router(redaccion_buscar_router, prefix="/api/redaccion/v1", tags=["redaccion"])
+app.include_router(redaccion_detalle_router, prefix="/api/redaccion/v1", tags=["redaccion"])
 
 
 @app.get("/health")
