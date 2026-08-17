@@ -402,6 +402,7 @@ def test_resumen_incluye_por_abogado(client, db, admin):
     pa = body["por_abogado"]
     # Ordenado por total desc: Ana (600k) > Beto (480k) > Sin asignar (120k)
     assert [x["lawyer_nombre"] for x in pa] == ["Ana Abogada", "Beto Abogado", "Sin asignar"]
-    assert pa[0]["cantidad"] == 2 and pa[0]["total"] == 600_000
-    assert pa[1]["cantidad"] == 1 and pa[1]["total"] == 480_000
-    assert pa[2]["lawyer_id"] is None and pa[2]["total"] == 120_000
+    # comisión = cantidad × $10.400 (V2), NO el monto del contrato (total).
+    assert pa[0]["cantidad"] == 2 and pa[0]["total"] == 600_000 and pa[0]["comision"] == 20_800
+    assert pa[1]["cantidad"] == 1 and pa[1]["total"] == 480_000 and pa[1]["comision"] == 10_400
+    assert pa[2]["lawyer_id"] is None and pa[2]["comision"] == 10_400

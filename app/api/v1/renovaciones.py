@@ -18,6 +18,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.api.deps import get_current_lawyer, get_db, require_admin
+from app.services.bono_calc import V2_POR_RENOVACION
 from app.models.lawyer import Lawyer
 from app.models.renovacion import Renovacion, CUOTAS_RENOVACION
 from app.utils.rut import format_rut, normalize_rut
@@ -72,7 +73,8 @@ class RenovacionAbogadoRow(BaseModel):
     lawyer_id: Optional[int] = None
     lawyer_nombre: str
     cantidad: int
-    total: int  # sum of r.total (anual = cuota × 12) for this lawyer
+    total: int  # sum of r.total (anual = cuota × 12) for this lawyer — recaudación
+    comision: int  # comisión del abogado = cantidad × V2 ($10.400 por renovación)
 
 
 class RenovacionResumen(BaseModel):
@@ -307,7 +309,12 @@ async def resumen_renovaciones(
         )
         e["cantidad"] += 1
         e["total"] += r.total
-    por_abogado = sorted(by_ab.values(), key=lambda x: x["total"], reverse=True)
+    # Comisión del abogado = cantidad × V2 ($10.400/renovación), no el monto del contrato.
+    for e in by_ab.values():
+        e["comision"] = e["cantidad"] * V2_POR_RENOVACION
+    por_abogado = sorted(
+        by_ab.values(), key=lambda x: (x["comision"], x["cantidad"]), reverse=True
+    )
 
     return RenovacionResumen(
         count=len(rows),
