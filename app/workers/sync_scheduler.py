@@ -470,8 +470,13 @@ async def sync_all_lawyers():
     logger.info("Starting scheduled sync for all lawyers")
     logger.info("=" * 60)
     
-    db = SessionLocal()
-
+    # Short-lived session ONLY for the credential scan + active-lawyer lookup.
+    # Never keep a session open across the whole multi-hour cycle: its Cloud SQL
+    # connection would sit idle, get killed server-side, and the final close()
+    # then raised OperationalError — crashing the job and stalling the scheduler.
+    # Fetch what we need, close it, then run the long loop with fresh per-work-unit
+    # sessions only (each gets a live, pre-pinged connection at checkout).
+    setup_db = SessionLocal()
     try:
         # Detect PJUD credential rotations (ciphertext-fingerprint diff) once per
         # cycle so the monitoring vault stays current without a manual scan.
@@ -479,80 +484,76 @@ async def sync_all_lawyers():
         try:
             from app.services.credential_audit import scan_credential_changes
 
-            recorded = scan_credential_changes(db)
+            recorded = scan_credential_changes(setup_db)
             if recorded:
                 logger.info("Credential scan: %d credential change(s) recorded", recorded)
         except Exception:
             logger.exception("Credential change scan failed (non-fatal)")
 
-        # Get all active lawyers. We only need lawyer IDs downstream —
-        # sync_lawyer_cases re-resolves the Lawyer row from whatever session it
-        # is handed — so capture the IDs and release the outer session's rows.
-        lawyers = db.query(Lawyer).filter(Lawyer.is_active == True).all()
+        # Only lawyer IDs are needed downstream — sync_lawyer_cases re-resolves the
+        # Lawyer row from whatever session it is handed.
+        lawyers = setup_db.query(Lawyer).filter(Lawyer.is_active == True).all()
         lawyer_ids = [lawyer.id for lawyer in lawyers]
-
-        if not lawyer_ids:
-            logger.info("No active lawyers found, nothing to sync")
-            return
-
-        logger.info(f"Found {len(lawyer_ids)} active lawyers")
-
-        results = {
-            "total_lawyers": len(lawyer_ids),
-            "synced": 0,
-            "skipped": 0,
-            "failed": 0,
-        }
-
-        for lawyer_id in lawyer_ids:
-            for competencia in COMPETENCIAS:
-                # Fresh, short-lived session PER (lawyer, competencia) work unit.
-                # If the Cloud SQL Auth Proxy drops the connection mid-batch, the
-                # poisoned session is confined to this iteration and discarded;
-                # the next iteration opens a clean connection instead of the
-                # whole cycle failing on a shared, poisoned session.
-                work_db = SessionLocal()
-                try:
-                    # Check if sync is needed
-                    sync_service = SyncService(work_db)
-                    if not sync_service.needs_sync(lawyer_id, competencia, MAX_DATA_AGE_HOURS):
-                        logger.debug(f"Lawyer {lawyer_id} {competencia} is fresh, skipping")
-                        continue
-
-                    result = await sync_lawyer_cases(lawyer_id, competencia, work_db)
-
-                    if result.get("skipped"):
-                        results["skipped"] += 1
-                    elif result.get("success"):
-                        results["synced"] += 1
-                    else:
-                        results["failed"] += 1
-                except Exception as iter_exc:
-                    # A single work-unit failure (e.g. a dropped connection that
-                    # poisoned work_db) must NOT abort the cycle — count it and
-                    # move on to the next lawyer/competencia with a fresh session.
-                    logger.error(
-                        "Sync failed for lawyer %s %s: %s",
-                        lawyer_id,
-                        competencia,
-                        iter_exc,
-                    )
-                    results["failed"] += 1
-                finally:
-                    work_db.close()
-
-                # Small delay between requests to avoid overwhelming PJUD
-                await asyncio.sleep(2)
-
-        logger.info("=" * 60)
-        logger.info(f"Sync complete: {results}")
-        logger.info("=" * 60)
-
-    except Exception as e:
-        logger.error(f"Sync job failed: {e}")
-
     finally:
-        db.close()
+        # Release the setup connection BEFORE the long loop — never held idle.
+        setup_db.close()
+
+    if not lawyer_ids:
+        logger.info("No active lawyers found, nothing to sync")
+        return
+
+    logger.info(f"Found {len(lawyer_ids)} active lawyers")
+
+    results = {
+        "total_lawyers": len(lawyer_ids),
+        "synced": 0,
+        "skipped": 0,
+        "failed": 0,
+    }
+
+    for lawyer_id in lawyer_ids:
+        for competencia in COMPETENCIAS:
+            # Fresh, short-lived session PER (lawyer, competencia) work unit.
+            # If the Cloud SQL Auth Proxy drops the connection mid-batch, the
+            # poisoned session is confined to this iteration and discarded;
+            # the next iteration opens a clean connection instead of the
+            # whole cycle failing on a shared, poisoned session.
+            work_db = SessionLocal()
+            try:
+                # Check if sync is needed
+                sync_service = SyncService(work_db)
+                if not sync_service.needs_sync(lawyer_id, competencia, MAX_DATA_AGE_HOURS):
+                    logger.debug(f"Lawyer {lawyer_id} {competencia} is fresh, skipping")
+                    continue
+
+                result = await sync_lawyer_cases(lawyer_id, competencia, work_db)
+
+                if result.get("skipped"):
+                    results["skipped"] += 1
+                elif result.get("success"):
+                    results["synced"] += 1
+                else:
+                    results["failed"] += 1
+            except Exception as iter_exc:
+                # A single work-unit failure (e.g. a dropped connection that
+                # poisoned work_db) must NOT abort the cycle — count it and
+                # move on to the next lawyer/competencia with a fresh session.
+                logger.error(
+                    "Sync failed for lawyer %s %s: %s",
+                    lawyer_id,
+                    competencia,
+                    iter_exc,
+                )
+                results["failed"] += 1
+            finally:
+                work_db.close()
+
+            # Small delay between requests to avoid overwhelming PJUD
+            await asyncio.sleep(2)
+
+    logger.info("=" * 60)
+    logger.info(f"Sync complete: {results}")
+    logger.info("=" * 60)
 
 
 async def sync_single_lawyer(lawyer_id: int):
@@ -608,6 +609,15 @@ def start_scheduler():
         name="Sync all lawyers every N hours",
         replace_existing=True,
         next_run_time=datetime.now() + timedelta(minutes=5),  # First run in 5 min
+        # A cycle can run long (huge-caseload lawyers) and the event loop is busy
+        # driving the browser. APScheduler's default misfire_grace_time is 1s, which
+        # SILENTLY SKIPS any fire that is even slightly late — that left the station
+        # idle for hours. Allow a fire to be up to a full interval late and still
+        # run; coalesce backed-up fires into one; never run two cycles at once (two
+        # browsers = Shape ban risk).
+        misfire_grace_time=int(SYNC_INTERVAL_HOURS * 3600),
+        coalesce=True,
+        max_instances=1,
     )
     
     # Alternative: Use cron for specific times (e.g., 6am, 12pm, 6pm, 12am)
