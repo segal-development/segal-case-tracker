@@ -76,10 +76,14 @@ class Hito(Base):
     valor_bruto = Column(Integer, nullable=False)  # snapshot from HitoTipo at creation
 
     fecha_hito = Column(Date, nullable=False, index=True)  # when the milestone occurred
-    rol_causa = Column(String(50), nullable=True)  # the case ROL / RUT reference
+    rol_causa = Column(String(50), nullable=True)  # the CLIENT RUT reference
     case_id = Column(Integer, ForeignKey("cases.id"), nullable=True, index=True)  # linked case, if matched
     procedimiento = Column(String(100), nullable=True)  # RECURSO, EXHIBICION, ...
-    descripcion = Column(String(500), nullable=True)  # free note ("DOCUMENTACIÓN OK", ...)
+    descripcion = Column(String(500), nullable=True)  # the causa ROL (e.g. C-8818-2026) / free note
+    # Tribunal that hears the causa. Part of the causa identity for dedup: the same
+    # ROL can exist in DIFFERENT tribunals for the same client, so those are
+    # distinct causas (both hitos payable). Nullable/free-text (typed on entry).
+    tribunal = Column(String(255), nullable=True)
     # ETAPA/TRAMITE — manual for now; later auto-filled from scraped movements.
     etapa_sysgal = Column(String(100), nullable=True)
     tramite_sysgal = Column(String(255), nullable=True)

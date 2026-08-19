@@ -41,6 +41,19 @@ def _causa_key(descripcion: Optional[str]) -> Optional[str]:
     m = _ROL_RE.search(descripcion)
     return (m.group(0).upper() if m else descripcion.strip().upper()[:120]) or None
 
+
+def _tribunal_key(tribunal: Optional[str]) -> Optional[str]:
+    """Normalized tribunal token used for hito dedup.
+
+    The same ROL in DIFFERENT tribunals is a DIFFERENT causa, so the tribunal is
+    part of the dedup identity. Compared case-insensitively on trimmed text; two
+    hitos with no tribunal (both ``None``) still collide, preserving the old
+    (RUT, ROL) behaviour when the field is left blank.
+    """
+    if not tribunal:
+        return None
+    return tribunal.strip().upper()[:255] or None
+
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
@@ -76,6 +89,7 @@ class HitoResponse(BaseModel):
     rol_causa: Optional[str] = None
     procedimiento: Optional[str] = None
     descripcion: Optional[str] = None
+    tribunal: Optional[str] = None
     etapa_sysgal: Optional[str] = None
     tramite_sysgal: Optional[str] = None
     tiene_evidencia: bool
@@ -138,6 +152,7 @@ def _to_response(h: Hito) -> HitoResponse:
         rol_causa=h.rol_causa,
         procedimiento=h.procedimiento,
         descripcion=h.descripcion,
+        tribunal=h.tribunal,
         etapa_sysgal=h.etapa_sysgal,
         tramite_sysgal=h.tramite_sysgal,
         tiene_evidencia=h.tiene_evidencia,
@@ -175,6 +190,7 @@ async def create_hito(
     rol_causa: Optional[str] = Form(None),
     procedimiento: Optional[str] = Form(None),
     descripcion: Optional[str] = Form(None),
+    tribunal: Optional[str] = Form(None),
     etapa_sysgal: Optional[str] = Form(None),
     tramite_sysgal: Optional[str] = Form(None),
     lawyer_id: Optional[int] = Form(None),  # admins may register for another lawyer
@@ -205,18 +221,21 @@ async def create_hito(
 
     # No duplicate on the SAME causa: a lawyer may repeat the same client
     # (rol_causa = RUT) across DIFFERENT causas, so the block is keyed on
-    # (abogado, RUT, causa) — the causa is derived from descripcion (see
-    # _causa_key). Only enforced when a rol_causa is given. Checked before storing
-    # evidence so a rejected duplicate never uploads a file.
+    # (abogado, RUT, ROL, tribunal) — the ROL is derived from descripcion (see
+    # _causa_key) and the tribunal disambiguates same-ROL causas in different
+    # courts (see _tribunal_key). Only enforced when a rol_causa is given.
+    # Checked before storing evidence so a rejected duplicate never uploads a file.
     rol_norm = (rol_causa or "").strip() or None
+    tribunal_norm = (tribunal or "").strip() or None
     if rol_norm is not None:
         causa = _causa_key(descripcion)
+        trib = _tribunal_key(tribunal_norm)
         prior = (
-            db.query(Hito.descripcion)
+            db.query(Hito.descripcion, Hito.tribunal)
             .filter(Hito.lawyer_id == target_lawyer_id, Hito.rol_causa == rol_norm)
             .all()
         )
-        if any(_causa_key(d) == causa for (d,) in prior):
+        if any(_causa_key(d) == causa and _tribunal_key(t) == trib for (d, t) in prior):
             raise HTTPException(
                 status_code=409,
                 detail="Ya existe un hito de este abogado para esa causa",
@@ -252,6 +271,7 @@ async def create_hito(
         rol_causa=rol_norm,
         procedimiento=procedimiento,
         descripcion=descripcion,
+        tribunal=tribunal_norm,
         etapa_sysgal=etapa_sysgal or tipo.etapa_tramite,
         tramite_sysgal=tramite_sysgal,
         evidencia_storage_key=storage_uri,
@@ -759,6 +779,7 @@ class HitoUpdate(BaseModel):
     rol_causa: Optional[str] = None
     procedimiento: Optional[str] = None
     descripcion: Optional[str] = None
+    tribunal: Optional[str] = None
 
 
 @router.put("/{hito_id}", response_model=HitoResponse)
@@ -788,13 +809,16 @@ async def update_hito(
             raise HTTPException(status_code=404, detail="Abogado no encontrado en el estudio")
         hito.lawyer_id = abogado.id
 
-    # No duplicate: the resulting (abogado, RUT, causa) must not collide with
-    # ANOTHER hito. Same client on a DIFFERENT causa is allowed (see _causa_key).
+    # No duplicate: the resulting (abogado, RUT, ROL, tribunal) must not collide
+    # with ANOTHER hito. Same client on a DIFFERENT causa — different ROL, or same
+    # ROL in a different tribunal — is allowed (see _causa_key / _tribunal_key).
     rol_norm = (body.rol_causa or "").strip() or None
+    tribunal_norm = (body.tribunal or "").strip() or None
     if rol_norm is not None:
         causa = _causa_key(body.descripcion)
+        trib = _tribunal_key(tribunal_norm)
         prior = (
-            db.query(Hito.descripcion)
+            db.query(Hito.descripcion, Hito.tribunal)
             .filter(
                 Hito.id != hito.id,
                 Hito.lawyer_id == hito.lawyer_id,
@@ -802,7 +826,7 @@ async def update_hito(
             )
             .all()
         )
-        if any(_causa_key(d) == causa for (d,) in prior):
+        if any(_causa_key(d) == causa and _tribunal_key(t) == trib for (d, t) in prior):
             raise HTTPException(
                 status_code=409,
                 detail="Ya existe un hito de este abogado para esa causa",
@@ -814,6 +838,7 @@ async def update_hito(
     hito.rol_causa = rol_norm
     hito.procedimiento = body.procedimiento
     hito.descripcion = body.descripcion
+    hito.tribunal = tribunal_norm
     db.commit()
     db.refresh(hito)
     return _to_response(hito)
