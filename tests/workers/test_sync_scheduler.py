@@ -214,3 +214,34 @@ class TestSyncLawyerCasesCasesFound:
         assert sync_records[0].cases_found == 0, (
             f"cases_found should be 0, got {sync_records[0].cases_found!r}"
         )
+
+
+class TestWorkerDbResilience:
+    """The station must self-recover from Cloud SQL dropping idle connections."""
+
+    def test_engine_has_pre_ping_and_recycle(self):
+        # pre_ping replaces a dead connection at checkout; recycle retires old ones
+        # before Cloud SQL's idle cutoff. Together they stop the "server closed the
+        # connection unexpectedly" crash that stalled the worker.
+        from app.core.database import engine
+
+        assert engine.pool._pre_ping is True
+        assert engine.pool._recycle == 1800
+
+    def test_sync_job_registered_with_generous_misfire_and_single_instance(self):
+        # APScheduler's default misfire_grace_time is 1s → a slightly-late fire is
+        # SILENTLY skipped, which left the station idle for hours. The job must
+        # tolerate a late fire, coalesce backlog, and never run two cycles at once.
+        from app.workers import sync_scheduler
+
+        mock_scheduler = MagicMock()
+        mock_scheduler.running = False
+        with patch.object(sync_scheduler, "get_scheduler", return_value=mock_scheduler):
+            sync_scheduler.start_scheduler()
+
+        assert mock_scheduler.add_job.called
+        kwargs = mock_scheduler.add_job.call_args.kwargs
+        assert kwargs["misfire_grace_time"] >= 3600
+        assert kwargs["max_instances"] == 1
+        assert kwargs["coalesce"] is True
+        mock_scheduler.start.assert_called_once()
