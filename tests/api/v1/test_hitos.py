@@ -292,6 +292,25 @@ def test_create_same_client_rut_different_causa_allowed(client, db, admin, lawye
     assert r3.status_code == 409  # same client + same causa → duplicate
 
 
+def test_create_same_rol_different_tribunal_allowed(client, db, admin, lawyer, tipo):
+    """The same ROL can exist in DIFFERENT tribunals for the same client — those
+    are distinct causas, both payable. Same ROL + same tribunal is a duplicate."""
+    common = {"hito_tipo_id": tipo.id, "fecha_hito": "2026-07-15",
+              "rol_causa": "12.894.075-8", "descripcion": "C-8818-2026",
+              "lawyer_id": lawyer.id}
+    r1 = client.post("/api/v1/hitos", headers=_h(ADMIN_RUT),
+                     data={**common, "tribunal": "1er Juzgado Civil de Santiago"})
+    assert r1.status_code == 201
+    # Same client + same ROL but a DIFFERENT tribunal → distinct causa → allowed.
+    r2 = client.post("/api/v1/hitos", headers=_h(ADMIN_RUT),
+                     data={**common, "tribunal": "2do Juzgado Civil de Santiago"})
+    assert r2.status_code == 201
+    # Same client + same ROL + same tribunal (case/space-insensitive) → duplicate.
+    r3 = client.post("/api/v1/hitos", headers=_h(ADMIN_RUT),
+                     data={**common, "tribunal": "  1ER JUZGADO CIVIL DE SANTIAGO "})
+    assert r3.status_code == 409
+
+
 def test_create_allows_multiple_without_causa(client, db, admin, tipo):
     # Hitos without a causa can't collide → both allowed.
     base = {"hito_tipo_id": tipo.id, "fecha_hito": "2026-07-15"}
