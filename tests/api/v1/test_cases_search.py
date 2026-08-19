@@ -317,3 +317,31 @@ class TestYearFloor:
         r = authed_client.get("/api/v1/cases")
         ids = {i["id"] for i in r.json()["items"]}
         assert kept.id in ids
+
+
+# ---------------------------------------------------------------------------
+# sort_by=ultima_actuacion — most-recent actuación first, nulls last
+# ---------------------------------------------------------------------------
+
+
+class TestSortUltimaActuacion:
+    def test_orders_by_last_movement_desc_nulls_last(
+        self, authed_client, db, lawyer, court
+    ):
+        # Seed out of order; last_movement_at drives the expected ranking.
+        old = _make_case(db, lawyer, court, "C-8001-2025")
+        old.last_movement_at = datetime(2024, 1, 1)
+        mid = _make_case(db, lawyer, court, "C-8002-2025")
+        mid.last_movement_at = datetime(2025, 6, 15)
+        recent = _make_case(db, lawyer, court, "C-8003-2025")
+        recent.last_movement_at = datetime(2026, 8, 1)
+        never = _make_case(db, lawyer, court, "C-8004-2025")
+        never.last_movement_at = None
+        db.commit()
+
+        r = authed_client.get("/api/v1/cases?sort_by=ultima_actuacion&per_page=100")
+        assert r.status_code == 200
+        order = [i["id"] for i in r.json()["items"]]
+        # Most-recent first; the null-movement case sinks to the bottom.
+        assert order.index(recent.id) < order.index(mid.id) < order.index(old.id)
+        assert order.index(old.id) < order.index(never.id)

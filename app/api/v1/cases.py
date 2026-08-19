@@ -324,11 +324,12 @@ async def list_cases(
     ),
     tribunal: Optional[str] = Query(None, description="Filter by court (tribunal) name"),
     materia: Optional[str] = Query(None, description="Filter by procedure (materia)"),
-    sort_by: Optional[Literal["criticidad", "updated_at"]] = Query(
+    sort_by: Optional[Literal["criticidad", "ultima_actuacion", "updated_at"]] = Query(
         None,
         description=(
             "Sort order. 'criticidad' orders by next_deadline_at ASC NULLS LAST "
-            "(most-urgent first). Default: updated_at DESC."
+            "(most-urgent first). 'ultima_actuacion' orders by last_movement_at "
+            "DESC NULLS LAST (most-recent actuación first). Default: updated_at DESC."
         ),
     ),
     current_lawyer: dict = Depends(get_current_lawyer),
@@ -397,6 +398,10 @@ async def list_cases(
     if sort_by == "criticidad":
         # ORDER BY next_deadline_at ASC NULLS LAST — most-critical/soonest first
         order_clause = nullslast(Case.next_deadline_at.asc())
+    elif sort_by == "ultima_actuacion":
+        # ORDER BY last_movement_at DESC NULLS LAST — most-recent actuación first;
+        # cases with no known movement date sink to the bottom.
+        order_clause = nullslast(Case.last_movement_at.desc())
     else:
         order_clause = Case.updated_at.desc()
 
