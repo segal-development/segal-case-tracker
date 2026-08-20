@@ -172,6 +172,13 @@ class Settings(BaseSettings):
     SYNC_COMMIT_CHUNK_SIZE: int = 200       # Cases processed between commits
     SYNC_COMMIT_MAX_RETRIES: int = 2        # Max commit attempts on OperationalError (incl. the first)
 
+    # Presentación worker (Slice 2a — scaffolding). Master gate defaults OFF:
+    # while False the station-side worker only logs queue depth and claims/
+    # processes NOTHING (the OJV/PJUD automation lands in Slice 2b).
+    PRESENTACION_WORKER_ENABLED: bool = False   # Gate: drain the presentaciones queue
+    PRESENTACION_POLL_INTERVAL_SECONDS: int = 120  # Seconds between queue polls
+    PRESENTACION_MAX_INTENTOS: int = 3          # Max attempts before a filing goes to error
+
     # Environment
     ENVIRONMENT: str = "production"
     DEBUG: bool = True
