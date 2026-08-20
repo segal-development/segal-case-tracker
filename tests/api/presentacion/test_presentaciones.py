@@ -160,3 +160,109 @@ def test_get_missing_key_401(client, db):
     _seed_key(db)
     resp = client.get(f"{POST_URL}/1")
     assert resp.status_code == 401
+
+
+# ------------------------------------------------------------------------ enviar
+
+
+def _seed_cargada(db, idempotency_key: str = "gedoc-enviar-1") -> Presentacion:
+    """Seed a row directly at ``cargada_pendiente_envio`` (as the worker would)."""
+    row = Presentacion(
+        idempotency_key=idempotency_key,
+        tipo_gestion="escrito",
+        credential_ref="16021492-9",
+        payload={"litigantes": [], "documento_principal": {}, "documentos": []},
+        estado="cargada_pendiente_envio",
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def test_enviar_confirms_cargada_200(client, db):
+    _seed_key(db)
+    row = _seed_cargada(db)
+
+    resp = client.post(
+        f"{POST_URL}/{row.id}/enviar",
+        json={"confirmado_por": "redactor@segal.cl"},
+        headers={"X-API-Key": VALID_KEY},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["estado"] == "envio_confirmado"
+    assert body["confirmado_por"] == "redactor@segal.cl"
+    assert body["confirmado_at"] is not None
+
+
+def test_enviar_is_idempotent(client, db):
+    _seed_key(db)
+    row = _seed_cargada(db)
+
+    first = client.post(
+        f"{POST_URL}/{row.id}/enviar",
+        json={"confirmado_por": "redactor@segal.cl"},
+        headers={"X-API-Key": VALID_KEY},
+    )
+    assert first.status_code == 200
+
+    # A second confirm (with a different confirmado_por) is a no-op.
+    second = client.post(
+        f"{POST_URL}/{row.id}/enviar",
+        json={"confirmado_por": "otro@segal.cl"},
+        headers={"X-API-Key": VALID_KEY},
+    )
+    assert second.status_code == 200
+    body = second.json()
+    assert body["estado"] == "envio_confirmado"
+    assert body["confirmado_por"] == "redactor@segal.cl"  # unchanged
+
+
+def test_enviar_from_en_cola_409(client, db):
+    _seed_key(db)
+    created = client.post(POST_URL, json=_body(), headers={"X-API-Key": VALID_KEY})
+    pres_id = created.json()["id"]
+
+    resp = client.post(
+        f"{POST_URL}/{pres_id}/enviar",
+        json={"confirmado_por": "redactor@segal.cl"},
+        headers={"X-API-Key": VALID_KEY},
+    )
+    assert resp.status_code == 409
+
+
+def test_enviar_missing_404(client, db):
+    _seed_key(db)
+    resp = client.post(
+        f"{POST_URL}/999999/enviar",
+        json={"confirmado_por": "redactor@segal.cl"},
+        headers={"X-API-Key": VALID_KEY},
+    )
+    assert resp.status_code == 404
+
+
+def test_enviar_missing_key_401(client, db):
+    _seed_key(db)
+    row = _seed_cargada(db)
+    resp = client.post(
+        f"{POST_URL}/{row.id}/enviar", json={"confirmado_por": "x"}
+    )
+    assert resp.status_code == 401
+
+
+def test_get_after_enviar_reflects_state(client, db):
+    _seed_key(db)
+    row = _seed_cargada(db)
+    client.post(
+        f"{POST_URL}/{row.id}/enviar",
+        json={"confirmado_por": "redactor@segal.cl"},
+        headers={"X-API-Key": VALID_KEY},
+    )
+
+    resp = client.get(f"{POST_URL}/{row.id}", headers={"X-API-Key": VALID_KEY})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["estado"] == "envio_confirmado"
+    assert body["confirmado_por"] == "redactor@segal.cl"
+    assert body["confirmado_at"] is not None
