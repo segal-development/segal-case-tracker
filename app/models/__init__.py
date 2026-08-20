@@ -29,6 +29,8 @@ from app.models.bono_cierre import BonoCierre
 from app.models.renovacion import Renovacion
 from app.models.sysgal_api_key import SysgalApiKey
 from app.models.redaccion_api_key import RedaccionApiKey
+from app.models.presentacion_api_key import PresentacionApiKey
+from app.models.presentacion import Presentacion
 from app.models.evaluacion import (
     EvaluacionCriterio,
     EvaluacionEvaluable,
@@ -67,6 +69,8 @@ __all__ = [
     "Renovacion",
     "SysgalApiKey",
     "RedaccionApiKey",
+    "PresentacionApiKey",
+    "Presentacion",
     "EvaluacionCriterio",
     "EvaluacionEvaluable",
     "Evaluacion",
