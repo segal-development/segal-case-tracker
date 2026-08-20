@@ -12,6 +12,7 @@ from app.api.sysgal.novedades import router as sysgal_novedades_router
 from app.api.sysgal.buscar import router as sysgal_buscar_router
 from app.api.redaccion.buscar import router as redaccion_buscar_router
 from app.api.redaccion.detalle import router as redaccion_detalle_router
+from app.api.presentacion.presentaciones import router as presentacion_router
 from app.config import settings
 
 
@@ -64,6 +65,12 @@ app.include_router(sysgal_buscar_router, prefix="/api/sysgal/v1", tags=["sysgal"
 # fully isolated from BOTH the internal /api/v1 app and the Sysgal API.
 app.include_router(redaccion_buscar_router, prefix="/api/redaccion/v1", tags=["redaccion"])
 app.include_router(redaccion_detalle_router, prefix="/api/redaccion/v1", tags=["redaccion"])
+
+# External API for the Presentación (GEDOC escrito-upload) system. Mounted
+# SEPARATELY (own prefix /api/presentacion/v1, own auth PresentacionApiKey) so it
+# is fully isolated from the internal /api/v1 app AND from the Sysgal/Redaccion
+# APIs. Slice 1 only queues filings (estado="en_cola") — no OJV/PJUD writes.
+app.include_router(presentacion_router, prefix="/api/presentacion/v1", tags=["presentacion"])
 
 
 @app.get("/health")
