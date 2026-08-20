@@ -21,7 +21,12 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
 from app.api.presentacion.deps import require_presentacion_key
-from app.models.presentacion import PRES_EN_COLA, Presentacion
+from app.models.presentacion import (
+    PRES_CARGADA_PENDIENTE,
+    PRES_EN_COLA,
+    PRES_ENVIO_CONFIRMADO,
+    Presentacion,
+)
 
 # prefix="/presentaciones" so the full path (mounted at /api/presentacion/v1)
 # resolves to POST /api/presentacion/v1/presentaciones and
@@ -99,6 +104,12 @@ class PresentacionCreate(BaseModel):
         return v
 
 
+class PresentacionEnviar(BaseModel):
+    # The redactor who authorizes the final send (supplied by GEDOC), stored for
+    # the audit trail. Optional — the send may be confirmed anonymously.
+    confirmado_por: Optional[str] = None
+
+
 # ---------------------------------------------------------------------------
 # Response schemas.
 # ---------------------------------------------------------------------------
@@ -121,6 +132,8 @@ class PresentacionStatus(BaseModel):
     fecha_envio: Optional[datetime] = None
     certificado_url: Optional[str] = None
     error_detail: Optional[str] = None
+    confirmado_por: Optional[str] = None
+    confirmado_at: Optional[datetime] = None
 
 
 @router.post("", response_model=PresentacionCreated, status_code=status.HTTP_202_ACCEPTED)
@@ -206,4 +219,71 @@ def get_presentacion(
         fecha_envio=presentacion.fecha_envio,
         certificado_url=presentacion.certificado_url,
         error_detail=presentacion.error_detail,
+        confirmado_por=presentacion.confirmado_por,
+        confirmado_at=presentacion.confirmado_at,
+    )
+
+
+@router.post("/{presentacion_id}/enviar", response_model=PresentacionStatus)
+def confirmar_envio(
+    presentacion_id: int,
+    body: PresentacionEnviar,
+    db: Session = Depends(get_db),
+    key=Depends(require_presentacion_key),
+) -> PresentacionStatus:
+    """Confirm the final send of a loaded filing (Opción 2 / semiauto).
+
+    This is the redactor's authorization of the irreversible "Enviar Poder
+    Judicial" step: it only flips the state from ``cargada_pendiente_envio`` to
+    ``envio_confirmado`` and records who confirmed it. The actual OJV send is
+    performed later by the station worker (a future slice) — nothing is sent
+    here.
+
+    State rules:
+      * ``cargada_pendiente_envio`` -> ``envio_confirmado`` (stamps
+        ``confirmado_por`` / ``confirmado_at``), returns 200.
+      * ``envio_confirmado`` (already confirmed) -> idempotent no-op, returns
+        the current state (200) without overwriting the audit fields.
+      * any other estado -> 409 Conflict.
+      * unknown id -> 404.
+    """
+    presentacion = (
+        db.query(Presentacion).filter(Presentacion.id == presentacion_id).first()
+    )
+    if presentacion is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Presentacion not found"
+        )
+
+    if presentacion.estado == PRES_CARGADA_PENDIENTE:
+        now = datetime.utcnow()
+        presentacion.estado = PRES_ENVIO_CONFIRMADO
+        presentacion.confirmado_por = body.confirmado_por
+        presentacion.confirmado_at = now
+        presentacion.updated_at = now
+        db.commit()
+        db.refresh(presentacion)
+    elif presentacion.estado != PRES_ENVIO_CONFIRMADO:
+        # Idempotent for envio_confirmado; every other estado is a conflict.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"No se puede confirmar el envío: la presentación está en estado "
+                f"'{presentacion.estado}' (requiere 'cargada_pendiente_envio')."
+            ),
+        )
+
+    return PresentacionStatus(
+        id=presentacion.id,
+        estado=presentacion.estado,
+        tipo_gestion=presentacion.tipo_gestion,
+        modo=presentacion.modo,
+        rol_asignado=presentacion.rol_asignado,
+        ruc=presentacion.ruc,
+        numero_identificador=presentacion.numero_identificador,
+        fecha_envio=presentacion.fecha_envio,
+        certificado_url=presentacion.certificado_url,
+        error_detail=presentacion.error_detail,
+        confirmado_por=presentacion.confirmado_por,
+        confirmado_at=presentacion.confirmado_at,
     )
