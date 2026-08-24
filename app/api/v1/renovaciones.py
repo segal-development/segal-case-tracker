@@ -207,20 +207,24 @@ async def create_renovacion(
         raise HTTPException(status_code=404, detail="Abogado no encontrado en el estudio")
 
     rut_norm = normalize_rut(body.cliente_rut)[:20]
+    contrato = body.numero_contrato.strip()[:50]
 
     desde = body.fecha_desde or date.today()
     hasta = desde + relativedelta(years=1)
     total = body.monto_cuota * CUOTAS_RENOVACION
 
-    # One renovación per client PER PERIOD: reject a same-RUT renovación whose
-    # fecha_desde falls in the same month (period). Blocks a duplicate entry of
-    # the same renewal, while still letting the client renew again next period.
+    # One renovación per (client, CONTRACT) PER PERIOD: a client can hold several
+    # contracts, each a legitimate separate renewal in the same period, so the
+    # duplicate check keys on the CONTRACT too — not just the RUT. It still blocks
+    # re-entering the SAME contract twice in the same month, while letting the
+    # client renew again next period. (Mirrors the importer's (contrato, rut, desde) key.)
     period_start = desde.replace(day=1)
     period_end = period_start + relativedelta(months=1)
     if (
         db.query(Renovacion.id)
         .filter(
             Renovacion.cliente_rut == rut_norm,
+            Renovacion.numero_contrato == contrato,
             Renovacion.fecha_desde >= period_start,
             Renovacion.fecha_desde < period_end,
         )
@@ -229,11 +233,11 @@ async def create_renovacion(
     ):
         raise HTTPException(
             status_code=409,
-            detail="Ya existe una renovación de ese cliente en este período",
+            detail="Ya existe una renovación de ese contrato en este período",
         )
 
     reno = Renovacion(
-        numero_contrato=body.numero_contrato[:50],
+        numero_contrato=contrato,
         cliente_rut=rut_norm,
         cliente_nombre=body.cliente_nombre[:255],
         lawyer_id=abogado.id,
