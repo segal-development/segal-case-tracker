@@ -1,12 +1,10 @@
 """
-Tests for NotificationService - email (SendGrid) and webhook notifications.
-
-TDD: written BEFORE implementation. All tests must fail initially.
+Tests for NotificationService - email (SMTP) and webhook notifications.
 
 Tests:
-1. send_email_alert with empty SENDGRID_API_KEY -> False, no raise, alert untouched
-2. send_email_alert happy path (SendGrid 202) -> True, alert.email_sent=True/at set
-3. send_email_alert when SendGrid raises -> False, no raise
+1. send_email_alert with empty SMTP_HOST -> False, no raise, alert untouched
+2. send_email_alert happy path (SMTP send) -> True, alert.email_sent=True/at set
+3. send_email_alert when SMTP raises -> False, no raise
 4. send_webhook correct HMAC: canonical body + sha256 signature in header
 5. send_webhook non-2xx -> False, webhook.failure_count incremented
 6. send_webhook empty secret -> no X-Webhook-Signature header, warning logged
@@ -109,13 +107,13 @@ def _make_movement(**kwargs):
 
 
 class TestSendEmailAlert:
-    def test_empty_api_key_returns_false_without_raising(self, service, caplog):
-        """When SENDGRID_API_KEY is empty, return False, do not raise, log warning."""
+    def test_no_smtp_host_returns_false_without_raising(self, service, caplog):
+        """When SMTP_HOST is empty, return False, do not raise, log warning."""
         alert = _make_alert()
         lawyer = _make_lawyer()
 
         with patch("app.services.notification_service.settings") as mock_settings:
-            mock_settings.SENDGRID_API_KEY = ""
+            mock_settings.SMTP_HOST = ""
             mock_settings.FROM_EMAIL = "from@segal.cl"
 
             with caplog.at_level(logging.WARNING, logger="app.services.notification_service"):
@@ -123,42 +121,51 @@ class TestSendEmailAlert:
 
         assert result is False
         assert alert.email_sent is False
-        assert any("SENDGRID" in r.message.upper() or "api_key" in r.message.lower() or "key" in r.message.lower()
-                   for r in caplog.records), "Expected a warning log about missing API key"
+        assert any("smtp" in r.message.lower() for r in caplog.records), \
+            "Expected a warning log about missing SMTP config"
 
-    def test_happy_path_202_sets_alert_fields(self, service):
-        """SendGrid returns 202 -> True, alert.email_sent=True, email_sent_at set."""
+    def test_happy_path_sends_via_smtp_and_sets_alert_fields(self, service):
+        """SMTP send succeeds -> True, alert.email_sent=True, email_sent_at set,
+        and the message is sent (with TLS + login when configured)."""
         alert = _make_alert()
         lawyer = _make_lawyer()
 
-        mock_response = MagicMock()
-        mock_response.status_code = 202
-
         with patch("app.services.notification_service.settings") as mock_settings:
-            mock_settings.SENDGRID_API_KEY = "SG.test_key_abc"
+            mock_settings.SMTP_HOST = "smtp.proveedor.cl"
+            mock_settings.SMTP_PORT = 587
+            mock_settings.SMTP_USER = "user@segal.cl"
+            mock_settings.SMTP_PASSWORD = "secret"
+            mock_settings.SMTP_USE_TLS = True
+            mock_settings.SMTP_FROM = "notificaciones@segal.cl"
             mock_settings.FROM_EMAIL = "from@segal.cl"
 
-            with patch("app.services.notification_service.SendGridAPIClient") as MockSG:
-                MockSG.return_value.send.return_value = mock_response
-
+            with patch("app.services.notification_service.smtplib.SMTP") as MockSMTP:
+                server = MockSMTP.return_value.__enter__.return_value
                 result = service.send_email_alert(alert, lawyer)
 
         assert result is True
         assert alert.email_sent is True
         assert alert.email_sent_at is not None
+        server.starttls.assert_called_once()
+        server.login.assert_called_once_with("user@segal.cl", "secret")
+        server.send_message.assert_called_once()
 
-    def test_sendgrid_raises_returns_false_without_raising(self, service):
-        """If SendGridAPIClient.send() raises, return False without re-raising."""
+    def test_smtp_raises_returns_false_without_raising(self, service):
+        """If the SMTP send raises, return False without re-raising."""
         alert = _make_alert()
         lawyer = _make_lawyer()
 
         with patch("app.services.notification_service.settings") as mock_settings:
-            mock_settings.SENDGRID_API_KEY = "SG.test_key_abc"
+            mock_settings.SMTP_HOST = "smtp.proveedor.cl"
+            mock_settings.SMTP_PORT = 587
+            mock_settings.SMTP_USER = "user@segal.cl"
+            mock_settings.SMTP_PASSWORD = "secret"
+            mock_settings.SMTP_USE_TLS = True
+            mock_settings.SMTP_FROM = ""
             mock_settings.FROM_EMAIL = "from@segal.cl"
 
-            with patch("app.services.notification_service.SendGridAPIClient") as MockSG:
-                MockSG.return_value.send.side_effect = Exception("Network timeout")
-
+            with patch("app.services.notification_service.smtplib.SMTP") as MockSMTP:
+                MockSMTP.return_value.__enter__.return_value.send_message.side_effect = Exception("SMTP down")
                 result = service.send_email_alert(alert, lawyer)
 
         assert result is False
