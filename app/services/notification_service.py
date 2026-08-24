@@ -1,15 +1,16 @@
-"""Notification service - Email (SendGrid) and HMAC-signed webhook notifications."""
+"""Notification service - Email (SMTP) and HMAC-signed webhook notifications."""
 
 import hashlib
 import hmac
 import json
 import logging
+import smtplib
+import ssl
 from datetime import datetime
+from email.message import EmailMessage
 from typing import List
 
 import httpx
-from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -37,41 +38,47 @@ class NotificationService:
 
     def send_email_alert(self, alert: Alert, lawyer: Lawyer) -> bool:
         """
-        Send an email alert via SendGrid.
+        Send an email alert via SMTP — the firm's own provider credentials, the
+        same transport as the daily agenda / supervisor alerts (mirrors
+        ``supervisor_alert_service._send_smtp_sync``). No third-party email API.
 
-        Returns True on 2xx success, False otherwise.
+        Returns True on success, False otherwise.
         Never raises — failures are logged and suppressed so callers (e.g. the
         sync pipeline) are never blocked by notification errors.
         """
-        if not settings.SENDGRID_API_KEY:
+        if not settings.SMTP_HOST:
             logger.warning(
-                "SENDGRID_API_KEY is not configured; skipping email for alert %s",
+                "SMTP_HOST is not configured; skipping email for alert %s",
+                alert.id,
+            )
+            return False
+        if not lawyer.email:
+            logger.warning(
+                "Lawyer %s has no email; skipping email for alert %s",
+                getattr(lawyer, "id", None),
                 alert.id,
             )
             return False
 
         try:
-            mail = Mail(
-                from_email=settings.FROM_EMAIL,
-                to_emails=lawyer.email,
-                subject=alert.title,
-                plain_text_content=alert.message,
-            )
-            client = SendGridAPIClient(settings.SENDGRID_API_KEY)
-            response = client.send(mail)
+            msg = EmailMessage()
+            msg["Subject"] = alert.title
+            msg["From"] = settings.SMTP_FROM or settings.FROM_EMAIL
+            msg["To"] = lawyer.email
+            msg.set_content(alert.message)
 
-            if 200 <= response.status_code < 300:
-                alert.email_sent = True
-                alert.email_sent_at = datetime.utcnow()
-                self.db.flush()
-                return True
+            context = ssl.create_default_context()
+            with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT, timeout=10) as server:
+                if settings.SMTP_USE_TLS:
+                    server.starttls(context=context)
+                if settings.SMTP_USER:
+                    server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
+                server.send_message(msg)
 
-            logger.error(
-                "SendGrid returned non-2xx status %s for alert %s",
-                response.status_code,
-                alert.id,
-            )
-            return False
+            alert.email_sent = True
+            alert.email_sent_at = datetime.utcnow()
+            self.db.flush()
+            return True
 
         except Exception as exc:  # noqa: BLE001
             logger.error("Failed to send email for alert %s: %s", alert.id, exc)
