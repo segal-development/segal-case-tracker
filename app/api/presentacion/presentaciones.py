@@ -25,6 +25,7 @@ from app.models.presentacion import (
     PRES_CARGADA_PENDIENTE,
     PRES_EN_COLA,
     PRES_ENVIO_CONFIRMADO,
+    PRES_REVISADO,
     Presentacion,
 )
 
@@ -104,6 +105,13 @@ class PresentacionCreate(BaseModel):
         return v
 
 
+class PresentacionRevisar(BaseModel):
+    # The second person who cross-reviews the loaded filing (revisión cruzada /
+    # four-eyes), supplied by GEDOC, stored for the audit trail. Optional — the
+    # review may be recorded anonymously.
+    revisado_por: Optional[str] = None
+
+
 class PresentacionEnviar(BaseModel):
     # The redactor who authorizes the final send (supplied by GEDOC), stored for
     # the audit trail. Optional — the send may be confirmed anonymously.
@@ -132,6 +140,8 @@ class PresentacionStatus(BaseModel):
     fecha_envio: Optional[datetime] = None
     certificado_url: Optional[str] = None
     error_detail: Optional[str] = None
+    revisado_por: Optional[str] = None
+    revisado_at: Optional[datetime] = None
     confirmado_por: Optional[str] = None
     confirmado_at: Optional[datetime] = None
 
@@ -219,31 +229,33 @@ def get_presentacion(
         fecha_envio=presentacion.fecha_envio,
         certificado_url=presentacion.certificado_url,
         error_detail=presentacion.error_detail,
+        revisado_por=presentacion.revisado_por,
+        revisado_at=presentacion.revisado_at,
         confirmado_por=presentacion.confirmado_por,
         confirmado_at=presentacion.confirmado_at,
     )
 
 
-@router.post("/{presentacion_id}/enviar", response_model=PresentacionStatus)
-def confirmar_envio(
+@router.post("/{presentacion_id}/revisar", response_model=PresentacionStatus)
+def revisar(
     presentacion_id: int,
-    body: PresentacionEnviar,
+    body: PresentacionRevisar,
     db: Session = Depends(get_db),
     key=Depends(require_presentacion_key),
 ) -> PresentacionStatus:
-    """Confirm the final send of a loaded filing (Opción 2 / semiauto).
+    """Cross-review (revisión cruzada / four-eyes) a loaded filing before the send.
 
-    This is the redactor's authorization of the irreversible "Enviar Poder
-    Judicial" step: it only flips the state from ``cargada_pendiente_envio`` to
-    ``envio_confirmado`` and records who confirmed it. The actual OJV send is
-    performed later by the station worker (a future slice) — nothing is sent
-    here.
+    This records the approval of a SECOND, distinct person — not the redactor
+    who sends — of a filing loaded in the OJV Bandeja. It only flips the state
+    from ``cargada_pendiente_envio`` to ``revisado`` and stamps who reviewed it;
+    nothing is sent here. The final send (``/enviar``) then requires this prior
+    review and forbids the reviewer from being the sender.
 
     State rules:
-      * ``cargada_pendiente_envio`` -> ``envio_confirmado`` (stamps
-        ``confirmado_por`` / ``confirmado_at``), returns 200.
-      * ``envio_confirmado`` (already confirmed) -> idempotent no-op, returns
-        the current state (200) without overwriting the audit fields.
+      * ``cargada_pendiente_envio`` -> ``revisado`` (stamps ``revisado_por`` /
+        ``revisado_at``), returns 200.
+      * ``revisado`` (already reviewed) -> idempotent no-op, returns the current
+        state (200) without overwriting the audit fields.
       * any other estado -> 409 Conflict.
       * unknown id -> 404.
     """
@@ -257,18 +269,18 @@ def confirmar_envio(
 
     if presentacion.estado == PRES_CARGADA_PENDIENTE:
         now = datetime.utcnow()
-        presentacion.estado = PRES_ENVIO_CONFIRMADO
-        presentacion.confirmado_por = body.confirmado_por
-        presentacion.confirmado_at = now
+        presentacion.estado = PRES_REVISADO
+        presentacion.revisado_por = body.revisado_por
+        presentacion.revisado_at = now
         presentacion.updated_at = now
         db.commit()
         db.refresh(presentacion)
-    elif presentacion.estado != PRES_ENVIO_CONFIRMADO:
-        # Idempotent for envio_confirmado; every other estado is a conflict.
+    elif presentacion.estado != PRES_REVISADO:
+        # Idempotent for revisado; every other estado is a conflict.
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
-                f"No se puede confirmar el envío: la presentación está en estado "
+                f"No se puede revisar: la presentación está en estado "
                 f"'{presentacion.estado}' (requiere 'cargada_pendiente_envio')."
             ),
         )
@@ -284,6 +296,87 @@ def confirmar_envio(
         fecha_envio=presentacion.fecha_envio,
         certificado_url=presentacion.certificado_url,
         error_detail=presentacion.error_detail,
+        revisado_por=presentacion.revisado_por,
+        revisado_at=presentacion.revisado_at,
+        confirmado_por=presentacion.confirmado_por,
+        confirmado_at=presentacion.confirmado_at,
+    )
+
+
+@router.post("/{presentacion_id}/enviar", response_model=PresentacionStatus)
+def confirmar_envio(
+    presentacion_id: int,
+    body: PresentacionEnviar,
+    db: Session = Depends(get_db),
+    key=Depends(require_presentacion_key),
+) -> PresentacionStatus:
+    """Confirm the final send of a loaded, cross-reviewed filing (Opción 2 / semiauto).
+
+    This is the redactor's authorization of the irreversible "Enviar Poder
+    Judicial" step: it only flips the state from ``revisado`` to
+    ``envio_confirmado`` and records who confirmed it. A prior cross-review
+    (revisión cruzada / four-eyes) is now required — the filing must already be
+    ``revisado`` — and the sender must NOT be the same person who reviewed it.
+    The actual OJV send is performed later by the station worker (a future
+    slice) — nothing is sent here.
+
+    State rules:
+      * ``revisado`` -> ``envio_confirmado`` (stamps ``confirmado_por`` /
+        ``confirmado_at``), returns 200.
+      * ``revisado`` but ``confirmado_por`` equals the row's ``revisado_por``
+        -> 409 Conflict (four-eyes rule), state unchanged.
+      * ``envio_confirmado`` (already confirmed) -> idempotent no-op, returns
+        the current state (200) without overwriting the audit fields.
+      * any other estado -> 409 Conflict.
+      * unknown id -> 404.
+    """
+    presentacion = (
+        db.query(Presentacion).filter(Presentacion.id == presentacion_id).first()
+    )
+    if presentacion is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Presentacion not found"
+        )
+
+    if presentacion.estado == PRES_REVISADO:
+        # Four-eyes: the sender must not be the same person who cross-reviewed.
+        enviador = (body.confirmado_por or "").strip()
+        revisor = (presentacion.revisado_por or "").strip()
+        if enviador and revisor and enviador == revisor:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="El que envía no puede ser el mismo que revisó (revisión cruzada).",
+            )
+        now = datetime.utcnow()
+        presentacion.estado = PRES_ENVIO_CONFIRMADO
+        presentacion.confirmado_por = body.confirmado_por
+        presentacion.confirmado_at = now
+        presentacion.updated_at = now
+        db.commit()
+        db.refresh(presentacion)
+    elif presentacion.estado != PRES_ENVIO_CONFIRMADO:
+        # Idempotent for envio_confirmado; every other estado is a conflict.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"No se puede confirmar el envío: la presentación está en estado "
+                f"'{presentacion.estado}' (requiere 'revisado')."
+            ),
+        )
+
+    return PresentacionStatus(
+        id=presentacion.id,
+        estado=presentacion.estado,
+        tipo_gestion=presentacion.tipo_gestion,
+        modo=presentacion.modo,
+        rol_asignado=presentacion.rol_asignado,
+        ruc=presentacion.ruc,
+        numero_identificador=presentacion.numero_identificador,
+        fecha_envio=presentacion.fecha_envio,
+        certificado_url=presentacion.certificado_url,
+        error_detail=presentacion.error_detail,
+        revisado_por=presentacion.revisado_por,
+        revisado_at=presentacion.revisado_at,
         confirmado_por=presentacion.confirmado_por,
         confirmado_at=presentacion.confirmado_at,
     )
