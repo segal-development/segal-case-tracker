@@ -162,7 +162,7 @@ def test_get_missing_key_401(client, db):
     assert resp.status_code == 401
 
 
-# ------------------------------------------------------------------------ enviar
+# --------------------------------------------------------------- revisar / enviar
 
 
 def _seed_cargada(db, idempotency_key: str = "gedoc-enviar-1") -> Presentacion:
@@ -180,10 +180,150 @@ def _seed_cargada(db, idempotency_key: str = "gedoc-enviar-1") -> Presentacion:
     return row
 
 
-def test_enviar_confirms_cargada_200(client, db):
+def _seed_revisado(
+    db,
+    idempotency_key: str = "gedoc-revisado-1",
+    revisado_por: str = "revisor@segal.cl",
+) -> Presentacion:
+    """Seed a row directly at ``revisado`` (already cross-reviewed)."""
+    from datetime import datetime
+
+    row = Presentacion(
+        idempotency_key=idempotency_key,
+        tipo_gestion="escrito",
+        credential_ref="16021492-9",
+        payload={"litigantes": [], "documento_principal": {}, "documentos": []},
+        estado="revisado",
+        revisado_por=revisado_por,
+        revisado_at=datetime.utcnow(),
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+# ----------------------------------------------------------------------- revisar
+
+
+def test_revisar_from_cargada_200(client, db):
     _seed_key(db)
     row = _seed_cargada(db)
 
+    resp = client.post(
+        f"{POST_URL}/{row.id}/revisar",
+        json={"revisado_por": "revisor@segal.cl"},
+        headers={"X-API-Key": VALID_KEY},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["estado"] == "revisado"
+    assert body["revisado_por"] == "revisor@segal.cl"
+    assert body["revisado_at"] is not None
+
+
+def test_revisar_is_idempotent(client, db):
+    _seed_key(db)
+    row = _seed_cargada(db)
+
+    first = client.post(
+        f"{POST_URL}/{row.id}/revisar",
+        json={"revisado_por": "revisor@segal.cl"},
+        headers={"X-API-Key": VALID_KEY},
+    )
+    assert first.status_code == 200
+
+    # A second review (with a different revisado_por) is a no-op.
+    second = client.post(
+        f"{POST_URL}/{row.id}/revisar",
+        json={"revisado_por": "otro@segal.cl"},
+        headers={"X-API-Key": VALID_KEY},
+    )
+    assert second.status_code == 200
+    body = second.json()
+    assert body["estado"] == "revisado"
+    assert body["revisado_por"] == "revisor@segal.cl"  # unchanged
+
+
+def test_revisar_from_en_cola_409(client, db):
+    _seed_key(db)
+    created = client.post(POST_URL, json=_body(), headers={"X-API-Key": VALID_KEY})
+    pres_id = created.json()["id"]
+
+    resp = client.post(
+        f"{POST_URL}/{pres_id}/revisar",
+        json={"revisado_por": "revisor@segal.cl"},
+        headers={"X-API-Key": VALID_KEY},
+    )
+    assert resp.status_code == 409
+
+
+def test_revisar_missing_404(client, db):
+    _seed_key(db)
+    resp = client.post(
+        f"{POST_URL}/999999/revisar",
+        json={"revisado_por": "revisor@segal.cl"},
+        headers={"X-API-Key": VALID_KEY},
+    )
+    assert resp.status_code == 404
+
+
+def test_revisar_missing_key_401(client, db):
+    _seed_key(db)
+    row = _seed_cargada(db)
+    resp = client.post(
+        f"{POST_URL}/{row.id}/revisar", json={"revisado_por": "x"}
+    )
+    assert resp.status_code == 401
+
+
+def test_get_after_revisar_reflects_state(client, db):
+    _seed_key(db)
+    row = _seed_cargada(db)
+    client.post(
+        f"{POST_URL}/{row.id}/revisar",
+        json={"revisado_por": "revisor@segal.cl"},
+        headers={"X-API-Key": VALID_KEY},
+    )
+
+    resp = client.get(f"{POST_URL}/{row.id}", headers={"X-API-Key": VALID_KEY})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["estado"] == "revisado"
+    assert body["revisado_por"] == "revisor@segal.cl"
+    assert body["revisado_at"] is not None
+
+
+# ------------------------------------------------------------------------ enviar
+
+
+def test_enviar_from_cargada_requires_review_409(client, db):
+    # A filing not yet cross-reviewed cannot be sent.
+    _seed_key(db)
+    row = _seed_cargada(db)
+
+    resp = client.post(
+        f"{POST_URL}/{row.id}/enviar",
+        json={"confirmado_por": "redactor@segal.cl"},
+        headers={"X-API-Key": VALID_KEY},
+    )
+    assert resp.status_code == 409
+    # State is unchanged — still awaiting review.
+    db.refresh(row)
+    assert row.estado == "cargada_pendiente_envio"
+
+
+def test_enviar_confirms_revisado_200(client, db):
+    _seed_key(db)
+    row = _seed_cargada(db)
+
+    # Cross-review by one person...
+    client.post(
+        f"{POST_URL}/{row.id}/revisar",
+        json={"revisado_por": "revisor@segal.cl"},
+        headers={"X-API-Key": VALID_KEY},
+    )
+    # ...then a DIFFERENT person sends.
     resp = client.post(
         f"{POST_URL}/{row.id}/enviar",
         json={"confirmado_por": "redactor@segal.cl"},
@@ -196,9 +336,25 @@ def test_enviar_confirms_cargada_200(client, db):
     assert body["confirmado_at"] is not None
 
 
+def test_enviar_four_eyes_same_person_409(client, db):
+    # The sender must not be the same person who cross-reviewed.
+    _seed_key(db)
+    row = _seed_revisado(db, revisado_por="mismo@segal.cl")
+
+    resp = client.post(
+        f"{POST_URL}/{row.id}/enviar",
+        json={"confirmado_por": "mismo@segal.cl"},
+        headers={"X-API-Key": VALID_KEY},
+    )
+    assert resp.status_code == 409
+    # State unchanged — the send was rejected.
+    db.refresh(row)
+    assert row.estado == "revisado"
+
+
 def test_enviar_is_idempotent(client, db):
     _seed_key(db)
-    row = _seed_cargada(db)
+    row = _seed_revisado(db)
 
     first = client.post(
         f"{POST_URL}/{row.id}/enviar",
@@ -244,7 +400,7 @@ def test_enviar_missing_404(client, db):
 
 def test_enviar_missing_key_401(client, db):
     _seed_key(db)
-    row = _seed_cargada(db)
+    row = _seed_revisado(db)
     resp = client.post(
         f"{POST_URL}/{row.id}/enviar", json={"confirmado_por": "x"}
     )
@@ -253,7 +409,7 @@ def test_enviar_missing_key_401(client, db):
 
 def test_get_after_enviar_reflects_state(client, db):
     _seed_key(db)
-    row = _seed_cargada(db)
+    row = _seed_revisado(db)
     client.post(
         f"{POST_URL}/{row.id}/enviar",
         json={"confirmado_por": "redactor@segal.cl"},

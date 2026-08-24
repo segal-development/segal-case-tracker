@@ -21,10 +21,11 @@ from sqlalchemy import JSON, Column, DateTime, ForeignKey, Integer, String
 from app.core.database import Base
 
 # Lifecycle states: en_cola -> presentando -> cargada_pendiente_envio ->
-# envio_confirmado -> presentada / rechazada / error.
+# revisado -> envio_confirmado -> presentada / rechazada / error.
 PRES_EN_COLA = "en_cola"
 PRES_PRESENTANDO = "presentando"
 PRES_CARGADA_PENDIENTE = "cargada_pendiente_envio"
+PRES_REVISADO = "revisado"
 PRES_ENVIO_CONFIRMADO = "envio_confirmado"
 PRES_PRESENTADA = "presentada"
 PRES_RECHAZADA = "rechazada"
@@ -74,6 +75,12 @@ class Presentacion(Base):
     certificado_url = Column(String(1024), nullable=True)
     error_detail = Column(String(1024), nullable=True)
     intentos = Column(Integer, nullable=False, default=0)
+
+    # Audit trail of the cross-reviewer (revisión cruzada / four-eyes) — a person
+    # DISTINCT from the sender, supplied by GEDOC — recorded when the filing moves
+    # to ``revisado``.
+    revisado_por = Column(String(255), nullable=True)  # who cross-reviewed
+    revisado_at = Column(DateTime, nullable=True)
 
     # Audit trail of who authorized the irreversible send (the redactor, via
     # GEDOC), recorded when the filing moves to ``envio_confirmado``.
