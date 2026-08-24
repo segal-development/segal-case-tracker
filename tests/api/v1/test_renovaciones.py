@@ -128,16 +128,27 @@ def test_create_rejects_non_firm_lawyer(client, admin, db):
     assert r.status_code == 404
 
 
-def test_create_rejects_duplicate_client_rut_same_period(client, admin, abogado):
+def test_create_rejects_duplicate_same_contract_same_period(client, admin, abogado):
     base = {"cliente_nombre": "Cliente", "lawyer_id": abogado.id,
-            "monto_cuota": 25000, "fecha_desde": "2026-07-10"}
+            "monto_cuota": 25000, "numero_contrato": "C-A"}
     r1 = client.post("/api/v1/renovaciones", headers=_h(ADMIN_RUT), json={
-        **base, "numero_contrato": "C-A", "cliente_rut": "17.098.014-k"})
+        **base, "cliente_rut": "17.098.014-k", "fecha_desde": "2026-07-10"})
     assert r1.status_code == 201
-    # Same client RUT (any format / any contract) in the SAME period → rejected.
+    # SAME client + SAME contract in the SAME period → rejected (real duplicate).
     r2 = client.post("/api/v1/renovaciones", headers=_h(ADMIN_RUT), json={
-        **base, "numero_contrato": "C-B", "cliente_rut": "17098014-K", "fecha_desde": "2026-07-25"})
+        **base, "cliente_rut": "17098014-K", "fecha_desde": "2026-07-25"})
     assert r2.status_code == 409
+
+
+def test_create_allows_same_rut_different_contract_same_period(client, admin, abogado):
+    # A client can hold SEVERAL contracts, each a separate renewal in the same
+    # period. Same RUT but a DIFFERENT contrato must be accepted.
+    base = {"cliente_nombre": "Cliente", "lawyer_id": abogado.id,
+            "monto_cuota": 25000, "cliente_rut": "17.098.014-k", "fecha_desde": "2026-07-10"}
+    assert client.post("/api/v1/renovaciones", headers=_h(ADMIN_RUT), json={
+        **base, "numero_contrato": "C-A"}).status_code == 201
+    assert client.post("/api/v1/renovaciones", headers=_h(ADMIN_RUT), json={
+        **base, "numero_contrato": "C-B"}).status_code == 201
 
 
 def test_create_allows_same_rut_different_period(client, admin, abogado):
