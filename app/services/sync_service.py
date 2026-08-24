@@ -17,7 +17,7 @@ import hashlib
 import logging
 import random
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields as dataclass_fields
 from datetime import datetime
 from typing import Any, Callable, List, Optional, Tuple, Awaitable, TypeVar
 from sqlalchemy.orm import Session
@@ -71,6 +71,22 @@ from app.services.shape_cooldown import get_shape_cooldown
 from app.services.deadline_engine import DeadlineEngine, SemaforoTransition, _today_chile
 
 
+def _scrub_nul_fields(obj) -> None:
+    """Strip NUL (0x00) from every string field of a scraped dataclass, in place.
+
+    PostgreSQL text columns reject NUL bytes ("A string literal cannot contain NUL
+    (0x00) characters"), and PJUD PDF/HTML text occasionally carries a stray NUL
+    that crashes the whole flush (poisoning the session and dropping the case).
+    Scrubbing at the source guarantees no scraped string reaches the DB with one,
+    across every consumer (list sync, movement detection, detail) and any field
+    added later.
+    """
+    for f in dataclass_fields(obj):
+        v = getattr(obj, f.name)
+        if isinstance(v, str) and "\x00" in v:
+            setattr(obj, f.name, v.replace("\x00", ""))
+
+
 @dataclass
 class ScrapedCase:
     """Case data from PJUD scraper."""
@@ -83,6 +99,9 @@ class ScrapedCase:
     institucion: Optional[str] = None
     competencia: str = "civil"
 
+    def __post_init__(self) -> None:
+        _scrub_nul_fields(self)
+
 
 @dataclass
 class ScrapedMovement:
@@ -94,6 +113,9 @@ class ScrapedMovement:
     etapa: Optional[str] = None
     foja: Optional[str] = None
     tiene_documento: bool = False
+
+    def __post_init__(self) -> None:
+        _scrub_nul_fields(self)
 
 
 @dataclass

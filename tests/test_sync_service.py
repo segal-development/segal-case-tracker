@@ -315,3 +315,38 @@ class TestSyncServiceIntegration:
         sync = SyncService(mock_db)
         
         assert sync.needs_sync(lawyer_id=1, competencia="civil", max_age_hours=4) is False
+
+
+class TestScrubNulFields:
+    """Scraped dataclasses must strip NUL (0x00) — Postgres text rejects it."""
+
+    def test_scraped_case_strips_nul(self):
+        c = ScrapedCase(
+            rol="C-1-2026",
+            tribunal="1\x00er Juzgado",
+            caratulado="BANCO\x00 / DEUDOR",
+            fecha_ingreso="2026-01-01",
+            estado_cuaderno="Tramitación",
+            cuaderno="Principal",
+        )
+        assert "\x00" not in c.tribunal
+        assert "\x00" not in c.caratulado
+        assert c.tribunal == "1er Juzgado"
+        assert c.caratulado == "BANCO / DEUDOR"
+
+    def test_scraped_movement_strips_nul(self):
+        m = ScrapedMovement(
+            folio="1",
+            fecha="2026-01-01",
+            tipo_tramite="RESOLUCION\x00",
+            descripcion="Texto con NUL\x00 embebido",
+            etapa="ETAPA\x00",
+        )
+        assert "\x00" not in m.tipo_tramite
+        assert "\x00" not in m.descripcion
+        assert "\x00" not in (m.etapa or "")
+        assert m.descripcion == "Texto con NUL embebido"
+
+    def test_clean_strings_unchanged(self):
+        m = ScrapedMovement(folio="1", fecha="2026-01-01", tipo_tramite="RES", descripcion="ok")
+        assert m.descripcion == "ok" and m.tipo_tramite == "RES"
