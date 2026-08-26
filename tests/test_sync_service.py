@@ -350,3 +350,33 @@ class TestScrubNulFields:
     def test_clean_strings_unchanged(self):
         m = ScrapedMovement(folio="1", fecha="2026-01-01", tipo_tramite="RES", descripcion="ok")
         assert m.descripcion == "ok" and m.tipo_tramite == "RES"
+
+
+class TestDocDownloadYearFloor:
+    """PDF-download year floor is independent from the detail/ingest floor."""
+
+    def test_doc_download_year_ok_respects_min_year(self):
+        from app.services.sync_service import doc_download_year_ok
+        with patch("app.services.sync_service.settings") as s:
+            s.DOC_DOWNLOAD_MIN_YEAR = 2024
+            assert doc_download_year_ok("C-1-2026") is True
+            assert doc_download_year_ok("C-1-2024") is True
+            assert doc_download_year_ok("C-1-2023") is False
+            assert doc_download_year_ok("C-1-2021") is False
+
+    def test_doc_download_year_ok_fails_open(self):
+        from app.services.sync_service import doc_download_year_ok
+        with patch("app.services.sync_service.settings") as s:
+            # 0 disables the floor
+            s.DOC_DOWNLOAD_MIN_YEAR = 0
+            assert doc_download_year_ok("C-1-2010") is True
+            # ROL without a -YYYY suffix → fail-open (downloaded)
+            s.DOC_DOWNLOAD_MIN_YEAR = 2024
+            assert doc_download_year_ok("SIN-ANIO") is True
+
+    def test_rol_year_ok_still_uses_detail_min_year(self):
+        from app.services.sync_service import rol_year_ok
+        with patch("app.services.sync_service.settings") as s:
+            s.DETAIL_MIN_YEAR = 2021
+            assert rol_year_ok("C-1-2021") is True
+            assert rol_year_ok("C-1-2020") is False
