@@ -210,8 +210,9 @@ def _plazo_texto(next_deadline_at) -> str:
     return f"Próximo plazo: {fecha}."
 
 
-def rol_year_ok(rol: str) -> bool:
-    min_year = settings.DETAIL_MIN_YEAR
+def _rol_year_at_least(rol: str, min_year: int) -> bool:
+    """True if the ROL's trailing 4-digit year is >= min_year. Fail-open (True)
+    when min_year is unset/0 or the ROL has no parseable -YYYY suffix."""
     if not min_year or min_year <= 0:
         return True
     try:
@@ -221,6 +222,21 @@ def rol_year_ok(rol: str) -> bool:
     if len(last) != 4 or not last.isdigit():
         return True
     return int(last) >= min_year
+
+
+def rol_year_ok(rol: str) -> bool:
+    """Year floor for INGESTION/DETAIL (``DETAIL_MIN_YEAR``)."""
+    return _rol_year_at_least(rol, settings.DETAIL_MIN_YEAR)
+
+
+def doc_download_year_ok(rol: str) -> bool:
+    """Year floor for PDF DOWNLOAD only (``DOC_DOWNLOAD_MIN_YEAR``).
+
+    Detail-scraping still covers all ``DETAIL_MIN_YEAR``+ cases; this only limits
+    which cases' documents get downloaded/stored. Older docs stay in PJUD (we keep
+    ``Document.pjud_url``) and can be fetched on demand later.
+    """
+    return _rol_year_at_least(rol, settings.DOC_DOWNLOAD_MIN_YEAR)
 
 
 # ---------------------------------------------------------------------------
@@ -1938,7 +1954,9 @@ async def detect_and_sync_movements(
             # 4. Synchronous document download (Slice 2 — S2-T6).
             # MUST run in this same sync task while the live browser page and
             # freshly-parsed JWT tokens are still valid (1-hour expiry window).
-            if settings.DOC_DOWNLOAD_ENABLED and persisted_docs:
+            # Year floor: only download docs for recent cases (DOC_DOWNLOAD_MIN_YEAR);
+            # older cases are still detailed, their docs just stay in PJUD.
+            if settings.DOC_DOWNLOAD_ENABLED and persisted_docs and doc_download_year_ok(db_case.rol):
                 from app.services.document_downloader import (
                     DocumentDownloader,
                     AsyncSleepLimiter,
@@ -2368,7 +2386,8 @@ async def sync_via_consulta(
                 _maybe_recompute_deadlines(db, case, budget=shared_budget)
                 db.commit()
 
-                if settings.DOC_DOWNLOAD_ENABLED and persisted_docs:
+                # Year floor: only recent cases' docs are downloaded (DOC_DOWNLOAD_MIN_YEAR).
+                if settings.DOC_DOWNLOAD_ENABLED and persisted_docs and doc_download_year_ok(case.rol):
                     from app.services.document_downloader import (
                         DocumentDownloader,
                         AsyncSleepLimiter,

@@ -142,6 +142,11 @@ class Settings(BaseSettings):
     GCS_BUCKET: str = ""                        # Empty → LocalStorageBackend; set → GCSStorageBackend
     GCS_SIGNED_URL_TTL: int = 3600              # Signed URL TTL in seconds
     DOC_DOWNLOAD_ENABLED: bool = False          # Gate: download PDFs during sync
+    # Year floor for PDF DOWNLOAD only (independent of DETAIL_MIN_YEAR): only
+    # download documents of cases whose ROL year >= this. Detail-scraping still
+    # covers all DETAIL_MIN_YEAR+ cases; older docs stay in PJUD (we keep pjud_url)
+    # and can be fetched on demand. 0 = download for all detailed cases.
+    DOC_DOWNLOAD_MIN_YEAR: int = 2024
 
     # PJUD session lifetime
     PJUD_SESSION_EXPIRY_MINUTES: int = 90  # Measured session lasts ≥2h; 90 min is conservative
