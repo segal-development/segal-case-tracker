@@ -60,15 +60,28 @@ def firm_lawyer_ruts(db: Session) -> set[str]:
     return {normalize_rut(r[0]) for r in rows if r[0]}
 
 
-def _firm_case_ids(db: Session, firm_ruts: set[str], *, competencia: str = "civil") -> set[int]:
+def _firm_case_ids(
+    db: Session,
+    firm_ruts: set[str],
+    *,
+    competencia: str = "civil",
+    by_case: Optional[dict[int, list]] = None,
+) -> set[int]:
     """Case ids where at least one firm lawyer is an abogado-of-record litigante.
 
     This is the firm's REAL caseload — the scope of the transversal study views
     (risk board, productividad), as opposed to every scraped/monitored case.
+
+    ``by_case`` is the ``_abogado_litigantes_by_case`` mapping. Callers that
+    have already computed it for the same ``competencia`` pass it through to
+    avoid re-running the (expensive) firm-wide litigante scan a second time;
+    when ``None`` it is computed here exactly as before.
     """
+    if by_case is None:
+        by_case = _abogado_litigantes_by_case(db, competencia=competencia)
     return {
         cid
-        for cid, litigantes in _abogado_litigantes_by_case(db, competencia=competencia).items()
+        for cid, litigantes in by_case.items()
         if any(
             normalize_rut(lit.rut) in firm_ruts and lit.participante in ALL_ABOGADO
             for lit in litigantes
@@ -383,7 +396,11 @@ def firm_dashboard_stats_all(db: Session) -> dict:
     # Scope to the firm's REAL caseload: only cases where one of the firm's own
     # lawyers is an abogado of record (not every monitored/external case).
     firm_ruts = firm_lawyer_ruts(db)
-    firm_ids = _firm_case_ids(db, firm_ruts)
+    # Compute the firm-wide abogado litigante map ONCE and reuse it both to
+    # scope the firm's caseload (via _firm_case_ids) and to build the
+    # per-abogado breakdown below — avoiding a duplicate firm-wide scan.
+    by_case = _abogado_litigantes_by_case(db)
+    firm_ids = _firm_case_ids(db, firm_ruts, by_case=by_case)
     cases = [c for c in cases if c.id in firm_ids]
     case_map = {c.id: c for c in cases}
 
@@ -432,7 +449,7 @@ def firm_dashboard_stats_all(db: Session) -> dict:
     # RUT appearing on them (no single-account side filter — count every
     # abogado on every case). A lawyer appearing twice on the same case
     # (e.g. patrocinante + AB.DDO) is counted once for that case.
-    by_case = _abogado_litigantes_by_case(db)
+    # ``by_case`` was already computed above — reuse it (no second scan).
     abogado_case_ids: dict[str, set[int]] = defaultdict(set)
     abogado_nombre: dict[str, str] = {}
     for case_id, litigantes in by_case.items():
@@ -528,7 +545,11 @@ def firm_risk_board(db: Session, account_rut: str) -> dict:
     # Scope to the firm's REAL caseload: only cases where one of the firm's own
     # lawyers is an abogado of record (not every monitored/external case).
     firm_ruts = firm_lawyer_ruts(db)
-    firm_ids = _firm_case_ids(db, firm_ruts)
+    # Compute the firm-wide abogado litigante map ONCE and reuse it both to
+    # scope the firm's caseload (via _firm_case_ids) and for the by_lawyer /
+    # top_critical attribution below — avoiding a duplicate firm-wide scan.
+    by_case = _abogado_litigantes_by_case(db)
+    firm_ids = _firm_case_ids(db, firm_ruts, by_case=by_case)
     cases = [c for c in cases if c.id in firm_ids]
     case_map = {c.id: c for c in cases}
 
@@ -561,7 +582,7 @@ def firm_risk_board(db: Session, account_rut: str) -> dict:
     # by_lawyer / top_critical abogado names: firm-wide litigante attribution
     # (mirrors firm_dashboard_stats_all — no single-account side filter, every
     # AB./AP. abogado-of-record RUT on a case counts toward that case).
-    by_case = _abogado_litigantes_by_case(db)
+    # ``by_case`` was already computed above — reuse it (no second scan).
     abogado_case_ids: dict[str, set[int]] = defaultdict(set)
     abogado_nombre: dict[str, str] = {}
     case_abogado_names: dict[int, list[str]] = defaultdict(list)
@@ -823,8 +844,11 @@ def admin_dashboard_stats(db: Session, account_rut: str) -> dict:
     # badge flags real unassigned firm work, not the ~13k monitored cases where
     # the firm simply isn't a litigating party.
     firm_ruts = firm_lawyer_ruts(db)
-    firm_ids = _firm_case_ids(db, firm_ruts)
+    # Compute the firm-wide abogado litigante map ONCE and reuse it both to
+    # scope the firm's caseload (via _firm_case_ids) and for the assignment
+    # check below — avoiding a duplicate firm-wide scan.
     by_case = _abogado_litigantes_by_case(db)
+    firm_ids = _firm_case_ids(db, firm_ruts, by_case=by_case)
     assigned: set[int] = set()
     for cid in firm_ids:
         for lit in by_case.get(cid, []):

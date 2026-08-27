@@ -265,7 +265,7 @@ async def list_renovaciones(
     _lawyer: dict = Depends(get_current_lawyer),
 ):
     """List renewals, most recent first, optionally filtered by month/lawyer/text."""
-    query = db.query(Renovacion)
+    query = db.query(Renovacion).options(joinedload(Renovacion.lawyer))
     if periodo:
         start, end = _period_bounds(periodo)
         query = query.filter(Renovacion.fecha_desde >= start, Renovacion.fecha_desde < end)

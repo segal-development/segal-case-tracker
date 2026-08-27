@@ -15,7 +15,7 @@ from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.api.deps import get_current_lawyer, get_db, _resolve_lawyer_id
 from app.models.alert import Alert
@@ -217,7 +217,11 @@ async def list_alerts(
     cases_by_id = {}
     if case_ids:
         cases_by_id = {
-            c.id: c for c in db.query(Case).filter(Case.id.in_(case_ids)).all()
+            c.id: c
+            for c in db.query(Case)
+            .options(joinedload(Case.court))
+            .filter(Case.id.in_(case_ids))
+            .all()
         }
 
     items = [
