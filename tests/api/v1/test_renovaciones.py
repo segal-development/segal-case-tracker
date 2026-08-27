@@ -191,12 +191,34 @@ def test_list_filter_and_resumen(client, admin, abogado):
             "cliente_nombre": "Cliente", "lawyer_id": abogado.id,
             "monto_cuota": 25000, "fecha_desde": m,
         })
-    jul = client.get("/api/v1/renovaciones?periodo=2026-07", headers=_h(ADMIN_RUT)).json()
+    jul = client.get("/api/v1/renovaciones?periodo=2026-07", headers=_h(ADMIN_RUT)).json()["items"]
     assert len(jul) == 2
     res = client.get("/api/v1/renovaciones/resumen?periodo=2026-07", headers=_h(ADMIN_RUT)).json()
     assert res["count"] == 2
     assert res["total_cuotas"] == 50000
     assert res["total_anual"] == 50000 * 12
+
+
+def test_list_paginates_total_pages_and_slices(client, admin, abogado):
+    """The list is a bounded, paginated envelope: total/pages are correct and a
+    second page returns the next (non-overlapping) slice."""
+    for i, day in enumerate((5, 10, 15, 20, 25)):
+        client.post("/api/v1/renovaciones", headers=_h(ADMIN_RUT), json={
+            "numero_contrato": f"C-PAG-{i}", "cliente_rut": f"1000000{i}-1",
+            "cliente_nombre": "Cliente", "lawyer_id": abogado.id,
+            "monto_cuota": 25000, "fecha_desde": f"2026-09-{day:02d}",
+        })
+
+    p1 = client.get("/api/v1/renovaciones?periodo=2026-09&per_page=2&page=1", headers=_h(ADMIN_RUT)).json()
+    assert p1["total"] == 5
+    assert p1["pages"] == 3          # ceil(5 / 2)
+    assert p1["page"] == 1 and p1["per_page"] == 2
+    assert len(p1["items"]) == 2
+
+    p2 = client.get("/api/v1/renovaciones?periodo=2026-09&per_page=2&page=2", headers=_h(ADMIN_RUT)).json()
+    assert len(p2["items"]) == 2
+    # No overlap between page 1 and page 2 (stable order → disjoint slices).
+    assert {r["id"] for r in p1["items"]}.isdisjoint({r["id"] for r in p2["items"]})
 
 
 def _make_xlsx(rows):
@@ -246,9 +268,9 @@ def test_importar_excel_maps_and_dedups(client, admin, abogado):
     assert r2.json()["omitidas_duplicadas"] == 2
 
     # linked row shows the system lawyer; text-only row shows the raw renovador
-    enero = client.get("/api/v1/renovaciones?periodo=2026-01", headers=_h(ADMIN_RUT)).json()
+    enero = client.get("/api/v1/renovaciones?periodo=2026-01", headers=_h(ADMIN_RUT)).json()["items"]
     assert enero[0]["renovador"] == "Eduardo Venegas"
-    febrero = client.get("/api/v1/renovaciones?periodo=2026-02", headers=_h(ADMIN_RUT)).json()
+    febrero = client.get("/api/v1/renovaciones?periodo=2026-02", headers=_h(ADMIN_RUT)).json()["items"]
     assert febrero[0]["renovador"] == "MVERA"
     assert febrero[0]["lawyer_id"] is None
 
@@ -269,7 +291,7 @@ def test_importar_matchea_username_de_procurador(client, admin, abogado, db):
     )
     assert r.status_code == 200
     assert r.json()["vinculadas"] == 1
-    febrero = client.get("/api/v1/renovaciones?periodo=2026-02", headers=_h(ADMIN_RUT)).json()
+    febrero = client.get("/api/v1/renovaciones?periodo=2026-02", headers=_h(ADMIN_RUT)).json()["items"]
     assert febrero[0]["renovador"] == "MARÍA JOSÉ VERA PICHUNANTE"
     assert febrero[0]["lawyer_id"] is not None
 
@@ -308,7 +330,7 @@ def test_listar_hojas_and_import_single_sheet(client, admin, abogado):
         files={"archivo": ("reno.xlsx", data, _XLSX_MIME)},
     ).json()
     assert r["creadas"] == 2
-    assert client.get("/api/v1/renovaciones?periodo=2025-03", headers=_h(ADMIN_RUT)).json() == []
+    assert client.get("/api/v1/renovaciones?periodo=2025-03", headers=_h(ADMIN_RUT)).json()["items"] == []
 
 
 def test_import_unknown_sheet_404(client, admin, abogado):
@@ -332,7 +354,7 @@ def test_importar_trunca_campos_largos(client, admin, abogado):
     )
     assert r.status_code == 200
     assert r.json()["creadas"] == 1
-    row = client.get("/api/v1/renovaciones?periodo=2026-05", headers=_h(ADMIN_RUT)).json()[0]
+    row = client.get("/api/v1/renovaciones?periodo=2026-05", headers=_h(ADMIN_RUT)).json()["items"][0]
     assert len(row["cliente_rut"]) <= 20
 
 

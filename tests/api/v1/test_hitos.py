@@ -160,7 +160,26 @@ def test_lawyer_lists_only_own(client, db, admin, lawyer, tipo):
     _create(client, _h(LAWYER_RUT), tipo.id)                      # lawyer's own
     r = client.get("/api/v1/hitos", headers=_h(LAWYER_RUT))
     assert r.status_code == 200
-    assert {x["lawyer_id"] for x in r.json()} == {lawyer.id}  # only their own
+    assert {x["lawyer_id"] for x in r.json()["items"]} == {lawyer.id}  # only their own
+
+
+def test_list_paginates_total_pages_and_slices(client, db, admin, lawyer, tipo):
+    """The list is a bounded, paginated envelope: total/pages are correct and a
+    second page returns the next (non-overlapping) slice."""
+    # 5 hitos on distinct dates so the deterministic order is unambiguous.
+    for day in (10, 11, 12, 13, 14):
+        _add_hito(db, lawyer.id, tipo.id, date(2026, 7, day))
+
+    p1 = client.get("/api/v1/hitos?periodo=2026-07&per_page=2&page=1", headers=_h(ADMIN_RUT)).json()
+    assert p1["total"] == 5
+    assert p1["pages"] == 3          # ceil(5 / 2)
+    assert p1["page"] == 1 and p1["per_page"] == 2
+    assert len(p1["items"]) == 2
+
+    p2 = client.get("/api/v1/hitos?periodo=2026-07&per_page=2&page=2", headers=_h(ADMIN_RUT)).json()
+    assert len(p2["items"]) == 2
+    # No overlap between page 1 and page 2 (stable order → disjoint slices).
+    assert {h["id"] for h in p1["items"]}.isdisjoint({h["id"] for h in p2["items"]})
 
 
 _XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -213,7 +232,7 @@ def test_importar_hitos_hojas_y_mapeo(client, db, admin):
     assert r2["creadas"] == 0
     assert r2["omitidas_duplicadas"] == 2
 
-    hitos = client.get("/api/v1/hitos?periodo=2026-07", headers=_h(ADMIN_RUT)).json()
+    hitos = client.get("/api/v1/hitos?periodo=2026-07", headers=_h(ADMIN_RUT)).json()["items"]
     assert len(hitos) == 2
     assert {h["lawyer_id"] for h in hitos} == {lw.id}
 
@@ -237,7 +256,7 @@ def test_admin_deletes_hito(client, db, admin, lawyer, tipo):
     assert forbidden.status_code == 403           # non-admin cannot delete
     ok = client.delete(f"/api/v1/hitos/{hid}", headers=_h(ADMIN_RUT))
     assert ok.status_code == 204                  # admin can
-    assert client.get("/api/v1/hitos?periodo=2026-07", headers=_h(ADMIN_RUT)).json() == []
+    assert client.get("/api/v1/hitos?periodo=2026-07", headers=_h(ADMIN_RUT)).json()["items"] == []
 
 
 def test_admin_edits_hito(client, db, admin, lawyer, tipo):
@@ -432,11 +451,11 @@ def test_list_expone_origen_confianza_de_sugeridos(client, db, admin, lawyer, ti
     db.add(h)
     db.commit()
     # sin filtro: aparece con sus campos
-    body = client.get("/api/v1/hitos?periodo=2026-07", headers=_h(ADMIN_RUT)).json()
+    body = client.get("/api/v1/hitos?periodo=2026-07", headers=_h(ADMIN_RUT)).json()["items"]
     row = next(x for x in body if x["estado"] == "sugerido")
     assert row["origen"] == "detector" and row["confianza"] == "alta"
     # filtro por estado=sugerido
-    sug = client.get("/api/v1/hitos?periodo=2026-07&estado=sugerido", headers=_h(ADMIN_RUT)).json()
+    sug = client.get("/api/v1/hitos?periodo=2026-07&estado=sugerido", headers=_h(ADMIN_RUT)).json()["items"]
     assert all(x["estado"] == "sugerido" for x in sug) and len(sug) == 1
 
 
@@ -485,7 +504,7 @@ def test_importar_formato_nuevo_hoja_por_abogado(client, db, admin):
     assert r["creadas"] == 2
     assert r["aprobados"] == 1 and r["pendientes"] == 1
     # el ROL cayó en descripcion (para dedup por causa)
-    hitos = client.get("/api/v1/hitos?periodo=2026-07", headers=_h(ADMIN_RUT)).json()
+    hitos = client.get("/api/v1/hitos?periodo=2026-07", headers=_h(ADMIN_RUT)).json()["items"]
     assert {h["descripcion"] for h in hitos} == {"C-1062-2026", "C-1089-2026"}
 
 
@@ -507,7 +526,7 @@ def test_reimport_hoja_sin_rut_no_duplica(client, db, admin):
     assert r2["creadas"] == 0
     assert r2["omitidas_duplicadas"] == 2
     # en total sigue habiendo 2, no 4
-    hitos = client.get("/api/v1/hitos?periodo=2026-07", headers=_h(ADMIN_RUT)).json()
+    hitos = client.get("/api/v1/hitos?periodo=2026-07", headers=_h(ADMIN_RUT)).json()["items"]
     assert len([h for h in hitos if h["lawyer_id"] == lw.id]) == 2
 
 
@@ -527,7 +546,7 @@ def test_importar_acepta_fecha_en_texto(client, db, admin):
     r = client.post("/api/v1/hitos/importar?hoja=LCONTRERAS", headers=_h(ADMIN_RUT),
                     files={"archivo": ("t.xlsx", buf.getvalue(), _XLSX_MIME)}).json()
     assert r["creadas"] == 2 and r["errores"] == 0
-    hitos = client.get("/api/v1/hitos?periodo=2026-07", headers=_h(ADMIN_RUT)).json()
+    hitos = client.get("/api/v1/hitos?periodo=2026-07", headers=_h(ADMIN_RUT)).json()["items"]
     assert len([h for h in hitos if h["lawyer_id"] == lw.id]) == 2
 
 

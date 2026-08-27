@@ -64,6 +64,15 @@ class RenovacionResponse(BaseModel):
     created_by_name: Optional[str] = None
 
 
+class RenovacionListResponse(BaseModel):
+    """Paginated renovación list (bounded server-side pagination)."""
+    items: List[RenovacionResponse]
+    total: int
+    page: int
+    per_page: int
+    pages: int
+
+
 class AbogadoOption(BaseModel):
     lawyer_id: int
     nombre: str
@@ -256,15 +265,22 @@ async def create_renovacion(
     return _to_response(reno)
 
 
-@router.get("", response_model=List[RenovacionResponse])
+@router.get("", response_model=RenovacionListResponse)
 async def list_renovaciones(
     periodo: Optional[str] = Query(None, description="Filtrar por mes YYYY-MM (fecha de renovación)"),
     lawyer_id: Optional[int] = Query(None),
     q: Optional[str] = Query(None, description="Buscar por nombre, RUT o N° contrato"),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(500, ge=1, le=2000),
     db: Session = Depends(get_db),
     _lawyer: dict = Depends(get_current_lawyer),
 ):
-    """List renewals, most recent first, optionally filtered by month/lawyer/text."""
+    """List renewals, most recent first, optionally filtered by month/lawyer/text.
+
+    Bounded server-side pagination: the response is a ``{items, total, page,
+    per_page, pages}`` envelope. The screen still consumes the full list — the
+    frontend hook loops every page and flattens client-side.
+    """
     query = db.query(Renovacion).options(joinedload(Renovacion.lawyer))
     if periodo:
         start, end = _period_bounds(periodo)
@@ -278,8 +294,23 @@ async def list_renovaciones(
             | Renovacion.cliente_rut.ilike(like)
             | Renovacion.numero_contrato.ilike(like)
         )
-    rows = query.order_by(Renovacion.fecha_desde.desc(), Renovacion.id.desc()).all()
-    return [_to_response(r) for r in rows]
+    # Count the filtered set BEFORE offset/limit, then page over a DETERMINISTIC
+    # order so slices are stable across requests.
+    total = query.count()
+    pages = (total + per_page - 1) // per_page if total else 0
+    rows = (
+        query.order_by(Renovacion.fecha_desde.desc(), Renovacion.id.desc())
+        .offset((page - 1) * per_page)
+        .limit(per_page)
+        .all()
+    )
+    return RenovacionListResponse(
+        items=[_to_response(r) for r in rows],
+        total=total,
+        page=page,
+        per_page=per_page,
+        pages=pages,
+    )
 
 
 @router.get("/resumen", response_model=RenovacionResumen)
