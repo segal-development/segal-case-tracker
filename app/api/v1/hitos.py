@@ -102,6 +102,15 @@ class HitoResponse(BaseModel):
     rechazo_motivo: Optional[str] = None
 
 
+class HitoListResponse(BaseModel):
+    """Paginated hito list (bounded server-side pagination)."""
+    items: List[HitoResponse]
+    total: int
+    page: int
+    per_page: int
+    pages: int
+
+
 class HitoResumenRow(BaseModel):
     lawyer_id: int
     lawyer_nombre: str
@@ -287,15 +296,22 @@ async def create_hito(
     return _to_response(hito)
 
 
-@router.get("", response_model=List[HitoResponse])
+@router.get("", response_model=HitoListResponse)
 async def list_hitos(
     periodo: Optional[str] = Query(None, description="Filtrar por mes YYYY-MM"),
     lawyer_id: Optional[int] = Query(None),
     estado: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(500, ge=1, le=2000),
     db: Session = Depends(get_db),
     current_lawyer: dict = Depends(get_current_lawyer),
 ):
-    """List hitos. Admins see all; a lawyer sees only their own."""
+    """List hitos. Admins see all; a lawyer sees only their own.
+
+    Bounded server-side pagination: the response is a ``{items, total, page,
+    per_page, pages}`` envelope. The screen still consumes the full list — the
+    frontend hook loops every page and flattens client-side.
+    """
     actor = _resolve_lawyer(db, current_lawyer)
     if actor is None:
         raise HTTPException(status_code=401, detail="No se pudo resolver el abogado")
@@ -318,7 +334,23 @@ async def list_hitos(
             raise HTTPException(status_code=400, detail="periodo inválido (usa YYYY-MM)")
         q = q.filter(Hito.fecha_hito >= start, Hito.fecha_hito < end)
 
-    return [_to_response(h) for h in q.order_by(Hito.fecha_hito.desc(), Hito.id.desc()).all()]
+    # Count the filtered set BEFORE offset/limit, then page over a DETERMINISTIC
+    # order so slices are stable across requests.
+    total = q.count()
+    pages = (total + per_page - 1) // per_page if total else 0
+    rows = (
+        q.order_by(Hito.fecha_hito.desc(), Hito.id.desc())
+        .offset((page - 1) * per_page)
+        .limit(per_page)
+        .all()
+    )
+    return HitoListResponse(
+        items=[_to_response(h) for h in rows],
+        total=total,
+        page=page,
+        per_page=per_page,
+        pages=pages,
+    )
 
 
 @router.post("/{hito_id}/aprobar", response_model=HitoResponse)
