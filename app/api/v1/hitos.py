@@ -16,7 +16,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.api.deps import get_current_lawyer, get_db, require_admin
 from app.models.hito import Hito, HitoTipo, HITO_APROBADO, HITO_PENDIENTE, HITO_RECHAZADO
@@ -300,7 +300,9 @@ async def list_hitos(
     if actor is None:
         raise HTTPException(status_code=401, detail="No se pudo resolver el abogado")
 
-    q = db.query(Hito)
+    q = db.query(Hito).options(
+        selectinload(Hito.lawyer), selectinload(Hito.tipo)
+    )
     if not _is_admin(actor):
         q = q.filter(Hito.lawyer_id == actor.id)  # non-admins: own hitos only
     elif lawyer_id is not None:
@@ -457,6 +459,7 @@ async def resumen_hitos(
 
     rows = (
         db.query(Hito)
+        .options(selectinload(Hito.lawyer))
         .filter(Hito.fecha_hito >= start, Hito.fecha_hito < end)
         .all()
     )
@@ -536,6 +539,7 @@ async def stats_mensual_hitos(
 
     rows = (
         db.query(Hito)
+        .options(selectinload(Hito.lawyer))
         .filter(Hito.fecha_hito >= start, Hito.fecha_hito < end)
         .all()
     )
