@@ -1,8 +1,8 @@
 """Tests for migration 052: performance indexes.
 
 Lightweight file-sanity checks matching the pattern used by other migration
-tests in this repo, plus an assertion that 052 is the single Alembic head so
-the linear migration chain is not accidentally forked.
+tests in this repo, plus an assertion that the Alembic chain has a single head
+so it is not accidentally forked (not pinned to a specific revision).
 
 The indexes themselves are not exercised against a live DB — the test suite
 builds its schema from ``Base.metadata`` (see tests/conftest.py), not by
@@ -49,9 +49,12 @@ class TestMigration052Importable:
 
 
 class TestMigrationChainHasSingleHead:
-    def test_052_is_the_single_head(self):
+    def test_chain_has_a_single_head(self):
+        """The migration chain must stay linear — exactly ONE head. Deliberately
+        NOT pinned to a specific revision, so adding a new migration never breaks
+        this test; it only guards against an accidental fork/branch."""
         cfg = Config(str(_REPO_ROOT / "alembic.ini"))
         cfg.set_main_option("script_location", str(_REPO_ROOT / "alembic"))
         script = ScriptDirectory.from_config(cfg)
         heads = list(script.get_heads())
-        assert heads == ["052"], f"Expected single head 052, got {heads}"
+        assert len(heads) == 1, f"Expected a single migration head, got {heads}"
