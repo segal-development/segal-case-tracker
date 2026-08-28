@@ -77,6 +77,39 @@ async def require_admin(
     return str(lawyer.rut)
 
 
+async def require_evaluaciones_manager(
+    current_lawyer: dict = Depends(get_current_lawyer),
+    db: Session = Depends(get_db),
+) -> str:
+    """Allow access to admins OR lawyers with the ``can_manage_evaluaciones`` flag.
+
+    Granular per-user permission gating the Evaluaciones admin endpoints: a
+    non-admin lawyer with ``can_manage_evaluaciones=True`` can do everything an
+    admin can inside that module (and nothing else). Mirrors ``require_admin``'s
+    lawyer resolution — sub = RUT string (real JWT) or numeric id string (test
+    mocks). Returns the lawyer's RUT string; raises 403 otherwise.
+    """
+    from app.models.lawyer import Lawyer
+
+    sub = current_lawyer.get("sub") or current_lawyer.get("lawyer_id")
+    if not sub:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
+    # Handle numeric id (used by test mocks) or RUT string (real JWT)
+    if isinstance(sub, int) or (isinstance(sub, str) and sub.isdigit()):
+        lawyer = db.query(Lawyer).filter(Lawyer.id == int(sub)).first()
+    else:
+        lawyer = db.query(Lawyer).filter(Lawyer.rut == str(sub)).first()
+
+    if lawyer is None or not (lawyer.role == "admin" or lawyer.can_manage_evaluaciones):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Requiere permiso de Evaluaciones",
+        )
+
+    return str(lawyer.rut)
+
+
 async def require_auditor(
     current_lawyer: dict = Depends(get_current_lawyer),
     db: Session = Depends(get_db),

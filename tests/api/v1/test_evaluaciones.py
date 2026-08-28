@@ -19,6 +19,7 @@ from app.models.lawyer import Lawyer
 
 ADMIN_RUT = "16021492-9"
 LAWYER_RUT = "19643548-4"
+MANAGER_RUT = "17555444-3"
 
 
 def _h(rut):
@@ -37,6 +38,17 @@ def admin(db):
 @pytest.fixture
 def abogado(db):
     obj = Lawyer(rut=LAWYER_RUT, name="Eduardo Venegas", role="lawyer", is_firm_lawyer=True)
+    db.add(obj)
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+
+@pytest.fixture
+def manager(db):
+    """A plain lawyer granted the granular Evaluaciones permission (not admin)."""
+    obj = Lawyer(rut=MANAGER_RUT, name="Ana Gestora", role="lawyer",
+                 is_firm_lawyer=True, can_manage_evaluaciones=True)
     db.add(obj)
     db.commit()
     db.refresh(obj)
@@ -513,3 +525,55 @@ def test_submit_requires_valid_email(client, admin, procurador, db):
     assert client.post("/api/v1/evaluaciones", json={**base, "evaluador_email": "no-es-email"}).status_code == 422
     # email válido → 201 (sin ningún header de auth: confirma que es público)
     assert client.post("/api/v1/evaluaciones", json={**base, "evaluador_email": "ok@segal.cl"}).status_code == 201
+
+
+# --------------------------------------------------------------------------- #
+# Granular permission: can_manage_evaluaciones (manage the module w/o being admin)
+# --------------------------------------------------------------------------- #
+def test_manager_can_read_resultados(client, manager, procurador, db):
+    """A role='lawyer' WITH can_manage_evaluaciones reaches the admin endpoints."""
+    _mk_evaluable(db, procurador.id)
+    r = client.get("/api/v1/evaluaciones/resultados", headers=_h(MANAGER_RUT))
+    assert r.status_code == 200
+
+
+def test_manager_can_create_criterio(client, manager, db):
+    r = client.post("/api/v1/evaluaciones/criterios", headers=_h(MANAGER_RUT),
+                    json={"label": "Iniciativa", "grupo": "Criterios", "orden": 1})
+    assert r.status_code == 201
+
+
+def test_manager_can_manage_evaluables_and_periodos(client, manager, procurador, db):
+    add = client.post("/api/v1/evaluaciones/evaluables", headers=_h(MANAGER_RUT),
+                      json={"lawyer_id": procurador.id})
+    assert add.status_code == 201
+    assert client.get("/api/v1/evaluaciones/evaluables",
+                      headers=_h(MANAGER_RUT)).status_code == 200
+    assert client.get("/api/v1/evaluaciones/periodos",
+                      headers=_h(MANAGER_RUT)).status_code == 200
+
+
+def test_plain_lawyer_without_flag_forbidden(client, abogado, db):
+    """A plain lawyer WITHOUT the flag is still 403 on the admin endpoints."""
+    assert client.get("/api/v1/evaluaciones/resultados",
+                      headers=_h(LAWYER_RUT)).status_code == 403
+    assert client.post("/api/v1/evaluaciones/criterios", headers=_h(LAWYER_RUT),
+                       json={"label": "X"}).status_code == 403
+    assert client.get("/api/v1/evaluaciones/evaluables",
+                      headers=_h(LAWYER_RUT)).status_code == 403
+
+
+def test_admin_still_manages(client, admin, db):
+    assert client.get("/api/v1/evaluaciones/resultados",
+                      headers=_h(ADMIN_RUT)).status_code == 200
+
+
+def test_me_includes_can_manage_evaluaciones(client, admin, manager, abogado):
+    # manager: flag True
+    r = client.get("/api/v1/auth/me", headers=_h(MANAGER_RUT))
+    assert r.status_code == 200
+    assert r.json()["can_manage_evaluaciones"] is True
+    # plain lawyer: flag False
+    r2 = client.get("/api/v1/auth/me", headers=_h(LAWYER_RUT))
+    assert r2.status_code == 200
+    assert r2.json()["can_manage_evaluaciones"] is False

@@ -44,6 +44,11 @@ class Lawyer(Base):
     # never as accounts — naturally out. New lawyer accounts default in (True).
     is_firm_lawyer = Column(Boolean, nullable=False, server_default=text("true"), default=True)
 
+    # Granular permission: manage the Evaluaciones module without being a full admin.
+    can_manage_evaluaciones = Column(
+        Boolean, nullable=False, server_default=text("false"), default=False
+    )
+
     # Bonus tier for the "SISTEMA DE HITOS": "junior" | "pleno" | NULL. Only
     # lawyers with a nivel participate in the monthly bonus/liquidación; it sets
     # their fixed salary and the V1/V3 tramo tables. NULL = not in the bonus.
