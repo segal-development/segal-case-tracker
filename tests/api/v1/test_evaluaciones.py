@@ -4,6 +4,8 @@ Covers criterios CRUD + admin gate, evaluables add/reactivate/soft-delete, the
 /form endpoint, evaluation submit (happy path + validation), and resultados
 averages that ignore N/A.
 """
+from datetime import datetime
+
 import pytest
 
 from app.core.security import create_access_token
@@ -233,6 +235,7 @@ def test_submit_rejects_non_evaluable(client, admin, abogado, procurador, db):
     r = client.post("/api/v1/evaluaciones", json={
         "evaluado_lawyer_id": procurador.id,
         "evaluador_email": "eval@segal.cl",
+        "comentarios": "ok",
         "respuestas": [{"criterio_id": c1.id, "puntaje": 3}],
     })
     assert r.status_code == 400
@@ -244,6 +247,7 @@ def test_submit_rejects_inactive_evaluable(client, admin, abogado, procurador, d
     r = client.post("/api/v1/evaluaciones", json={
         "evaluado_lawyer_id": procurador.id,
         "evaluador_email": "eval@segal.cl",
+        "comentarios": "ok",
         "respuestas": [{"criterio_id": c1.id, "puntaje": 3}],
     })
     assert r.status_code == 400
@@ -255,6 +259,7 @@ def test_submit_rejects_out_of_range_puntaje(client, admin, abogado, procurador,
     r = client.post("/api/v1/evaluaciones", json={
         "evaluado_lawyer_id": procurador.id,
         "evaluador_email": "eval@segal.cl",
+        "comentarios": "ok",
         "respuestas": [{"criterio_id": c1.id, "puntaje": 6}],
     })
     assert r.status_code == 400
@@ -266,6 +271,7 @@ def test_submit_rejects_null_on_non_permite_na(client, admin, abogado, procurado
     r = client.post("/api/v1/evaluaciones", json={
         "evaluado_lawyer_id": procurador.id,
         "evaluador_email": "eval@segal.cl",
+        "comentarios": "ok",
         "respuestas": [{"criterio_id": c1.id, "puntaje": None}],
     })
     assert r.status_code == 400
@@ -277,6 +283,7 @@ def test_submit_rejects_inactive_criterio(client, admin, abogado, procurador, db
     r = client.post("/api/v1/evaluaciones", json={
         "evaluado_lawyer_id": procurador.id,
         "evaluador_email": "eval@segal.cl",
+        "comentarios": "ok",
         "respuestas": [{"criterio_id": c1.id, "puntaje": 3}],
     })
     assert r.status_code == 400
@@ -295,6 +302,7 @@ def test_resultados_averages_ignore_na(client, admin, abogado, procurador, db):
         db.add(Evaluacion(
             evaluado_lawyer_id=procurador.id,
             evaluador_email="eval@segal.cl",
+            periodo="2026-08",
             comentarios=comment,
             respuestas=[
                 EvaluacionRespuesta(criterio_id=c1.id, puntaje=puntajes[0]),
@@ -325,11 +333,179 @@ def test_resultados_admin_gate(client, admin, abogado):
                       headers=_h(LAWYER_RUT)).status_code == 403
 
 
+# --------------------------------------------------------------------------- #
+# Monthly limit (1 per evaluador+evaluado+mes) + required comment
+# --------------------------------------------------------------------------- #
+def _second_evaluable(db):
+    other = Lawyer(rut="18111111-1", name="Otro Evaluable", role="procurador",
+                   is_firm_lawyer=False, is_active=True)
+    db.add(other)
+    db.commit()
+    db.refresh(other)
+    _mk_evaluable(db, other.id)
+    return other
+
+
+def test_submit_sets_periodo_current_month(client, admin, procurador, db):
+    c1 = _mk_criterio(db, label="Iniciativa")
+    _mk_evaluable(db, procurador.id)
+    r = client.post("/api/v1/evaluaciones", json={
+        "evaluado_lawyer_id": procurador.id,
+        "evaluador_email": "eval@segal.cl",
+        "comentarios": "ok",
+        "respuestas": [{"criterio_id": c1.id, "puntaje": 3}],
+    })
+    assert r.status_code == 201
+    ev = db.query(Evaluacion).filter(Evaluacion.id == r.json()["id"]).first()
+    assert ev.periodo == datetime.utcnow().strftime("%Y-%m")
+
+
+def test_submit_monthly_limit_same_evaluador_evaluado(client, admin, procurador, db):
+    c1 = _mk_criterio(db, label="Iniciativa")
+    _mk_evaluable(db, procurador.id)
+    other = _second_evaluable(db)
+    payload = {
+        "evaluado_lawyer_id": procurador.id,
+        "evaluador_email": "Eval@segal.cl",  # normalized/lowercased by validator
+        "comentarios": "ok",
+        "respuestas": [{"criterio_id": c1.id, "puntaje": 3}],
+    }
+    # first submit → 201
+    assert client.post("/api/v1/evaluaciones", json=payload).status_code == 201
+    # second submit, same evaluador+evaluado, same month → 409
+    r2 = client.post("/api/v1/evaluaciones", json=payload)
+    assert r2.status_code == 409
+    assert "este mes" in r2.json()["detail"]
+    # same evaluador → DIFFERENT evaluado, same month → allowed (201)
+    r3 = client.post("/api/v1/evaluaciones", json={**payload, "evaluado_lawyer_id": other.id})
+    assert r3.status_code == 201
+
+
+def test_submit_requires_comentarios(client, admin, procurador, db):
+    c1 = _mk_criterio(db, label="Iniciativa")
+    _mk_evaluable(db, procurador.id)
+    base = {"evaluado_lawyer_id": procurador.id,
+            "evaluador_email": "eval@segal.cl",
+            "respuestas": [{"criterio_id": c1.id, "puntaje": 3}]}
+    # missing comentarios → 422
+    assert client.post("/api/v1/evaluaciones", json=base).status_code == 422
+    # blank/whitespace comentarios → 422
+    assert client.post("/api/v1/evaluaciones",
+                       json={**base, "comentarios": "   "}).status_code == 422
+
+
+# --------------------------------------------------------------------------- #
+# Admin reset (free the evaluador+evaluado+mes slot)
+# --------------------------------------------------------------------------- #
+def test_reset_deletes_and_allows_resubmit(client, admin, procurador, db):
+    c1 = _mk_criterio(db, label="Iniciativa")
+    _mk_evaluable(db, procurador.id)
+    payload = {
+        "evaluado_lawyer_id": procurador.id,
+        "evaluador_email": "eval@segal.cl",
+        "comentarios": "ok",
+        "respuestas": [{"criterio_id": c1.id, "puntaje": 3}],
+    }
+    first = client.post("/api/v1/evaluaciones", json=payload)
+    assert first.status_code == 201
+    ev_id = first.json()["id"]
+    # a second submit is blocked this month
+    assert client.post("/api/v1/evaluaciones", json=payload).status_code == 409
+
+    periodo = datetime.utcnow().strftime("%Y-%m")
+    r = client.post("/api/v1/evaluaciones/reset", headers=_h(ADMIN_RUT), json={
+        "evaluado_lawyer_id": procurador.id,
+        "evaluador_email": "eval@segal.cl",
+        "periodo": periodo,
+    })
+    assert r.status_code == 200
+    assert r.json()["deleted"] is True
+    # evaluation + its respuestas are gone
+    assert db.query(Evaluacion).filter(Evaluacion.id == ev_id).first() is None
+    assert db.query(EvaluacionRespuesta).filter(
+        EvaluacionRespuesta.evaluacion_id == ev_id).count() == 0
+    # slot freed → same evaluador can submit again this month
+    assert client.post("/api/v1/evaluaciones", json=payload).status_code == 201
+
+
+def test_reset_missing_404(client, admin, procurador, db):
+    r = client.post("/api/v1/evaluaciones/reset", headers=_h(ADMIN_RUT), json={
+        "evaluado_lawyer_id": procurador.id,
+        "evaluador_email": "nadie@segal.cl",
+        "periodo": "2026-01",
+    })
+    assert r.status_code == 404
+
+
+def test_reset_requires_admin(client, admin, abogado, procurador, db):
+    r = client.post("/api/v1/evaluaciones/reset", headers=_h(LAWYER_RUT), json={
+        "evaluado_lawyer_id": procurador.id,
+        "evaluador_email": "eval@segal.cl",
+        "periodo": "2026-01",
+    })
+    assert r.status_code == 403
+
+
+# --------------------------------------------------------------------------- #
+# Resultados period filter + periodos list
+# --------------------------------------------------------------------------- #
+def test_resultados_filtered_by_periodo(client, admin, procurador, db):
+    c1 = _mk_criterio(db, label="Iniciativa")
+    _mk_evaluable(db, procurador.id)
+    # two evaluations in different months
+    db.add(Evaluacion(
+        evaluado_lawyer_id=procurador.id, evaluador_email="a@segal.cl",
+        periodo="2026-07", comentarios="jul",
+        respuestas=[EvaluacionRespuesta(criterio_id=c1.id, puntaje=2)],
+    ))
+    db.add(Evaluacion(
+        evaluado_lawyer_id=procurador.id, evaluador_email="b@segal.cl",
+        periodo="2026-08", comentarios="ago",
+        respuestas=[EvaluacionRespuesta(criterio_id=c1.id, puntaje=4)],
+    ))
+    db.commit()
+
+    # filter to 2026-08 only
+    rows = client.get("/api/v1/evaluaciones/resultados?periodo=2026-08",
+                      headers=_h(ADMIN_RUT)).json()
+    row = next(x for x in rows if x["lawyer_id"] == procurador.id)
+    assert row["total_evaluaciones"] == 1
+    assert row["comentarios"] == ["ago"]
+    per = {c["criterio_id"]: c for c in row["por_criterio"]}
+    assert per[c1.id]["promedio"] == 4.0
+
+    # no filter → both months aggregated
+    rows_all = client.get("/api/v1/evaluaciones/resultados", headers=_h(ADMIN_RUT)).json()
+    row_all = next(x for x in rows_all if x["lawyer_id"] == procurador.id)
+    assert row_all["total_evaluaciones"] == 2
+
+
+def test_periodos_distinct_desc(client, admin, procurador, db):
+    c1 = _mk_criterio(db, label="Iniciativa")
+    _mk_evaluable(db, procurador.id)
+    for per in ("2026-07", "2026-08", "2026-08"):
+        db.add(Evaluacion(
+            evaluado_lawyer_id=procurador.id, evaluador_email=f"{per}@segal.cl",
+            periodo=per, comentarios="c",
+            respuestas=[EvaluacionRespuesta(criterio_id=c1.id, puntaje=3)],
+        ))
+    db.commit()
+    r = client.get("/api/v1/evaluaciones/periodos", headers=_h(ADMIN_RUT))
+    assert r.status_code == 200
+    assert r.json() == ["2026-08", "2026-07"]
+
+
+def test_periodos_admin_gate(client, admin, abogado):
+    assert client.get("/api/v1/evaluaciones/periodos",
+                      headers=_h(LAWYER_RUT)).status_code == 403
+
+
 def test_submit_requires_valid_email(client, admin, procurador, db):
     """Público: el email del evaluador es obligatorio y debe ser válido."""
     c1 = _mk_criterio(db, label="Iniciativa")
     _mk_evaluable(db, procurador.id)
     base = {"evaluado_lawyer_id": procurador.id,
+            "comentarios": "ok",
             "respuestas": [{"criterio_id": c1.id, "puntaje": 3}]}
     # sin email → 422
     assert client.post("/api/v1/evaluaciones", json=base).status_code == 422

@@ -11,10 +11,12 @@ evaluated; any logged-in user renders the form and submits an evaluation.
 - ``/resultados``  (admin) — per-evaluable aggregates (averages ignore N/A).
 """
 import logging
+from datetime import datetime
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, field_validator
+from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
 from app.api.deps import get_db, require_admin
@@ -110,7 +112,7 @@ class RespuestaInput(BaseModel):
 class EvaluacionCreate(BaseModel):
     evaluado_lawyer_id: int
     evaluador_email: str  # público: el evaluador se identifica por email (no login)
-    comentarios: Optional[str] = None
+    comentarios: str  # required, non-blank (see validator)
     respuestas: List[RespuestaInput] = []
 
     @field_validator("evaluador_email")
@@ -120,6 +122,22 @@ class EvaluacionCreate(BaseModel):
         if "@" not in v or "." not in v.split("@")[-1]:
             raise ValueError("Email inválido")
         return v.lower()
+
+    @field_validator("comentarios")
+    @classmethod
+    def _comment_required(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("El comentario es obligatorio.")
+        return v
+
+
+class EvaluacionReset(BaseModel):
+    """Admin request to free a taken (evaluador, evaluado, mes) slot."""
+
+    evaluado_lawyer_id: int
+    evaluador_email: str
+    periodo: str  # "YYYY-MM"
 
 
 class EvaluacionCreated(BaseModel):
@@ -404,6 +422,24 @@ async def submit_evaluacion(
             status_code=400, detail="La persona evaluada no está en la lista de evaluables"
         )
 
+    # Monthly limit: one evaluation per (evaluador, evaluado, mes). The period is
+    # derived server-side from the current month (never taken from the request).
+    periodo = datetime.utcnow().strftime("%Y-%m")
+    already = (
+        db.query(Evaluacion)
+        .filter(
+            Evaluacion.evaluado_lawyer_id == body.evaluado_lawyer_id,
+            func.lower(Evaluacion.evaluador_email) == body.evaluador_email,
+            Evaluacion.periodo == periodo,
+        )
+        .first()
+    )
+    if already is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Ya registraste una evaluación de esta persona este mes.",
+        )
+
     # Load the active criteria referenced, keyed by id for validation.
     criterio_ids = [r.criterio_id for r in body.respuestas]
     criterios = {
@@ -434,7 +470,8 @@ async def submit_evaluacion(
     ev = Evaluacion(
         evaluado_lawyer_id=body.evaluado_lawyer_id,
         evaluador_email=body.evaluador_email,
-        comentarios=(body.comentarios.strip() if body.comentarios else None) or None,
+        periodo=periodo,
+        comentarios=body.comentarios,  # required + non-blank (validated)
     )
     ev.respuestas = [
         EvaluacionRespuesta(criterio_id=r.criterio_id, puntaje=r.puntaje)
@@ -457,15 +494,51 @@ async def submit_evaluacion(
 
 
 # --------------------------------------------------------------------------- #
+# Reset de una evaluación (admin)
+# --------------------------------------------------------------------------- #
+@router.post("/reset")
+async def reset_evaluacion(
+    body: EvaluacionReset,
+    db: Session = Depends(get_db),
+    _admin_rut: str = Depends(require_admin),
+):
+    """Delete the evaluation matching (evaluado, evaluador, periodo), freeing that
+    monthly slot so the evaluador can submit again for that person that month.
+
+    Its ``EvaluacionRespuesta`` rows are removed via the ORM delete-orphan
+    cascade on ``Evaluacion.respuestas``.
+    """
+    email = (body.evaluador_email or "").strip().lower()
+    ev = (
+        db.query(Evaluacion)
+        .filter(
+            Evaluacion.evaluado_lawyer_id == body.evaluado_lawyer_id,
+            func.lower(Evaluacion.evaluador_email) == email,
+            Evaluacion.periodo == body.periodo,
+        )
+        .first()
+    )
+    if ev is None:
+        raise HTTPException(status_code=404, detail="No se encontró esa evaluación.")
+    db.delete(ev)  # cascades to respuestas (delete-orphan)
+    db.commit()
+    return {"deleted": True}
+
+
+# --------------------------------------------------------------------------- #
 # Resultados (admin)
 # --------------------------------------------------------------------------- #
 @router.get("/resultados", response_model=List[ResultadoEvaluable])
 async def resultados(
+    periodo: Optional[str] = Query(None),
     db: Session = Depends(get_db),
     _admin_rut: str = Depends(require_admin),
 ):
     """Per-evaluable aggregates. Averages ignore NULL puntajes (N/A). Includes
-    every active evaluable, plus anyone who has evaluations (even if removed)."""
+    every active evaluable, plus anyone who has evaluations (even if removed).
+
+    When ``periodo`` ("YYYY-MM") is given, only evaluations of that month are
+    aggregated; omitted means all months (unchanged behavior)."""
     criterios = db.query(EvaluacionCriterio).all()
     criterio_meta = {c.id: c for c in criterios}
 
@@ -479,14 +552,13 @@ async def resultados(
     ):
         lawyer_ids[e.lawyer_id] = e.lawyer.name if e.lawyer else f"#{e.lawyer_id}"
 
-    evaluaciones = (
-        db.query(Evaluacion)
-        .options(
-            joinedload(Evaluacion.evaluado),
-            joinedload(Evaluacion.respuestas),
-        )
-        .all()
+    ev_query = db.query(Evaluacion).options(
+        joinedload(Evaluacion.evaluado),
+        joinedload(Evaluacion.respuestas),
     )
+    if periodo:
+        ev_query = ev_query.filter(Evaluacion.periodo == periodo)
+    evaluaciones = ev_query.all()
     for ev in evaluaciones:
         if ev.evaluado_lawyer_id not in lawyer_ids:
             lawyer_ids[ev.evaluado_lawyer_id] = (
@@ -546,3 +618,22 @@ async def resultados(
     # Deterministic sort: promedio_general desc (nulls last), then nombre.
     out.sort(key=lambda r: (r.promedio_general is None, -(r.promedio_general or 0), r.nombre))
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Periodos (admin)
+# --------------------------------------------------------------------------- #
+@router.get("/periodos", response_model=List[str])
+async def periodos(
+    db: Session = Depends(get_db),
+    _admin_rut: str = Depends(require_admin),
+):
+    """Distinct ``periodo`` values ("YYYY-MM") present in evaluaciones, most
+    recent first — so the frontend month selector can populate."""
+    rows = (
+        db.query(Evaluacion.periodo)
+        .distinct()
+        .order_by(Evaluacion.periodo.desc())
+        .all()
+    )
+    return [p for (p,) in rows]
