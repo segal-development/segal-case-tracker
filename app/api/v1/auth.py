@@ -285,6 +285,7 @@ def get_me(
         "name": lawyer.name,
         "email": lawyer.email,
         "role": lawyer.role,
+        "can_manage_evaluaciones": lawyer.can_manage_evaluaciones,
     }
 
 

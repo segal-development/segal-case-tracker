@@ -19,7 +19,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
-from app.api.deps import get_db, require_admin
+from app.api.deps import get_db, require_evaluaciones_manager
 from app.models.evaluacion import (
     Evaluacion,
     EvaluacionCriterio,
@@ -185,7 +185,7 @@ def _criterio_response(c: EvaluacionCriterio) -> CriterioResponse:
 @router.get("/criterios", response_model=List[CriterioResponse])
 async def list_criterios(
     db: Session = Depends(get_db),
-    _admin_rut: str = Depends(require_admin),
+    _mgr_rut: str = Depends(require_evaluaciones_manager),
 ):
     """All criteria (including inactive), ordered by (grupo, orden, id)."""
     rows = (
@@ -208,7 +208,7 @@ async def list_criterios(
 async def create_criterio(
     body: CriterioCreate,
     db: Session = Depends(get_db),
-    _admin_rut: str = Depends(require_admin),
+    _mgr_rut: str = Depends(require_evaluaciones_manager),
 ):
     """Create a criterion."""
     c = EvaluacionCriterio(
@@ -229,7 +229,7 @@ async def update_criterio(
     criterio_id: int,
     body: CriterioUpdate,
     db: Session = Depends(get_db),
-    _admin_rut: str = Depends(require_admin),
+    _mgr_rut: str = Depends(require_evaluaciones_manager),
 ):
     """Update a criterion (partial)."""
     c = db.query(EvaluacionCriterio).filter(EvaluacionCriterio.id == criterio_id).first()
@@ -254,7 +254,7 @@ async def update_criterio(
 async def delete_criterio(
     criterio_id: int,
     db: Session = Depends(get_db),
-    _admin_rut: str = Depends(require_admin),
+    _mgr_rut: str = Depends(require_evaluaciones_manager),
 ):
     """Soft-delete a criterion (activo=False) to preserve historical responses."""
     c = db.query(EvaluacionCriterio).filter(EvaluacionCriterio.id == criterio_id).first()
@@ -270,7 +270,7 @@ async def delete_criterio(
 @router.get("/evaluables", response_model=List[EvaluableResponse])
 async def list_evaluables(
     db: Session = Depends(get_db),
-    _admin_rut: str = Depends(require_admin),
+    _mgr_rut: str = Depends(require_evaluaciones_manager),
 ):
     """The curated list of who can be evaluated (join Lawyer), active first."""
     rows = (
@@ -302,7 +302,7 @@ async def list_evaluables(
 async def add_evaluable(
     body: EvaluableCreate,
     db: Session = Depends(get_db),
-    _admin_rut: str = Depends(require_admin),
+    _mgr_rut: str = Depends(require_evaluaciones_manager),
 ):
     """Add a lawyer as evaluable. Reactivates an existing (soft-deleted) row
     instead of duplicating."""
@@ -340,7 +340,7 @@ async def add_evaluable(
 async def delete_evaluable(
     evaluable_id: int,
     db: Session = Depends(get_db),
-    _admin_rut: str = Depends(require_admin),
+    _mgr_rut: str = Depends(require_evaluaciones_manager),
 ):
     """Soft-delete an evaluable (activo=False)."""
     e = db.query(EvaluacionEvaluable).filter(EvaluacionEvaluable.id == evaluable_id).first()
@@ -500,7 +500,7 @@ async def submit_evaluacion(
 async def reset_evaluacion(
     body: EvaluacionReset,
     db: Session = Depends(get_db),
-    _admin_rut: str = Depends(require_admin),
+    _mgr_rut: str = Depends(require_evaluaciones_manager),
 ):
     """Delete the evaluation matching (evaluado, evaluador, periodo), freeing that
     monthly slot so the evaluador can submit again for that person that month.
@@ -532,7 +532,7 @@ async def reset_evaluacion(
 async def resultados(
     periodo: Optional[str] = Query(None),
     db: Session = Depends(get_db),
-    _admin_rut: str = Depends(require_admin),
+    _mgr_rut: str = Depends(require_evaluaciones_manager),
 ):
     """Per-evaluable aggregates. Averages ignore NULL puntajes (N/A). Includes
     every active evaluable, plus anyone who has evaluations (even if removed).
@@ -626,7 +626,7 @@ async def resultados(
 @router.get("/periodos", response_model=List[str])
 async def periodos(
     db: Session = Depends(get_db),
-    _admin_rut: str = Depends(require_admin),
+    _mgr_rut: str = Depends(require_evaluaciones_manager),
 ):
     """Distinct ``periodo`` values ("YYYY-MM") present in evaluaciones, most
     recent first — so the frontend month selector can populate."""
