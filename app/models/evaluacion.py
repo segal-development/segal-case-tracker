@@ -74,6 +74,9 @@ class Evaluacion(Base):
     # Public form: the evaluator is NOT authenticated — identified by the email
     # they type in (like the original Google Form's email field).
     evaluador_email = Column(String(255), nullable=False, index=True)
+    # "YYYY-MM" — the month the evaluation belongs to. Backs the monthly limit
+    # (1 evaluation per evaluador+evaluado+mes) enforced in the endpoint.
+    periodo = Column(String(7), nullable=False, index=True)
     comentarios = Column(Text, nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow)
