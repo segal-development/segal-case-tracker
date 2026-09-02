@@ -29,7 +29,10 @@ from app.models.court import Court
 from app.models.sync_history import SyncHistory
 from app.models.document import Document
 from app.models.generated_document import GeneratedDocument
+from app.models.cliente_sysgal_estado import ClienteSysgalEstado
+from app.services.sysgal_cobertura import COBERTURAS, derive_cobertura
 from app.services.timeline_service import build_case_timeline
+from app.utils.rut import clean_rut
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +82,13 @@ class CaseResponse(BaseModel):
     titulo_fecha: Optional[date] = None
     prescripcion_cumplida: bool = False
     prescripcion_fecha: Optional[date] = None
+    # Sysgal cobertura (derived from the demandado's cached commercial state).
+    # Populated ONLY for cases in abandono/apremio/prescripción that have a
+    # DDO litigante with a RUT; None otherwise. See _sysgal_info_by_case.
+    sysgal_cobertura: Optional[str] = None
+    sysgal_estado_codigo: Optional[str] = None
+    sysgal_vigencia_hasta: Optional[date] = None
+    sysgal_synced_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -118,6 +128,11 @@ class CaseSummaryResponse(BaseModel):
     abandono: int
     apremio: int
     prescripcion: int
+    # Sysgal cobertura chips — cases in the 3 states, bucketed by cobertura.
+    sysgal_activo: int = 0
+    sysgal_moroso: int = 0
+    sysgal_caducado: int = 0
+    sysgal_sin_dato: int = 0
 
 
 class CaseFacetsResponse(BaseModel):
@@ -252,6 +267,127 @@ class CaseDetailResponse(BaseModel):
 
 
 # ============================================================================
+# SYSGAL COBERTURA (derived tag for cases in abandono/apremio/prescripción)
+# ============================================================================
+
+# Cases in any of the 3 states that get a Sysgal cobertura tag.
+_SYSGAL_STATE_FLAGS = or_(
+    Case.abandono_disponible.is_(True),
+    Case.en_apremio.is_(True),
+    Case.prescripcion_cumplida.is_(True),
+)
+
+# When a case has several demandados with different coberturas, the tag shows
+# the most-covered one (any demandado with active coverage covers the causa).
+_COBERTURA_PRIORITY = {c: i for i, c in enumerate(COBERTURAS)}
+
+
+def _case_in_sysgal_states(case: Case) -> bool:
+    return bool(case.abandono_disponible or case.en_apremio or case.prescripcion_cumplida)
+
+
+def _sysgal_info_by_case(db: Session, case_ids, today: Optional[date] = None) -> dict:
+    """Sysgal cobertura per case id, for the given case ids (list or subquery).
+
+    Two queries total, never N+1: one for the DDO litigante RUTs of those
+    cases, one for the matching cache rows. Cobertura is derived in Python
+    with ``derive_cobertura`` (the single business rule). RUTs are normalised
+    with ``clean_rut`` on our side because litigantes store PJUD's raw form
+    (may carry dots) while the cache is keyed by the canonical form.
+
+    Returns ``{case_id: {"cobertura", "estado_codigo", "vigencia_hasta",
+    "synced_at"}}`` only for cases that have at least one DDO RUT. A DDO RUT
+    with no cache row derives to ``sin_dato`` (other fields None). Callers
+    must restrict ``case_ids`` to cases in the 3 states.
+    """
+    lit_rows = (
+        db.query(CaseLitigante.case_id, CaseLitigante.rut)
+        .filter(
+            CaseLitigante.case_id.in_(case_ids),
+            CaseLitigante.participante.ilike("DDO%"),
+            CaseLitigante.rut != "",
+        )
+        .all()
+    )
+    ruts_by_case: dict[int, set[str]] = {}
+    for case_id, raw_rut in lit_rows:
+        rut = clean_rut(raw_rut) if raw_rut else ""
+        if rut:
+            ruts_by_case.setdefault(case_id, set()).add(rut)
+    if not ruts_by_case:
+        return {}
+
+    all_ruts = set().union(*ruts_by_case.values())
+    cache = {
+        row.rut: row
+        for row in db.query(ClienteSysgalEstado)
+        .filter(ClienteSysgalEstado.rut.in_(all_ruts))
+        .all()
+    }
+
+    today = today or date.today()
+    result: dict[int, dict] = {}
+    for case_id, ruts in ruts_by_case.items():
+        best = None
+        for rut in sorted(ruts):
+            row = cache.get(rut)
+            if row is None:
+                info = {"cobertura": "sin_dato", "estado_codigo": None,
+                        "vigencia_hasta": None, "synced_at": None}
+            else:
+                info = {
+                    "cobertura": derive_cobertura(
+                        row.estado_codigo, row.vigencia_hasta, row.encontrado, today
+                    ),
+                    "estado_codigo": row.estado_codigo,
+                    "vigencia_hasta": row.vigencia_hasta,
+                    "synced_at": row.synced_at,
+                }
+            if best is None or (
+                _COBERTURA_PRIORITY[info["cobertura"]] < _COBERTURA_PRIORITY[best["cobertura"]]
+            ):
+                best = info
+        result[case_id] = best
+    return result
+
+
+def _sysgal_cobertura_case_ids(db: Session, base_query, cobertura: str) -> set[int]:
+    """Case ids (within ``base_query``, restricted to the 3 states) whose
+    Sysgal cobertura is ``cobertura``.
+
+    Correct over clever: the cobertura is a Python-derived value (stale-ACTIVO
+    catch, RUT normalisation), so it cannot be expressed as a SQL predicate.
+    The in-scope population is small (~1.4k demandado RUTs), so we derive it
+    per case with ``_sysgal_info_by_case`` and hand the id set back to the
+    caller as ``Case.id IN (...)`` — pagination and totals stay exact.
+    """
+    state_ids = base_query.filter(_SYSGAL_STATE_FLAGS).with_entities(Case.id)
+    info = _sysgal_info_by_case(db, state_ids)
+    return {cid for cid, i in info.items() if i["cobertura"] == cobertura}
+
+
+def _sysgal_summary_counts(db: Session, base_query) -> dict:
+    """Cobertura chip counts over the scoped set (cases in the 3 states)."""
+    state_ids = base_query.filter(_SYSGAL_STATE_FLAGS).with_entities(Case.id)
+    counts = {c: 0 for c in COBERTURAS}
+    for i in _sysgal_info_by_case(db, state_ids).values():
+        counts[i["cobertura"]] += 1
+    return counts
+
+
+def _sysgal_fields(info: Optional[dict]) -> dict:
+    """Kwargs for CaseResponse from a ``_sysgal_info_by_case`` entry (or None)."""
+    if not info:
+        return {}
+    return {
+        "sysgal_cobertura": info["cobertura"],
+        "sysgal_estado_codigo": info["estado_codigo"],
+        "sysgal_vigencia_hasta": info["vigencia_hasta"],
+        "sysgal_synced_at": info["synced_at"],
+    }
+
+
+# ============================================================================
 # ENDPOINTS
 # ============================================================================
 
@@ -324,6 +460,13 @@ async def list_cases(
     ),
     tribunal: Optional[str] = Query(None, description="Filter by court (tribunal) name"),
     materia: Optional[str] = Query(None, description="Filter by procedure (materia)"),
+    cobertura: Optional[Literal["activo", "moroso", "caducado", "sin_dato"]] = Query(
+        None,
+        description=(
+            "Sysgal cobertura filter (cases in abandono/apremio/prescripción only): "
+            "activo|moroso|caducado|sin_dato."
+        ),
+    ),
     sort_by: Optional[Literal["criticidad", "ultima_actuacion", "updated_at"]] = Query(
         None,
         description=(
@@ -391,6 +534,13 @@ async def list_cases(
     if materia:
         query = query.filter(Case.procedure == materia)
 
+    # Sysgal cobertura filter — server-side so total/pages stay exact. The id
+    # set is derived in Python over the scoped 3-state population (see
+    # _sysgal_cobertura_case_ids); an empty set yields an empty page.
+    if cobertura:
+        matching_ids = _sysgal_cobertura_case_ids(db, query, cobertura)
+        query = query.filter(Case.id.in_(matching_ids))
+
     # Get total count
     total = query.count()
 
@@ -430,7 +580,11 @@ async def list_cases(
     
     # Calculate pages
     pages = (total + per_page - 1) // per_page if total > 0 else 0
-    
+
+    # Sysgal cobertura for this page's 3-state cases (2 queries, no N+1).
+    sysgal_ids = [c.id for c in cases if _case_in_sysgal_states(c)]
+    sysgal_info = _sysgal_info_by_case(db, sysgal_ids) if sysgal_ids else {}
+
     # Build response with court info
     items = []
     for case in cases:
@@ -462,6 +616,7 @@ async def list_cases(
             next_deadline_fatal=case.next_deadline_fatal or False,
             en_apremio=case.en_apremio or False,
             prescripcion_cumplida=case.prescripcion_cumplida or False,
+            **_sysgal_fields(sysgal_info.get(case.id)),
         ))
 
     return CaseListResponse(
@@ -507,6 +662,9 @@ async def cases_summary(
     apremio = base.filter(Case.en_apremio.is_(True)).count()
     prescripcion = base.filter(Case.prescripcion_cumplida.is_(True)).count()
 
+    # Sysgal cobertura chips over the 3-state subset (derived in Python).
+    sysgal = _sysgal_summary_counts(db, base)
+
     return CaseSummaryResponse(
         total=total,
         rojo=sem_counts.get("rojo", 0),
@@ -516,6 +674,10 @@ async def cases_summary(
         abandono=abandono,
         apremio=apremio,
         prescripcion=prescripcion,
+        sysgal_activo=sysgal["activo"],
+        sysgal_moroso=sysgal["moroso"],
+        sysgal_caducado=sysgal["caducado"],
+        sysgal_sin_dato=sysgal["sin_dato"],
     )
 
 
@@ -600,6 +762,13 @@ async def get_case(
             region=case.court.region,
         )
 
+    # Sysgal cobertura — same derivation as the list, single case.
+    sysgal_info = (
+        _sysgal_info_by_case(db, [case.id]).get(case.id)
+        if _case_in_sysgal_states(case)
+        else None
+    )
+
     case_response = CaseResponse(
         id=case.id,
         rol=case.rol,
@@ -619,6 +788,8 @@ async def get_case(
         abandono_disponible=case.abandono_disponible or False,
         next_deadline_fatal=case.next_deadline_fatal or False,
         en_apremio=case.en_apremio or False,
+        prescripcion_cumplida=case.prescripcion_cumplida or False,
+        **_sysgal_fields(sysgal_info),
     )
 
     movements_response = [

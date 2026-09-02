@@ -81,6 +81,11 @@ class Settings(BaseSettings):
     SMTP_FROM: str = ""
     SUPERVISOR_EMAIL: str = ""
 
+    # Sysgal CRM (read-only client-coverage lookup by demandado RUT).
+    # Both empty = integration disabled (sync is a no-op).
+    SYSGAL_BASE_URL: str = ""
+    SYSGAL_API_KEY: str = ""
+
     # Firebase (push notifications)
     FIREBASE_CREDENTIALS_PATH: str = ""
     FIREBASE_CREDENTIALS_JSON: str = ""
