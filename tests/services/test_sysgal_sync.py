@@ -11,6 +11,7 @@ from app.models.court import Court
 from app.models.lawyer import Lawyer
 from app.services.sysgal_client import SysgalError
 from app.services.sysgal_sync import sync_sysgal_estados
+from app.utils.rut import clean_rut
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +103,9 @@ class FakeClient:
             raise ValueError("too many")
         if (len(self.batches) - 1) in self.fail_batches:
             raise SysgalError("simulated failure")
-        return {r: self.answers.get(r, NOT_FOUND) for r in ruts}
+        # Like the real API: accepts dotted or canonical RUTs, keys the answer
+        # exactly as sent.
+        return {r: self.answers.get(clean_rut(r), NOT_FOUND) for r in ruts}
 
 
 # ---------------------------------------------------------------------------
@@ -254,3 +257,43 @@ class TestSafeFail:
         # Second chunk (50 ruts) still persisted
         assert db.query(ClienteSysgalEstado).count() == 50
         assert result["no_encontrados"] == 50
+
+
+# ---------------------------------------------------------------------------
+# Wire format: dotted RUT on the request, canonical key in the cache
+# ---------------------------------------------------------------------------
+
+
+class TestWireFormat:
+    def test_sends_dotted_when_valid_canonical_when_not_and_keys_cache_canonically(
+        self, db, lawyer, court
+    ):
+        """Sysgal is verified to accept the dotted form; the undotted form is
+        not. A RUT that validates is sent dotted; one with a bad verification
+        digit (format_rut → None) falls back to canonical. Either way the cache
+        row is keyed by the canonical form."""
+        from app.utils.rut import calculate_verification_digit, format_rut
+
+        num, num2 = 14183245, 12345678
+        valid = f"{num}-{calculate_verification_digit(num)}"
+        good_dv = calculate_verification_digit(num2)
+        invalid = f"{num2}-{'0' if good_dv != '0' else '1'}"
+        assert format_rut(valid) is not None and format_rut(invalid) is None  # sanity
+
+        case = _make_case(db, lawyer, court, "C-9001-2026", en_apremio=True)
+        _add_litigante(db, case.id, "DDO.", valid)
+        _add_litigante(db, case.id, "DDO.", invalid)
+
+        client = FakeClient(answers={valid: _found(), invalid: _found(code="TERMINADO", label="Terminado")})
+        result = sync_sysgal_estados(db, client=client)
+
+        assert result["errores"] == 0 and result["encontrados"] == 2
+        sent = client.batches[0]
+        assert format_rut(valid) in sent            # dotted on the wire, e.g. "14.183.245-K"
+        assert valid not in sent                    # never the undotted form for a valid RUT
+        assert invalid in sent                      # invalid dv → canonical fallback
+
+        rows = {r.rut: r for r in db.query(ClienteSysgalEstado).all()}
+        assert set(rows) == {valid, invalid}        # cache keyed canonically, never dotted
+        assert rows[valid].encontrado and rows[valid].estado_codigo == "ACTIVO"
+        assert rows[invalid].encontrado and rows[invalid].estado_codigo == "TERMINADO"

@@ -20,7 +20,7 @@ from app.models.case import Case
 from app.models.case_litigante import CaseLitigante
 from app.models.cliente_sysgal_estado import ClienteSysgalEstado
 from app.services.sysgal_client import MAX_RUTS_PER_REQUEST, SysgalClient
-from app.utils.rut import clean_rut
+from app.utils.rut import clean_rut, format_rut
 
 logger = logging.getLogger(__name__)
 
@@ -128,8 +128,13 @@ def sync_sysgal_estados(
     for start in range(0, len(ruts), MAX_RUTS_PER_REQUEST):
         chunk = ruts[start : start + MAX_RUTS_PER_REQUEST]
         summary["chunks"] += 1
+        # Wire format: Sysgal is VERIFIED to accept the dotted form
+        # ("14.183.245-K"); the undotted canonical form is unverified. Send
+        # dotted whenever the RUT validates, fall back to canonical otherwise,
+        # and always key the cache by the canonical form.
+        sent_by_canon = {rut: (format_rut(rut) or rut) for rut in chunk}
         try:
-            data = client.estado_por_ruts(chunk)
+            data = client.estado_por_ruts(list(sent_by_canon.values()))
         except Exception as exc:  # noqa: BLE001 — safe-fail per chunk, no PII in the message
             summary["errores"] += 1
             logger.warning(
@@ -144,7 +149,7 @@ def sync_sysgal_estados(
         }
         for rut in chunk:
             # Sysgal keys the answer exactly as sent; a missing key means "no answer".
-            item = data.get(rut) or {"encontrado": False}
+            item = data.get(sent_by_canon[rut]) or {"encontrado": False}
             row = existing.get(rut)
             if row is None:
                 row = ClienteSysgalEstado(rut=rut, encontrado=False, synced_at=now)
