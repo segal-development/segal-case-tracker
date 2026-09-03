@@ -25,6 +25,31 @@ from app.services import bono_cierre_service as cierre_svc
 
 # A ROL like "C-9960-2026" embedded anywhere in the free-text descripcion.
 _ROL_RE = re.compile(r"[A-Za-z]+-\d+-\d{4}")
+# A bare ROL typed without its letter prefix ("6147-2026"). This system only
+# tracks civil causas, so the missing prefix is always "C-".
+_BARE_ROL_RE = re.compile(r"^\d+-\d{4}$")
+
+
+def _normalize_rol_text(descripcion: Optional[str]) -> Optional[str]:
+    """Normalize the causa text stored in ``descripcion`` at every write site.
+
+    Trims whitespace; a bare ROL (``6147-2026``) becomes ``C-6147-2026`` and a
+    ROL with a letter prefix is upper-cased (``c-6147-2026`` → ``C-6147-2026``).
+    Free text is left untouched. ``None`` for empty input.
+
+    Why: in the August 2026 audit hito 457 had been stored as ``6147-2026`` and did
+    NOT dedup against ``C-6147-2026`` — the same causa could have been paid twice.
+    """
+    if not descripcion:
+        return None
+    text = str(descripcion).strip()
+    if not text:
+        return None
+    if _BARE_ROL_RE.match(text):
+        return f"C-{text}"
+    if _ROL_RE.fullmatch(text):
+        return text.upper()
+    return text
 
 
 def _causa_key(descripcion: Optional[str]) -> Optional[str]:
@@ -35,11 +60,17 @@ def _causa_key(descripcion: Optional[str]) -> Optional[str]:
     ``descripcion`` (a ROL like ``C-9960-2026``), so dedup keys on
     ``(lawyer, rol_causa, _causa_key(descripcion))``: the ROL when present, else the
     normalized free text. ``None`` for empty descripcion.
+
+    A bare ROL (``6147-2026``) keys as ``C-6147-2026`` so legacy rows written
+    before ``_normalize_rol_text`` existed still collide with the prefixed form.
     """
     if not descripcion:
         return None
-    m = _ROL_RE.search(descripcion)
-    return (m.group(0).upper() if m else descripcion.strip().upper()[:120]) or None
+    text = descripcion.strip()
+    if _BARE_ROL_RE.match(text):
+        return f"C-{text}"
+    m = _ROL_RE.search(text)
+    return (m.group(0).upper() if m else text.upper()[:120]) or None
 
 
 def _tribunal_key(tribunal: Optional[str]) -> Optional[str]:
@@ -279,7 +310,7 @@ async def create_hito(
         fecha_hito=fecha_hito,
         rol_causa=rol_norm,
         procedimiento=procedimiento,
-        descripcion=descripcion,
+        descripcion=_normalize_rol_text(descripcion),
         tribunal=tribunal_norm,
         etapa_sysgal=etapa_sysgal or tipo.etapa_tramite,
         tramite_sysgal=tramite_sysgal,
@@ -873,7 +904,7 @@ async def update_hito(
     hito.fecha_hito = body.fecha_hito
     hito.rol_causa = rol_norm
     hito.procedimiento = body.procedimiento
-    hito.descripcion = body.descripcion
+    hito.descripcion = _normalize_rol_text(body.descripcion)
     hito.tribunal = tribunal_norm
     db.commit()
     db.refresh(hito)
@@ -942,7 +973,7 @@ async def importar_hitos(
         # descripcion = ROL de la causa (o el texto libre viejo); es lo que distingue
         # dos hitos del mismo cliente en causas distintas.
         desc_src = descripcion if descripcion else rol
-        desc_norm = (str(desc_src).strip()[:500] if desc_src else None)
+        desc_norm = _normalize_rol_text(str(desc_src)[:500]) if desc_src else None
         causa = _causa_key(desc_norm)
         # Dedupea si hay RUT O causa (ROL). Así protege también las hojas sin RUT
         # (rol_causa None) que traen el ROL en la descripción.
