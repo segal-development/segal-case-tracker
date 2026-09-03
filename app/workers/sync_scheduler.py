@@ -490,6 +490,17 @@ async def sync_all_lawyers():
         except Exception:
             logger.exception("Credential change scan failed (non-fatal)")
 
+        # Refresh the Sysgal coverage cache (demandado RUT → estado comercial)
+        # once per cycle so the "cobertura" tag on causas stays current.
+        # SAFE-FAIL: a Sysgal outage must never abort the sync run.
+        try:
+            from app.services.sysgal_sync import sync_sysgal_estados
+
+            sysgal_summary = sync_sysgal_estados(setup_db)
+            logger.info("Sysgal cobertura sync: %s", sysgal_summary)
+        except Exception:
+            logger.exception("Sysgal cobertura sync failed (non-fatal)")
+
         # Only lawyer IDs are needed downstream — sync_lawyer_cases re-resolves the
         # Lawyer row from whatever session it is handed.
         lawyers = setup_db.query(Lawyer).filter(Lawyer.is_active == True).all()
