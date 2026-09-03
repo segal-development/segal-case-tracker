@@ -699,6 +699,7 @@ _COL_KEYS = {
     "abogado": ["ABOGADO"], "fecha": ["FECHA"], "rut": ["RUT"], "rol": ["ROL"],
     "tipo": ["TIPO DE HITO", "TIPO"], "proc": ["PROCEDIMIENTO"], "desc": ["DESCRIPCION"],
     "etapa": ["ETAPA"], "tramite": ["TRAMITE"], "aprobado": ["APROBADO"], "valor": ["VALOR"],
+    "tribunal": ["TRIBUNAL"],
 }
 
 
@@ -944,25 +945,40 @@ async def importar_hitos(
     tipos = db.query(HitoTipo).all()
     junior_tipo = next((t for t in tipos if t.nivel == "junior"), None)
     pleno_tipos = [t for t in tipos if t.nivel == "pleno"]
-    # Dedup key: (abogado, RUT, causa). Mismo cliente (RUT) en causas DISTINTAS no es
-    # duplicado. Se dedupea si hay RUT O una causa (ROL en descripción) — así las
-    # hojas SIN columna RUT (solo ROL) también quedan protegidas contra recargas.
-    existing = {
-        (h.lawyer_id, h.rol_causa, _causa_key(h.descripcion))
-        for h in db.query(Hito.lawyer_id, Hito.rol_causa, Hito.descripcion)
+    # Dedup identity: (abogado, RUT, causa, tribunal) — the same ROL in a different
+    # tribunal is a different causa (see _tribunal_key), and the same client (RUT)
+    # on different causas is never a duplicate. Rows are deduped whenever they carry
+    # a RUT OR a causa (ROL in descripcion), so sheets without a RUT column are still
+    # protected against re-uploads.
+    #
+    # Two keyings are kept because legacy hitos (imported before the TRIBUNAL column
+    # existed) have tribunal=NULL, and bulk import is where a duplicate multiplies
+    # into real money. So the importer is deliberately MORE tolerant than the strict
+    # create/edit rule: a stored hito WITHOUT tribunal matches whatever tribunal the
+    # sheet brings, and a sheet row WITHOUT tribunal matches a stored hito that has one.
+    existing3: set = set()  # (lawyer_id, rut, causa)
+    existing4: set = set()  # (lawyer_id, rut, causa, tribunal_key)
+    for h in (
+        db.query(Hito.lawyer_id, Hito.rol_causa, Hito.descripcion, Hito.tribunal)
         .filter((Hito.rol_causa.isnot(None)) | (Hito.descripcion.isnot(None)))
         .all()
-        if h.rol_causa is not None or _causa_key(h.descripcion) is not None
-    }
+    ):
+        causa = _causa_key(h.descripcion)
+        if h.rol_causa is None and causa is None:
+            continue
+        existing3.add((h.lawyer_id, h.rol_causa, causa))
+        existing4.add((h.lawyer_id, h.rol_causa, causa, _tribunal_key(h.tribunal)))
 
     total = creadas = aprobados = pendientes = dup = err = 0
-    seen: set = set()
+    seen3: set = set()
+    seen4: set = set()
     nuevos: list[Hito] = []
 
     def _add(lawyer, tipo, fecha, *, rut, rol, procedimiento, descripcion,
-             etapa, tramite, aprobado, valor_cell=None) -> str:
+             etapa, tramite, aprobado, valor_cell=None, tribunal=None) -> str:
         """Dedup + build a Hito. Returns 'dup' | 'ok'. rol_causa = client RUT;
-        the causa (ROL) goes to descripcion (matches the create/edit/dedup rule)."""
+        the causa (ROL) goes to descripcion and the tribunal completes the identity
+        (matches the create/edit/dedup rule; see the tolerant NULL rule above)."""
         try:
             valor = int(valor_cell) if valor_cell else tipo.valor_bruto
         except (ValueError, TypeError):
@@ -975,19 +991,34 @@ async def importar_hitos(
         desc_src = descripcion if descripcion else rol
         desc_norm = _normalize_rol_text(str(desc_src)[:500]) if desc_src else None
         causa = _causa_key(desc_norm)
-        # Dedupea si hay RUT O causa (ROL). Así protege también las hojas sin RUT
-        # (rol_causa None) que traen el ROL en la descripción.
+        tribunal_norm = (str(tribunal).strip()[:255] or None) if tribunal else None
+        trib = _tribunal_key(tribunal_norm)
+        # Dedup whenever there is a RUT OR a causa (ROL) — sheets without a RUT
+        # column are still protected. Tribunal-aware with the tolerant NULL rule.
         if rol_causa is not None or causa is not None:
-            key = (lawyer.id, rol_causa, causa)
-            if key in existing or key in seen:
+            k3 = (lawyer.id, rol_causa, causa)
+            k4 = k3 + (trib,)
+            if trib is None:
+                # No tribunal on the row: any stored/seen hito on this causa is it.
+                is_dup = k3 in existing3 or k3 in seen3
+            else:
+                # Exact court match, or a hito stored/seen without a tribunal.
+                k4_none = k3 + (None,)
+                is_dup = (
+                    k4 in existing4 or k4 in seen4
+                    or k4_none in existing4 or k4_none in seen4
+                )
+            if is_dup:
                 return "dup"
-            seen.add(key)
+            seen3.add(k3)
+            seen4.add(k4)
         estado = HITO_APROBADO if aprobado else HITO_PENDIENTE
         nuevos.append(Hito(
             lawyer_id=lawyer.id, hito_tipo_id=tipo.id, valor_bruto=valor,
             fecha_hito=fecha, rol_causa=rol_causa,
             procedimiento=(str(procedimiento).strip()[:100] if procedimiento else None),
             descripcion=desc_norm,
+            tribunal=tribunal_norm,
             etapa_sysgal=(str(etapa).strip()[:100] if etapa else None),
             tramite_sysgal=(str(tramite).strip()[:255] if tramite else None),
             estado=estado, created_by_rut=admin_rut,
@@ -1026,6 +1057,7 @@ async def importar_hitos(
                 res = _add(
                     lawyer, tipo, fecha, rut=g(row, "rut"), rol=g(row, "rol"),
                     procedimiento=g(row, "proc"), descripcion=g(row, "desc"),
+                    tribunal=g(row, "tribunal"),
                     etapa=g(row, "etapa"), tramite=g(row, "tramite"),
                     aprobado=_norm(g(row, "aprobado")) in ("SI", "SÍ", "S"),
                     valor_cell=g(row, "valor"),
