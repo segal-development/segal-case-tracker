@@ -85,6 +85,21 @@ def _tribunal_key(tribunal: Optional[str]) -> Optional[str]:
         return None
     return tribunal.strip().upper()[:255] or None
 
+
+def _tribunal_collides(a: Optional[str], b: Optional[str]) -> bool:
+    """Tolerant tribunal match for dedup (a, b are already ``_tribunal_key`` tokens).
+
+    Two hitos on the same (abogado, RUT, causa) are the SAME causa when their
+    tribunales are equal OR either one is blank. A legacy hito stored without a
+    tribunal (created before migration 048) must still block a re-entry that now
+    carries one, and vice versa — otherwise the same causa is paid twice. This is
+    exactly how Silvia's August 2026 duplicates slipped in: old hitos had no
+    tribunal, so re-adding them WITH a tribunal did not collide under a strict
+    equality check. The bulk importer already uses this rule; create/edit now match.
+    """
+    return a == b or a is None or b is None
+
+
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
@@ -263,7 +278,8 @@ async def create_hito(
     # (rol_causa = RUT) across DIFFERENT causas, so the block is keyed on
     # (abogado, RUT, ROL, tribunal) — the ROL is derived from descripcion (see
     # _causa_key) and the tribunal disambiguates same-ROL causas in different
-    # courts (see _tribunal_key). Only enforced when a rol_causa is given.
+    # courts, tolerating a blank tribunal on either side (see _tribunal_collides).
+    # Only enforced when a rol_causa is given.
     # Checked before storing evidence so a rejected duplicate never uploads a file.
     rol_norm = (rol_causa or "").strip() or None
     tribunal_norm = (tribunal or "").strip() or None
@@ -275,7 +291,7 @@ async def create_hito(
             .filter(Hito.lawyer_id == target_lawyer_id, Hito.rol_causa == rol_norm)
             .all()
         )
-        if any(_causa_key(d) == causa and _tribunal_key(t) == trib for (d, t) in prior):
+        if any(_causa_key(d) == causa and _tribunal_collides(_tribunal_key(t), trib) for (d, t) in prior):
             raise HTTPException(
                 status_code=409,
                 detail="Ya existe un hito de este abogado para esa causa",
@@ -879,7 +895,8 @@ async def update_hito(
 
     # No duplicate: the resulting (abogado, RUT, ROL, tribunal) must not collide
     # with ANOTHER hito. Same client on a DIFFERENT causa — different ROL, or same
-    # ROL in a different tribunal — is allowed (see _causa_key / _tribunal_key).
+    # ROL in a different (non-blank) tribunal — is allowed; a blank tribunal on
+    # either side still collides (see _causa_key / _tribunal_collides).
     rol_norm = (body.rol_causa or "").strip() or None
     tribunal_norm = (body.tribunal or "").strip() or None
     if rol_norm is not None:
@@ -894,7 +911,7 @@ async def update_hito(
             )
             .all()
         )
-        if any(_causa_key(d) == causa and _tribunal_key(t) == trib for (d, t) in prior):
+        if any(_causa_key(d) == causa and _tribunal_collides(_tribunal_key(t), trib) for (d, t) in prior):
             raise HTTPException(
                 status_code=409,
                 detail="Ya existe un hito de este abogado para esa causa",
