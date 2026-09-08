@@ -31,6 +31,20 @@ class InvalidCredentialsError(LoginError):
     pass
 
 
+class CredentialExpiredError(InvalidCredentialsError):
+    """Raised when PJUD requires the lawyer to renew their clave.
+
+    PJUD answers the login POST with a redirect to
+    ``home/includes/expiraPass.php`` (password-expiry page) instead of the
+    authenticated ``indexN.php``. The credential is not *wrong* but it is
+    unusable until the lawyer renews it, so — like ``InvalidCredentialsError`` —
+    retrying is pointless and the supervisor must be told. Subclassing keeps
+    the existing re-auth handling (credential vault ``validation_failed`` +
+    one supervisor alert) without extra wiring.
+    """
+    pass
+
+
 class SessionExpiredError(PJUDError):
     """Raised when PJUD session has expired."""
     pass
@@ -150,3 +164,22 @@ class ShapeChallengeError(SessionNotAuthenticatedError):
             f"looks_like_login={looks_like_login}. Treat as a PJUD block, not a retryable session error."
         )
         self.args = (self.message,)
+
+
+class TransientNavigationError(PJUDError):
+    """Raised when a PJUD page did not load (DNS, connection, timeout, empty body).
+
+    Deliberately NOT a ``SessionNotAuthenticatedError``/``SessionExpiredError``:
+    the credential and session are fine, the network or PJUD simply did not
+    answer. Callers should retry with backoff and never re-authenticate on it.
+    """
+
+    def __init__(self, url: str, reason: str):
+        # This text reaches sync_history.error_message — neutral Spanish, and
+        # it must name the real cause (network/PJUD), never authentication.
+        message = (
+            f"Red o PJUD no disponible: la página no cargó ({reason}). url={url}"
+        )
+        super().__init__(message)
+        self.url = url
+        self.reason = reason

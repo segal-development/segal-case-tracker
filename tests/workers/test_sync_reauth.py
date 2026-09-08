@@ -601,3 +601,130 @@ class TestReauthCredentialAlert:
         assert reason is None
         mock_alert.assert_not_awaited()
         assert lawyer.credential_alert_sent_at is None
+
+
+# ---------------------------------------------------------------------------
+# Expired clave (PJUD redirected the login to expiraPass.php)
+# ---------------------------------------------------------------------------
+
+class TestReauthCredentialExpired:
+    """``CredentialExpiredError`` (PJUD demands a clave renewal) is a definitive
+    credential outcome: it must record ``validation_failed`` in the credential
+    vault and alert the supervisor exactly once, on BOTH auth methods. The
+    initial-login path in ``sync_lawyer_cases`` (no session in Redis) goes
+    through this same ``_reauth`` function, so it is covered too."""
+
+    @pytest.mark.asyncio
+    async def test_captcha_expired_clave_records_vault_failure_and_alerts_once(self, fake_redis):
+        from app.workers.sync_scheduler import _reauth
+        from app.services.session_store import SessionStore
+        from app.scrapper.pjud.exceptions import CredentialExpiredError
+
+        enc_pass = encrypt_pjud_password("pjudpass")
+        lawyer = _make_lawyer(
+            preferred_auth_method="captcha",
+            encrypted_pjud_password=enc_pass,
+            credential_alert_sent_at=None,
+        )
+        store = SessionStore(redis_client=fake_redis)
+
+        mock_scraper_class, mock_scraper = _mock_civil_scraper(
+            login_side_effect=CredentialExpiredError(
+                "PJUD exige renovar la clave del RUT 19586894 (redirigido a la página de clave expirada)"
+            )
+        )
+
+        with (
+            patch("app.scrapper.pjud.civil.CivilScraper", mock_scraper_class),
+            patch(
+                "app.workers.sync_scheduler.send_supervisor_credential_alert",
+                new_callable=AsyncMock,
+            ) as mock_alert,
+            patch("app.workers.sync_scheduler._audit_validation") as mock_audit,
+        ):
+            mock_alert.return_value = True
+            session, reason = await _reauth(lawyer, store)
+
+        assert session is None
+        assert reason == "invalid_credentials"
+        mock_alert.assert_awaited_once()
+        assert "renovar la clave" in mock_alert.await_args.args[1]
+        assert lawyer.credential_alert_sent_at is not None
+        mock_audit.assert_called_once()
+        audit_args, audit_kwargs = mock_audit.call_args
+        assert audit_args[0] is lawyer
+        assert audit_args[1] == "pjud"
+        assert audit_kwargs["ok"] is False
+        assert audit_kwargs["detail"] == "credential_expired"
+        mock_scraper.stop.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_captcha_expired_clave_second_episode_does_not_resend_alert(self, fake_redis):
+        from app.workers.sync_scheduler import _reauth
+        from app.services.session_store import SessionStore
+        from app.scrapper.pjud.exceptions import CredentialExpiredError
+
+        enc_pass = encrypt_pjud_password("pjudpass")
+        lawyer = _make_lawyer(
+            preferred_auth_method="captcha",
+            encrypted_pjud_password=enc_pass,
+            credential_alert_sent_at=datetime(2026, 9, 1, 12, 0, 0),
+        )
+        store = SessionStore(redis_client=fake_redis)
+
+        mock_scraper_class, _ = _mock_civil_scraper(
+            login_side_effect=CredentialExpiredError("clave expirada")
+        )
+
+        with (
+            patch("app.scrapper.pjud.civil.CivilScraper", mock_scraper_class),
+            patch(
+                "app.workers.sync_scheduler.send_supervisor_credential_alert",
+                new_callable=AsyncMock,
+            ) as mock_alert,
+        ):
+            session, reason = await _reauth(lawyer, store)
+
+        assert session is None
+        assert reason == "invalid_credentials"
+        mock_alert.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_clave_unica_expired_clave_records_vault_failure_and_alerts_once(self, fake_redis):
+        from app.workers.sync_scheduler import _reauth
+        from app.services.session_store import SessionStore
+        from app.scrapper.pjud.exceptions import CredentialExpiredError
+
+        enc_pass = encrypt_pjud_password("mypassword")
+        lawyer = _make_lawyer(
+            preferred_auth_method="clave_unica",
+            encrypted_clave_unica_password=enc_pass,
+            credential_alert_sent_at=None,
+        )
+        store = SessionStore(redis_client=fake_redis)
+
+        mock_browser_class, mock_auth_class = _mock_browser_and_auth(
+            login_side_effect=CredentialExpiredError("clave expirada")
+        )
+
+        with (
+            patch("app.scrapper.pjud.browser.BrowserFactory", mock_browser_class),
+            patch("app.scrapper.pjud.clave_unica.ClaveUnicaAuth", mock_auth_class),
+            patch(
+                "app.workers.sync_scheduler.send_supervisor_credential_alert",
+                new_callable=AsyncMock,
+            ) as mock_alert,
+            patch("app.workers.sync_scheduler._audit_validation") as mock_audit,
+        ):
+            mock_alert.return_value = True
+            session, reason = await _reauth(lawyer, store)
+
+        assert session is None
+        assert reason == "invalid_credentials"
+        mock_alert.assert_awaited_once()
+        assert lawyer.credential_alert_sent_at is not None
+        mock_audit.assert_called_once()
+        audit_args, audit_kwargs = mock_audit.call_args
+        assert audit_args[1] == "clave_unica"
+        assert audit_kwargs["ok"] is False
+        assert audit_kwargs["detail"] == "credential_expired"

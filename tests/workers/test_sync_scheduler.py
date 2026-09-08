@@ -245,3 +245,96 @@ class TestWorkerDbResilience:
         assert kwargs["max_instances"] == 1
         assert kwargs["coalesce"] is True
         mock_scheduler.start.assert_called_once()
+
+
+class TestSyncLawyerCasesRecordsBatchStopReason:
+    """When detect_and_sync_movements stops the batch (network/PJUD unavailable),
+    the reason must land in sync_history.error_message (status partial) instead
+    of being logged and lost — operators read that column, not the worker log."""
+
+    @pytest.mark.asyncio
+    async def test_batch_stop_reason_recorded_in_sync_history(self):
+        from app.workers.sync_scheduler import sync_lawyer_cases
+
+        mock_db = MagicMock()
+        last_history = MagicMock()
+        last_history.status = "completed"
+        last_history.error_message = None
+        mock_db.query.return_value.filter.return_value.order_by.return_value.first.return_value = (
+            last_history
+        )
+
+        stop_reason = (
+            "Red o PJUD no disponible: 5 fallos de navegación consecutivos; lote detenido"
+        )
+        mock_result = MagicMock(cases_total=0, cases_new=0)
+
+        with patch("app.workers.sync_scheduler.get_session_store") as mock_store_fn, \
+             patch("app.api.v1.pjud.get_scraper") as mock_get_scraper, \
+             patch("app.workers.sync_scheduler.SyncService") as mock_sync_service_cls, \
+             patch(
+                 "app.workers.sync_scheduler._select_cases_for_detail_rotation",
+                 return_value=[],
+             ), \
+             patch(
+                 "app.workers.sync_scheduler.detect_and_sync_movements",
+                 new_callable=AsyncMock,
+             ) as mock_detect:
+            mock_store = MagicMock()
+            mock_store.get_session_by_lawyer = AsyncMock(return_value=MagicMock())
+            mock_store_fn.return_value = mock_store
+
+            mock_scraper = MagicMock()
+            mock_scraper.get_my_cases = AsyncMock(return_value=[])
+            mock_scraper.close = AsyncMock()
+            mock_get_scraper.return_value = mock_scraper
+
+            mock_sync_service_cls.return_value.sync_cases.return_value = mock_result
+            mock_detect.return_value = (0, 0, ["Fallo de navegación procesando C-1", stop_reason])
+
+            result = await sync_lawyer_cases(lawyer_id=1, competencia="civil", db=mock_db)
+
+        assert result.get("success") is True
+        assert last_history.error_message == stop_reason
+        assert last_history.status == "partial"
+
+    @pytest.mark.asyncio
+    async def test_per_case_errors_without_stop_do_not_touch_sync_history(self):
+        from app.workers.sync_scheduler import sync_lawyer_cases
+
+        mock_db = MagicMock()
+        last_history = MagicMock()
+        last_history.status = "completed"
+        last_history.error_message = None
+        mock_db.query.return_value.filter.return_value.order_by.return_value.first.return_value = (
+            last_history
+        )
+        mock_result = MagicMock(cases_total=0, cases_new=0)
+
+        with patch("app.workers.sync_scheduler.get_session_store") as mock_store_fn, \
+             patch("app.api.v1.pjud.get_scraper") as mock_get_scraper, \
+             patch("app.workers.sync_scheduler.SyncService") as mock_sync_service_cls, \
+             patch(
+                 "app.workers.sync_scheduler._select_cases_for_detail_rotation",
+                 return_value=[],
+             ), \
+             patch(
+                 "app.workers.sync_scheduler.detect_and_sync_movements",
+                 new_callable=AsyncMock,
+             ) as mock_detect:
+            mock_store = MagicMock()
+            mock_store.get_session_by_lawyer = AsyncMock(return_value=MagicMock())
+            mock_store_fn.return_value = mock_store
+
+            mock_scraper = MagicMock()
+            mock_scraper.get_my_cases = AsyncMock(return_value=[])
+            mock_scraper.close = AsyncMock()
+            mock_get_scraper.return_value = mock_scraper
+
+            mock_sync_service_cls.return_value.sync_cases.return_value = mock_result
+            mock_detect.return_value = (0, 0, ["Movement fetch failed for C-1: parse error"])
+
+            await sync_lawyer_cases(lawyer_id=1, competencia="civil", db=mock_db)
+
+        assert last_history.error_message is None
+        assert last_history.status == "completed"
