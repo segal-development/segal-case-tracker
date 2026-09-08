@@ -44,6 +44,22 @@ PER_CASE_DETAIL_TIMEOUT_SECONDS = 60.0
 # abort the batch like the Shape path does and let the next run start fresh.
 MAX_CONSECUTIVE_TIMEOUTS = 3
 
+# Transient navigation failures (the page did not load: DNS, connection reset,
+# Playwright goto timeout, empty body). The credential is fine, so these are
+# retried on the SAME case with backoff and WITHOUT re-authenticating.
+# Attempts per case = 1 initial + len(backoffs) retries.
+TRANSIENT_NAV_BACKOFF_SECONDS: tuple[float, ...] = (10.0, 20.0, 40.0)
+TRANSIENT_NAV_MAX_ATTEMPTS = 1 + len(TRANSIENT_NAV_BACKOFF_SECONDS)
+# Consecutive CASES that exhausted their transient retries → the network or
+# PJUD is down for everyone; stop the batch instead of burning the cycle.
+MAX_CONSECUTIVE_TRANSIENT_FAILURES = 5
+
+# Raw Playwright navigation errors that mean "the page did not load".
+_TRANSIENT_NAV_ERROR_RE = re.compile(
+    r"net::ERR_|Timeout .*exceeded|Target (?:page, context or browser has been )?closed",
+    re.IGNORECASE,
+)
+
 T = TypeVar("T")
 
 from app.config import settings
@@ -62,10 +78,12 @@ from app.models.document import Document
 from app.services.notification_service import NotificationService
 from app.services.document_persistence import DocumentPersistenceService
 from app.scrapper.pjud.exceptions import (
+    CircuitOpenError,
     ConsultaSessionExpired,
     SessionExpiredError,
     SessionNotAuthenticatedError,
     ShapeChallengeError,
+    TransientNavigationError,
 )
 from app.services.shape_cooldown import get_shape_cooldown
 from app.services.deadline_engine import DeadlineEngine, SemaforoTransition, _today_chile
@@ -1677,6 +1695,27 @@ def _maybe_recompute_deadlines(
         )
 
 
+def _is_transient_navigation_error(exc: BaseException) -> bool:
+    """True when *exc* means the page did not load (retry, never re-auth).
+
+    ``TransientNavigationError`` is the scraper's explicit verdict. An open
+    ``pjud-detail`` circuit (``CircuitOpenError``) means PJUD is failing for
+    everyone right now — same class of problem, and the backoff here
+    (10+20+40s) outlasts the breaker's recovery window so the last retry probes
+    the half-open circuit. Raw Playwright errors are matched on text
+    (``net::ERR_*``, goto timeouts, closed target). Session/Shape errors and the
+    per-case ``asyncio.TimeoutError`` are never transient here — they have their
+    own handlers.
+    """
+    if isinstance(exc, (TransientNavigationError, CircuitOpenError)):
+        return True
+    if isinstance(
+        exc, (SessionExpiredError, SessionNotAuthenticatedError, asyncio.TimeoutError)
+    ):
+        return False
+    return bool(_TRANSIENT_NAV_ERROR_RE.search(str(exc)))
+
+
 async def detect_and_sync_movements(
     db: Session,
     scraper,
@@ -1813,6 +1852,9 @@ async def detect_and_sync_movements(
 
     # Consecutive per-case timeouts; reset on any success (see MAX_CONSECUTIVE_TIMEOUTS).
     consecutive_timeouts = 0
+    # Consecutive cases that exhausted their transient-navigation retries; reset
+    # on any success (see MAX_CONSECUTIVE_TRANSIENT_FAILURES).
+    consecutive_transient = 0
 
     for api_case in cases_for_check:
         if not api_case.case_token:
@@ -1982,12 +2024,57 @@ async def detect_and_sync_movements(
 
             return new_count, alert_count
 
+        async def _fetch_with_transient_retry() -> Tuple[int, int]:
+            """Run ``_do_fetch``, retrying transient navigation failures in place.
+
+            Backoff follows ``TRANSIENT_NAV_BACKOFF_SECONDS``; no re-auth is
+            involved because the session is not the problem. When the retries
+            are exhausted the failure surfaces as ``TransientNavigationError``
+            (raw Playwright errors are wrapped) so the caller has ONE branch.
+            Any other exception propagates untouched on the first occurrence.
+            """
+            for attempt, delay in enumerate(TRANSIENT_NAV_BACKOFF_SECONDS, start=1):
+                try:
+                    return await _do_fetch()
+                except Exception as exc:
+                    if not _is_transient_navigation_error(exc):
+                        raise
+                    # Partial rows from the aborted attempt must not leak into
+                    # the retry's commit; the live page may also be poisoned.
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+                    scraper._panel_loaded = False
+                    logger.warning(
+                        "detect_and_sync_movements: transient navigation failure for "
+                        "lawyer_id=%s rol=%s (attempt %d/%d), retrying in %.0fs: %s",
+                        lawyer_id,
+                        api_case.rol,
+                        attempt,
+                        TRANSIENT_NAV_MAX_ATTEMPTS,
+                        delay,
+                        exc,
+                    )
+                    await asyncio.sleep(delay)
+            try:
+                return await _do_fetch()
+            except TransientNavigationError:
+                raise
+            except Exception as exc:
+                if not _is_transient_navigation_error(exc):
+                    raise
+                raise TransientNavigationError(
+                    url=getattr(exc, "url", "") or "?", reason=str(exc)
+                ) from exc
+
         try:
-            delta_m, delta_a = await _do_fetch()
+            delta_m, delta_a = await _fetch_with_transient_retry()
             movements_new += delta_m
             alerts_created += delta_a
             shape_cooldown.clear()
             consecutive_timeouts = 0
+            consecutive_transient = 0
 
         except ShapeChallengeError as shape_exc:
             # Shape/TSPD flags the egress IP's behavioral reputation — it is a
@@ -2014,6 +2101,42 @@ async def detect_and_sync_movements(
                 "batch stopped"
             )
             break
+
+        except TransientNavigationError as nav_exc:
+            # The page did not load even after TRANSIENT_NAV_MAX_ATTEMPTS tries.
+            # Not an auth problem (no re-auth) and not the case's fault (keep its
+            # rotation position): count ONE error and move on to the next case.
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            scraper._panel_loaded = False
+            consecutive_transient += 1
+            logger.error(
+                "detect_and_sync_movements: navigation failed for lawyer_id=%s rol=%s "
+                "after %d attempts (%d consecutive cases): %s",
+                lawyer_id,
+                api_case.rol,
+                TRANSIENT_NAV_MAX_ATTEMPTS,
+                consecutive_transient,
+                nav_exc.reason,
+            )
+            errors.append(
+                f"Fallo de navegación (red/PJUD) procesando {api_case.rol} tras "
+                f"{TRANSIENT_NAV_MAX_ATTEMPTS} intentos: {nav_exc.reason}"
+            )
+            if consecutive_transient >= MAX_CONSECUTIVE_TRANSIENT_FAILURES:
+                logger.error(
+                    "detect_and_sync_movements: %d consecutive transient navigation "
+                    "failures (lawyer_id=%s) — network/PJUD unavailable, stopping batch",
+                    consecutive_transient,
+                    lawyer_id,
+                )
+                errors.append(
+                    f"Red o PJUD no disponible: {consecutive_transient} fallos de "
+                    "navegación consecutivos; lote detenido"
+                )
+                break
 
         except (SessionExpiredError, SessionNotAuthenticatedError) as session_exc:
             logger.warning(
@@ -2049,10 +2172,11 @@ async def detect_and_sync_movements(
             # Reauth succeeded — update the local session reference and retry once.
             pjud_session = new_session
             try:
-                delta_m, delta_a = await _do_fetch()
+                delta_m, delta_a = await _fetch_with_transient_retry()
                 movements_new += delta_m
                 alerts_created += delta_a
                 shape_cooldown.clear()
+                consecutive_transient = 0
             except ShapeChallengeError as shape_retry_exc:
                 # The retry (after a successful reauth) itself hit a Shape
                 # challenge — same treatment as the first-attempt case: no

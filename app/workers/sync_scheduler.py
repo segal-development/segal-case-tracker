@@ -26,7 +26,7 @@ from app.core.database import SessionLocal
 from app.core.security import decrypt_pjud_password
 from app.models.lawyer import Lawyer
 from app.models.sync_history import SyncHistory
-from app.scrapper.pjud.exceptions import InvalidCredentialsError
+from app.scrapper.pjud.exceptions import CredentialExpiredError, InvalidCredentialsError
 from app.services.sync_service import (
     SyncService,
     convert_api_cases_to_scraped,
@@ -105,6 +105,28 @@ def _audit_validation(
             credential_type,
             exc,
         )
+
+
+def _credential_failure_detail(exc: InvalidCredentialsError) -> str:
+    """Vault detail for a definitive credential failure.
+
+    ``CredentialExpiredError`` (PJUD demands a clave renewal) is recorded apart
+    from a plainly rejected clave so the monitoring module can tell "renew"
+    from "wrong".
+    """
+    return "credential_expired" if isinstance(exc, CredentialExpiredError) else "invalid_credentials"
+
+
+# detect_and_sync_movements appends one of these when it stops the batch early.
+_BATCH_STOP_MARKERS = ("lote detenido", "batch stopped")
+
+
+def _batch_stop_reason(mov_errors: list[str]) -> Optional[str]:
+    """Return the batch-stop entry from *mov_errors*, if the batch was aborted."""
+    for err in reversed(mov_errors):
+        if any(marker in err for marker in _BATCH_STOP_MARKERS):
+            return err
+    return None
 
 
 async def _reauth(
@@ -216,7 +238,7 @@ async def _reauth(
                 sent = await send_supervisor_credential_alert(lawyer, str(exc))
                 if sent:
                     lawyer.credential_alert_sent_at = datetime.utcnow()
-            _audit_validation(lawyer, "clave_unica", ok=False, detail="invalid_credentials")
+            _audit_validation(lawyer, "clave_unica", ok=False, detail=_credential_failure_detail(exc))
             return None, "invalid_credentials"
         except Exception as exc:
             logger.error("Re-auth (clave_unica) failed for lawyer %d: %s", lawyer.id, exc)
@@ -268,7 +290,7 @@ async def _reauth(
                 sent = await send_supervisor_credential_alert(lawyer, str(exc))
                 if sent:
                     lawyer.credential_alert_sent_at = datetime.utcnow()
-            _audit_validation(lawyer, "pjud", ok=False, detail="invalid_credentials")
+            _audit_validation(lawyer, "pjud", ok=False, detail=_credential_failure_detail(exc))
             return None, "invalid_credentials"
         except Exception as exc:
             logger.error("Re-auth (captcha) failed for lawyer %d: %s", lawyer.id, exc)
@@ -405,8 +427,12 @@ async def sync_lawyer_cases(
             for err in mov_errors:
                 logger.warning("sync_lawyer_cases movement error: %s", err)
 
-        # Update the SyncHistory record created by sync_cases with movements_new.
-        if movements_new > 0:
+        # Update the SyncHistory record created by sync_cases with movements_new
+        # and, when the movement batch was aborted early (network/PJUD down,
+        # Shape block, session), with the real stop reason — operators read
+        # sync_history.error_message, not the worker log.
+        stop_reason = _batch_stop_reason(mov_errors)
+        if movements_new > 0 or stop_reason:
             last_sync_history = (
                 db.query(SyncHistory)
                 .filter(
@@ -417,8 +443,12 @@ async def sync_lawyer_cases(
                 .first()
             )
             if last_sync_history:
-                last_sync_history.movements_new = movements_new  # type: ignore[assignment]
-                last_sync_history.alerts_created = alerts_created  # type: ignore[assignment]
+                if movements_new > 0:
+                    last_sync_history.movements_new = movements_new  # type: ignore[assignment]
+                    last_sync_history.alerts_created = alerts_created  # type: ignore[assignment]
+                if stop_reason:
+                    last_sync_history.status = "partial"  # type: ignore[assignment]
+                    last_sync_history.error_message = stop_reason[:1024]  # type: ignore[assignment]
                 db.commit()
 
         logger.info(

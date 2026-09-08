@@ -12,7 +12,7 @@ import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Literal, Optional, Any
 
 from playwright.async_api import (
     async_playwright,
@@ -33,12 +33,14 @@ _CHROME_UA = (
 from app.config import settings
 from app.services.pjud_session import PJUDSession
 from app.scrapper.pjud.exceptions import (
+    CredentialExpiredError,
     InvalidCredentialsError,
     LoginError,
     ScrapingError,
     SessionExpiredError,
     SessionNotAuthenticatedError,
     ShapeChallengeError,
+    TransientNavigationError,
 )
 
 
@@ -190,9 +192,108 @@ def detect_shape_challenge(page_content: str | None, url: str = "") -> tuple[boo
     return False, ""
 
 
+# Visible-text markers PJUD shows when the clave must be renewed. Matched on
+# accent-stripped lowercase text so "contraseña"/"contrasena" and any casing hit.
+# "expiraPass" itself is matched on the URL only: the login page may reference
+# that script in JS, and a token rejection must stay retry-able.
+_PASSWORD_EXPIRED_MARKERS = (
+    "clave ha expirado",
+    "contrasena ha expirado",
+    "debe cambiar su clave",
+)
+_SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b.*?</\1\s*>", re.IGNORECASE | re.DOTALL)
+
+_ACCENT_MAP = str.maketrans("áéíóúüñÁÉÍÓÚÜÑ", "aeiouunAEIOUUN")
+
+
+def _normalize_text(value: str) -> str:
+    """Lowercase + strip accents so marker matching is tolerant to encoding/case."""
+    return value.translate(_ACCENT_MAP).lower()
+
+
+def classify_post_login(
+    url: str, content: str | None
+) -> Literal["ok", "login_page", "expired"]:
+    """Classify where the login POST landed.
+
+    - ``"expired"``: PJUD redirected to its password-expiry page
+      (``expiraPass.php``) or the body shows a clave-expired message. The
+      clave must be renewed by the lawyer — retrying is pointless.
+    - ``"login_page"``: still on ``home/index.php`` (rejected credentials or
+      token — see ``classify_login_failure``).
+    - ``"ok"``: anything else (normally ``indexN.php``).
+
+    ``expired`` wins over ``login_page`` because the expiry page lives under
+    ``home/`` too and a stale login body may be mixed into the redirect chain.
+    """
+    url_norm = (url or "").lower()
+    if "expirapass" in url_norm:
+        return "expired"
+    if isinstance(content, str) and content:
+        visible = re.sub(r"<[^>]+>", " ", _SCRIPT_STYLE_RE.sub(" ", content))
+        text = re.sub(r"\s+", " ", _normalize_text(visible))
+        if any(marker in text for marker in _PASSWORD_EXPIRED_MARKERS):
+            return "expired"
+    if "home/index.php" in url_norm:
+        return "login_page"
+    return "ok"
+
+
+# --- misCausas-missing classification -------------------------------------
+# When the authenticated panel entry point (``misCausas()``) is absent we must
+# tell a genuine auth failure (login page) from a page that simply did not
+# load. Reload retries + this classifier keep network blips out of the
+# "not authenticated" bucket.
+MISCAUSAS_RELOAD_BACKOFF_SECONDS: tuple[float, ...] = (3.0, 8.0)
+MISCAUSAS_MIN_CONTENT_LEN = 2000
+
+_LOGIN_URL_MARKERS = ("home/index.php", "loginn.php")
+_NAV_ERROR_RE = re.compile(
+    r"net::ERR_|Timeout|Target (?:page, context or browser has been )?closed|"
+    r"Execution context was destroyed",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_login_url(url: str) -> bool:
+    url_norm = (url or "").lower()
+    return any(marker in url_norm for marker in _LOGIN_URL_MARKERS)
+
+
+def classify_missing_miscausas(
+    url: str, content_len: int, nav_error_text: str
+) -> Literal["auth", "transient"]:
+    """Decide why ``misCausas()`` is absent after the reload retries.
+
+    - login URL → ``"auth"`` (PJUD sent us to the login page: real auth failure).
+    - not login + last navigation raised a Playwright network/timeout error, or
+      the body is short (page never rendered) → ``"transient"``.
+    - not login + fully loaded body + no navigation error → ``"auth"``
+      (unknown state; keep today's diagnostics rather than guessing).
+    """
+    if _looks_like_login_url(url):
+        return "auth"
+    if nav_error_text and _NAV_ERROR_RE.search(nav_error_text):
+        return "transient"
+    if content_len < MISCAUSAS_MIN_CONTENT_LEN:
+        return "transient"
+    return "auth"
+
+
 # ============================================================================
 # DATA CLASSES
 # ============================================================================
+
+@dataclass
+class _MisCausasDiagnostics:
+    """Snapshot of the page state when ``misCausas()`` is absent."""
+    url: str
+    jquery_present: bool
+    looks_like_login: bool
+    content_len: int
+    is_shape_challenge: bool
+    shape_marker: str
+
 
 @dataclass
 class PJUDCase:
@@ -876,14 +977,32 @@ class PJUDBaseScraper(ABC):
             
             current_url = page.url
             logger.info(f"Post-login URL: {current_url}")
+
+            # Read the body once (retry-safe against mid-navigation reads) and
+            # classify the landing page BEFORE any success heuristic.
+            page_content = await self._safe_page_content(page)
+            landing = classify_post_login(current_url, page_content)
+            if landing == "expired":
+                # PJUD demands a clave renewal (redirect to expiraPass.php).
+                # The session it left behind is unusable — never save it or
+                # log success; surface a definitive credential outcome so the
+                # scheduler records it in the vault and alerts the supervisor.
+                logger.error(
+                    "Login for RUT %s landed on the password-expiry page (url=%s)",
+                    rut_clean,
+                    current_url,
+                )
+                raise CredentialExpiredError(
+                    f"PJUD exige renovar la clave del RUT {rut_clean} "
+                    "(redirigido a la página de clave expirada)"
+                )
             
             # 5. Check we're logged in (should be at indexN.php)
-            if "home/index.php" in current_url:
+            if landing == "login_page":
                 # Still on login → distinguish wrong credentials (the lawyer must
                 # update their clave — retry is pointless) from a rejected captcha
                 # token or a transient error (retry-able).
-                stuck_content = await self._safe_page_content(page)
-                invalid, snippet = classify_login_failure(stuck_content)
+                invalid, snippet = classify_login_failure(page_content)
                 if invalid:
                     raise InvalidCredentialsError(
                         f"PJUD rejected credentials for RUT {rut_clean}"
@@ -894,8 +1013,7 @@ class PJUDBaseScraper(ABC):
                     + (f" ({snippet})" if snippet else "")
                 )
             
-            # 6. Verify session by checking page content (retry-safe against mid-navigation reads)
-            page_content = await self._safe_page_content(page)
+            # 6. Verify session by checking page content
             has_user = (
                 rut_clean in page_content or 
                 'misCausas' in page_content.lower() or
@@ -960,36 +1078,46 @@ class PJUDBaseScraper(ABC):
                 return
             self._panel_loaded = False
 
-        # Check if we're on indexN.php
-        if 'indexN.php' not in page.url:
-            await page.goto(PJUD_INDEX_URL, wait_until="domcontentloaded")
-            await asyncio.sleep(2)
-        
-        # Let any client-side redirect after the initial load settle before we
-        # evaluate — PJUD can navigate post-domcontentloaded, which would destroy
-        # the execution context mid-evaluate.
-        try:
-            await page.wait_for_load_state("networkidle", timeout=10000)
-        except Exception:
-            pass
+        # Load the index (if needed) and probe for misCausas. When the probe
+        # fails on a page that is NOT the login page and NOT a Shape challenge,
+        # the page most likely did not load (DNS/connection/timeout — see the
+        # production evidence in TransientNavigationError): reload the index a
+        # bounded number of times before deciding it is an auth failure.
+        has_fn, nav_error_text = await self._load_index_and_probe_miscausas(
+            page, navigate="indexN.php" not in page.url
+        )
+        diag: Optional[_MisCausasDiagnostics] = None
+        if not has_fn:
+            diag = await self._miscausas_diagnostics(page)
+            if not diag.is_shape_challenge and not diag.looks_like_login:
+                total = len(MISCAUSAS_RELOAD_BACKOFF_SECONDS)
+                for attempt, delay in enumerate(MISCAUSAS_RELOAD_BACKOFF_SECONDS, start=1):
+                    logger.warning(
+                        "misCausas absent on a non-login page (url=%s, content_len=%d, "
+                        "nav_error=%r) — reloading index in %.0fs (attempt %d/%d)",
+                        diag.url,
+                        diag.content_len,
+                        nav_error_text[:120],
+                        delay,
+                        attempt,
+                        total,
+                    )
+                    await asyncio.sleep(delay)
+                    has_fn, nav_error_text = await self._load_index_and_probe_miscausas(
+                        page, navigate=True
+                    )
+                    if has_fn:
+                        logger.info(
+                            "misCausas recovered after a transient load failure "
+                            "(reload attempt %d/%d)",
+                            attempt,
+                            total,
+                        )
+                        break
+                    diag = await self._miscausas_diagnostics(page)
+                    if diag.is_shape_challenge or diag.looks_like_login:
+                        break
 
-        # Check if misCausas function exists. A late PJUD navigation can destroy
-        # the execution context mid-evaluate; retry (bounded) so a second navigation
-        # on the retry itself doesn't propagate out and abort the whole lawyer.
-        has_fn = False
-        for _attempt in range(3):
-            try:
-                has_fn = await page.evaluate("typeof misCausas === 'function'")
-                break
-            except Exception as e:
-                if "Execution context was destroyed" not in str(e):
-                    raise
-                try:
-                    await page.wait_for_load_state("domcontentloaded", timeout=10000)
-                except Exception:
-                    pass
-                await asyncio.sleep(1)
-        
         if has_fn:
             # Call misCausas() to load the panel. It can trigger a navigation
             # that destroys the JS execution context mid-call — that specific
@@ -1022,38 +1150,100 @@ class PJUDBaseScraper(ABC):
                     logger.warning("misCausas() called but content not loaded")
             except Exception as e:
                 logger.warning(f"Error waiting for panel: {e}")
-        else:
-            # Gather diagnostics before raising so callers can act on them.
-            current_url = page.url
-            try:
-                jquery_present: bool = await page.evaluate(
-                    "typeof window.jQuery !== 'undefined' || typeof window.$ !== 'undefined'"
-                )
-            except Exception:
-                jquery_present = False
-            looks_like_login = "home/index.php" in current_url
-            try:
-                page_content = await self._safe_page_content(page)
-            except Exception:
-                page_content = ""
-            is_shape_challenge, shape_marker = detect_shape_challenge(page_content, current_url)
+            return
 
-            logger.warning(
-                f"misCausas not found — session restore failed. "
-                f"url={current_url}, jquery={jquery_present}, login_page={looks_like_login}"
+        assert diag is not None  # set on every has_fn=False path above
+        logger.warning(
+            f"misCausas not found — session restore failed. "
+            f"url={diag.url}, jquery={diag.jquery_present}, login_page={diag.looks_like_login}, "
+            f"content_len={diag.content_len}, nav_error={nav_error_text[:120]!r}"
+        )
+        if diag.is_shape_challenge:
+            raise ShapeChallengeError(
+                url=diag.url,
+                jquery_present=diag.jquery_present,
+                looks_like_login=diag.looks_like_login,
+                marker=diag.shape_marker,
             )
-            if is_shape_challenge:
-                raise ShapeChallengeError(
-                    url=current_url,
-                    jquery_present=jquery_present,
-                    looks_like_login=looks_like_login,
-                    marker=shape_marker,
-                )
-            raise SessionNotAuthenticatedError(
-                url=current_url,
-                jquery_present=jquery_present,
-                looks_like_login=looks_like_login,
+        verdict = classify_missing_miscausas(diag.url, diag.content_len, nav_error_text)
+        if verdict == "transient":
+            reason = nav_error_text.strip() or (
+                f"página incompleta ({diag.content_len} caracteres) tras "
+                f"{len(MISCAUSAS_RELOAD_BACKOFF_SECONDS)} recargas"
             )
+            raise TransientNavigationError(url=diag.url, reason=reason)
+        raise SessionNotAuthenticatedError(
+            url=diag.url,
+            jquery_present=diag.jquery_present,
+            looks_like_login=diag.looks_like_login,
+        )
+
+    async def _load_index_and_probe_miscausas(
+        self, page: Page, navigate: bool
+    ) -> tuple[bool, str]:
+        """Optionally ``goto`` the PJUD index, then probe ``typeof misCausas``.
+
+        Returns ``(has_fn, nav_error_text)``. A navigation failure is captured
+        as text (never raised) so the caller can retry and, if it persists,
+        classify it as transient instead of "not authenticated".
+        """
+        if navigate:
+            try:
+                await page.goto(PJUD_INDEX_URL, wait_until="domcontentloaded")
+                await asyncio.sleep(2)
+            except Exception as nav_exc:
+                return False, str(nav_exc)
+
+        # Let any client-side redirect after the initial load settle before we
+        # evaluate — PJUD can navigate post-domcontentloaded, which would destroy
+        # the execution context mid-evaluate.
+        try:
+            await page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass
+
+        # Check if misCausas function exists. A late PJUD navigation can destroy
+        # the execution context mid-evaluate; retry (bounded) so a second navigation
+        # on the retry itself doesn't propagate out and abort the whole lawyer.
+        has_fn = False
+        for _attempt in range(3):
+            try:
+                has_fn = bool(await page.evaluate("typeof misCausas === 'function'"))
+                break
+            except Exception as e:
+                if "Execution context was destroyed" not in str(e):
+                    raise
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
+        return has_fn, ""
+
+    async def _miscausas_diagnostics(self, page: Page) -> "_MisCausasDiagnostics":
+        """Gather the page state used to classify a missing ``misCausas``."""
+        current_url = page.url
+        try:
+            jquery_present = bool(await page.evaluate(
+                "typeof window.jQuery !== 'undefined' || typeof window.$ !== 'undefined'"
+            ))
+        except Exception:
+            jquery_present = False
+        try:
+            page_content = await self._safe_page_content(page)
+        except Exception:
+            page_content = ""
+        if not isinstance(page_content, str):
+            page_content = ""
+        is_shape, shape_marker = detect_shape_challenge(page_content, current_url)
+        return _MisCausasDiagnostics(
+            url=current_url,
+            jquery_present=jquery_present,
+            looks_like_login=_looks_like_login_url(current_url),
+            content_len=len(page_content),
+            is_shape_challenge=is_shape,
+            shape_marker=shape_marker,
+        )
     
     # ========================================================================
     # PAGINATION HELPERS (Concrete)

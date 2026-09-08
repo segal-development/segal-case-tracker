@@ -125,14 +125,16 @@ class TestEnsurePanelLoaded:
 
     @pytest.mark.asyncio
     async def test_raises_session_not_authenticated_when_miscausas_absent(self):
-        """_ensure_panel_loaded raises SessionNotAuthenticatedError when misCausas is not a function."""
+        """_ensure_panel_loaded raises SessionNotAuthenticatedError when misCausas is
+        not a function on a FULLY LOADED non-login page (unknown state).
+
+        A short/empty body on a non-login page is now a transient load failure
+        (TransientNavigationError) — see test_expired_clave_and_transient_nav.py.
+        """
         from app.scrapper.pjud.civil import CivilScraper
         from app.scrapper.pjud.exceptions import SessionNotAuthenticatedError
 
         scraper = CivilScraper(headless=True)
-
-        # Simulate page already on indexN.php so we skip the goto
-        login_url = "https://oficinajudicialvirtual.pjud.cl/home/index.php"
 
         async def evaluate_sequence(expr, *args, **kwargs):
             # misCausas check → False (not a function)
@@ -143,13 +145,16 @@ class TestEnsurePanelLoaded:
                 return False
             return False
 
+        # Simulate page already on indexN.php so we skip the goto
         page = self._make_page(
             url="https://oficinajudicialvirtual.pjud.cl/indexN.php",
             evaluate_return=evaluate_sequence,
         )
+        page.content = AsyncMock(return_value="<html>" + "x" * 5000 + "</html>")
 
-        with pytest.raises(SessionNotAuthenticatedError) as exc_info:
-            await scraper._ensure_panel_loaded(page)
+        with patch("app.scrapper.pjud.base.asyncio.sleep", new_callable=AsyncMock):
+            with pytest.raises(SessionNotAuthenticatedError) as exc_info:
+                await scraper._ensure_panel_loaded(page)
 
         error_msg = str(exc_info.value)
         # Must contain the page URL
