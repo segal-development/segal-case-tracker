@@ -103,7 +103,9 @@ def scan_credential_changes(db: Session) -> int:
     the new fingerprint. Returns the number of events recorded. Commits.
     """
     recorded = 0
-    lawyers = db.query(Lawyer).all()
+    # Only current staff: a deactivated lawyer (left the firm) is out of the
+    # scraping rotation and must not generate change events or alerts.
+    lawyers = db.query(Lawyer).filter(Lawyer.is_active.is_(True)).all()
 
     for lawyer in lawyers:
         for credential_type in CREDENTIAL_TYPES:
@@ -142,9 +144,13 @@ def _sub_status(db: Session, lawyer: Lawyer, credential_type: str) -> dict:
     last_changed = _latest_event(db, int(lawyer.id), credential_type, ["value_changed"])
     latest_validation = _latest_event(db, int(lawyer.id), credential_type, _VALIDATION_EVENTS)
 
-    if latest_validation is not None:
+    if not present:
+        # No stored credential: nothing can be "valid" or "failing" right now.
+        # Shown as "No cargada"; the validation timestamps stay as history.
+        health = "never_validated"
+    elif latest_validation is not None:
         health = "valid" if latest_validation.event_type == "validation_ok" else "failing"
-    elif present and getattr(lawyer, "credential_alert_sent_at", None) is not None:
+    elif getattr(lawyer, "credential_alert_sent_at", None) is not None:
         # No recorded validation yet, but a failure-episode alert is active.
         health = "failing"
     else:
@@ -167,7 +173,10 @@ def credential_status(db: Session) -> list[dict]:
     internal ciphertext fingerprint is deliberately NOT surfaced.
     """
     result: list[dict] = []
-    for lawyer in db.query(Lawyer).order_by(Lawyer.id.asc()).all():
+    # Current staff only — a lawyer who left the firm is deactivated and must
+    # not appear in the vault nor count towards the "credentials failing" alert.
+    lawyers = db.query(Lawyer).filter(Lawyer.is_active.is_(True)).order_by(Lawyer.id.asc()).all()
+    for lawyer in lawyers:
         result.append(
             {
                 "lawyer_id": int(lawyer.id),
