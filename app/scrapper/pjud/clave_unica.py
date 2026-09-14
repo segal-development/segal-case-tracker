@@ -19,8 +19,17 @@ from typing import Optional, List, Dict, Any
 
 from playwright.async_api import Page, TimeoutError as PlaywrightTimeout
 
-from app.scrapper.pjud.base import classify_login_failure, detect_shape_challenge
-from app.scrapper.pjud.exceptions import InvalidCredentialsError, ShapeChallengeError
+from app.scrapper.pjud.base import (
+    _looks_like_login_url,
+    classify_login_failure,
+    detect_shape_challenge,
+    visible_text,
+)
+from app.scrapper.pjud.exceptions import (
+    InvalidCredentialsError,
+    LoginPageError,
+    ShapeChallengeError,
+)
 from app.scrapper.pjud.selectors.registry import SelectorRegistry
 from app.services.pjud_session import PJUDSession
 
@@ -55,6 +64,15 @@ class ClaveUnicaCredentials:
 
 class ClaveUnicaAuthError(Exception):
     """Raised when Clave Unica authentication fails."""
+    pass
+
+
+class ClaveUnicaLoginPageError(ClaveUnicaAuthError, LoginPageError):
+    """Clave Única login bounced back to PJUD's login page, no credential message.
+
+    Both a ``ClaveUnicaAuthError`` (existing callers keep working) and a
+    ``LoginPageError`` so ``_reauth`` records the rejected login in the vault.
+    """
     pass
 
 
@@ -136,10 +154,10 @@ class ClaveUnicaAuth:
         except PlaywrightTimeout as e:
             logger.error(f"Timeout during Clave Unica login: {e}")
             raise ClaveUnicaAuthError(f"Login timeout: {e}") from e
-        except (InvalidCredentialsError, ShapeChallengeError):
+        except (InvalidCredentialsError, ShapeChallengeError, LoginPageError):
             # Already classified — never re-wrap into the generic error, the
             # caller (_reauth) needs the specific exception type to decide
-            # whether to alert the supervisor.
+            # whether to alert the supervisor / record the vault outcome.
             raise
         except Exception as e:
             logger.error(f"Clave Unica login failed: {e}")
@@ -179,6 +197,22 @@ class ClaveUnicaAuth:
                 + (f": {snippet}" if snippet else "")
             )
 
+        # Unclassified: log what the page actually shows (visible text only —
+        # never the password) so a login that bounces every cycle is
+        # diagnosable. Back on PJUD's login page = a rejected login the vault
+        # must learn about (LoginPageError); anywhere else stays generic.
+        visible = visible_text(content, 300)
+        logger.warning(
+            "Clave Única login for RUT %s could not be verified (url=%s); visible text: %r",
+            credentials.rut,
+            url,
+            visible,
+        )
+        if _looks_like_login_url(url):
+            return ClaveUnicaLoginPageError(
+                "Login failed: PJUD sigue en la página de login"
+                + (f": {visible[:200]}" if visible else "")
+            )
         return ClaveUnicaAuthError("Login failed: Could not verify logged in state")
 
     async def _safe_page_content(self, page: Page) -> str:

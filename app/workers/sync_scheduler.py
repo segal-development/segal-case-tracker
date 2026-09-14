@@ -26,7 +26,11 @@ from app.core.database import SessionLocal
 from app.core.security import decrypt_pjud_password
 from app.models.lawyer import Lawyer
 from app.models.sync_history import SyncHistory
-from app.scrapper.pjud.exceptions import CredentialExpiredError, InvalidCredentialsError
+from app.scrapper.pjud.exceptions import (
+    CredentialExpiredError,
+    InvalidCredentialsError,
+    LoginPageError,
+)
 from app.services.sync_service import (
     SyncService,
     convert_api_cases_to_scraped,
@@ -273,6 +277,18 @@ async def _reauth(
                     lawyer.credential_alert_sent_at = datetime.utcnow()
             _audit_validation(lawyer, "clave_unica", ok=False, detail=_credential_failure_detail(exc))
             return None, "invalid_credentials"
+        except LoginPageError as exc:
+            # PJUD bounced the login back to its login page with no recognised
+            # credential message. Retry-able (no supervisor email, alert marker
+            # untouched) but it IS a rejected login: record it so the vault
+            # stops showing "Válida" for a lawyer who cannot log in.
+            logger.error(
+                "Re-auth (clave_unica) failed for lawyer %d: stuck on login page (%s)",
+                lawyer.id,
+                exc,
+            )
+            _audit_validation(lawyer, "clave_unica", ok=False, detail="login_page")
+            return None, f"reauth_failed: {exc}"
         except Exception as exc:
             logger.error("Re-auth (clave_unica) failed for lawyer %d: %s", lawyer.id, exc)
             return None, f"reauth_failed: {exc}"
@@ -325,6 +341,17 @@ async def _reauth(
                     lawyer.credential_alert_sent_at = datetime.utcnow()
             _audit_validation(lawyer, "pjud", ok=False, detail=_credential_failure_detail(exc))
             return None, "invalid_credentials"
+        except LoginPageError as exc:
+            # Same as the clave_unica branch: a rejected login with no
+            # recognised credential message — vault "failing", no email,
+            # credential_alert_sent_at untouched.
+            logger.error(
+                "Re-auth (captcha) failed for lawyer %d: stuck on login page (%s)",
+                lawyer.id,
+                exc,
+            )
+            _audit_validation(lawyer, "pjud", ok=False, detail="login_page")
+            return None, f"reauth_failed: {exc}"
         except Exception as exc:
             logger.error("Re-auth (captcha) failed for lawyer %d: %s", lawyer.id, exc)
             return None, f"reauth_failed: {exc}"

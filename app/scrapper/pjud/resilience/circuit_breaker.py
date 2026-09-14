@@ -40,11 +40,14 @@ class CircuitBreakerConfig:
         recovery_timeout: Seconds to wait before trying half-open
         half_open_max_calls: Max calls allowed in half-open state
         success_threshold: Successes needed in half-open to close
+        ignored_exceptions: Exception types that propagate WITHOUT counting
+            as a failure (e.g. an expired session is not a PJUD outage)
     """
     failure_threshold: int = 5
     recovery_timeout: int = 60
     half_open_max_calls: int = 3
     success_threshold: int = 2
+    ignored_exceptions: tuple[type[BaseException], ...] = ()
 
 
 @dataclass
@@ -155,8 +158,12 @@ class CircuitBreaker:
             
             await self.record_success()
             return result
-            
+
         except Exception as e:
+            if isinstance(e, self.config.ignored_exceptions):
+                # Not a health signal for the protected endpoint — propagate
+                # untouched, neither a failure nor a success.
+                raise
             await self.record_failure()
             raise
     

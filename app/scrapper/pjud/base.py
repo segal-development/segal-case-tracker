@@ -36,6 +36,7 @@ from app.scrapper.pjud.exceptions import (
     CredentialExpiredError,
     InvalidCredentialsError,
     LoginError,
+    LoginPageError,
     ScrapingError,
     SessionExpiredError,
     SessionNotAuthenticatedError,
@@ -141,11 +142,17 @@ _BUILD_LOGIN_POST_JS = r"""({ rut, clave, token, jwt }) => {
 # stuck-on-login can be classified as bad credentials (the lawyer must update
 # their clave) vs. a rejected captcha token or a transient error (retry-able).
 # Pattern is broad on purpose; the captured snippet lets us refine on real cases.
+#
+# Matched on VISIBLE text only (scripts/styles/tags stripped) after accent
+# stripping + lowercasing, so "contraseña"/"contrasena" and any casing hit.
+# Subject: clave / contrasena / usuario / credenciales / rut / datos / cuenta.
+# Verdict: incorrecta / erronea / invalida / no coincide / no valida / bloqueada /
+# no existe / no registrado.
 _LOGIN_CRED_ERROR_RE = re.compile(
-    r"(clave|contraseña|usuario|credencial(?:es)?|rut)"
+    r"(clave|contrasena|usuario|credencial(?:es)?|rut|datos|cuenta)"
     r"[^<>{}]{0,40}"
-    r"(incorrect\w*|erróne\w*|inválid\w*|no\s+coincide\w*|no\s+válid\w*|bloquead\w*)",
-    re.IGNORECASE,
+    r"(incorrect\w*|errone\w*|invalid\w*|no\s+coincide\w*|no\s+valid\w*|bloquead\w*"
+    r"|no\s+existe\w*|no\s+(?:se\s+encuentra\s+)?registrad\w*)",
 )
 
 
@@ -154,16 +161,22 @@ def classify_login_failure(page_content: str) -> tuple:
 
     ``is_invalid_credentials`` is True when the page shows a wrong-password /
     wrong-user style message — meaning a retry is pointless and the lawyer must
-    update their clave. ``short_msg`` is a cleaned snippet for logging/reporting.
+    update their clave. ``short_msg`` is a cleaned snippet (original casing and
+    accents) for logging/reporting.
     """
     if not isinstance(page_content, str) or not page_content:
         return False, ""
-    text = re.sub(r"<[^>]+>", " ", page_content)
-    text = re.sub(r"\s+", " ", text).strip()
-    m = _LOGIN_CRED_ERROR_RE.search(text)
+    text = visible_text(page_content)
+    # Match on the normalised text but slice the snippet from the original:
+    # ``_normalize_text`` is a 1:1 character map for Spanish text, so offsets
+    # line up; if some exotic character changed the length, fall back to
+    # slicing the normalised text rather than misaligning the snippet.
+    normalized = _normalize_text(text)
+    source = text if len(normalized) == len(text) else normalized
+    m = _LOGIN_CRED_ERROR_RE.search(normalized)
     if m:
         start = max(0, m.start() - 30)
-        return True, text[start:m.end() + 50].strip()
+        return True, source[start:m.end() + 50].strip()
     return False, ""
 
 
@@ -209,6 +222,64 @@ _ACCENT_MAP = str.maketrans("áéíóúüñÁÉÍÓÚÜÑ", "aeiouunAEIOUUN")
 def _normalize_text(value: str) -> str:
     """Lowercase + strip accents so marker matching is tolerant to encoding/case."""
     return value.translate(_ACCENT_MAP).lower()
+
+
+def visible_text(html: str | None, limit: int | None = None) -> str:
+    """Return the user-visible text of *html*: scripts/styles/tags stripped,
+    whitespace collapsed, optionally truncated to *limit* chars.
+
+    Used for diagnostics that are logged and stored (``sync_history``), so it
+    never carries markup or inline JS — and a login POST never echoes the
+    password into the page body, so the text is safe to log.
+    """
+    if not isinstance(html, str) or not html:
+        return ""
+    text = re.sub(r"<[^>]+>", " ", _SCRIPT_STYLE_RE.sub(" ", html))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit] if limit is not None else text
+
+
+# --- small detail modal classification -------------------------------------
+# A real case modal is ~20-40k chars. Since 2026-09-14 PJUD answers the detail
+# call with a constant ~276-char fragment about an hour after each login
+# (session TTL ~90 min) — parsing it raised ``ValueError("Invalid ROL format")``
+# and opened the pjud-detail breaker with no re-auth. Anything below this
+# threshold is classified here and NEVER handed to the parser.
+DETAIL_MODAL_MIN_CHARS = 2000
+
+# Visible-text markers meaning PJUD is asking for a login again. Matched on
+# accent-stripped lowercase text; the login URLs are also matched against the
+# markup itself (a redirect lives in an href/JS, not in the visible text).
+_DETAIL_SESSION_TEXT_MARKERS = (
+    "sesion",
+    "expir",
+    "iniciar sesion",
+    "ingrese",
+    "login",
+    "acceso denegado",
+    "no autorizado",
+    "usuario",
+)
+_DETAIL_SESSION_URL_MARKERS = ("home/index.php", "loginn.php")
+
+
+def classify_small_detail_modal(html: str) -> Literal["session", "transient"]:
+    """Classify a detail modal shorter than ``DETAIL_MODAL_MIN_CHARS``.
+
+    - ``"session"``: the fragment talks about the session/login (or points at a
+      login URL) → the PJUD session is gone; the caller must re-authenticate.
+    - ``"transient"``: anything else (partial load, "cargando", empty table) →
+      retry with backoff, never re-auth.
+    """
+    if not isinstance(html, str) or not html:
+        return "transient"
+    text = _normalize_text(visible_text(html))
+    if any(marker in text for marker in _DETAIL_SESSION_TEXT_MARKERS):
+        return "session"
+    markup = _normalize_text(html)
+    if any(marker in markup for marker in _DETAIL_SESSION_URL_MARKERS):
+        return "session"
+    return "transient"
 
 
 def classify_post_login(
@@ -1008,9 +1079,22 @@ class PJUDBaseScraper(ABC):
                         f"PJUD rejected credentials for RUT {rut_clean}"
                         + (f": {snippet}" if snippet else "")
                     )
-                raise LoginError(
-                    "Session not established - still on login page"
-                    + (f" ({snippet})" if snippet else "")
+                # No recognised credential message: log what PJUD actually
+                # shows (visible text only — no markup/JS, and the password is
+                # never echoed into the page) so a lawyer stuck here every
+                # cycle is diagnosable, and carry it in the error so it reaches
+                # sync_history.error_message via the scheduler.
+                visible = visible_text(page_content, 300)
+                logger.warning(
+                    "Login for RUT %s stuck on the login page (url=%s) with no "
+                    "recognised credential message; visible text: %r",
+                    rut_clean,
+                    current_url,
+                    visible,
+                )
+                raise LoginPageError(
+                    "PJUD no estableció la sesión (sigue en la página de login)"
+                    + (f": {visible[:200]}" if visible else "")
                 )
             
             # 6. Verify session by checking page content
@@ -1444,6 +1528,44 @@ class PJUDBaseScraper(ABC):
         """
         ...
     
+    @staticmethod
+    def _raise_for_small_detail_modal(detail_html: str, url: str) -> None:
+        """Turn a too-small detail modal into the right exception — never a parse.
+
+        Logs PJUD's visible text at WARNING (the diagnostic we lacked for the
+        constant ~276-char fragment), then raises, in priority order:
+
+        - ``ShapeChallengeError`` — Shape/TSPD fragment (station-wide block).
+        - ``SessionExpiredError`` — session/login markers → the caller
+          (``detect_and_sync_movements``) re-authenticates and retries once.
+        - ``TransientNavigationError`` — anything else → backoff retries, no
+          re-auth.
+        """
+        size = len(detail_html)
+        snippet = visible_text(detail_html, 300)
+        is_shape, marker = detect_shape_challenge(detail_html, url)
+        verdict = "shape" if is_shape else classify_small_detail_modal(detail_html)
+        logger.warning(
+            "Detail modal too small (%d chars < %d) — classified as %s; "
+            "url=%s visible text: %r",
+            size,
+            DETAIL_MODAL_MIN_CHARS,
+            verdict,
+            url,
+            snippet,
+        )
+        if is_shape:
+            raise ShapeChallengeError(
+                url=url, jquery_present=False, looks_like_login=False, marker=marker
+            )
+        if verdict == "session":
+            raise SessionExpiredError(
+                f"Sesión PJUD vencida durante el detalle (modal de {size} caracteres)"
+            )
+        raise TransientNavigationError(
+            url=url, reason=f"modal de detalle incompleto ({size} caracteres)"
+        )
+
     async def get_case_detail(
         self,
         session: PJUDSession,
@@ -1538,6 +1660,9 @@ class PJUDBaseScraper(ABC):
 
             if not detail_html or len(detail_html) < 100:
                 raise ScrapingError("Modal content empty - detail failed to load")
+
+            if len(detail_html) < DETAIL_MODAL_MIN_CHARS:
+                self._raise_for_small_detail_modal(detail_html, page.url)
 
             logger.info(f"Captured detail modal: {len(detail_html)} chars")
             return self._parse_case_detail_html(detail_html, case_token)
