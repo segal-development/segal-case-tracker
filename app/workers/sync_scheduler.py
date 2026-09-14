@@ -20,7 +20,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy.orm import Session
-from sqlalchemy import and_
+from sqlalchemy import and_, func
 
 from app.core.database import SessionLocal
 from app.core.security import decrypt_pjud_password
@@ -58,6 +58,39 @@ SYNC_INTERVAL_HOURS = settings.SYNC_INTERVAL_HOURS
 
 # Max age before considering data stale (in hours)
 MAX_DATA_AGE_HOURS = settings.MAX_DATA_AGE_HOURS
+
+
+def _active_lawyer_ids_by_staleness(db: Session) -> list[int]:
+    """Active lawyer ids in the order the cycle should visit them.
+
+    Oldest successful sync first; lawyers that never completed a sync go first
+    of all; ties break by id. Only ``completed`` runs count — a string of
+    failures does not make a lawyer "recent".
+
+    Why: the cycle used to iterate ``query(Lawyer).all()`` with no ORDER BY, i.e.
+    Postgres heap order. Each lawyer takes ~1h and the worker restarts about
+    daily, so the same 6–7 lawyers at the head of the heap synced every day while
+    the tail (Carla included) never got a turn for two weeks. Ordering by
+    staleness makes the rotation fair no matter where a cycle gets cut.
+    """
+    last_ok = (
+        db.query(
+            SyncHistory.lawyer_id.label("lawyer_id"),
+            func.max(SyncHistory.completed_at).label("last_ok"),
+        )
+        .filter(SyncHistory.status == "completed")
+        .group_by(SyncHistory.lawyer_id)
+        .subquery()
+    )
+    rows = (
+        db.query(Lawyer.id, last_ok.c.last_ok)
+        .outerjoin(last_ok, last_ok.c.lawyer_id == Lawyer.id)
+        .filter(Lawyer.is_active.is_(True))
+        .all()
+    )
+    # Sort in Python: NULLS FIRST is dialect-dependent (SQLite in tests).
+    rows.sort(key=lambda r: (r.last_ok is not None, r.last_ok or datetime.min, r.id))
+    return [r.id for r in rows]
 
 # Competencias to sync — sourced from settings (default civil-only). The firm
 # only handles juicio-ejecutivo DEFENSE (civil); laboral/penal would be wasted
@@ -532,9 +565,10 @@ async def sync_all_lawyers():
             logger.exception("Sysgal cobertura sync failed (non-fatal)")
 
         # Only lawyer IDs are needed downstream — sync_lawyer_cases re-resolves the
-        # Lawyer row from whatever session it is handed.
-        lawyers = setup_db.query(Lawyer).filter(Lawyer.is_active == True).all()
-        lawyer_ids = [lawyer.id for lawyer in lawyers]
+        # Lawyer row from whatever session it is handed. Ordered by staleness so
+        # a cycle interrupted by a worker restart resumes with whoever waited most.
+        lawyer_ids = _active_lawyer_ids_by_staleness(setup_db)
+        logger.info("Sync order (oldest successful sync first): %s", lawyer_ids)
     finally:
         # Release the setup connection BEFORE the long loop — never held idle.
         setup_db.close()

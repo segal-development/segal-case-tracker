@@ -17,10 +17,10 @@ class TestSyncCycleCredentialScan:
         from app.workers.sync_scheduler import sync_all_lawyers
 
         mock_db = MagicMock()
-        # No active lawyers → the cycle returns right after the scan.
-        mock_db.query.return_value.filter.return_value.all.return_value = []
 
+        # No active lawyers → the cycle returns right after the scan.
         with patch("app.workers.sync_scheduler.SessionLocal", return_value=mock_db), \
+             patch("app.workers.sync_scheduler._active_lawyer_ids_by_staleness", return_value=[]), \
              patch(
                  "app.services.credential_audit.scan_credential_changes",
                  return_value=0,
@@ -34,9 +34,9 @@ class TestSyncCycleCredentialScan:
         from app.workers.sync_scheduler import sync_all_lawyers
 
         mock_db = MagicMock()
-        mock_db.query.return_value.filter.return_value.all.return_value = []
 
         with patch("app.workers.sync_scheduler.SessionLocal", return_value=mock_db), \
+             patch("app.workers.sync_scheduler._active_lawyer_ids_by_staleness", return_value=[]), \
              patch(
                  "app.services.credential_audit.scan_credential_changes",
                  side_effect=RuntimeError("boom"),
@@ -90,6 +90,9 @@ class TestSyncAllLawyersSessionIsolation:
         with patch(
             "app.workers.sync_scheduler.SessionLocal",
             side_effect=session_sequence,
+        ), patch(
+            "app.workers.sync_scheduler._active_lawyer_ids_by_staleness",
+            return_value=[lawyer1.id, lawyer2.id],
         ), patch(
             "app.workers.sync_scheduler.SyncService", mock_sync_service
         ), patch(
