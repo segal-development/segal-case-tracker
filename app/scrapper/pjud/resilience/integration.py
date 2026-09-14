@@ -296,6 +296,11 @@ async def resilient_call(operation: str, factory):
         retryable = (TimeoutError, ConnectionError, asyncio.TimeoutError)
 
     from app.config import settings
+    from app.scrapper.pjud.exceptions import (
+        SessionExpiredError,
+        SessionNotAuthenticatedError,
+        ShapeChallengeError,
+    )
     from app.scrapper.pjud.resilience.circuit_breaker import CircuitBreakerConfig, get_circuit_breaker
     from app.scrapper.pjud.resilience.retry import RetryConfig, retry_async
 
@@ -305,6 +310,18 @@ async def resilient_call(operation: str, factory):
             failure_threshold=settings.PJUD_CB_FAILURE_THRESHOLD,
             recovery_timeout=settings.PJUD_CB_RECOVERY_TIMEOUT,
             half_open_max_calls=3,
+            # The breaker guards against a PJUD *outage*. An expired session,
+            # a not-authenticated page or a Shape block are verdicts about OUR
+            # session/IP, not about PJUD's health: they must not open the
+            # circuit (which would also drop every remaining case of the
+            # lawyer after a re-auth). ``TransientNavigationError`` (page did
+            # not load: DNS/timeout/empty body) deliberately KEEPS counting —
+            # that is precisely the outage signal the breaker exists for.
+            ignored_exceptions=(
+                SessionExpiredError,
+                SessionNotAuthenticatedError,
+                ShapeChallengeError,
+            ),
         ),
     )
     retry_cfg = RetryConfig(

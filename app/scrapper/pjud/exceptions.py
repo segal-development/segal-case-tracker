@@ -19,6 +19,20 @@ class LoginError(PJUDError):
     pass
 
 
+class LoginPageError(LoginError):
+    """Raised when the login POST landed back on PJUD's login page with no
+    recognised credential message.
+
+    Retry-able (a rejected captcha token or a transient PJUD hiccup look the
+    same), so it is NOT an ``InvalidCredentialsError`` and never alerts the
+    supervisor. It is still a *rejected* login, so the scheduler records it in
+    the credential vault (``validation_failed`` / ``login_page``) — otherwise
+    the vault shows "Válida" for a lawyer whose login bounces every cycle. The
+    message carries PJUD's visible text so operators can finally read why.
+    """
+    pass
+
+
 class InvalidCredentialsError(LoginError):
     """Raised when PJUD rejects the login because the credentials are wrong.
 
