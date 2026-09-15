@@ -1400,11 +1400,8 @@ class PJUDBaseScraper(ABC):
         rut_num = rut[:-1] if len(rut) > 8 else rut
         dv = rut[-1] if len(rut) > 8 else session.rut.split("-")[-1]
         
-        # Use injected page if valid, otherwise create new one
-        if self._page is not None and not self._page.is_closed():
-            page = self._page
-        else:
-            page = await self._get_page(session)
+        # Reuse the live page only if it belongs to this session (see _page_for).
+        page = await self._page_for(session)
         
         try:
             await self._ensure_panel_loaded(page)
@@ -1572,6 +1569,26 @@ class PJUDBaseScraper(ABC):
             url=url, reason=f"modal de detalle incompleto ({size} caracteres)"
         )
 
+    async def _page_for(self, session: Optional["PJUDSession"]) -> Page:
+        """Reuse the live page only if it was built for *this* session.
+
+        After a re-auth the caller passes a NEW ``PJUDSession``; a page built for
+        the old one still carries the dead cookies, so reusing it just replays
+        the failure (production 2026-09-15 12:57: re-auth succeeded, the retry
+        <1 s later got the same empty modal and the batch stopped). When the
+        recorded session key differs from ``id(session)`` the browser context is
+        rebuilt through ``_get_page``. A page whose session is unknown (injected
+        or CDP-attached, no key recorded) keeps being reused as before.
+        """
+        if self._page is not None and not self._page.is_closed():
+            key = getattr(self, "_page_session_key", None)
+            if key is None or session is None or key == id(session):
+                return self._page
+            logger.info(
+                "Session changed since the page was built — rebuilding the browser context"
+            )
+        return await self._get_page(session)
+
     async def get_case_detail(
         self,
         session: PJUDSession,
@@ -1592,11 +1609,8 @@ class PJUDBaseScraper(ABC):
         from app.scrapper.pjud.resilience.rate_limiter import pjud_action_limiter
         await pjud_action_limiter("detail").acquire()
 
-        # Use injected page if valid, otherwise create new one
-        if self._page is not None and not self._page.is_closed():
-            page = self._page
-        else:
-            page = await self._get_page(session)
+        # Reuse the live page only if it belongs to this session (see _page_for).
+        page = await self._page_for(session)
 
         try:
             await self._ensure_panel_loaded(page)
@@ -1698,11 +1712,8 @@ class PJUDBaseScraper(ABC):
         rut_num = rut[:-1] if len(rut) > 8 else rut
         dv = rut[-1] if len(rut) > 8 else session.rut.split("-")[-1]
         
-        # Use injected page if valid, otherwise create new one
-        if self._page is not None and not self._page.is_closed():
-            page = self._page
-        else:
-            page = await self._get_page(session)
+        # Reuse the live page only if it belongs to this session (see _page_for).
+        page = await self._page_for(session)
         await self._ensure_panel_loaded(page)
 
         # Resilient wrapper: retries a transient PJUD ``ERROR:`` body / destroyed
