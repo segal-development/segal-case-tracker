@@ -17,6 +17,7 @@ import hashlib
 import logging
 import random
 import re
+import time
 from dataclasses import dataclass, field, fields as dataclass_fields
 from datetime import datetime
 from typing import Any, Callable, List, Optional, Tuple, Awaitable, TypeVar
@@ -53,6 +54,38 @@ TRANSIENT_NAV_MAX_ATTEMPTS = 1 + len(TRANSIENT_NAV_BACKOFF_SECONDS)
 # Consecutive CASES that exhausted their transient retries → the network or
 # PJUD is down for everyone; stop the batch instead of burning the cycle.
 MAX_CONSECUTIVE_TRANSIENT_FAILURES = 5
+
+# PJUD limits the detail endpoint per ACCOUNT after ~60 min of continuous detail
+# scraping (worker log 2026-09-15, seen for five lawyers): the detail modal comes
+# back as an empty shell (SessionExpiredError), a fresh re-auth SUCCEEDS, and the
+# same case comes back empty again — while another lawyer fetches details fine
+# seconds later. So an empty shell right after a successful re-auth is not a
+# session problem: the credential is fine, the account is throttled. Stop the
+# lawyer's batch cleanly (no second re-auth, no vault record) and let the
+# staleness order + detail rotation bring the lawyer back next cycle.
+PJUD_DETAIL_THROTTLE_REASON = (
+    "Límite de detalle de PJUD (~60 min por cuenta): lote detenido, "
+    "continúa en el próximo ciclo"
+)
+
+# Proactive rotation: stop the detail loop BEFORE the ~60 min account limit so
+# the batch ends on our terms instead of PJUD's. Measured from the moment this
+# batch started iterating cases (a monotonic clock), NOT from
+# ``PJUDSession.created_at``: the limit is per account and per continuous
+# scraping, and a session reused from the store may be hours old after only a
+# short earlier batch (created_at would stop the batch before its first case),
+# while a mid-batch re-auth would reset created_at without resetting the limit
+# (the throttled retry above proves the new session inherits it).
+DETAIL_BATCH_MAX_SECONDS = 55 * 60
+DETAIL_ROTATION_REASON_MARKER = "Rotación preventiva"
+DETAIL_ROTATION_REASON_TEMPLATE = (
+    DETAIL_ROTATION_REASON_MARKER
+    + ": {minutes} min de detalle (límite de PJUD ~60 min por cuenta), "
+    "continúa en el próximo ciclo"
+)
+# Clock used for the cap; monkeypatch in tests. Read at call time through the
+# module global so a patched attribute takes effect.
+DETAIL_BATCH_CLOCK: Callable[[], float] = time.monotonic
 
 # Raw Playwright navigation errors that mean "the page did not load".
 _TRANSIENT_NAV_ERROR_RE = re.compile(
@@ -1774,7 +1807,20 @@ async def detect_and_sync_movements(
             advanced on a session error — session failure is not the case's
             fault, and the rotation position must be preserved for the retry.
             NOTE: this callback is NEVER invoked for a ``ShapeChallengeError``
-            — see below.
+            — see below.  If the retry on the fresh session fails again with
+            ``SessionExpiredError`` (empty detail shell), that is PJUD's
+            per-account detail throttle (``PJUD_DETAIL_THROTTLE_REASON``):
+            the batch stops without a second re-auth and without touching
+            the vault.  A ``SessionNotAuthenticatedError`` on the retry is a
+            genuine auth failure and keeps the "second session expiry" stop.
+
+    Proactive rotation:
+        The detail loop stops on its own once ``DETAIL_BATCH_MAX_SECONDS``
+        (55 min) have elapsed since it started, appending
+        ``DETAIL_ROTATION_REASON_TEMPLATE`` — a planned stop, not an error.
+        Remaining cases keep ``last_detail_checked_at`` untouched, so the
+        rotation (``last_detail_checked_at ASC NULLS FIRST``) serves them first
+        next cycle.  The listing phase is not subject to the cap.
 
     Shape/TSPD handling:
         A ``ShapeChallengeError`` (subclass of ``SessionNotAuthenticatedError``)
@@ -1856,7 +1902,30 @@ async def detect_and_sync_movements(
     # on any success (see MAX_CONSECUTIVE_TRANSIENT_FAILURES).
     consecutive_transient = 0
 
+    # Detail-loop clock for the proactive rotation cap (see DETAIL_BATCH_MAX_SECONDS).
+    # The listing phase ran before this function; only detail time counts.
+    batch_started_at = DETAIL_BATCH_CLOCK()
+
     for api_case in cases_for_check:
+        elapsed = DETAIL_BATCH_CLOCK() - batch_started_at
+        if elapsed >= DETAIL_BATCH_MAX_SECONDS:
+            # Not an error and not the cases' fault: nothing is advanced, the
+            # remaining cases stay stale and lead the next rotation batch.
+            elapsed_minutes = int(elapsed // 60)
+            logger.info(
+                "detect_and_sync_movements: proactive rotation after %d min of "
+                "detail (cap %d min, PJUD account limit ~60 min); stopping batch "
+                "before %s (lawyer_id=%s)",
+                elapsed_minutes,
+                DETAIL_BATCH_MAX_SECONDS // 60,
+                api_case.rol,
+                lawyer_id,
+            )
+            errors.append(
+                DETAIL_ROTATION_REASON_TEMPLATE.format(minutes=elapsed_minutes)
+            )
+            break
+
         if not api_case.case_token:
             logger.debug(
                 "detect_and_sync_movements: no case_token for %s, skipping",
@@ -2197,7 +2266,25 @@ async def detect_and_sync_movements(
                     "batch stopped"
                 )
                 break
-            except (SessionExpiredError, SessionNotAuthenticatedError):
+            except SessionExpiredError as throttle_exc:
+                # The retry ran on a brand-new, successfully authenticated
+                # session and the modal STILL came back as an empty shell: that
+                # is PJUD's per-account detail limit, not a session problem (see
+                # PJUD_DETAIL_THROTTLE_REASON). Credentials are fine — no second
+                # re-auth, no vault record; stop this lawyer's batch and move on.
+                logger.warning(
+                    "detect_and_sync_movements: PJUD detail throttle — empty detail "
+                    "right after a successful reauth; stopping batch "
+                    "(lawyer_id=%s, rol=%s): %s",
+                    lawyer_id,
+                    api_case.rol,
+                    throttle_exc,
+                )
+                errors.append(PJUD_DETAIL_THROTTLE_REASON)
+                break
+            except SessionNotAuthenticatedError:
+                # Login page / not authenticated on the retry: a genuine auth
+                # problem, kept as today's "second session expiry" handling.
                 logger.error(
                     "detect_and_sync_movements: second session expiry after reauth; "
                     "stopping batch (lawyer_id=%s, rol=%s)",

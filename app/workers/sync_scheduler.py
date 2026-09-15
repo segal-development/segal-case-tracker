@@ -32,6 +32,7 @@ from app.scrapper.pjud.exceptions import (
     LoginPageError,
 )
 from app.services.sync_service import (
+    DETAIL_ROTATION_REASON_MARKER,
     SyncService,
     convert_api_cases_to_scraped,
     detect_and_sync_movements,
@@ -154,8 +155,10 @@ def _credential_failure_detail(exc: InvalidCredentialsError) -> str:
     return "credential_expired" if isinstance(exc, CredentialExpiredError) else "invalid_credentials"
 
 
-# detect_and_sync_movements appends one of these when it stops the batch early.
-_BATCH_STOP_MARKERS = ("lote detenido", "batch stopped")
+# detect_and_sync_movements appends one of these when it stops the batch early
+# (the proactive rotation reason carries its own marker: it is a planned stop,
+# not a failure, but operators still need it in sync_history.error_message).
+_BATCH_STOP_MARKERS = ("lote detenido", "batch stopped", DETAIL_ROTATION_REASON_MARKER)
 
 
 def _batch_stop_reason(mov_errors: list[str]) -> Optional[str]:
