@@ -303,6 +303,64 @@ def cb_settings():
         yield settings
 
 
+class TestPageFollowsTheSession:
+    """After a re-auth the caller passes a NEW PJUDSession. The page built for the
+    old session still carries the dead cookies, so reusing it replays the failure
+    (production 2026-09-15 12:57: re-auth OK, retry <1s later got the same empty
+    modal, batch stopped). The page must be rebuilt when the session changed."""
+
+    @pytest.mark.asyncio
+    async def test_rebuilds_page_when_session_changed(self):
+        from app.services.pjud_session import PJUDSession
+
+        scraper = _make_detail_scraper(EMPTY_SHELL_FRAGMENT)   # stale page (dead session)
+        old = PJUDSession.create(rut="16021492-9", cookies=[], lawyer_id=1)
+        new = PJUDSession.create(rut="16021492-9", cookies=[], lawyer_id=1)
+        scraper._page_session_key = id(old)
+        fresh_page = _make_detail_page(REAL_MODAL)
+        scraper._get_page = AsyncMock(return_value=fresh_page)
+        p1, p2 = _detail_patches()
+
+        with p1, p2:
+            result = await scraper.get_case_detail(session=new, case_token="tok")
+
+        scraper._get_page.assert_awaited_once_with(new)
+        scraper._parse_case_detail_html.assert_called_once()
+        assert result == "parsed"
+
+    @pytest.mark.asyncio
+    async def test_reuses_page_for_the_same_session(self):
+        from app.services.pjud_session import PJUDSession
+
+        scraper = _make_detail_scraper(REAL_MODAL)
+        session = PJUDSession.create(rut="16021492-9", cookies=[], lawyer_id=1)
+        scraper._page_session_key = id(session)
+        scraper._get_page = AsyncMock()
+        p1, p2 = _detail_patches()
+
+        with p1, p2:
+            await scraper.get_case_detail(session=session, case_token="tok")
+
+        scraper._get_page.assert_not_awaited()
+        scraper._parse_case_detail_html.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_reuses_injected_page_when_its_session_is_unknown(self):
+        """A page injected/attached without a recorded session key (tests, CDP
+        attach) keeps being used as before."""
+        from app.services.pjud_session import PJUDSession
+
+        scraper = _make_detail_scraper(REAL_MODAL)   # no _page_session_key set
+        session = PJUDSession.create(rut="16021492-9", cookies=[], lawyer_id=1)
+        scraper._get_page = AsyncMock()
+        p1, p2 = _detail_patches()
+
+        with p1, p2:
+            await scraper.get_case_detail(session=session, case_token="tok")
+
+        scraper._get_page.assert_not_awaited()
+
+
 class TestDetailBreakerIgnoresSessionErrors:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("exc_kind", ["session_expired", "not_authenticated", "shape"])
