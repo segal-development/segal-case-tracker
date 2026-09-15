@@ -268,12 +268,18 @@ def classify_small_detail_modal(html: str) -> Literal["session", "transient"]:
 
     - ``"session"``: the fragment talks about the session/login (or points at a
       login URL) → the PJUD session is gone; the caller must re-authenticate.
-    - ``"transient"``: anything else (partial load, "cargando", empty table) →
-      retry with backoff, never re-auth.
+    - ``"session"`` also when the markup carries NO visible text at all: a modal
+      shell without content is what a dead PJUD session returns (production,
+      2026-09-15: the same 276-char shell on every backoff retry ~60 min after
+      login, and 66 full modals in a row right after the next fresh login).
+    - ``"transient"``: anything else (partial load, "cargando") → retry with
+      backoff, never re-auth.
     """
-    if not isinstance(html, str) or not html:
+    if not isinstance(html, str) or not html.strip():
         return "transient"
     text = _normalize_text(visible_text(html))
+    if not text.strip():
+        return "session"
     if any(marker in text for marker in _DETAIL_SESSION_TEXT_MARKERS):
         return "session"
     markup = _normalize_text(html)

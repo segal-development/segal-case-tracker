@@ -53,6 +53,10 @@ SESSION_FRAGMENT = _padded(
     276,
 )
 UNRELATED_FRAGMENT = _padded("<div class='cargando'>Cargando datos de la causa...</div>", 276)
+# Production shape (2026-09-15 10:11): 276 chars of markup with NO visible text.
+# Retrying returned the same shell every time; the next lawyer's fresh login got
+# 66 full modals in a row → an empty shell means the session is dead.
+EMPTY_SHELL_FRAGMENT = _padded("<div class='modal-body'><table><tbody></tbody></table></div>", 276)
 SHAPE_FRAGMENT = _padded(
     "<html>failureConfig TSPD_101 what code is in the image support id 12345</html>",
     276,
@@ -116,7 +120,6 @@ class TestClassifySmallDetailModal:
         [
             "<div>Cargando datos de la causa...</div>",
             "<div class='cargando'>Espere un momento</div>",
-            "<table><tr><td></td></tr></table>",
             "   ",
             "",
         ],
@@ -125,6 +128,23 @@ class TestClassifySmallDetailModal:
         from app.scrapper.pjud.base import classify_small_detail_modal
 
         assert classify_small_detail_modal(html) == "transient"
+
+    @pytest.mark.parametrize(
+        "html",
+        [
+            "<table><tr><td></td></tr></table>",
+            "<div class='modal-body'><table><tbody></tbody></table></div>",
+            EMPTY_SHELL_FRAGMENT,
+            "<div><span></span><span></span></div>",
+        ],
+    )
+    def test_markup_with_no_visible_text_is_session(self, html):
+        """A modal shell with NO visible text is what a dead PJUD session returns
+        (verified in production: same 276-char shell on every retry, fixed only by
+        a fresh login). It must trigger re-auth, not backoff retries."""
+        from app.scrapper.pjud.base import classify_small_detail_modal
+
+        assert classify_small_detail_modal(html) == "session"
 
     def test_marker_only_inside_script_or_style_is_not_visible_text(self):
         """A JS reference to 'sesion' in a script block is not PJUD telling the
@@ -196,6 +216,25 @@ class TestGetCaseDetailSmallModal:
         # The diagnostic we never had: PJUD's visible text, at WARNING.
         warnings = _warning_messages(mock_logger)
         assert any("Su sesión ha expirado" in m and "276" in m for m in warnings)
+
+    @pytest.mark.asyncio
+    async def test_empty_shell_fragment_raises_session_expired(self):
+        """The production case: 276-char shell, visible text '' → session expired
+        → the caller re-authenticates (never the parser, never backoff)."""
+        from app.scrapper.pjud.exceptions import SessionExpiredError
+        from app.services.pjud_session import PJUDSession
+
+        scraper = _make_detail_scraper(EMPTY_SHELL_FRAGMENT)
+        session = PJUDSession.create(rut="16021492-9", cookies=[], lawyer_id=1)
+        p1, p2 = _detail_patches()
+
+        with p1, p2, patch("app.scrapper.pjud.base.logger") as mock_logger:
+            with pytest.raises(SessionExpiredError) as exc_info:
+                await scraper.get_case_detail(session=session, case_token="tok")
+
+        scraper._parse_case_detail_html.assert_not_called()
+        assert "276" in str(exc_info.value)
+        assert any("classified as session" in m for m in _warning_messages(mock_logger))
 
     @pytest.mark.asyncio
     async def test_unrelated_fragment_raises_transient_navigation(self):
