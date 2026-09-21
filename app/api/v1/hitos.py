@@ -19,7 +19,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session, selectinload
 
 from app.api.deps import get_current_lawyer, get_db, require_admin
-from app.models.hito import Hito, HitoTipo, HITO_APROBADO, HITO_PENDIENTE, HITO_RECHAZADO
+from app.models.hito import Hito, HitoTipo, HITO_APROBADO, HITO_PENDIENTE, HITO_RECHAZADO, HITO_SUGERIDO
 from app.models.lawyer import Lawyer
 from app.services import bono_cierre_service as cierre_svc
 
@@ -176,6 +176,15 @@ class HitoBulkIds(BaseModel):
 class HitoBulkResult(BaseModel):
     procesados: int
     ids: list[int]  # the ids actually acted on
+    # aprobar-lote only: hitos skipped because they have no evidence attached
+    # ("sin evidencia no se paga"). Always 0 / [] for rechazar-lote and eliminar-lote.
+    sin_evidencia: int = 0
+    omitidos_ids: list[int] = []
+
+
+_SIN_EVIDENCIA_DETAIL = "El hito no tiene evidencia adjunta; no se puede aprobar sin evidencia."
+_EVIDENCIA_ESTADO_DETAIL = "Solo se puede adjuntar evidencia a un hito pendiente, sugerido o rechazado."
+_EVIDENCE_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "application/pdf": "pdf"}
 
 
 # --------------------------------------------------------------------------- #
@@ -192,6 +201,32 @@ def _resolve_lawyer(db: Session, current_lawyer: dict) -> Optional[Lawyer]:
 
 def _is_admin(lawyer: Optional[Lawyer]) -> bool:
     return bool(lawyer and lawyer.role == "admin")
+
+
+def _store_evidencia(lawyer_id: int, data: bytes, upload: UploadFile) -> tuple[str, Optional[str], str]:
+    """Validate an evidence upload and store it; return ``(storage_key, filename, content_type)``.
+
+    Single place for the evidence rules shared by create and ``PUT /{id}/evidencia``:
+    max 15 MB, PNG/JPG/WEBP/PDF only, content-addressed key under the owning
+    lawyer (``hitos/evidencia/{lawyer_id}/{sha256[:16]}.{ext}``). ``data`` is the
+    already-read body so the caller decides what an empty upload means.
+    """
+    if len(data) > _MAX_EVIDENCE_BYTES:
+        raise HTTPException(status_code=413, detail="La evidencia supera el tamaño máximo (15 MB)")
+    content_type = upload.content_type or "application/octet-stream"
+    if content_type not in _ALLOWED_EVIDENCE:
+        raise HTTPException(
+            status_code=415,
+            detail="Formato de evidencia no permitido (usa PNG, JPG, WEBP o PDF)",
+        )
+    from app.config import settings
+    from app.services.storage_service import get_storage_backend
+
+    digest = hashlib.sha256(data).hexdigest()[:16]
+    ext = _EVIDENCE_EXT.get(content_type, "bin")
+    key = f"hitos/evidencia/{lawyer_id}/{digest}.{ext}"
+    storage_uri = get_storage_backend(settings).upload(data, key, content_type=content_type)
+    return storage_uri, upload.filename, content_type
 
 
 def _to_response(h: Hito) -> HitoResponse:
@@ -297,27 +332,12 @@ async def create_hito(
                 detail="Ya existe un hito de este abogado para esa causa",
             )
 
-    # Evidence is optional. If provided, validate + store it.
+    # Evidence is optional at creation (it can be attached later via
+    # PUT /{id}/evidencia) but mandatory to approve. If provided, validate + store it.
     storage_uri = ev_filename = ev_content_type = None
     data = await evidencia.read() if evidencia is not None else b""
     if data:
-        if len(data) > _MAX_EVIDENCE_BYTES:
-            raise HTTPException(status_code=413, detail="La evidencia supera el tamaño máximo (15 MB)")
-        content_type = evidencia.content_type or "application/octet-stream"
-        if content_type not in _ALLOWED_EVIDENCE:
-            raise HTTPException(
-                status_code=415,
-                detail="Formato de evidencia no permitido (usa PNG, JPG, WEBP o PDF)",
-            )
-        from app.config import settings
-        from app.services.storage_service import get_storage_backend
-
-        digest = hashlib.sha256(data).hexdigest()[:16]
-        ext = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "application/pdf": "pdf"}.get(content_type, "bin")
-        key = f"hitos/evidencia/{target_lawyer_id}/{digest}.{ext}"
-        storage_uri = get_storage_backend(settings).upload(data, key, content_type=content_type)
-        ev_filename = evidencia.filename
-        ev_content_type = content_type
+        storage_uri, ev_filename, ev_content_type = _store_evidencia(target_lawyer_id, data, evidencia)
 
     hito = Hito(
         lawyer_id=target_lawyer_id,
@@ -406,12 +426,14 @@ async def aprobar_hito(
     db: Session = Depends(get_db),
     admin_rut: str = Depends(require_admin),
 ):
-    """Approve a hito (admin only)."""
+    """Approve a hito (admin only). Evidence is mandatory: "sin evidencia no se paga"."""
     hito = db.query(Hito).filter(Hito.id == hito_id).first()
     if hito is None:
         raise HTTPException(status_code=404, detail="Hito no encontrado")
     if cierre_svc.is_cerrado(db, cierre_svc.periodo_de_fecha(hito.fecha_hito)):
         raise HTTPException(status_code=409, detail="El período de ese hito está cerrado")
+    if not hito.tiene_evidencia:
+        raise HTTPException(status_code=409, detail=_SIN_EVIDENCIA_DETAIL)
 
     admin = db.query(Lawyer).filter(Lawyer.rut == admin_rut).first()
     hito.estado = HITO_APROBADO
@@ -457,14 +479,19 @@ async def aprobar_hitos_lote(
 ):
     """Approve every existing hito in ``ids`` (admin only). Skips ids that don't
     exist; a closed period blocks the whole batch with the same 409 as the
-    single endpoint."""
+    single endpoint. Hitos without evidence are NOT approved: they are left
+    untouched and reported in ``sin_evidencia`` / ``omitidos_ids``."""
     hitos = db.query(Hito).filter(Hito.id.in_(body.ids)).all()
     admin = db.query(Lawyer).filter(Lawyer.rut == admin_rut).first()
     now = datetime.utcnow()
     acted: list[int] = []
+    omitidos: list[int] = []
     for hito in hitos:
         if cierre_svc.is_cerrado(db, cierre_svc.periodo_de_fecha(hito.fecha_hito)):
             raise HTTPException(status_code=409, detail="El período de ese hito está cerrado")
+        if not hito.tiene_evidencia:
+            omitidos.append(hito.id)
+            continue
         hito.estado = HITO_APROBADO
         hito.aprobado_by_rut = admin_rut
         hito.aprobado_by_name = admin.name if admin else None
@@ -472,7 +499,10 @@ async def aprobar_hitos_lote(
         hito.rechazo_motivo = None
         acted.append(hito.id)
     db.commit()
-    return HitoBulkResult(procesados=len(acted), ids=acted)
+    return HitoBulkResult(
+        procesados=len(acted), ids=acted,
+        sin_evidencia=len(omitidos), omitidos_ids=omitidos,
+    )
 
 
 @router.post("/rechazar-lote", response_model=HitoBulkResult)
@@ -1159,3 +1189,38 @@ async def get_evidencia(
         media_type=hito.evidencia_content_type or "application/octet-stream",
         headers={"Content-Disposition": f'inline; filename="{hito.evidencia_filename or "evidencia"}"'},
     )
+
+
+@router.put("/{hito_id}/evidencia", response_model=HitoResponse)
+async def put_evidencia(
+    hito_id: int,
+    evidencia: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_lawyer: dict = Depends(get_current_lawyer),
+):
+    """Attach or replace a hito's PJUD evidence after creation.
+
+    Admins, or the owning lawyer, only — same boundary as ``GET /{id}/evidencia``.
+    Allowed only while the hito is ``pendiente`` or ``rechazado``: an approved
+    hito was paid on the evidence it had, so it is frozen. Same validation and
+    storage rules as create (see ``_store_evidencia``).
+    """
+    actor = _resolve_lawyer(db, current_lawyer)
+    hito = db.query(Hito).filter(Hito.id == hito_id).first()
+    if hito is None:
+        raise HTTPException(status_code=404, detail="Hito no encontrado")
+    if not _is_admin(actor) and (actor is None or actor.id != hito.lawyer_id):
+        raise HTTPException(status_code=403, detail="Sin acceso a esta evidencia")
+    if hito.estado not in (HITO_PENDIENTE, HITO_SUGERIDO, HITO_RECHAZADO):
+        raise HTTPException(status_code=409, detail=_EVIDENCIA_ESTADO_DETAIL)
+
+    data = await evidencia.read()
+    if not data:
+        raise HTTPException(status_code=422, detail="La evidencia está vacía")
+    storage_uri, ev_filename, ev_content_type = _store_evidencia(hito.lawyer_id, data, evidencia)
+    hito.evidencia_storage_key = storage_uri
+    hito.evidencia_filename = ev_filename
+    hito.evidencia_content_type = ev_content_type
+    db.commit()
+    db.refresh(hito)
+    return _to_response(hito)

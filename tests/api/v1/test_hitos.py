@@ -87,16 +87,17 @@ def test_create_without_evidence_ok(client, db, admin, tipo):
     assert r.json()["tiene_evidencia"] is False
 
 
-def test_approve_without_evidence_ok(client, db, admin, lawyer, tipo):
-    # A hito with no evidence can now be approved (evidence no longer mandatory).
+def test_approve_without_evidence_blocked(client, db, admin, lawyer, tipo):
+    # Evidence is optional at creation but MANDATORY to approve ("sin evidencia no se paga").
     h = Hito(lawyer_id=lawyer.id, hito_tipo_id=tipo.id, valor_bruto=8077,
              fecha_hito=date(2026, 7, 15), estado=HITO_PENDIENTE)
     db.add(h)
     db.commit()
     db.refresh(h)
     r = client.post(f"/api/v1/hitos/{h.id}/aprobar", headers=_h(ADMIN_RUT))
-    assert r.status_code == 200
-    assert r.json()["estado"] == "aprobado"
+    assert r.status_code == 409
+    db.refresh(h)
+    assert h.estado == HITO_PENDIENTE
 
 
 def test_admin_approves_and_resumen_totals(client, db, admin, lawyer, tipo):
@@ -420,9 +421,12 @@ def test_detector_provenance_fields_persist(db, lawyer, tipo):
 
 
 def test_sugerido_hito_can_be_approved(client, db, admin, lawyer, tipo):
-    """Carla confirms a suggested candidate → it becomes aprobado (counts for the bono)."""
+    """Carla confirms a suggested candidate → it becomes aprobado (counts for the bono).
+
+    Approval still requires evidence, so the candidate carries one here."""
     h = Hito(lawyer_id=lawyer.id, hito_tipo_id=tipo.id, valor_bruto=tipo.valor_bruto,
-             fecha_hito=date(2026, 7, 15), estado=HITO_SUGERIDO, origen=ORIGEN_DETECTOR)
+             fecha_hito=date(2026, 7, 15), estado=HITO_SUGERIDO, origen=ORIGEN_DETECTOR,
+             evidencia_storage_key="hitos/evidencia/x/cap.png")
     db.add(h)
     db.commit()
     db.refresh(h)
@@ -554,11 +558,12 @@ def test_importar_acepta_fecha_en_texto(client, db, admin):
 # Bulk actions (aprobar-lote / rechazar-lote / eliminar-lote)
 # --------------------------------------------------------------------------- #
 def _pending(db, lawyer, tipo, n, fecha=date(2026, 7, 15)):
-    """Create n pending hitos for a lawyer; return their ids."""
+    """Create n pending hitos (with evidence, so they are approvable); return their ids."""
     ids = []
     for _ in range(n):
         h = Hito(lawyer_id=lawyer.id, hito_tipo_id=tipo.id, valor_bruto=8077,
-                 fecha_hito=fecha, estado=HITO_PENDIENTE)
+                 fecha_hito=fecha, estado=HITO_PENDIENTE,
+                 evidencia_storage_key="hitos/evidencia/x/cap.png")
         db.add(h)
         db.commit()
         db.refresh(h)
