@@ -9,7 +9,7 @@ from datetime import date
 import pytest
 
 from app.core.security import create_access_token
-from app.models.hito import Hito, HitoTipo, HITO_APROBADO, HITO_PENDIENTE, HITO_RECHAZADO
+from app.models.hito import Hito, HitoTipo, HITO_APROBADO, HITO_PENDIENTE, HITO_RECHAZADO, HITO_SUGERIDO
 from app.models.lawyer import Lawyer
 from app.services import storage_service
 
@@ -18,7 +18,7 @@ LAWYER_RUT = "19643548-4"
 OTHER_RUT = "18248270-6"
 
 SIN_EVIDENCIA = "El hito no tiene evidencia adjunta; no se puede aprobar sin evidencia."
-ESTADO_NO_PERMITE = "Solo se puede adjuntar evidencia a un hito pendiente o rechazado."
+ESTADO_NO_PERMITE = "Solo se puede adjuntar evidencia a un hito pendiente, sugerido o rechazado."
 
 
 class _FakeBackend:
@@ -225,6 +225,16 @@ def test_put_evidencia_other_lawyer_403(client, db, storage, admin, lawyer, othe
     db.refresh(h)
     assert h.evidencia_storage_key is None
     assert storage.uploads == []
+
+
+def test_put_evidencia_on_sugerido_then_aprobar(client, db, storage, admin, lawyer, tipo):
+    """Detector-suggested hitos are born without evidence; the admin must be able to attach it and approve."""
+    h = _hito(db, lawyer, tipo, estado=HITO_SUGERIDO)
+    r = _put(client, _h(ADMIN_RUT), h.id)
+    assert r.status_code == 200, r.text
+    assert r.json()["tiene_evidencia"] is True
+    r2 = client.post(f"/api/v1/hitos/{h.id}/aprobar", headers=_h(ADMIN_RUT))
+    assert r2.status_code == 200, r2.text
 
 
 def test_put_evidencia_on_aprobado_409(client, db, storage, admin, lawyer, tipo):

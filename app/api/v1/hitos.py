@@ -19,7 +19,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session, selectinload
 
 from app.api.deps import get_current_lawyer, get_db, require_admin
-from app.models.hito import Hito, HitoTipo, HITO_APROBADO, HITO_PENDIENTE, HITO_RECHAZADO
+from app.models.hito import Hito, HitoTipo, HITO_APROBADO, HITO_PENDIENTE, HITO_RECHAZADO, HITO_SUGERIDO
 from app.models.lawyer import Lawyer
 from app.services import bono_cierre_service as cierre_svc
 
@@ -183,7 +183,7 @@ class HitoBulkResult(BaseModel):
 
 
 _SIN_EVIDENCIA_DETAIL = "El hito no tiene evidencia adjunta; no se puede aprobar sin evidencia."
-_EVIDENCIA_ESTADO_DETAIL = "Solo se puede adjuntar evidencia a un hito pendiente o rechazado."
+_EVIDENCIA_ESTADO_DETAIL = "Solo se puede adjuntar evidencia a un hito pendiente, sugerido o rechazado."
 _EVIDENCE_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "application/pdf": "pdf"}
 
 
@@ -1211,7 +1211,7 @@ async def put_evidencia(
         raise HTTPException(status_code=404, detail="Hito no encontrado")
     if not _is_admin(actor) and (actor is None or actor.id != hito.lawyer_id):
         raise HTTPException(status_code=403, detail="Sin acceso a esta evidencia")
-    if hito.estado not in (HITO_PENDIENTE, HITO_RECHAZADO):
+    if hito.estado not in (HITO_PENDIENTE, HITO_SUGERIDO, HITO_RECHAZADO):
         raise HTTPException(status_code=409, detail=_EVIDENCIA_ESTADO_DETAIL)
 
     data = await evidencia.read()
