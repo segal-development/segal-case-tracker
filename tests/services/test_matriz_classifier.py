@@ -536,3 +536,90 @@ class TestCrashProof:
 
         assert result.matriz is None
         assert result.origen == "error"
+
+
+# ---------------------------------------------------------------------------
+# Bulk preload of the latest movement (backfill performance)
+# ---------------------------------------------------------------------------
+
+
+def _preload_fixture(db, lawyer, court):
+    """Three cases covering every branch the preload has to reproduce."""
+    _mapeo(db, "Apremio", "APREMIO")
+    _descripcion_rule(db, "Archivo del expediente", "CAUSA ARCHIVADA", orden=1)
+    _clasificacion(db, DEFAULT_PROC_SIMPLE, "APREMIO", "M3")
+    _clasificacion(db, DEFAULT_PROC_SIMPLE, "CAUSA ARCHIVADA", "M1 Baja")
+
+    con_etapa = _make_case(db, lawyer, court, rol="C-100-2026")
+    _make_movement(db, con_etapa, stage="Apremio", movement_date=datetime(2026, 1, 1))
+    # A newer movement with a blank stage must win and fall through to the
+    # description layer — the same tie-break the per-case query applies.
+    _make_movement(
+        db, con_etapa, stage="", description="Archivo del expediente en el Tribunal",
+        movement_date=datetime(2026, 5, 1),
+    )
+    solo_etapa = _make_case(db, lawyer, court, rol="C-200-2026")
+    _make_movement(db, solo_etapa, stage="Apremio", movement_date=datetime(2026, 2, 1))
+    sin_movimientos = _make_case(db, lawyer, court, rol="C-300-2026")
+    return [con_etapa, solo_etapa, sin_movimientos]
+
+
+def test_preload_matches_per_case_query(db, lawyer, court):
+    """Preloaded classification must equal the one-query-per-case result."""
+    cases = _preload_fixture(db, lawyer, court)
+
+    sin_preload = MatrizMappingCache.load(db)
+    esperado = [classify_case(db, c, mapping_cache=sin_preload) for c in cases]
+
+    con_preload = MatrizMappingCache.load(db)
+    con_preload.preload_latest_movements(db, [c.id for c in cases])
+    obtenido = [classify_case(db, c, mapping_cache=con_preload) for c in cases]
+
+    assert obtenido == esperado
+    assert [r.matriz for r in obtenido] == ["M1 Baja", "M3", "M1 Baja"]
+    assert [r.origen for r in obtenido] == [
+        ORIGEN_DESCRIPCION, ORIGEN_ETAPA, ORIGEN_SIN_DETALLE,
+    ]
+
+
+def test_preload_issues_no_per_case_query(db, lawyer, court):
+    """A preloaded case must not hit the DB again — that was the backfill bug."""
+    cases = _preload_fixture(db, lawyer, court)
+    cache = MatrizMappingCache.load(db)
+    cache.preload_latest_movements(db, [c.id for c in cases])
+
+    calls = {"n": 0}
+    original = db.query
+
+    def contando(*args, **kwargs):
+        calls["n"] += 1
+        return original(*args, **kwargs)
+
+    db.query = contando
+    try:
+        for case in cases:
+            classify_case(db, case, mapping_cache=cache)
+    finally:
+        db.query = original
+
+    assert calls["n"] == 0
+
+
+def test_preload_without_ids_covers_every_case(db, lawyer, court):
+    """``case_ids=None`` preloads the whole portfolio in one pass."""
+    cases = _preload_fixture(db, lawyer, court)
+    cache = MatrizMappingCache.load(db)
+    cache.preload_latest_movements(db)
+
+    assert {c.id for c in cases} <= cache.preloaded_case_ids
+    # The case with no movements is marked as preloaded but holds no entry,
+    # which is what lets the classifier tell "no movements" from "not loaded".
+    assert cases[2].id not in cache.latest_movement
+    assert classify_case(db, cases[2], mapping_cache=cache).origen == ORIGEN_SIN_DETALLE
+
+
+def test_preload_empty_id_list_is_a_noop(db, lawyer, court):
+    cache = MatrizMappingCache.load(db)
+    cache.preload_latest_movements(db, [])
+    assert cache.preloaded_case_ids == set()
+    assert cache.latest_movement == {}

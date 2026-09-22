@@ -92,6 +92,9 @@ from app.models.movement import Movement
 
 logger = logging.getLogger(__name__)
 
+#: Max case ids per IN clause when preloading movements in chunks.
+_PRELOAD_CHUNK = 5000
+
 DEFAULT_PROC_SIMPLE = "Juicio Ejecutivo Completo"
 
 ORIGEN_PROCEDIMIENTO = "pjud_procedimiento"
@@ -138,6 +141,15 @@ class _DescripcionRule(NamedTuple):
     matriz_etapa: str
 
 
+@dataclass(frozen=True)
+class _LatestMovement:
+    """The fields of a case's most recent movement that the classifier reads."""
+
+    stage: Optional[str]
+    description: Optional[str]
+    procedure: Optional[str]
+
+
 @dataclass
 class MatrizMappingCache:
     """Preloaded matriz reference data, built once per sync/backfill run.
@@ -152,6 +164,11 @@ class MatrizMappingCache:
     descripcion_rules: list[_DescripcionRule] = field(default_factory=list)
     clasificacion: dict[tuple[str, str], _ClasificacionEntry] = field(default_factory=dict)
     tramite_overrides: dict[tuple[str, str, str], str] = field(default_factory=dict)
+    #: Bulk-preloaded most recent movement per case id. Populated by
+    #: :meth:`preload_latest_movements`; absence of a preloaded id means the
+    #: case genuinely has no movements (not that it was never loaded).
+    latest_movement: dict[int, _LatestMovement] = field(default_factory=dict)
+    preloaded_case_ids: set[int] = field(default_factory=set)
 
     @classmethod
     def load(cls, db: Session) -> "MatrizMappingCache":
@@ -191,6 +208,50 @@ class MatrizMappingCache:
             tramite_overrides=tramite_overrides,
         )
 
+    def preload_latest_movements(
+        self, db: Session, case_ids: Optional[list[int]] = None
+    ) -> None:
+        """Load the most recent movement of many cases in one pass.
+
+        Without this, :func:`classify_case` issues one query per case, which
+        over a Cloud SQL proxy turns a full-portfolio backfill into tens of
+        thousands of round-trips. Pass ``case_ids=None`` to preload every case.
+        """
+        query = db.query(
+            Movement.case_id,
+            Movement.stage,
+            Movement.description,
+            Movement.procedure,
+            Movement.movement_date,
+            Movement.id,
+        )
+        id_chunks: list[Optional[list[int]]]
+        if case_ids is None:
+            id_chunks = [None]
+        else:
+            if not case_ids:
+                return
+            id_chunks = [
+                case_ids[i : i + _PRELOAD_CHUNK] for i in range(0, len(case_ids), _PRELOAD_CHUNK)
+            ]
+
+        best: dict[int, tuple] = {}
+        for chunk in id_chunks:
+            rows = query if chunk is None else query.filter(Movement.case_id.in_(chunk))
+            for case_id, stage, description, procedure, movement_date, mid in rows.all():
+                sort_key = (movement_date, mid)
+                current = best.get(case_id)
+                if current is None or sort_key > current[0]:
+                    best[case_id] = (sort_key, _LatestMovement(stage, description, procedure))
+            if chunk is not None:
+                self.preloaded_case_ids.update(chunk)
+
+        if case_ids is None:
+            self.preloaded_case_ids.update(
+                case_id for (case_id,) in db.query(Case.id).all()
+            )
+        self.latest_movement.update({cid: val for cid, (_, val) in best.items()})
+
     def match_descripcion(self, description: Optional[str]) -> Optional[str]:
         """First active description rule (by orden, then id) whose substring
         is found in *description* — or ``None``."""
@@ -228,12 +289,15 @@ def _classify_case(
     # stage on the latest movement is common (PJUD doesn't always tag one)
     # and is handled by the description fallback below, never by silently
     # falling back to an OLDER, possibly-stale movement's stage.
-    last_movement = (
-        db.query(Movement)
-        .filter(Movement.case_id == case.id)
-        .order_by(Movement.movement_date.desc(), Movement.id.desc())
-        .first()
-    )
+    if case.id in mapping_cache.preloaded_case_ids:
+        last_movement = mapping_cache.latest_movement.get(case.id)
+    else:
+        last_movement = (
+            db.query(Movement)
+            .filter(Movement.case_id == case.id)
+            .order_by(Movement.movement_date.desc(), Movement.id.desc())
+            .first()
+        )
     if last_movement is None:
         return MatrizResult(
             matriz=_SIN_DETALLE_MATRIZ, matriz_etapa=_SIN_DETALLE_ETAPA, origen=ORIGEN_SIN_DETALLE
