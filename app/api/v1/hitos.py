@@ -1,9 +1,10 @@
 """Hitos (milestone → bonus) endpoints — Slice 1.
 
 Replaces the manual "SISTEMA DE HITOS" sheet: a pre-loaded hito-type catalog, a
-guided entry with a MANDATORY PJUD evidence capture, admin approval, and a
-per-lawyer monthly total. Firm rule enforced here: a hito can never be approved
-without evidence ("sin evidencia no se paga").
+guided entry with a PJUD evidence capture, admin approval, and a per-lawyer
+monthly total. Firm rule enforced here: a hito submitted by a lawyer through the
+public form (origen=formulario) can never be approved without evidence ("sin
+evidencia no se paga"); hitos loaded by the admin, Excel or the detector are exempt.
 """
 import hashlib
 import io
@@ -22,6 +23,7 @@ from sqlalchemy.orm import Session, selectinload
 from app.api.deps import get_current_lawyer, get_db, require_admin
 from app.models.hito import (
     Hito, HitoTipo, HITO_APROBADO, HITO_PENDIENTE, HITO_RECHAZADO, HITO_SUGERIDO,
+    ORIGEN_FORMULARIO, ORIGEN_MANUAL,
 )
 from app.models.lawyer import Lawyer
 from app.services import bono_cierre_service as cierre_svc
@@ -179,8 +181,8 @@ class HitoBulkIds(BaseModel):
 class HitoBulkResult(BaseModel):
     procesados: int
     ids: list[int]  # the ids actually acted on
-    # aprobar-lote only: hitos skipped because they have no evidence attached
-    # ("sin evidencia no se paga"). Always 0 / [] for rechazar-lote and eliminar-lote.
+    # aprobar-lote only: public-form hitos (origen=formulario) skipped because they
+    # have no evidence ("sin evidencia no se paga"). Always 0 / [] for the other bulk actions.
     sin_evidencia: int = 0
     omitidos_ids: list[int] = []
 
@@ -315,6 +317,7 @@ async def _create_hito(
     etapa_sysgal: Optional[str],
     tramite_sysgal: Optional[str],
     evidencia: Optional[UploadFile],
+    origen: str = ORIGEN_MANUAL,
 ) -> Hito:
     """Create a hito for ``target_lawyer_id`` on behalf of ``actor`` (who is recorded
     as ``created_by``). Shared by the authenticated create and the public form so
@@ -373,6 +376,7 @@ async def _create_hito(
         evidencia_filename=ev_filename,
         evidencia_content_type=ev_content_type,
         estado=HITO_PENDIENTE,
+        origen=origen,
         created_by_rut=actor.rut,
         created_by_name=actor.name,
     )
@@ -380,6 +384,25 @@ async def _create_hito(
     db.commit()
     db.refresh(hito)
     return hito
+
+
+def _falta_evidencia_para_aprobar(hito: Hito) -> bool:
+    """The "sin evidencia no se paga" gate, scoped by the client's decision: it
+    applies ONLY to hitos submitted through the public form (``origen ==
+    formulario``, which always carry evidence — this is a defensive check).
+    Hitos loaded by the admin, by Excel import or by the detector may be
+    approved without evidence.
+    """
+    return hito.origen == ORIGEN_FORMULARIO and not hito.tiene_evidencia
+
+
+def _required_form_text(value: Optional[str], field: str) -> str:
+    """Public-form fields are mandatory server-side (the form cannot be bypassed
+    by posting directly): blank after strip is a 422 naming the field."""
+    text = (value or "").strip()
+    if not text:
+        raise HTTPException(status_code=422, detail=f"El campo {field} es obligatorio")
+    return text
 
 
 def _lawyer_by_token(db: Session, token: str) -> Lawyer:
@@ -645,23 +668,37 @@ async def public_form(
 @router.post("/public/{token}", response_model=HitoResponse, status_code=status.HTTP_201_CREATED)
 async def public_create_hito(
     token: str,
-    hito_tipo_id: int = Form(...),
-    fecha_hito: date = Form(...),
+    # Every field is declared optional so a missing/blank one yields OUR 422
+    # ("El campo X es obligatorio") instead of FastAPI's generic body error.
+    hito_tipo_id: Optional[int] = Form(None),
+    fecha_hito: Optional[date] = Form(None),
     rol_causa: Optional[str] = Form(None),
     procedimiento: Optional[str] = Form(None),
     descripcion: Optional[str] = Form(None),
     tribunal: Optional[str] = Form(None),
     etapa_sysgal: Optional[str] = Form(None),
     tramite_sysgal: Optional[str] = Form(None),
-    evidencia: Optional[UploadFile] = File(None),  # required — checked below for a clear 422
+    evidencia: Optional[UploadFile] = File(None),
     db: Session = Depends(get_db),
 ):
-    """PUBLIC (no auth). Register a hito for the token's lawyer. Evidence is
-    REQUIRED here (the lawyer has no other way to attach it later except this
-    form). The lawyer is both owner and ``created_by``; there is no ``lawyer_id``
-    field, so the link can never create for someone else.
+    """PUBLIC (no auth). Register a hito for the token's lawyer.
+
+    ALL business fields are mandatory server-side (tipo, fecha, RUT cliente,
+    ROL/causa, tribunal, procedimiento, evidencia) — the public form cannot be
+    bypassed by posting directly; only ``etapa_sysgal``/``tramite_sysgal`` stay
+    optional. The lawyer is both owner and ``created_by``; there is no
+    ``lawyer_id`` field, so the link can never create for someone else. The hito
+    is stamped ``origen=formulario``.
     """
     lawyer = _lawyer_by_token(db, token)
+    if hito_tipo_id is None:
+        raise HTTPException(status_code=422, detail="El campo hito_tipo_id es obligatorio")
+    if fecha_hito is None:
+        raise HTTPException(status_code=422, detail="El campo fecha_hito es obligatorio")
+    rol_causa = _required_form_text(rol_causa, "rol_causa")
+    descripcion = _required_form_text(descripcion, "descripcion")
+    tribunal = _required_form_text(tribunal, "tribunal")
+    procedimiento = _required_form_text(procedimiento, "procedimiento")
     if evidencia is None:
         raise HTTPException(status_code=422, detail=_EVIDENCIA_OBLIGATORIA_DETAIL)
     data = await evidencia.read()
@@ -673,6 +710,7 @@ async def public_create_hito(
         hito_tipo_id=hito_tipo_id, fecha_hito=fecha_hito, rol_causa=rol_causa,
         procedimiento=procedimiento, descripcion=descripcion, tribunal=tribunal,
         etapa_sysgal=etapa_sysgal, tramite_sysgal=tramite_sysgal, evidencia=evidencia,
+        origen=ORIGEN_FORMULARIO,
     )
     return _to_response(hito)
 
@@ -727,13 +765,14 @@ async def aprobar_hito(
     db: Session = Depends(get_db),
     admin_rut: str = Depends(require_admin),
 ):
-    """Approve a hito (admin only). Evidence is mandatory: "sin evidencia no se paga"."""
+    """Approve a hito (admin only). A public-form hito ("formulario") cannot be
+    approved without evidence; see ``_falta_evidencia_para_aprobar``."""
     hito = db.query(Hito).filter(Hito.id == hito_id).first()
     if hito is None:
         raise HTTPException(status_code=404, detail="Hito no encontrado")
     if cierre_svc.is_cerrado(db, cierre_svc.periodo_de_fecha(hito.fecha_hito)):
         raise HTTPException(status_code=409, detail="El período de ese hito está cerrado")
-    if not hito.tiene_evidencia:
+    if _falta_evidencia_para_aprobar(hito):
         raise HTTPException(status_code=409, detail=_SIN_EVIDENCIA_DETAIL)
 
     admin = db.query(Lawyer).filter(Lawyer.rut == admin_rut).first()
@@ -780,8 +819,9 @@ async def aprobar_hitos_lote(
 ):
     """Approve every existing hito in ``ids`` (admin only). Skips ids that don't
     exist; a closed period blocks the whole batch with the same 409 as the
-    single endpoint. Hitos without evidence are NOT approved: they are left
-    untouched and reported in ``sin_evidencia`` / ``omitidos_ids``."""
+    single endpoint. Public-form hitos ("formulario") without evidence are NOT
+    approved: they are left untouched and reported in ``sin_evidencia`` /
+    ``omitidos_ids`` (see ``_falta_evidencia_para_aprobar``)."""
     hitos = db.query(Hito).filter(Hito.id.in_(body.ids)).all()
     admin = db.query(Lawyer).filter(Lawyer.rut == admin_rut).first()
     now = datetime.utcnow()
@@ -790,7 +830,7 @@ async def aprobar_hitos_lote(
     for hito in hitos:
         if cierre_svc.is_cerrado(db, cierre_svc.periodo_de_fecha(hito.fecha_hito)):
             raise HTTPException(status_code=409, detail="El período de ese hito está cerrado")
-        if not hito.tiene_evidencia:
+        if _falta_evidencia_para_aprobar(hito):
             omitidos.append(hito.id)
             continue
         hito.estado = HITO_APROBADO

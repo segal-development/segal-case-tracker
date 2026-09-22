@@ -1,5 +1,7 @@
-"""Evidence is mandatory to approve a hito ("sin evidencia no se paga").
+"""Evidence is mandatory to approve a PUBLIC-FORM hito ("sin evidencia no se paga").
 
+Client decision: the gate applies only to ``origen == formulario``; hitos loaded
+by the admin, by Excel import or by the detector approve without evidence.
 Covers the approval gate (single + bulk) and the ``PUT /hitos/{id}/evidencia``
 endpoint that attaches or replaces evidence after creation, so a hito created
 without a capture can still be completed and approved.
@@ -9,7 +11,10 @@ from datetime import date
 import pytest
 
 from app.core.security import create_access_token
-from app.models.hito import Hito, HitoTipo, HITO_APROBADO, HITO_PENDIENTE, HITO_RECHAZADO, HITO_SUGERIDO
+from app.models.hito import (
+    Hito, HitoTipo, HITO_APROBADO, HITO_PENDIENTE, HITO_RECHAZADO,
+    HITO_SUGERIDO, ORIGEN_DETECTOR, ORIGEN_FORMULARIO, ORIGEN_MANUAL,
+)
 from app.models.lawyer import Lawyer
 from app.services import storage_service
 
@@ -85,10 +90,10 @@ def _h(rut):
     return {"Authorization": "Bearer " + create_access_token({"sub": rut})}
 
 
-def _hito(db, lawyer, tipo, estado=HITO_PENDIENTE, evidencia=False):
+def _hito(db, lawyer, tipo, estado=HITO_PENDIENTE, evidencia=False, origen=ORIGEN_FORMULARIO):
     h = Hito(
         lawyer_id=lawyer.id, hito_tipo_id=tipo.id, valor_bruto=8077,
-        fecha_hito=date(2026, 7, 15), estado=estado,
+        fecha_hito=date(2026, 7, 15), estado=estado, origen=origen,
         evidencia_storage_key="hitos/evidencia/x/cap.png" if evidencia else None,
         evidencia_content_type="image/png" if evidencia else None,
     )
@@ -108,8 +113,8 @@ def _put(client, headers, hito_id, filename="cap.png", data=b"\x89PNG_fake", con
 # --------------------------------------------------------------------------- #
 # POST /{id}/aprobar
 # --------------------------------------------------------------------------- #
-def test_aprobar_sin_evidencia_409(client, db, admin, lawyer, tipo):
-    h = _hito(db, lawyer, tipo)
+def test_aprobar_formulario_sin_evidencia_409(client, db, admin, lawyer, tipo):
+    h = _hito(db, lawyer, tipo)  # origen=formulario
     r = client.post(f"/api/v1/hitos/{h.id}/aprobar", headers=_h(ADMIN_RUT))
     assert r.status_code == 409
     assert r.json()["detail"] == SIN_EVIDENCIA
@@ -118,14 +123,25 @@ def test_aprobar_sin_evidencia_409(client, db, admin, lawyer, tipo):
     assert h.aprobado_at is None
 
 
-def test_aprobar_con_evidencia_200(client, db, admin, lawyer, tipo):
+def test_aprobar_formulario_con_evidencia_200(client, db, admin, lawyer, tipo):
     h = _hito(db, lawyer, tipo, evidencia=True)
     r = client.post(f"/api/v1/hitos/{h.id}/aprobar", headers=_h(ADMIN_RUT))
     assert r.status_code == 200
     assert r.json()["estado"] == HITO_APROBADO
+    assert r.json()["origen"] == ORIGEN_FORMULARIO
 
 
-def test_reaprobar_rechazado_sin_evidencia_409(client, db, admin, lawyer, tipo):
+@pytest.mark.parametrize("origen", [ORIGEN_MANUAL, ORIGEN_DETECTOR])
+def test_aprobar_no_formulario_sin_evidencia_200(client, db, admin, lawyer, tipo, origen):
+    """Client decision: hitos loaded by the admin, Excel or the detector approve without evidence."""
+    h = _hito(db, lawyer, tipo, origen=origen)
+    r = client.post(f"/api/v1/hitos/{h.id}/aprobar", headers=_h(ADMIN_RUT))
+    assert r.status_code == 200
+    assert r.json()["estado"] == HITO_APROBADO
+    assert r.json()["tiene_evidencia"] is False
+
+
+def test_reaprobar_rechazado_formulario_sin_evidencia_409(client, db, admin, lawyer, tipo):
     h = _hito(db, lawyer, tipo, estado=HITO_RECHAZADO)
     r = client.post(f"/api/v1/hitos/{h.id}/aprobar", headers=_h(ADMIN_RUT))
     assert r.status_code == 409
@@ -135,24 +151,26 @@ def test_reaprobar_rechazado_sin_evidencia_409(client, db, admin, lawyer, tipo):
 # --------------------------------------------------------------------------- #
 # POST /aprobar-lote
 # --------------------------------------------------------------------------- #
-def test_aprobar_lote_solo_con_evidencia(client, db, admin, lawyer, tipo):
-    con = [_hito(db, lawyer, tipo, evidencia=True).id for _ in range(2)]
-    sin = [_hito(db, lawyer, tipo).id for _ in range(2)]
-    r = client.post("/api/v1/hitos/aprobar-lote", headers=_h(ADMIN_RUT), json={"ids": con + sin})
+def test_aprobar_lote_omite_solo_formulario_sin_evidencia(client, db, admin, lawyer, tipo):
+    form_con = _hito(db, lawyer, tipo, evidencia=True).id
+    form_sin = _hito(db, lawyer, tipo).id
+    manual_sin = _hito(db, lawyer, tipo, origen=ORIGEN_MANUAL).id
+    detector_sin = _hito(db, lawyer, tipo, origen=ORIGEN_DETECTOR).id
+    ids = [form_con, form_sin, manual_sin, detector_sin]
+    r = client.post("/api/v1/hitos/aprobar-lote", headers=_h(ADMIN_RUT), json={"ids": ids})
     assert r.status_code == 200
     body = r.json()
-    assert body["procesados"] == 2
-    assert sorted(body["ids"]) == sorted(con)
-    assert body["sin_evidencia"] == 2
-    assert sorted(body["omitidos_ids"]) == sorted(sin)
-    for i in con:
+    assert body["procesados"] == 3
+    assert sorted(body["ids"]) == sorted([form_con, manual_sin, detector_sin])
+    assert body["sin_evidencia"] == 1
+    assert body["omitidos_ids"] == [form_sin]
+    for i in (form_con, manual_sin, detector_sin):
         assert db.get(Hito, i).estado == HITO_APROBADO
-    for i in sin:
-        assert db.get(Hito, i).estado == HITO_PENDIENTE
+    assert db.get(Hito, form_sin).estado == HITO_PENDIENTE
 
 
-def test_aprobar_lote_todos_sin_evidencia_no_aprueba_nada(client, db, admin, lawyer, tipo):
-    sin = [_hito(db, lawyer, tipo).id for _ in range(3)]
+def test_aprobar_lote_todos_formulario_sin_evidencia_no_aprueba_nada(client, db, admin, lawyer, tipo):
+    sin = [_hito(db, lawyer, tipo).id for _ in range(3)]  # all origen=formulario
     r = client.post("/api/v1/hitos/aprobar-lote", headers=_h(ADMIN_RUT), json={"ids": sin})
     assert r.status_code == 200
     body = r.json()
