@@ -26,6 +26,7 @@ from app.models.hito import (
     Hito, HitoTipo, HITO_APROBADO, HITO_PENDIENTE, HITO_RECHAZADO, HITO_SUGERIDO,
     ORIGEN_FORMULARIO, ORIGEN_MANUAL,
 )
+from app.models.hito_form_link import FORM_LINK_KIND_PROCURADORES, HitoFormLink
 from app.models.lawyer import Lawyer
 from app.services import bono_cierre_service as cierre_svc
 
@@ -217,10 +218,32 @@ class PublicFormResponse(BaseModel):
     tipos: List[HitoTipoResponse]
 
 
+class ProcuradoresFormLink(BaseModel):
+    """State of the single shared link the procuradores use."""
+    kind: str = FORM_LINK_KIND_PROCURADORES
+    tiene_link: bool
+    token: Optional[str] = None
+
+
+class ProcuradoresFormLinkCreated(BaseModel):
+    kind: str = FORM_LINK_KIND_PROCURADORES
+    token: str
+
+
+class PublicProcuradoresFormResponse(BaseModel):
+    """What the shared procuradores form needs: the tipo catalog + the lawyers to pick from."""
+    tipos: List[HitoTipoResponse]
+    abogados: List[PublicAbogado]
+
+
 _SIN_EVIDENCIA_DETAIL = "El hito no tiene evidencia adjunta; no se puede aprobar sin evidencia."
 _EVIDENCIA_ESTADO_DETAIL = "Solo se puede adjuntar evidencia a un hito pendiente, sugerido o rechazado."
 _EVIDENCIA_OBLIGATORIA_DETAIL = "La evidencia es obligatoria"
 _LINK_INVALIDO_DETAIL = "Link inválido o vencido"
+_ABOGADO_INVALIDO_DETAIL = "Selecciona un abogado válido"
+# created_by stamp for hitos submitted through the shared procuradores link, so
+# the admin can tell them apart from the lawyer's own submissions.
+_PROCURADOR_CREATED_BY = ("procurador", "Procurador (link genérico)")
 # States in which evidence may still be attached/replaced. An approved hito was
 # paid on the evidence it had, so it is frozen.
 _EVIDENCIA_ESTADOS = (HITO_PENDIENTE, HITO_SUGERIDO, HITO_RECHAZADO)
@@ -335,6 +358,7 @@ async def _create_hito(
     tramite_sysgal: Optional[str],
     evidencia: Optional[UploadFile],
     origen: str = ORIGEN_MANUAL,
+    created_by: Optional[tuple[str, str]] = None,
 ) -> Hito:
     """Create a hito for ``target_lawyer_id`` on behalf of ``actor`` (who is recorded
     as ``created_by``). Shared by the authenticated create and the public form so
@@ -394,8 +418,8 @@ async def _create_hito(
         evidencia_content_type=ev_content_type,
         estado=HITO_PENDIENTE,
         origen=origen,
-        created_by_rut=actor.rut,
-        created_by_name=actor.name,
+        created_by_rut=created_by[0] if created_by else actor.rut,
+        created_by_name=created_by[1] if created_by else actor.name,
     )
     db.add(hito)
     db.commit()
@@ -420,6 +444,64 @@ def _required_form_text(value: Optional[str], field: str) -> str:
     if not text:
         raise HTTPException(status_code=422, detail=f"El campo {field} es obligatorio")
     return text
+
+
+async def _validate_public_form_fields(
+    hito_tipo_id: Optional[int],
+    fecha_hito: Optional[date],
+    rol_causa: Optional[str],
+    descripcion: Optional[str],
+    tribunal: Optional[str],
+    procedimiento: Optional[str],
+    evidencia: Optional[UploadFile],
+) -> tuple[int, date, str, str, str, str, UploadFile]:
+    """The mandatory-field contract shared by every public hito form (per-lawyer
+    link and shared procuradores link): each business field must be present and
+    non-blank, evidence present and non-empty; otherwise 422 naming the field.
+    Returns the cleaned values; the upload is rewound for ``_create_hito``."""
+    if hito_tipo_id is None:
+        raise HTTPException(status_code=422, detail="El campo hito_tipo_id es obligatorio")
+    if fecha_hito is None:
+        raise HTTPException(status_code=422, detail="El campo fecha_hito es obligatorio")
+    rol_causa = _required_form_text(rol_causa, "rol_causa")
+    descripcion = _required_form_text(descripcion, "descripcion")
+    tribunal = _required_form_text(tribunal, "tribunal")
+    procedimiento = _required_form_text(procedimiento, "procedimiento")
+    if evidencia is None:
+        raise HTTPException(status_code=422, detail=_EVIDENCIA_OBLIGATORIA_DETAIL)
+    data = await evidencia.read()
+    if not data:
+        raise HTTPException(status_code=422, detail=_EVIDENCIA_OBLIGATORIA_DETAIL)
+    await evidencia.seek(0)  # _create_hito reads it again
+    return hito_tipo_id, fecha_hito, rol_causa, descripcion, tribunal, procedimiento, evidencia
+
+
+def _procuradores_link(db: Session) -> Optional[HitoFormLink]:
+    return db.query(HitoFormLink).filter(HitoFormLink.kind == FORM_LINK_KIND_PROCURADORES).first()
+
+
+def _procuradores_link_or_404(db: Session, token: str) -> HitoFormLink:
+    """Resolve the shared procuradores token, else 404. A revoked (NULL) token is
+    indistinguishable from an unknown one. Never logged."""
+    link = None
+    if token:
+        link = (
+            db.query(HitoFormLink)
+            .filter(HitoFormLink.kind == FORM_LINK_KIND_PROCURADORES, HitoFormLink.token == token)
+            .first()
+        )
+    if link is None:
+        raise HTTPException(status_code=404, detail=_LINK_INVALIDO_DETAIL)
+    return link
+
+
+def _active_firm_lawyers(db: Session) -> list[Lawyer]:
+    return (
+        db.query(Lawyer)
+        .filter(Lawyer.is_active.is_(True), Lawyer.is_firm_lawyer.is_(True))
+        .order_by(Lawyer.name)
+        .all()
+    )
 
 
 def _lawyer_by_token(db: Session, token: str) -> Lawyer:
@@ -628,6 +710,51 @@ async def list_form_links(
     ]
 
 
+# Shared procuradores link. LITERAL paths declared BEFORE ``/form-links/{lawyer_id}``
+# so "procuradores" is never parsed as a lawyer id.
+@router.get("/form-links/procuradores", response_model=ProcuradoresFormLink)
+async def get_procuradores_form_link(
+    db: Session = Depends(get_db),
+    _admin_rut: str = Depends(require_admin),
+):
+    """State of the single shared link the procuradores use (admin only)."""
+    link = _procuradores_link(db)
+    token = link.token if link else None
+    return ProcuradoresFormLink(tiene_link=bool(token), token=token)
+
+
+@router.post("/form-links/procuradores", response_model=ProcuradoresFormLinkCreated)
+async def create_procuradores_form_link(
+    regenerar: bool = Query(False, description="Reemplazar el token existente (invalida el link anterior)"),
+    db: Session = Depends(get_db),
+    _admin_rut: str = Depends(require_admin),
+):
+    """Issue the shared procuradores token (admin only). Idempotent unless
+    ``regenerar=true``, which replaces it and invalidates the previous link."""
+    link = _procuradores_link(db)
+    if link is None:
+        link = HitoFormLink(kind=FORM_LINK_KIND_PROCURADORES)
+        db.add(link)
+    if not link.token or regenerar:
+        link.token = secrets.token_urlsafe(32)
+    db.commit()
+    db.refresh(link)
+    return ProcuradoresFormLinkCreated(token=link.token)
+
+
+@router.delete("/form-links/procuradores", status_code=status.HTTP_204_NO_CONTENT)
+async def revoke_procuradores_form_link(
+    db: Session = Depends(get_db),
+    _admin_rut: str = Depends(require_admin),
+):
+    """Revoke the shared procuradores link (admin only). Idempotent."""
+    link = _procuradores_link(db)
+    if link is not None:
+        link.token = None
+        db.commit()
+    return None
+
+
 @router.post("/form-links/{lawyer_id}", response_model=FormLinkCreated)
 async def create_form_link(
     lawyer_id: int,
@@ -708,26 +835,91 @@ async def public_create_hito(
     is stamped ``origen=formulario``.
     """
     lawyer = _lawyer_by_token(db, token)
-    if hito_tipo_id is None:
-        raise HTTPException(status_code=422, detail="El campo hito_tipo_id es obligatorio")
-    if fecha_hito is None:
-        raise HTTPException(status_code=422, detail="El campo fecha_hito es obligatorio")
-    rol_causa = _required_form_text(rol_causa, "rol_causa")
-    descripcion = _required_form_text(descripcion, "descripcion")
-    tribunal = _required_form_text(tribunal, "tribunal")
-    procedimiento = _required_form_text(procedimiento, "procedimiento")
-    if evidencia is None:
-        raise HTTPException(status_code=422, detail=_EVIDENCIA_OBLIGATORIA_DETAIL)
-    data = await evidencia.read()
-    if not data:
-        raise HTTPException(status_code=422, detail=_EVIDENCIA_OBLIGATORIA_DETAIL)
-    await evidencia.seek(0)  # _create_hito reads it again
+    hito_tipo_id, fecha_hito, rol_causa, descripcion, tribunal, procedimiento, evidencia = (
+        await _validate_public_form_fields(
+            hito_tipo_id, fecha_hito, rol_causa, descripcion, tribunal, procedimiento, evidencia,
+        )
+    )
     hito = await _create_hito(
         db, lawyer, lawyer.id,
         hito_tipo_id=hito_tipo_id, fecha_hito=fecha_hito, rol_causa=rol_causa,
         procedimiento=procedimiento, descripcion=descripcion, tribunal=tribunal,
         etapa_sysgal=etapa_sysgal, tramite_sysgal=tramite_sysgal, evidencia=evidencia,
         origen=ORIGEN_FORMULARIO,
+    )
+    return _to_response(hito)
+
+
+# --------------------------------------------------------------------------- #
+# Shared procuradores form — NO auth dependency. One token for every procurador;
+# they pick the lawyer they work for. Deliberately NO list/evidence endpoints:
+# the link is shared, so it must not expose anyone's hitos.
+# --------------------------------------------------------------------------- #
+@router.get("/public-procuradores/{token}", response_model=PublicProcuradoresFormResponse)
+async def public_procuradores_form(
+    token: str,
+    db: Session = Depends(get_db),
+):
+    """PUBLIC (no auth). The hito-type catalog + the active firm lawyers to pick from."""
+    _procuradores_link_or_404(db, token)
+    tipos = (
+        db.query(HitoTipo)
+        .filter(HitoTipo.activo.is_(True))
+        .order_by(HitoTipo.orden)
+        .all()
+    )
+    return PublicProcuradoresFormResponse(
+        tipos=[HitoTipoResponse.model_validate(t) for t in tipos],
+        abogados=[
+            PublicAbogado(id=lw.id, nombre=lw.name, rut=lw.rut, nivel=lw.nivel)
+            for lw in _active_firm_lawyers(db)
+        ],
+    )
+
+
+@router.post("/public-procuradores/{token}", response_model=HitoResponse, status_code=status.HTTP_201_CREATED)
+async def public_procuradores_create_hito(
+    token: str,
+    lawyer_id: Optional[int] = Form(None),
+    hito_tipo_id: Optional[int] = Form(None),
+    fecha_hito: Optional[date] = Form(None),
+    rol_causa: Optional[str] = Form(None),
+    procedimiento: Optional[str] = Form(None),
+    descripcion: Optional[str] = Form(None),
+    tribunal: Optional[str] = Form(None),
+    etapa_sysgal: Optional[str] = Form(None),
+    tramite_sysgal: Optional[str] = Form(None),
+    evidencia: Optional[UploadFile] = File(None),
+    db: Session = Depends(get_db),
+):
+    """PUBLIC (no auth). A procurador registers a hito for the lawyer they pick.
+
+    ``lawyer_id`` must be an active firm lawyer (422 otherwise); the rest follows
+    the same mandatory-field contract as the per-lawyer public form. The hito is
+    owned by the selected lawyer, stamped ``origen=formulario`` and
+    ``created_by = Procurador (link genérico)``.
+    """
+    _procuradores_link_or_404(db, token)
+    lawyer = None
+    if lawyer_id is not None:
+        lawyer = (
+            db.query(Lawyer)
+            .filter(Lawyer.id == lawyer_id, Lawyer.is_active.is_(True), Lawyer.is_firm_lawyer.is_(True))
+            .first()
+        )
+    if lawyer is None:
+        raise HTTPException(status_code=422, detail=_ABOGADO_INVALIDO_DETAIL)
+    hito_tipo_id, fecha_hito, rol_causa, descripcion, tribunal, procedimiento, evidencia = (
+        await _validate_public_form_fields(
+            hito_tipo_id, fecha_hito, rol_causa, descripcion, tribunal, procedimiento, evidencia,
+        )
+    )
+    hito = await _create_hito(
+        db, lawyer, lawyer.id,
+        hito_tipo_id=hito_tipo_id, fecha_hito=fecha_hito, rol_causa=rol_causa,
+        procedimiento=procedimiento, descripcion=descripcion, tribunal=tribunal,
+        etapa_sysgal=etapa_sysgal, tramite_sysgal=tramite_sysgal, evidencia=evidencia,
+        origen=ORIGEN_FORMULARIO, created_by=_PROCURADOR_CREATED_BY,
     )
     return _to_response(hito)
 
