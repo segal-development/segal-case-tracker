@@ -12,6 +12,7 @@ import logging
 import re
 import secrets
 import unicodedata
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import List, Optional
 from zoneinfo import ZoneInfo
@@ -1255,6 +1256,57 @@ class HitoImportResult(BaseModel):
     errores: int  # rows skipped (no lawyer match, bad date, unknown pleno tipo)
 
 
+class HitoPreviewHoja(BaseModel):
+    nombre: str
+    reconocida: bool  # False for non-hito sheets (PARÁMETROS, VARIABLES BONO, ...)
+    filas: int
+
+
+class HitoPreviewFila(BaseModel):
+    fila: int  # 1-based row number in the sheet
+    hoja: str
+    resultado: str  # "nueva" | "duplicada" | "error"
+    abogado: Optional[str] = None
+    tipo: Optional[str] = None
+    fecha: Optional[date] = None
+    rut_cliente: Optional[str] = None  # what would go to rol_causa
+    causa: Optional[str] = None  # what would go to descripcion (the ROL)
+    tribunal: Optional[str] = None
+    estado: str  # "aprobado" | "pendiente"
+    valor: int
+    motivo: Optional[str] = None  # why it is duplicada/error
+    advertencias: List[str] = []
+
+
+class HitoPreviewResumen(BaseModel):
+    total_leidas: int
+    nuevas: int
+    duplicadas: int
+    errores: int
+    aprobados: int
+    pendientes: int
+    advertencias: int  # total count of per-row warnings
+    advertencias_generales: List[str] = []
+    sospechoso: bool = False
+    motivo_sospecha: Optional[str] = None
+
+
+class HitoPreviewPorAbogado(BaseModel):
+    abogado: str
+    nuevas: int
+    duplicadas: int
+    ya_tiene_en_el_mes: int
+
+
+class HitoImportPreview(BaseModel):
+    hojas: List[HitoPreviewHoja]
+    columnas_detectadas: dict  # field -> header text found (e.g. "rol" -> "ROL")
+    resumen: HitoPreviewResumen
+    filas: List[HitoPreviewFila]
+    filas_truncadas: bool
+    por_abogado: List[HitoPreviewPorAbogado]
+
+
 def _norm(s) -> str:
     return unicodedata.normalize("NFKD", str(s or "")).encode("ascii", "ignore").decode().upper().strip()
 
@@ -1394,21 +1446,437 @@ def _match_lawyer_by_name(name: str, lawyers) -> Optional[Lawyer]:
     return None
 
 
-def _match_pleno_tipo(text: str, pleno_tipos) -> Optional[HitoTipo]:
-    n = _norm(text)
-    if not n:
-        return None
-    for t in pleno_tipos:
-        lt = _norm(t.label)
-        if n == lt or n in lt or lt in n:
-            return t
-    ntok = set(n.split())
-    best, best_k = None, 0
-    for t in pleno_tipos:
-        k = len(ntok & set(_norm(t.label).split()))
-        if k > best_k:
-            best, best_k = t, k
-    return best if best_k >= 2 else None
+# --------------------------------------------------------------------------- #
+# Shared import engine — the ONE place that parses, matches, normalizes and
+# dedups a hitos workbook. ``POST /importar`` and ``POST /importar/preview``
+# both build on ``_run_hito_import``: the preview simply never persists the
+# ``Hito`` objects it builds. This is what the August 2026 incident needed —
+# a preview built from separate logic could silently drift from the real
+# import and stop meaning anything.
+# --------------------------------------------------------------------------- #
+def _looks_like_rol(text: Optional[str]) -> bool:
+    """True when ``text`` has ROL/RIT shape (LETTER(S)-DIGITS-YEAR, e.g.
+    "C-8818-2026") or is blank. Reuses ``_ROL_RE`` — the same shape the dedup
+    key already treats as a real ROL — so this warning and dedup never disagree.
+    Blank causa is legitimate (e.g. a recurso de protección with no ROL yet) and
+    never warns."""
+    if not text:
+        return True
+    return bool(_ROL_RE.fullmatch(text.strip()))
+
+
+def _str_or_none(v) -> Optional[str]:
+    s = str(v).strip() if v is not None else ""
+    return s or None
+
+
+def _period_bounds(periodo: str):
+    """``date`` range ``[start, end)`` covered by a 'YYYY-MM' period string."""
+    year, month = (int(x) for x in periodo.split("-"))
+    start = date(year, month, 1)
+    end = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    return start, end
+
+
+def _load_hito_matching_context(db: Session):
+    """Firm lawyers + hito-type catalog, split the way the importer needs them."""
+    lawyers = db.query(Lawyer).filter(Lawyer.is_firm_lawyer.is_(True)).all()
+    tipos = db.query(HitoTipo).all()
+    junior_tipo = next((t for t in tipos if t.nivel == "junior"), None)
+    pleno_tipos = [t for t in tipos if t.nivel == "pleno"]
+    return lawyers, tipos, junior_tipo, pleno_tipos
+
+
+def _hito_header_texts(ws, header_row: Optional[int], cols: Optional[dict]) -> dict:
+    """Original (non-normalized) header text found for each resolved field, e.g.
+    ``{"rol": "ROL causa", "desc": "Descripción"}``. Used for ``columnas_detectadas``
+    and to name the two headers in the ROL/DESCRIPCION shape-mismatch warning."""
+    if header_row is None or not cols:
+        return {}
+    row = next(ws.iter_rows(min_row=header_row + 1, max_row=header_row + 1, values_only=True), None)
+    if row is None:
+        return {}
+    out: dict = {}
+    for field_name, idx in cols.items():
+        if idx < len(row) and row[idx] is not None:
+            out[field_name] = str(row[idx]).strip()
+    return out
+
+
+@dataclass
+class _RawHitoRow:
+    """One data row of a hito sheet, parsed into raw field values only — no
+    lawyer/tipo matching, no dedup. The single source both the real import and
+    the preview read a row from, so they can never disagree on what a cell means."""
+    hoja: str
+    fila: int  # 1-based row number, as it appears in the sheet
+    ab_raw: object
+    fecha_raw: object
+    rut_raw: object
+    rol_raw: object
+    desc_raw: object
+    procedimiento_raw: object
+    tribunal_raw: object
+    etapa_raw: object
+    tramite_raw: object
+    aprobado_raw: object
+    valor_raw: object
+    tipo_text: Optional[str]  # cell text to match against tipo_candidates
+    tipo_candidates: list
+    tipo_fixed: Optional[HitoTipo] = None  # pre-assigned tipo (old-format JUNIOR sheets)
+
+
+def _iterate_hito_rows(sheets, tipos, junior_tipo, pleno_tipos) -> List[_RawHitoRow]:
+    """Parse every hito data row of every sheet, NEW format (header-based, any
+    layout/sheet name) or OLD format (fixed position by nivel) — mirrors exactly
+    what ``importar_hitos`` used to do inline, now the only place that does it."""
+    rows: List[_RawHitoRow] = []
+    for ws in sheets:
+        header_row, cols = _resolve_hito_columns(ws)
+        new_format = bool(cols and "tipo" in cols and "aprobado" in cols)
+
+        if new_format:
+            def g(row, field_name, _cols=cols):
+                i = _cols.get(field_name)
+                return row[i] if i is not None and i < len(row) else None
+
+            for ri, row in enumerate(ws.iter_rows(values_only=True), start=1):
+                if ri <= header_row + 1:
+                    continue
+                ab = g(row, "abogado")
+                if not ab or _norm(ab) in ("ABOGADO AT", "ABOGADO"):
+                    continue
+                rows.append(_RawHitoRow(
+                    hoja=ws.title, fila=ri, ab_raw=ab, fecha_raw=g(row, "fecha"),
+                    rut_raw=g(row, "rut"), rol_raw=g(row, "rol"), desc_raw=g(row, "desc"),
+                    procedimiento_raw=g(row, "proc"), tribunal_raw=g(row, "tribunal"),
+                    etapa_raw=g(row, "etapa"), tramite_raw=g(row, "tramite"),
+                    aprobado_raw=g(row, "aprobado"), valor_raw=g(row, "valor"),
+                    tipo_text=g(row, "tipo"), tipo_candidates=tipos, tipo_fixed=None,
+                ))
+            continue
+
+        # OLD format (hojas 'HITOS JUNIOR/PLENO'): posición fija por nivel.
+        is_junior = "JUNIOR" in _norm(ws.title)
+        for ri, row in enumerate(ws.iter_rows(values_only=True), start=1):
+            if not _is_hito_row(row):
+                continue
+            if is_junior:
+                procedimiento, rut, descripcion = _cell(row, 3), _cell(row, 4), _cell(row, 5)
+                tipo_text, tipo_candidates, tipo_fixed = None, [], junior_tipo
+            else:
+                procedimiento, rut, descripcion = None, _cell(row, 3), None
+                tipo_text, tipo_candidates, tipo_fixed = _cell(row, 5), pleno_tipos, None
+            rows.append(_RawHitoRow(
+                hoja=ws.title, fila=ri, ab_raw=_cell(row, 1), fecha_raw=_cell(row, 2),
+                rut_raw=rut, rol_raw=None, desc_raw=descripcion, procedimiento_raw=procedimiento,
+                tribunal_raw=None, etapa_raw=_cell(row, 6), tramite_raw=_cell(row, 7),
+                aprobado_raw=_cell(row, 8), valor_raw=_cell(row, 9),
+                tipo_text=tipo_text, tipo_candidates=tipo_candidates, tipo_fixed=tipo_fixed,
+            ))
+    return rows
+
+
+@dataclass
+class _HitoRowResult:
+    """The interpretation of ONE row: what the real import would do with it."""
+    hoja: str
+    fila: int
+    resultado: str  # "nueva" | "duplicada" | "error"
+    estado: str  # "aprobado" | "pendiente"
+    valor: int
+    abogado: Optional[str] = None
+    lawyer_id: Optional[int] = None
+    tipo: Optional[str] = None
+    fecha: Optional[date] = None
+    rut_cliente: Optional[str] = None
+    causa: Optional[str] = None
+    tribunal: Optional[str] = None
+    motivo: Optional[str] = None
+    advertencias: List[str] = field(default_factory=list)
+    hito: Optional[Hito] = None  # populated only when resultado == "nueva"
+
+
+class _HitoDedupTracker:
+    """(abogado, RUT, causa, tribunal) dedup state shared by preview and import.
+
+    Loads the existing DB rows once, then also tracks rows seen so far THIS run
+    so within-file duplicates are caught the same way for both. Mirrors the old
+    inline ``existing3``/``existing4``/``seen3``/``seen4`` sets — the tolerant
+    rule where a blank tribunal on either side still collides (``_tribunal_key``).
+    """
+
+    def __init__(self, db: Session):
+        self.existing3: set = set()
+        self.existing4: set = set()
+        self.seen3: set = set()
+        self.seen4: set = set()
+        for h in (
+            db.query(Hito.lawyer_id, Hito.rol_causa, Hito.descripcion, Hito.tribunal)
+            .filter((Hito.rol_causa.isnot(None)) | (Hito.descripcion.isnot(None)))
+            .all()
+        ):
+            causa = _causa_key(h.descripcion)
+            if h.rol_causa is None and causa is None:
+                continue
+            self.existing3.add((h.lawyer_id, h.rol_causa, causa))
+            self.existing4.add((h.lawyer_id, h.rol_causa, causa, _tribunal_key(h.tribunal)))
+
+    def check(self, lawyer_id: int, rol_causa: Optional[str], causa: Optional[str],
+              tribunal_norm: Optional[str]):
+        """Returns ``(is_dup, motivo)``; records the row as seen when not a dup."""
+        if rol_causa is None and causa is None:
+            return False, None
+        trib = _tribunal_key(tribunal_norm)
+        k3 = (lawyer_id, rol_causa, causa)
+        k4 = k3 + (trib,)
+        if trib is None:
+            is_dup = k3 in self.existing3 or k3 in self.seen3
+        else:
+            k4_none = k3 + (None,)
+            is_dup = (
+                k4 in self.existing4 or k4 in self.seen4
+                or k4_none in self.existing4 or k4_none in self.seen4
+            )
+        if is_dup:
+            return True, "Ya existe un hito para este abogado en esta causa (mismo cliente, ROL y tribunal)."
+        self.seen3.add(k3)
+        self.seen4.add(k4)
+        return False, None
+
+
+def _resolve_and_evaluate_row(
+    raw: _RawHitoRow, *, lawyers, dedup: _HitoDedupTracker, admin, admin_rut: str,
+    sheet_has_tribunal: bool,
+) -> _HitoRowResult:
+    """Interpret ONE raw row exactly like the real import would: match lawyer and
+    tipo, parse the date, normalize the causa (ROL manda sobre DESCRIPCION), check
+    dedup, and build the ``Hito`` that would be created. Never writes to the
+    database — the caller (import or preview) decides whether to persist it."""
+    aprobado_flag = _norm(raw.aprobado_raw) in ("SI", "SÍ", "S")
+    estado_txt = "aprobado" if aprobado_flag else "pendiente"
+
+    fecha = _parse_fecha(raw.fecha_raw)
+    if fecha is None:
+        return _HitoRowResult(
+            hoja=raw.hoja, fila=raw.fila, resultado="error", estado=estado_txt, valor=0,
+            rut_cliente=_str_or_none(raw.rut_raw), motivo="No se pudo interpretar la fecha.",
+        )
+
+    lawyer = _match_lawyer_by_name(raw.ab_raw, lawyers) if raw.ab_raw else None
+    tipo = raw.tipo_fixed if raw.tipo_fixed is not None else _match_tipo_any(raw.tipo_text, raw.tipo_candidates)
+
+    if lawyer is None or tipo is None:
+        motivos = []
+        if lawyer is None:
+            motivos.append(f'No se encontró un abogado que coincida con "{raw.ab_raw}".')
+        if tipo is None:
+            motivos.append("No se pudo determinar el tipo de hito.")
+        return _HitoRowResult(
+            hoja=raw.hoja, fila=raw.fila, resultado="error", estado=estado_txt, valor=0,
+            abogado=(lawyer.name if lawyer else None), tipo=(tipo.label if tipo else None),
+            fecha=fecha, rut_cliente=_str_or_none(raw.rut_raw), motivo=" ".join(motivos),
+        )
+
+    try:
+        valor = int(raw.valor_raw) if raw.valor_raw else tipo.valor_bruto
+    except (ValueError, TypeError):
+        valor = tipo.valor_bruto
+    if valor <= 0:
+        valor = tipo.valor_bruto
+
+    rol_causa = (str(raw.rut_raw).strip()[:50] or None) if raw.rut_raw is not None else None
+    # La columna ROL manda sobre DESCRIPCION (ver fix(hitos) #273): una planilla
+    # que trae ambas nunca debe usar el texto libre de DESCRIPCION como causa.
+    desc_src = raw.rol_raw if raw.rol_raw else raw.desc_raw
+    desc_norm = _normalize_rol_text(str(desc_src)[:500]) if desc_src else None
+    tribunal_norm = (str(raw.tribunal_raw).strip()[:255] or None) if raw.tribunal_raw else None
+
+    advertencias: List[str] = []
+    if desc_norm and not _looks_like_rol(desc_norm):
+        advertencias.append(
+            f'La causa "{desc_norm}" no tiene forma de ROL. Revisa que la columna ROL esté bien.'
+        )
+    if tribunal_norm is None and sheet_has_tribunal:
+        advertencias.append(
+            "Sin tribunal: se va a considerar la misma causa que cualquier hito de este cliente en este ROL."
+        )
+
+    is_dup, motivo_dup = dedup.check(lawyer.id, rol_causa, desc_norm, tribunal_norm)
+    if is_dup:
+        return _HitoRowResult(
+            hoja=raw.hoja, fila=raw.fila, resultado="duplicada", estado=estado_txt, valor=valor,
+            abogado=lawyer.name, lawyer_id=lawyer.id, tipo=tipo.label, fecha=fecha,
+            rut_cliente=rol_causa, causa=desc_norm, tribunal=tribunal_norm,
+            motivo=motivo_dup, advertencias=advertencias,
+        )
+
+    hito = Hito(
+        lawyer_id=lawyer.id, hito_tipo_id=tipo.id, valor_bruto=valor,
+        fecha_hito=fecha, rol_causa=rol_causa,
+        procedimiento=(str(raw.procedimiento_raw).strip()[:100] if raw.procedimiento_raw else None),
+        descripcion=desc_norm, tribunal=tribunal_norm,
+        etapa_sysgal=(str(raw.etapa_raw).strip()[:100] if raw.etapa_raw else None),
+        tramite_sysgal=(str(raw.tramite_raw).strip()[:255] if raw.tramite_raw else None),
+        estado=(HITO_APROBADO if aprobado_flag else HITO_PENDIENTE), created_by_rut=admin_rut,
+        created_by_name=admin.name if admin else None,
+        aprobado_by_rut=admin_rut if aprobado_flag else None,
+        aprobado_by_name=(admin.name if admin else None) if aprobado_flag else None,
+        aprobado_at=datetime.utcnow() if aprobado_flag else None,
+    )
+    return _HitoRowResult(
+        hoja=raw.hoja, fila=raw.fila, resultado="nueva", estado=estado_txt, valor=valor,
+        abogado=lawyer.name, lawyer_id=lawyer.id, tipo=tipo.label, fecha=fecha,
+        rut_cliente=rol_causa, causa=desc_norm, tribunal=tribunal_norm,
+        advertencias=advertencias, hito=hito,
+    )
+
+
+def _compute_por_abogado_and_sospecha(outcomes: List[_HitoRowResult], db: Session):
+    """Per-lawyer nuevas/duplicadas/ya_tiene_en_el_mes + the batch-level suspicious
+    guard: MORE THAN 10 new hitos with ZERO duplicates for a lawyer who ALREADY has
+    hitos in that same month — exactly the shape of the August 2026 incident (40
+    nuevas, 0 duplicadas, 35 ya cargados en el mes)."""
+    by_lawyer: dict = {}
+    for o in outcomes:
+        if o.lawyer_id is None:
+            continue
+        entry = by_lawyer.setdefault(o.lawyer_id, {
+            "abogado": o.abogado, "nuevas": 0, "duplicadas": 0, "periodos": {},
+        })
+        if o.resultado == "nueva":
+            entry["nuevas"] += 1
+            if o.fecha:
+                periodo = cierre_svc.periodo_de_fecha(o.fecha)
+                entry["periodos"][periodo] = entry["periodos"].get(periodo, 0) + 1
+        elif o.resultado == "duplicada":
+            entry["duplicadas"] += 1
+
+    por_abogado = []
+    sospechoso = False
+    motivo_sospecha = None
+    for lawyer_id, entry in by_lawyer.items():
+        periodo = max(entry["periodos"], key=entry["periodos"].get) if entry["periodos"] else None
+        ya_tiene = 0
+        if periodo:
+            start, end = _period_bounds(periodo)
+            ya_tiene = (
+                db.query(Hito)
+                .filter(Hito.lawyer_id == lawyer_id, Hito.fecha_hito >= start, Hito.fecha_hito < end)
+                .count()
+            )
+        por_abogado.append({
+            "abogado": entry["abogado"], "nuevas": entry["nuevas"],
+            "duplicadas": entry["duplicadas"], "ya_tiene_en_el_mes": ya_tiene,
+        })
+        if not sospechoso and entry["nuevas"] > 10 and entry["duplicadas"] == 0 and ya_tiene > 0:
+            sospechoso = True
+            motivo_sospecha = (
+                f'Esta carga crearía {entry["nuevas"]} hitos nuevos para {entry["abogado"]} y '
+                f'ninguno sale duplicado, pero ya tiene {ya_tiene} hitos cargados en {periodo}. '
+                f'Revisa la columna ROL antes de confirmar.'
+            )
+    return por_abogado, sospechoso, motivo_sospecha
+
+
+@dataclass
+class _HitoImportRun:
+    hojas: list
+    columnas_detectadas: dict
+    rows: List[_HitoRowResult]  # capped for the preview response
+    rows_truncated: bool
+    total: int
+    creadas: int
+    aprobados: int
+    pendientes: int
+    dup: int
+    err: int
+    advertencias_generales: List[str]
+    advertencias_count: int
+    por_abogado: list
+    sospechoso: bool
+    motivo_sospecha: Optional[str]
+    all_outcomes: List[_HitoRowResult]  # UNcapped — what importar_hitos persists
+
+
+def _run_hito_import(
+    db: Session, wb, sheets: list, admin, admin_rut: str, *, max_rows: int = 500,
+) -> _HitoImportRun:
+    """Parse + interpret + dedup an uploaded hitos workbook. Pure computation: it
+    never calls ``db.add``/``db.commit`` — the caller decides whether to persist
+    the ``Hito`` objects it built. ``importar_hitos`` persists them;
+    ``importar_hitos_preview`` never does."""
+    lawyers, tipos, junior_tipo, pleno_tipos = _load_hito_matching_context(db)
+
+    hojas_info = [
+        {"nombre": ws.title, "reconocida": _sheet_is_hito(ws),
+         "filas": _count_hito_rows(ws) if _sheet_is_hito(ws) else 0}
+        for ws in wb.worksheets
+    ]
+
+    columnas_detectadas: dict = {}
+    for ws in sheets:
+        header_row, cols = _resolve_hito_columns(ws)
+        if cols and "tipo" in cols and "aprobado" in cols:
+            columnas_detectadas = _hito_header_texts(ws, header_row, cols)
+            break
+
+    raw_rows = _iterate_hito_rows(sheets, tipos, junior_tipo, pleno_tipos)
+
+    sheet_has_tribunal: dict = {}
+    for raw in raw_rows:
+        has_it = bool(str(raw.tribunal_raw or "").strip())
+        sheet_has_tribunal[raw.hoja] = sheet_has_tribunal.get(raw.hoja, False) or has_it
+
+    advertencias_generales: List[str] = []
+    for ws in sheets:
+        header_row, cols = _resolve_hito_columns(ws)
+        if not cols or "rol" not in cols or "desc" not in cols:
+            continue
+        headers = _hito_header_texts(ws, header_row, cols)
+        for raw in raw_rows:
+            if raw.hoja != ws.title:
+                continue
+            rol_txt = _normalize_rol_text(str(raw.rol_raw)[:500]) if raw.rol_raw else None
+            desc_txt = _normalize_rol_text(str(raw.desc_raw)[:500]) if raw.desc_raw else None
+            if rol_txt and desc_txt and _looks_like_rol(rol_txt) != _looks_like_rol(desc_txt):
+                advertencias_generales.append(
+                    f'En la hoja "{ws.title}" las columnas "{headers.get("rol", "ROL")}" y '
+                    f'"{headers.get("desc", "DESCRIPCION")}" no concuerdan en formato: revisa '
+                    f'cuál de las dos trae realmente el ROL de la causa.'
+                )
+                break
+
+    dedup = _HitoDedupTracker(db)
+    total = creadas = aprobados = pendientes = dup_count = err = 0
+    all_outcomes: List[_HitoRowResult] = []
+    for raw in raw_rows:
+        total += 1
+        outcome = _resolve_and_evaluate_row(
+            raw, lawyers=lawyers, dedup=dedup, admin=admin, admin_rut=admin_rut,
+            sheet_has_tribunal=sheet_has_tribunal.get(raw.hoja, False),
+        )
+        if outcome.resultado == "error":
+            err += 1
+        elif outcome.resultado == "duplicada":
+            dup_count += 1
+        else:
+            creadas += 1
+            aprobados += 1 if outcome.estado == "aprobado" else 0
+            pendientes += 0 if outcome.estado == "aprobado" else 1
+        all_outcomes.append(outcome)
+
+    por_abogado, sospechoso, motivo_sospecha = _compute_por_abogado_and_sospecha(all_outcomes, db)
+    advertencias_count = sum(len(o.advertencias) for o in all_outcomes)
+
+    return _HitoImportRun(
+        hojas=hojas_info, columnas_detectadas=columnas_detectadas,
+        rows=all_outcomes[:max_rows], rows_truncated=len(all_outcomes) > max_rows,
+        total=total, creadas=creadas, aprobados=aprobados, pendientes=pendientes,
+        dup=dup_count, err=err, advertencias_generales=advertencias_generales,
+        advertencias_count=advertencias_count, por_abogado=por_abogado,
+        sospechoso=sospechoso, motivo_sospecha=motivo_sospecha, all_outcomes=all_outcomes,
+    )
 
 
 class HitoAbogado(BaseModel):
@@ -1532,6 +2000,56 @@ async def listar_hojas_hitos(
     return out
 
 
+@router.post("/importar/preview", response_model=HitoImportPreview)
+async def importar_hitos_preview(
+    archivo: UploadFile = File(...),
+    hoja: Optional[str] = Query(None, description="Hoja a previsualizar (default: todas las HITOS)"),
+    db: Session = Depends(get_db),
+    admin_rut: str = Depends(require_admin),
+):
+    """Preview a hitos Excel import WITHOUT writing anything to the database.
+
+    Runs the exact same column resolution, lawyer/tipo matching, date parsing,
+    normalization and dedup logic as ``POST /importar`` (both call
+    ``_run_hito_import``), so what the admin previews and what actually gets
+    written can never drift. Surfaces the warnings that a healthy-looking import
+    report can otherwise hide: a real incident (2026-09) had a free-text column
+    stored as the causa ROL, silently creating 64 duplicate hitos while the
+    report read "40 creadas, 0 duplicadas". The frontend calls this first, then
+    ``POST /importar`` to actually commit.
+    """
+    wb = _open_hito_wb(await archivo.read())
+    sheets = _hito_sheets(wb, hoja)
+    if hoja and not sheets:
+        wb.close()
+        raise HTTPException(status_code=404, detail=f"La hoja '{hoja}' no existe en el archivo")
+
+    admin = db.query(Lawyer).filter(Lawyer.rut == admin_rut).first()
+    run = _run_hito_import(db, wb, sheets, admin, admin_rut)
+    wb.close()
+
+    return HitoImportPreview(
+        hojas=[HitoPreviewHoja(**h) for h in run.hojas],
+        columnas_detectadas=run.columnas_detectadas,
+        resumen=HitoPreviewResumen(
+            total_leidas=run.total, nuevas=run.creadas, duplicadas=run.dup, errores=run.err,
+            aprobados=run.aprobados, pendientes=run.pendientes, advertencias=run.advertencias_count,
+            advertencias_generales=run.advertencias_generales, sospechoso=run.sospechoso,
+            motivo_sospecha=run.motivo_sospecha,
+        ),
+        filas=[
+            HitoPreviewFila(
+                fila=o.fila, hoja=o.hoja, resultado=o.resultado, abogado=o.abogado, tipo=o.tipo,
+                fecha=o.fecha, rut_cliente=o.rut_cliente, causa=o.causa, tribunal=o.tribunal,
+                estado=o.estado, valor=o.valor, motivo=o.motivo, advertencias=o.advertencias,
+            )
+            for o in run.rows
+        ],
+        filas_truncadas=run.rows_truncated,
+        por_abogado=[HitoPreviewPorAbogado(**p) for p in run.por_abogado],
+    )
+
+
 @router.post("/importar", response_model=HitoImportResult)
 async def importar_hitos(
     archivo: UploadFile = File(...),
@@ -1541,7 +2059,10 @@ async def importar_hitos(
 ):
     """Bulk-import hitos from SISTEMA DE HITOS.xlsx. JUNIOR and PLENO sheets have
     different columns; nivel comes from the sheet name. Maps abogado by name and
-    (pleno) tipo by its label; skips duplicates and rows it can't resolve."""
+    (pleno) tipo by its label; skips duplicates and rows it can't resolve. Row
+    parsing/matching/dedup all come from ``_run_hito_import`` — the same helper
+    ``POST /importar/preview`` uses — so this endpoint's contract/behavior is
+    unchanged; only its internals were extracted to share with the preview."""
     wb = _open_hito_wb(await archivo.read())
     sheets = _hito_sheets(wb, hoja)
     if hoja and not sheets:
@@ -1549,184 +2070,17 @@ async def importar_hitos(
         raise HTTPException(status_code=404, detail=f"La hoja '{hoja}' no existe en el archivo")
 
     admin = db.query(Lawyer).filter(Lawyer.rut == admin_rut).first()
-    lawyers = db.query(Lawyer).filter(Lawyer.is_firm_lawyer.is_(True)).all()
-    tipos = db.query(HitoTipo).all()
-    junior_tipo = next((t for t in tipos if t.nivel == "junior"), None)
-    pleno_tipos = [t for t in tipos if t.nivel == "pleno"]
-    # Dedup identity: (abogado, RUT, causa, tribunal) — the same ROL in a different
-    # tribunal is a different causa (see _tribunal_key), and the same client (RUT)
-    # on different causas is never a duplicate. Rows are deduped whenever they carry
-    # a RUT OR a causa (ROL in descripcion), so sheets without a RUT column are still
-    # protected against re-uploads.
-    #
-    # Two keyings are kept because legacy hitos (imported before the TRIBUNAL column
-    # existed) have tribunal=NULL, and bulk import is where a duplicate multiplies
-    # into real money. So the importer is deliberately MORE tolerant than the strict
-    # create/edit rule: a stored hito WITHOUT tribunal matches whatever tribunal the
-    # sheet brings, and a sheet row WITHOUT tribunal matches a stored hito that has one.
-    existing3: set = set()  # (lawyer_id, rut, causa)
-    existing4: set = set()  # (lawyer_id, rut, causa, tribunal_key)
-    for h in (
-        db.query(Hito.lawyer_id, Hito.rol_causa, Hito.descripcion, Hito.tribunal)
-        .filter((Hito.rol_causa.isnot(None)) | (Hito.descripcion.isnot(None)))
-        .all()
-    ):
-        causa = _causa_key(h.descripcion)
-        if h.rol_causa is None and causa is None:
-            continue
-        existing3.add((h.lawyer_id, h.rol_causa, causa))
-        existing4.add((h.lawyer_id, h.rol_causa, causa, _tribunal_key(h.tribunal)))
-
-    total = creadas = aprobados = pendientes = dup = err = 0
-    seen3: set = set()
-    seen4: set = set()
-    nuevos: list[Hito] = []
-
-    def _add(lawyer, tipo, fecha, *, rut, rol, procedimiento, descripcion,
-             etapa, tramite, aprobado, valor_cell=None, tribunal=None) -> str:
-        """Dedup + build a Hito. Returns 'dup' | 'ok'. rol_causa = client RUT;
-        the causa (ROL) goes to descripcion and the tribunal completes the identity
-        (matches the create/edit/dedup rule; see the tolerant NULL rule above)."""
-        try:
-            valor = int(valor_cell) if valor_cell else tipo.valor_bruto
-        except (ValueError, TypeError):
-            valor = tipo.valor_bruto
-        if valor <= 0:
-            valor = tipo.valor_bruto
-        rol_causa = (str(rut).strip()[:50] or None) if rut is not None else None
-        # descripcion = ROL de la causa; es lo que distingue dos hitos del mismo
-        # cliente en causas distintas y por eso forma parte de la clave de dedup.
-        # La columna ROL manda: cuando la planilla trae ADEMÁS una columna
-        # DESCRIPCION con texto libre ("PODER ACREDITADO"), ese texto NO es la
-        # causa y usarlo rompe el dedup (dos cargas del mismo hito no colisionan).
-        # El fallback a DESCRIPCION queda para las planillas viejas que no traen
-        # columna ROL y guardan el ROL en la descripción.
-        desc_src = rol if rol else descripcion
-        desc_norm = _normalize_rol_text(str(desc_src)[:500]) if desc_src else None
-        causa = _causa_key(desc_norm)
-        tribunal_norm = (str(tribunal).strip()[:255] or None) if tribunal else None
-        trib = _tribunal_key(tribunal_norm)
-        # Dedup whenever there is a RUT OR a causa (ROL) — sheets without a RUT
-        # column are still protected. Tribunal-aware with the tolerant NULL rule.
-        if rol_causa is not None or causa is not None:
-            k3 = (lawyer.id, rol_causa, causa)
-            k4 = k3 + (trib,)
-            if trib is None:
-                # No tribunal on the row: any stored/seen hito on this causa is it.
-                is_dup = k3 in existing3 or k3 in seen3
-            else:
-                # Exact court match, or a hito stored/seen without a tribunal.
-                k4_none = k3 + (None,)
-                is_dup = (
-                    k4 in existing4 or k4 in seen4
-                    or k4_none in existing4 or k4_none in seen4
-                )
-            if is_dup:
-                return "dup"
-            seen3.add(k3)
-            seen4.add(k4)
-        estado = HITO_APROBADO if aprobado else HITO_PENDIENTE
-        nuevos.append(Hito(
-            lawyer_id=lawyer.id, hito_tipo_id=tipo.id, valor_bruto=valor,
-            fecha_hito=fecha, rol_causa=rol_causa,
-            procedimiento=(str(procedimiento).strip()[:100] if procedimiento else None),
-            descripcion=desc_norm,
-            tribunal=tribunal_norm,
-            etapa_sysgal=(str(etapa).strip()[:100] if etapa else None),
-            tramite_sysgal=(str(tramite).strip()[:255] if tramite else None),
-            estado=estado, created_by_rut=admin_rut,
-            created_by_name=admin.name if admin else None,
-            aprobado_by_rut=admin_rut if aprobado else None,
-            aprobado_by_name=(admin.name if admin else None) if aprobado else None,
-            aprobado_at=datetime.utcnow() if aprobado else None,
-        ))
-        return "ok"
-
-    for ws in sheets:
-        header_row, cols = _resolve_hito_columns(ws)
-        new_format = bool(cols and "tipo" in cols and "aprobado" in cols)
-
-        if new_format:
-            # Header-based: cualquier layout (con/sin RUT), cualquier nombre de hoja.
-            def g(row, field):
-                i = cols.get(field)
-                return row[i] if i is not None and i < len(row) else None
-            for ri, row in enumerate(ws.iter_rows(values_only=True)):
-                if ri <= header_row:
-                    continue
-                ab = g(row, "abogado")
-                if not ab or _norm(ab) in ("ABOGADO AT", "ABOGADO"):
-                    continue
-                total += 1
-                fecha = _parse_fecha(g(row, "fecha"))
-                if fecha is None:
-                    err += 1
-                    continue
-                lawyer = _match_lawyer_by_name(ab, lawyers)
-                tipo = _match_tipo_any(g(row, "tipo"), tipos)
-                if lawyer is None or tipo is None:
-                    err += 1
-                    continue
-                res = _add(
-                    lawyer, tipo, fecha, rut=g(row, "rut"), rol=g(row, "rol"),
-                    procedimiento=g(row, "proc"), descripcion=g(row, "desc"),
-                    tribunal=g(row, "tribunal"),
-                    etapa=g(row, "etapa"), tramite=g(row, "tramite"),
-                    aprobado=_norm(g(row, "aprobado")) in ("SI", "SÍ", "S"),
-                    valor_cell=g(row, "valor"),
-                )
-                if res == "dup":
-                    dup += 1
-                    continue
-                creadas += 1
-                aprobados += 1 if _norm(g(row, "aprobado")) in ("SI", "SÍ", "S") else 0
-                pendientes += 0 if _norm(g(row, "aprobado")) in ("SI", "SÍ", "S") else 1
-            continue
-
-        # OLD format (hojas 'HITOS JUNIOR/PLENO'): posición fija por nivel.
-        is_junior = "JUNIOR" in _norm(ws.title)
-        for row in ws.iter_rows(values_only=True):
-            if not _is_hito_row(row):
-                continue
-            total += 1
-            fecha = _parse_fecha(_cell(row, 2))
-            if fecha is None:
-                err += 1
-                continue
-            lawyer = _match_lawyer_by_name(_cell(row, 1), lawyers)
-            if lawyer is None:
-                err += 1
-                continue
-            if is_junior:
-                procedimiento, rut, descripcion, tipo = (
-                    _cell(row, 3), _cell(row, 4), _cell(row, 5), junior_tipo
-                )
-            else:
-                procedimiento, rut, descripcion = None, _cell(row, 3), None
-                tipo = _match_pleno_tipo(_cell(row, 5), pleno_tipos)
-            aprobado = _norm(_cell(row, 8)) in ("SI", "SÍ", "S")
-            if tipo is None:
-                err += 1
-                continue
-            res = _add(
-                lawyer, tipo, fecha, rut=rut, rol=None, procedimiento=procedimiento,
-                descripcion=descripcion, etapa=_cell(row, 6), tramite=_cell(row, 7),
-                aprobado=aprobado, valor_cell=_cell(row, 9),
-            )
-            if res == "dup":
-                dup += 1
-                continue
-            creadas += 1
-            aprobados += 1 if aprobado else 0
-            pendientes += 0 if aprobado else 1
-
+    run = _run_hito_import(db, wb, sheets, admin, admin_rut)
     wb.close()
+
+    nuevos = [o.hito for o in run.all_outcomes if o.resultado == "nueva" and o.hito is not None]
     if nuevos:
         db.bulk_save_objects(nuevos)
         db.commit()
+
     return HitoImportResult(
-        total_leidas=total, creadas=creadas, aprobados=aprobados, pendientes=pendientes,
-        omitidas_duplicadas=dup, errores=err,
+        total_leidas=run.total, creadas=run.creadas, aprobados=run.aprobados,
+        pendientes=run.pendientes, omitidas_duplicadas=run.dup, errores=run.err,
     )
 
 
