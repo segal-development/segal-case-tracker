@@ -9,6 +9,7 @@ import hashlib
 import io
 import logging
 import re
+import secrets
 import unicodedata
 from datetime import date, datetime
 from typing import List, Optional
@@ -19,7 +20,9 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session, selectinload
 
 from app.api.deps import get_current_lawyer, get_db, require_admin
-from app.models.hito import Hito, HitoTipo, HITO_APROBADO, HITO_PENDIENTE, HITO_RECHAZADO, HITO_SUGERIDO
+from app.models.hito import (
+    Hito, HitoTipo, HITO_APROBADO, HITO_PENDIENTE, HITO_RECHAZADO, HITO_SUGERIDO,
+)
 from app.models.lawyer import Lawyer
 from app.services import bono_cierre_service as cierre_svc
 
@@ -182,9 +185,44 @@ class HitoBulkResult(BaseModel):
     omitidos_ids: list[int] = []
 
 
+class FormLinkRow(BaseModel):
+    """One active firm lawyer and the state of their public hito-form link."""
+    lawyer_id: int
+    nombre: str
+    rut: str
+    nivel: Optional[str] = None
+    tiene_link: bool
+    token: Optional[str] = None
+
+
+class FormLinkCreated(BaseModel):
+    lawyer_id: int
+    nombre: str
+    token: str
+
+
+class PublicAbogado(BaseModel):
+    id: int
+    nombre: str
+    rut: str
+    nivel: Optional[str] = None
+
+
+class PublicFormResponse(BaseModel):
+    """Everything the public form needs: who the link belongs to + the tipo catalog."""
+    abogado: PublicAbogado
+    tipos: List[HitoTipoResponse]
+
+
 _SIN_EVIDENCIA_DETAIL = "El hito no tiene evidencia adjunta; no se puede aprobar sin evidencia."
 _EVIDENCIA_ESTADO_DETAIL = "Solo se puede adjuntar evidencia a un hito pendiente, sugerido o rechazado."
+_EVIDENCIA_OBLIGATORIA_DETAIL = "La evidencia es obligatoria"
+_LINK_INVALIDO_DETAIL = "Link inválido o vencido"
+# States in which evidence may still be attached/replaced. An approved hito was
+# paid on the evidence it had, so it is frozen.
+_EVIDENCIA_ESTADOS = (HITO_PENDIENTE, HITO_SUGERIDO, HITO_RECHAZADO)
 _EVIDENCE_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "application/pdf": "pdf"}
+_PUBLIC_LIST_LIMIT = 100
 
 
 # --------------------------------------------------------------------------- #
@@ -227,6 +265,162 @@ def _store_evidencia(lawyer_id: int, data: bytes, upload: UploadFile) -> tuple[s
     key = f"hitos/evidencia/{lawyer_id}/{digest}.{ext}"
     storage_uri = get_storage_backend(settings).upload(data, key, content_type=content_type)
     return storage_uri, upload.filename, content_type
+
+
+async def _attach_evidencia(db: Session, hito: Hito, evidencia: UploadFile) -> Hito:
+    """Attach or replace ``hito``'s evidence (shared by the authenticated and public PUT).
+
+    Only while the hito is in one of ``_EVIDENCIA_ESTADOS``; an empty upload is a 422.
+    """
+    if hito.estado not in _EVIDENCIA_ESTADOS:
+        raise HTTPException(status_code=409, detail=_EVIDENCIA_ESTADO_DETAIL)
+    data = await evidencia.read()
+    if not data:
+        raise HTTPException(status_code=422, detail="La evidencia está vacía")
+    storage_uri, ev_filename, ev_content_type = _store_evidencia(hito.lawyer_id, data, evidencia)
+    hito.evidencia_storage_key = storage_uri
+    hito.evidencia_filename = ev_filename
+    hito.evidencia_content_type = ev_content_type
+    db.commit()
+    db.refresh(hito)
+    return hito
+
+
+def _stream_evidencia(hito: Hito) -> StreamingResponse:
+    """Stream ``hito``'s stored evidence (shared by the authenticated and public GET)."""
+    if not hito.evidencia_storage_key:
+        raise HTTPException(status_code=404, detail="Sin evidencia")
+    from app.config import settings
+    from app.services.storage_service import get_storage_backend
+
+    data = get_storage_backend(settings).retrieve(hito.evidencia_storage_key)
+    return StreamingResponse(
+        io.BytesIO(data),
+        media_type=hito.evidencia_content_type or "application/octet-stream",
+        headers={"Content-Disposition": f'inline; filename="{hito.evidencia_filename or "evidencia"}"'},
+    )
+
+
+async def _create_hito(
+    db: Session,
+    actor: Lawyer,
+    target_lawyer_id: int,
+    *,
+    hito_tipo_id: int,
+    fecha_hito: date,
+    rol_causa: Optional[str],
+    procedimiento: Optional[str],
+    descripcion: Optional[str],
+    tribunal: Optional[str],
+    etapa_sysgal: Optional[str],
+    tramite_sysgal: Optional[str],
+    evidencia: Optional[UploadFile],
+) -> Hito:
+    """Create a hito for ``target_lawyer_id`` on behalf of ``actor`` (who is recorded
+    as ``created_by``). Shared by the authenticated create and the public form so
+    the period lock, tipo lookup, dedup and normalization rules live in one place.
+    Authorization (may ``actor`` write for ``target_lawyer_id``?) is the caller's job.
+    """
+    if cierre_svc.is_cerrado(db, cierre_svc.periodo_de_fecha(fecha_hito)):
+        raise HTTPException(status_code=409, detail="El período de ese hito está cerrado")
+
+    tipo = db.query(HitoTipo).filter(HitoTipo.id == hito_tipo_id, HitoTipo.activo.is_(True)).first()
+    if tipo is None:
+        raise HTTPException(status_code=404, detail="Tipo de hito no encontrado")
+
+    # No duplicate on the SAME causa: a lawyer may repeat the same client
+    # (rol_causa = RUT) across DIFFERENT causas, so the block is keyed on
+    # (abogado, RUT, ROL, tribunal) — the ROL is derived from descripcion (see
+    # _causa_key) and the tribunal disambiguates same-ROL causas in different
+    # courts, tolerating a blank tribunal on either side (see _tribunal_collides).
+    # Only enforced when a rol_causa is given.
+    # Checked before storing evidence so a rejected duplicate never uploads a file.
+    rol_norm = (rol_causa or "").strip() or None
+    tribunal_norm = (tribunal or "").strip() or None
+    if rol_norm is not None:
+        causa = _causa_key(descripcion)
+        trib = _tribunal_key(tribunal_norm)
+        prior = (
+            db.query(Hito.descripcion, Hito.tribunal)
+            .filter(Hito.lawyer_id == target_lawyer_id, Hito.rol_causa == rol_norm)
+            .all()
+        )
+        if any(_causa_key(d) == causa and _tribunal_collides(_tribunal_key(t), trib) for (d, t) in prior):
+            raise HTTPException(
+                status_code=409,
+                detail="Ya existe un hito de este abogado para esa causa",
+            )
+
+    # Evidence is optional at creation (it can be attached later via
+    # PUT /{id}/evidencia) but mandatory to approve. If provided, validate + store it.
+    storage_uri = ev_filename = ev_content_type = None
+    data = await evidencia.read() if evidencia is not None else b""
+    if data:
+        storage_uri, ev_filename, ev_content_type = _store_evidencia(target_lawyer_id, data, evidencia)
+
+    hito = Hito(
+        lawyer_id=target_lawyer_id,
+        hito_tipo_id=tipo.id,
+        valor_bruto=tipo.valor_bruto,  # snapshot
+        fecha_hito=fecha_hito,
+        rol_causa=rol_norm,
+        procedimiento=procedimiento,
+        descripcion=_normalize_rol_text(descripcion),
+        tribunal=tribunal_norm,
+        etapa_sysgal=etapa_sysgal or tipo.etapa_tramite,
+        tramite_sysgal=tramite_sysgal,
+        evidencia_storage_key=storage_uri,
+        evidencia_filename=ev_filename,
+        evidencia_content_type=ev_content_type,
+        estado=HITO_PENDIENTE,
+        created_by_rut=actor.rut,
+        created_by_name=actor.name,
+    )
+    db.add(hito)
+    db.commit()
+    db.refresh(hito)
+    return hito
+
+
+def _lawyer_by_token(db: Session, token: str) -> Lawyer:
+    """Resolve a public form-link token to its ACTIVE firm lawyer, else 404.
+
+    Exact match only; an inactive/non-firm lawyer or a revoked (NULL) token is
+    indistinguishable from an unknown one. The token is never logged.
+    """
+    lawyer = None
+    if token:
+        lawyer = (
+            db.query(Lawyer)
+            .filter(
+                Lawyer.hito_form_token == token,
+                Lawyer.is_active.is_(True),
+                Lawyer.is_firm_lawyer.is_(True),
+            )
+            .first()
+        )
+    if lawyer is None:
+        raise HTTPException(status_code=404, detail=_LINK_INVALIDO_DETAIL)
+    return lawyer
+
+
+def _own_hito_or_404(db: Session, lawyer: Lawyer, hito_id: int) -> Hito:
+    """A hito reachable from the public form: it must belong to the token's lawyer."""
+    hito = db.query(Hito).filter(Hito.id == hito_id, Hito.lawyer_id == lawyer.id).first()
+    if hito is None:
+        raise HTTPException(status_code=404, detail="Hito no encontrado")
+    return hito
+
+
+def _active_firm_lawyer_or_404(db: Session, lawyer_id: int) -> Lawyer:
+    lawyer = (
+        db.query(Lawyer)
+        .filter(Lawyer.id == lawyer_id, Lawyer.is_active.is_(True), Lawyer.is_firm_lawyer.is_(True))
+        .first()
+    )
+    if lawyer is None:
+        raise HTTPException(status_code=404, detail="Abogado no encontrado")
+    return lawyer
 
 
 def _to_response(h: Hito) -> HitoResponse:
@@ -293,13 +487,6 @@ async def create_hito(
     if actor is None:
         raise HTTPException(status_code=401, detail="No se pudo resolver el abogado")
 
-    if cierre_svc.is_cerrado(db, cierre_svc.periodo_de_fecha(fecha_hito)):
-        raise HTTPException(status_code=409, detail="El período de ese hito está cerrado")
-
-    tipo = db.query(HitoTipo).filter(HitoTipo.id == hito_tipo_id, HitoTipo.activo.is_(True)).first()
-    if tipo is None:
-        raise HTTPException(status_code=404, detail="Tipo de hito no encontrado")
-
     # A lawyer registers hitos for themselves; only an admin may set another lawyer.
     target_lawyer_id = actor.id
     if lawyer_id is not None and lawyer_id != actor.id:
@@ -309,57 +496,12 @@ async def create_hito(
             raise HTTPException(status_code=404, detail="Abogado no encontrado")
         target_lawyer_id = lawyer_id
 
-    # No duplicate on the SAME causa: a lawyer may repeat the same client
-    # (rol_causa = RUT) across DIFFERENT causas, so the block is keyed on
-    # (abogado, RUT, ROL, tribunal) — the ROL is derived from descripcion (see
-    # _causa_key) and the tribunal disambiguates same-ROL causas in different
-    # courts, tolerating a blank tribunal on either side (see _tribunal_collides).
-    # Only enforced when a rol_causa is given.
-    # Checked before storing evidence so a rejected duplicate never uploads a file.
-    rol_norm = (rol_causa or "").strip() or None
-    tribunal_norm = (tribunal or "").strip() or None
-    if rol_norm is not None:
-        causa = _causa_key(descripcion)
-        trib = _tribunal_key(tribunal_norm)
-        prior = (
-            db.query(Hito.descripcion, Hito.tribunal)
-            .filter(Hito.lawyer_id == target_lawyer_id, Hito.rol_causa == rol_norm)
-            .all()
-        )
-        if any(_causa_key(d) == causa and _tribunal_collides(_tribunal_key(t), trib) for (d, t) in prior):
-            raise HTTPException(
-                status_code=409,
-                detail="Ya existe un hito de este abogado para esa causa",
-            )
-
-    # Evidence is optional at creation (it can be attached later via
-    # PUT /{id}/evidencia) but mandatory to approve. If provided, validate + store it.
-    storage_uri = ev_filename = ev_content_type = None
-    data = await evidencia.read() if evidencia is not None else b""
-    if data:
-        storage_uri, ev_filename, ev_content_type = _store_evidencia(target_lawyer_id, data, evidencia)
-
-    hito = Hito(
-        lawyer_id=target_lawyer_id,
-        hito_tipo_id=tipo.id,
-        valor_bruto=tipo.valor_bruto,  # snapshot
-        fecha_hito=fecha_hito,
-        rol_causa=rol_norm,
-        procedimiento=procedimiento,
-        descripcion=_normalize_rol_text(descripcion),
-        tribunal=tribunal_norm,
-        etapa_sysgal=etapa_sysgal or tipo.etapa_tramite,
-        tramite_sysgal=tramite_sysgal,
-        evidencia_storage_key=storage_uri,
-        evidencia_filename=ev_filename,
-        evidencia_content_type=ev_content_type,
-        estado=HITO_PENDIENTE,
-        created_by_rut=actor.rut,
-        created_by_name=actor.name,
+    hito = await _create_hito(
+        db, actor, target_lawyer_id,
+        hito_tipo_id=hito_tipo_id, fecha_hito=fecha_hito, rol_causa=rol_causa,
+        procedimiento=procedimiento, descripcion=descripcion, tribunal=tribunal,
+        etapa_sysgal=etapa_sysgal, tramite_sysgal=tramite_sysgal, evidencia=evidencia,
     )
-    db.add(hito)
-    db.commit()
-    db.refresh(hito)
     return _to_response(hito)
 
 
@@ -418,6 +560,165 @@ async def list_hitos(
         per_page=per_page,
         pages=pages,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Public form links (admin) — lawyers have NO app login, so each one gets a
+# secret per-lawyer link to a public hito form. Declared BEFORE every
+# ``/{hito_id}`` route so ``/form-links`` and ``/public/...`` never fall into them.
+# --------------------------------------------------------------------------- #
+@router.get("/form-links", response_model=List[FormLinkRow])
+async def list_form_links(
+    db: Session = Depends(get_db),
+    _admin_rut: str = Depends(require_admin),
+):
+    """Every active firm lawyer with the state of their public form link (admin only)."""
+    lawyers = (
+        db.query(Lawyer)
+        .filter(Lawyer.is_active.is_(True), Lawyer.is_firm_lawyer.is_(True))
+        .order_by(Lawyer.name)
+        .all()
+    )
+    return [
+        FormLinkRow(
+            lawyer_id=lw.id, nombre=lw.name, rut=lw.rut, nivel=lw.nivel,
+            tiene_link=bool(lw.hito_form_token), token=lw.hito_form_token,
+        )
+        for lw in lawyers
+    ]
+
+
+@router.post("/form-links/{lawyer_id}", response_model=FormLinkCreated)
+async def create_form_link(
+    lawyer_id: int,
+    regenerar: bool = Query(False, description="Reemplazar el token existente (invalida el link anterior)"),
+    db: Session = Depends(get_db),
+    _admin_rut: str = Depends(require_admin),
+):
+    """Issue the lawyer's public form token (admin only). Idempotent unless
+    ``regenerar=true``, which replaces it and invalidates the previous link."""
+    lawyer = _active_firm_lawyer_or_404(db, lawyer_id)
+    if not lawyer.hito_form_token or regenerar:
+        lawyer.hito_form_token = secrets.token_urlsafe(32)
+        db.commit()
+        db.refresh(lawyer)
+    return FormLinkCreated(lawyer_id=lawyer.id, nombre=lawyer.name, token=lawyer.hito_form_token)
+
+
+@router.delete("/form-links/{lawyer_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def revoke_form_link(
+    lawyer_id: int,
+    db: Session = Depends(get_db),
+    _admin_rut: str = Depends(require_admin),
+):
+    """Revoke the lawyer's public form link (admin only). Idempotent."""
+    lawyer = _active_firm_lawyer_or_404(db, lawyer_id)
+    lawyer.hito_form_token = None
+    db.commit()
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# Public hito form — NO auth dependency. The secret token in the path IS the
+# identity: every route resolves it through ``_lawyer_by_token`` and is scoped
+# to that lawyer's own hitos.
+# --------------------------------------------------------------------------- #
+@router.get("/public/{token}", response_model=PublicFormResponse)
+async def public_form(
+    token: str,
+    db: Session = Depends(get_db),
+):
+    """PUBLIC (no auth). Who the link belongs to + the hito-type catalog."""
+    lawyer = _lawyer_by_token(db, token)
+    tipos = (
+        db.query(HitoTipo)
+        .filter(HitoTipo.activo.is_(True))
+        .order_by(HitoTipo.orden)
+        .all()
+    )
+    return PublicFormResponse(
+        abogado=PublicAbogado(id=lawyer.id, nombre=lawyer.name, rut=lawyer.rut, nivel=lawyer.nivel),
+        tipos=[HitoTipoResponse.model_validate(t) for t in tipos],
+    )
+
+
+@router.post("/public/{token}", response_model=HitoResponse, status_code=status.HTTP_201_CREATED)
+async def public_create_hito(
+    token: str,
+    hito_tipo_id: int = Form(...),
+    fecha_hito: date = Form(...),
+    rol_causa: Optional[str] = Form(None),
+    procedimiento: Optional[str] = Form(None),
+    descripcion: Optional[str] = Form(None),
+    tribunal: Optional[str] = Form(None),
+    etapa_sysgal: Optional[str] = Form(None),
+    tramite_sysgal: Optional[str] = Form(None),
+    evidencia: Optional[UploadFile] = File(None),  # required — checked below for a clear 422
+    db: Session = Depends(get_db),
+):
+    """PUBLIC (no auth). Register a hito for the token's lawyer. Evidence is
+    REQUIRED here (the lawyer has no other way to attach it later except this
+    form). The lawyer is both owner and ``created_by``; there is no ``lawyer_id``
+    field, so the link can never create for someone else.
+    """
+    lawyer = _lawyer_by_token(db, token)
+    if evidencia is None:
+        raise HTTPException(status_code=422, detail=_EVIDENCIA_OBLIGATORIA_DETAIL)
+    data = await evidencia.read()
+    if not data:
+        raise HTTPException(status_code=422, detail=_EVIDENCIA_OBLIGATORIA_DETAIL)
+    await evidencia.seek(0)  # _create_hito reads it again
+    hito = await _create_hito(
+        db, lawyer, lawyer.id,
+        hito_tipo_id=hito_tipo_id, fecha_hito=fecha_hito, rol_causa=rol_causa,
+        procedimiento=procedimiento, descripcion=descripcion, tribunal=tribunal,
+        etapa_sysgal=etapa_sysgal, tramite_sysgal=tramite_sysgal, evidencia=evidencia,
+    )
+    return _to_response(hito)
+
+
+@router.get("/public/{token}/hitos", response_model=List[HitoResponse])
+async def public_list_hitos(
+    token: str,
+    db: Session = Depends(get_db),
+):
+    """PUBLIC (no auth). The token's lawyer's own hitos, newest first (max 100)."""
+    lawyer = _lawyer_by_token(db, token)
+    rows = (
+        db.query(Hito)
+        .options(selectinload(Hito.lawyer), selectinload(Hito.tipo))
+        .filter(Hito.lawyer_id == lawyer.id)
+        .order_by(Hito.fecha_hito.desc(), Hito.id.desc())
+        .limit(_PUBLIC_LIST_LIMIT)
+        .all()
+    )
+    return [_to_response(h) for h in rows]
+
+
+@router.put("/public/{token}/hitos/{hito_id}/evidencia", response_model=HitoResponse)
+async def public_put_evidencia(
+    token: str,
+    hito_id: int,
+    evidencia: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """PUBLIC (no auth). Attach/replace evidence on one of the lawyer's OWN hitos
+    (anyone else's is a 404). Same state rule and storage as the authenticated PUT."""
+    lawyer = _lawyer_by_token(db, token)
+    hito = _own_hito_or_404(db, lawyer, hito_id)
+    return _to_response(await _attach_evidencia(db, hito, evidencia))
+
+
+@router.get("/public/{token}/hitos/{hito_id}/evidencia")
+async def public_get_evidencia(
+    token: str,
+    hito_id: int,
+    db: Session = Depends(get_db),
+):
+    """PUBLIC (no auth). Stream the evidence of one of the lawyer's OWN hitos."""
+    lawyer = _lawyer_by_token(db, token)
+    hito = _own_hito_or_404(db, lawyer, hito_id)
+    return _stream_evidencia(hito)
 
 
 @router.post("/{hito_id}/aprobar", response_model=HitoResponse)
@@ -1177,18 +1478,7 @@ async def get_evidencia(
         raise HTTPException(status_code=404, detail="Hito no encontrado")
     if not _is_admin(actor) and (actor is None or actor.id != hito.lawyer_id):
         raise HTTPException(status_code=403, detail="Sin acceso a esta evidencia")
-    if not hito.evidencia_storage_key:
-        raise HTTPException(status_code=404, detail="Sin evidencia")
-
-    from app.config import settings
-    from app.services.storage_service import get_storage_backend
-
-    data = get_storage_backend(settings).retrieve(hito.evidencia_storage_key)
-    return StreamingResponse(
-        io.BytesIO(data),
-        media_type=hito.evidencia_content_type or "application/octet-stream",
-        headers={"Content-Disposition": f'inline; filename="{hito.evidencia_filename or "evidencia"}"'},
-    )
+    return _stream_evidencia(hito)
 
 
 @router.put("/{hito_id}/evidencia", response_model=HitoResponse)
@@ -1201,9 +1491,9 @@ async def put_evidencia(
     """Attach or replace a hito's PJUD evidence after creation.
 
     Admins, or the owning lawyer, only — same boundary as ``GET /{id}/evidencia``.
-    Allowed only while the hito is ``pendiente`` or ``rechazado``: an approved
-    hito was paid on the evidence it had, so it is frozen. Same validation and
-    storage rules as create (see ``_store_evidencia``).
+    Allowed only while the hito is pendiente, sugerido or rechazado (see
+    ``_attach_evidencia``): an approved hito was paid on the evidence it had, so
+    it is frozen. Same validation and storage rules as create (``_store_evidencia``).
     """
     actor = _resolve_lawyer(db, current_lawyer)
     hito = db.query(Hito).filter(Hito.id == hito_id).first()
@@ -1211,16 +1501,4 @@ async def put_evidencia(
         raise HTTPException(status_code=404, detail="Hito no encontrado")
     if not _is_admin(actor) and (actor is None or actor.id != hito.lawyer_id):
         raise HTTPException(status_code=403, detail="Sin acceso a esta evidencia")
-    if hito.estado not in (HITO_PENDIENTE, HITO_SUGERIDO, HITO_RECHAZADO):
-        raise HTTPException(status_code=409, detail=_EVIDENCIA_ESTADO_DETAIL)
-
-    data = await evidencia.read()
-    if not data:
-        raise HTTPException(status_code=422, detail="La evidencia está vacía")
-    storage_uri, ev_filename, ev_content_type = _store_evidencia(hito.lawyer_id, data, evidencia)
-    hito.evidencia_storage_key = storage_uri
-    hito.evidencia_filename = ev_filename
-    hito.evidencia_content_type = ev_content_type
-    db.commit()
-    db.refresh(hito)
-    return _to_response(hito)
+    return _to_response(await _attach_evidencia(db, hito, evidencia))
