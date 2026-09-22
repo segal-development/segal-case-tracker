@@ -1594,9 +1594,14 @@ async def importar_hitos(
         if valor <= 0:
             valor = tipo.valor_bruto
         rol_causa = (str(rut).strip()[:50] or None) if rut is not None else None
-        # descripcion = ROL de la causa (o el texto libre viejo); es lo que distingue
-        # dos hitos del mismo cliente en causas distintas.
-        desc_src = descripcion if descripcion else rol
+        # descripcion = ROL de la causa; es lo que distingue dos hitos del mismo
+        # cliente en causas distintas y por eso forma parte de la clave de dedup.
+        # La columna ROL manda: cuando la planilla trae ADEMÁS una columna
+        # DESCRIPCION con texto libre ("PODER ACREDITADO"), ese texto NO es la
+        # causa y usarlo rompe el dedup (dos cargas del mismo hito no colisionan).
+        # El fallback a DESCRIPCION queda para las planillas viejas que no traen
+        # columna ROL y guardan el ROL en la descripción.
+        desc_src = rol if rol else descripcion
         desc_norm = _normalize_rol_text(str(desc_src)[:500]) if desc_src else None
         causa = _causa_key(desc_norm)
         tribunal_norm = (str(tribunal).strip()[:255] or None) if tribunal else None

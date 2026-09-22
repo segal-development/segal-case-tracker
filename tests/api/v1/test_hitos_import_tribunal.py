@@ -138,3 +138,60 @@ class TestLegacyRowsWithoutTribunal:
         _seed(db, lawyer, tipo, tribunal=None)
         r = _import(client, [(TRIB_A, "C-6147-2026")])
         assert r["creadas"] == 1 and r["omitidas_duplicadas"] == 0
+
+
+def _import_con_descripcion(client, rows):
+    """Sheet carrying BOTH a ROL column and a free-text DESCRIPCION column."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "HITOS"
+    ws.append(["ABOGADO", "FECHA", "RUT", "ROL", "TIPO DE HITO", "TRIBUNAL",
+               "DESCRIPCION", "APROBADO"])
+    for tribunal, rol, texto in rows:
+        ws.append(["Eduardo Venegas", datetime(2026, 9, 4), CLIENT_RUT, rol,
+                   "dilatoria", tribunal, texto, "SI"])
+    buf = io.BytesIO()
+    wb.save(buf)
+    r = client.post("/api/v1/hitos/importar", headers=_h(ADMIN_RUT),
+                    files={"archivo": ("h.xlsx", buf.getvalue(), _XLSX_MIME)})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_import_rol_column_wins_over_free_text_descripcion(client, db, admin, lawyer, tipo):
+    """A sheet with BOTH ROL and a free-text DESCRIPCION must key on the ROL.
+
+    Regression: files carrying DESCRIPCION="PODER ACREDITADO" stored that text
+    as the causa, so re-importing the same rows never collided and every row
+    came back in as a duplicate hito.
+    """
+    filas = [("22\u00ba Juzgado Civil de Santiago", "C-11449-2026", "PODER ACREDITADO EXH DOC.")]
+
+    r1 = _import_con_descripcion(client, filas)
+    assert r1["creadas"] == 1
+
+    hito = db.query(Hito).filter(Hito.lawyer_id == lawyer.id).one()
+    assert hito.descripcion == "C-11449-2026"   # el ROL, no el texto libre
+
+    # Reimportar las mismas filas no puede crear nada nuevo.
+    r2 = _import_con_descripcion(client, filas)
+    assert r2["creadas"] == 0
+    assert r2["omitidas_duplicadas"] == 1
+
+
+def test_import_sin_columna_rol_sigue_usando_descripcion(client, db, admin, lawyer, tipo):
+    """Planillas viejas sin columna ROL guardan el ROL en DESCRIPCION: sigue valiendo."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "HITOS"
+    ws.append(["ABOGADO", "FECHA", "RUT", "TIPO DE HITO", "TRIBUNAL", "DESCRIPCION", "APROBADO"])
+    ws.append(["Eduardo Venegas", datetime(2026, 9, 4), CLIENT_RUT, "dilatoria",
+               "22\u00ba Juzgado Civil de Santiago", "C-9960-2026", "SI"])
+    buf = io.BytesIO()
+    wb.save(buf)
+    r = client.post("/api/v1/hitos/importar", headers=_h(ADMIN_RUT),
+                    files={"archivo": ("h.xlsx", buf.getvalue(), _XLSX_MIME)})
+    assert r.status_code == 200, r.text
+    assert r.json()["creadas"] == 1
+    hito = db.query(Hito).filter(Hito.lawyer_id == lawyer.id).one()
+    assert hito.descripcion == "C-9960-2026"
