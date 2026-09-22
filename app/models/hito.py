@@ -58,6 +58,7 @@ HITO_RECHAZADO = "rechazado"
 # Provenance of a hito row.
 ORIGEN_MANUAL = "manual"      # hand-entered (form or Excel import)
 ORIGEN_DETECTOR = "detector"  # created by the PJUD hito detector
+ORIGEN_FORMULARIO = "formulario"  # submitted by the lawyer through the public token form
 
 
 class Hito(Base):

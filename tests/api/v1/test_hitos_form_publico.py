@@ -90,10 +90,18 @@ def _public(token, suffix=""):
     return f"/api/v1/hitos/public/{token}{suffix}"
 
 
-def _post_public(client, token, tipo_id, evidencia=True, extra=None, rol="C-1-2026"):
-    data = {"hito_tipo_id": tipo_id, "fecha_hito": "2026-07-15", "rol_causa": rol}
-    if extra:
-        data.update(extra)
+def _form(tipo_id, **over):
+    """Every mandatory public-form field, overridable per test."""
+    data = {
+        "hito_tipo_id": tipo_id, "fecha_hito": "2026-07-15", "rol_causa": "C-1-2026",
+        "descripcion": "C-100-2026", "tribunal": "1º Juzgado Civil", "procedimiento": "Ejecutivo",
+    }
+    data.update(over)
+    return data
+
+
+def _post_public(client, token, tipo_id, evidencia=True, extra=None):
+    data = _form(tipo_id, **(extra or {}))
     files = {"evidencia": ("cap.png", b"\x89PNG_fake", "image/png")} if evidencia else None
     return client.post(_public(token), data=data, files=files)
 
@@ -220,13 +228,42 @@ def test_public_post_without_evidencia_422(client, db, storage, lawyer, tipo):
     r = _post_public(client, lawyer.hito_form_token, tipo.id, evidencia=False)
     assert r.status_code == 422
     assert r.json()["detail"] == EVIDENCIA_OBLIGATORIA
-    r = client.post(_public(lawyer.hito_form_token),
-                    data={"hito_tipo_id": tipo.id, "fecha_hito": "2026-07-15"},
+    r = client.post(_public(lawyer.hito_form_token), data=_form(tipo.id),
                     files={"evidencia": ("cap.png", b"", "image/png")})
     assert r.status_code == 422
     assert r.json()["detail"] == EVIDENCIA_OBLIGATORIA
     assert db.query(Hito).count() == 0
     assert storage.store == {}
+
+
+@pytest.mark.parametrize("field", ["hito_tipo_id", "fecha_hito", "rol_causa", "descripcion", "tribunal", "procedimiento"])
+def test_public_post_missing_field_422(client, db, storage, lawyer, tipo, field):
+    """Every business field is mandatory server-side: absent → 422 naming the field."""
+    data = _form(tipo.id)
+    data.pop(field)
+    r = client.post(_public(lawyer.hito_form_token), data=data,
+                    files={"evidencia": ("cap.png", b"\x89PNG", "image/png")})
+    assert r.status_code == 422
+    assert r.json()["detail"] == f"El campo {field} es obligatorio"
+    assert db.query(Hito).count() == 0
+    assert storage.store == {}
+
+
+@pytest.mark.parametrize("field", ["rol_causa", "descripcion", "tribunal", "procedimiento"])
+def test_public_post_blank_field_422(client, db, storage, lawyer, tipo, field):
+    """Whitespace-only text does not satisfy a mandatory field."""
+    r = client.post(_public(lawyer.hito_form_token), data=_form(tipo.id, **{field: "   "}),
+                    files={"evidencia": ("cap.png", b"\x89PNG", "image/png")})
+    assert r.status_code == 422
+    assert r.json()["detail"] == f"El campo {field} es obligatorio"
+    assert db.query(Hito).count() == 0
+
+
+def test_public_post_sysgal_fields_stay_optional(client, db, storage, lawyer, tipo):
+    r = _post_public(client, lawyer.hito_form_token, tipo.id)
+    assert r.status_code == 201
+    assert r.json()["etapa_sysgal"] == tipo.etapa_tramite  # defaulted from the tipo
+    assert r.json()["tramite_sysgal"] is None
 
 
 def test_public_post_creates_hito_for_token_lawyer(client, db, storage, lawyer, tipo):
@@ -236,7 +273,7 @@ def test_public_post_creates_hito_for_token_lawyer(client, db, storage, lawyer, 
     body = r.json()
     assert body["lawyer_id"] == lawyer.id
     assert body["estado"] == HITO_PENDIENTE
-    assert body["origen"] == "manual"
+    assert body["origen"] == "formulario"
     assert body["tiene_evidencia"] is True
     assert body["valor_bruto"] == 8077
     assert body["descripcion"] == "C-6147-2026"  # same normalization as the authenticated create
@@ -262,8 +299,7 @@ def test_public_post_applies_dedup_rule(client, db, storage, lawyer, tipo):
 
 
 def test_public_post_invalid_content_type_415(client, db, storage, lawyer, tipo):
-    r = client.post(_public(lawyer.hito_form_token),
-                    data={"hito_tipo_id": tipo.id, "fecha_hito": "2026-07-15"},
+    r = client.post(_public(lawyer.hito_form_token), data=_form(tipo.id),
                     files={"evidencia": ("cap.gif", b"GIF89a", "image/gif")})
     assert r.status_code == 415
 

@@ -87,17 +87,17 @@ def test_create_without_evidence_ok(client, db, admin, tipo):
     assert r.json()["tiene_evidencia"] is False
 
 
-def test_approve_without_evidence_blocked(client, db, admin, lawyer, tipo):
-    # Evidence is optional at creation but MANDATORY to approve ("sin evidencia no se paga").
+def test_approve_manual_without_evidence_ok(client, db, admin, lawyer, tipo):
+    # The "sin evidencia no se paga" gate applies only to public-form hitos
+    # (origen=formulario); admin/Excel/detector hitos approve without evidence.
     h = Hito(lawyer_id=lawyer.id, hito_tipo_id=tipo.id, valor_bruto=8077,
              fecha_hito=date(2026, 7, 15), estado=HITO_PENDIENTE)
     db.add(h)
     db.commit()
     db.refresh(h)
     r = client.post(f"/api/v1/hitos/{h.id}/aprobar", headers=_h(ADMIN_RUT))
-    assert r.status_code == 409
-    db.refresh(h)
-    assert h.estado == HITO_PENDIENTE
+    assert r.status_code == 200
+    assert r.json()["estado"] == "aprobado"
 
 
 def test_admin_approves_and_resumen_totals(client, db, admin, lawyer, tipo):
