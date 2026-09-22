@@ -26,9 +26,9 @@ from app.api.deps import (
 )
 from app.models.case import Case
 from app.models.lawyer import Lawyer
-from app.models.matriz_pjud_mapeo import MatrizPjudMapeo
-from app.models.movement import Movement
+from app.models.matriz_pjud_mapeo import MATCH_TIPO_STAGE, MatrizPjudMapeo
 from app.services.lawyer_roster import ALL_ABOGADO, _abogado_litigantes_by_case
+from app.services.matriz_classifier import top_unmapped_movements
 from app.utils.rut import normalize_rut
 
 logger = logging.getLogger(__name__)
@@ -55,6 +55,7 @@ class OrigenCountItem(BaseModel):
 
 class SinMapearItem(BaseModel):
     stage: Optional[str] = None
+    descripcion: Optional[str] = None
     causas: int
 
 
@@ -82,6 +83,8 @@ class MatrizMapeoResponse(BaseModel):
     matriz_etapa: str
     nota: Optional[str] = None
     activo: bool
+    match_tipo: str
+    orden: int
 
     class Config:
         from_attributes = True
@@ -92,6 +95,7 @@ class MatrizMapeoUpdate(BaseModel):
     matriz_etapa: Optional[str] = None
     activo: Optional[bool] = None
     nota: Optional[str] = None
+    orden: Optional[int] = None
 
 
 # ============================================================================
@@ -106,38 +110,6 @@ def _counted(counter: dict, total: int) -> list[dict]:
     ]
     items.sort(key=lambda i: (-i["causas"], str(i["key"] or "")))
     return items
-
-
-def _sin_mapear(db: Session, case_ids: list[int]) -> List[SinMapearItem]:
-    """Last-movement stage per unmapped causa, grouped and counted.
-
-    ``matriz_origen == "no_mapeada"`` is derived at classification time but
-    the triggering PJUD stage isn't a persisted Case column (only
-    ``matriz``/``matriz_etapa``/``matriz_origen`` are) — so this re-derives
-    it here, in ONE query over every candidate case's movements (never N+1).
-    """
-    if not case_ids:
-        return []
-    rows = (
-        db.query(Movement.case_id, Movement.stage, Movement.movement_date, Movement.id)
-        .filter(
-            Movement.case_id.in_(case_ids),
-            Movement.stage.isnot(None),
-            Movement.stage != "",
-        )
-        .all()
-    )
-    latest: dict[int, tuple] = {}
-    for case_id, stage, movement_date, mid in rows:
-        key = (movement_date, mid)
-        if case_id not in latest or key > latest[case_id][0]:
-            latest[case_id] = (key, stage)
-
-    counts = Counter(stage for _, stage in latest.values())
-    return [
-        SinMapearItem(stage=stage, causas=causas)
-        for stage, causas in counts.most_common()
-    ]
 
 
 # ============================================================================
@@ -176,7 +148,10 @@ async def get_distribucion(
         cid
         for (cid,) in query.filter(Case.matriz_origen == "no_mapeada").with_entities(Case.id).all()
     ]
-    sin_mapear = _sin_mapear(db, no_mapeada_ids)
+    sin_mapear = [
+        SinMapearItem(stage=stage, descripcion=descripcion, causas=causas)
+        for stage, descripcion, causas in top_unmapped_movements(db, no_mapeada_ids)
+    ]
 
     computed_at = query.with_entities(func.max(Case.matriz_computed_at)).scalar()
 
@@ -246,8 +221,13 @@ async def list_mapeo(
     _rut: str = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """The full PJUD-stage -> matriz-etapa mapping table, for the business to review."""
-    rows = db.query(MatrizPjudMapeo).order_by(MatrizPjudMapeo.pjud_stage).all()
+    """The full mapping table (both ``stage`` and ``descripcion`` rules), for
+    the business to review."""
+    rows = (
+        db.query(MatrizPjudMapeo)
+        .order_by(MatrizPjudMapeo.match_tipo, MatrizPjudMapeo.orden, MatrizPjudMapeo.pjud_stage)
+        .all()
+    )
     return [MatrizMapeoResponse.model_validate(r) for r in rows]
 
 
@@ -255,15 +235,28 @@ async def list_mapeo(
 async def update_mapeo(
     pjud_stage: str,
     payload: MatrizMapeoUpdate,
+    match_tipo: str = Query(
+        MATCH_TIPO_STAGE,
+        description=(
+            "Which rule to edit: 'stage' (default, matches movements.stage "
+            "exactly) or 'descripcion' (matches a substring of "
+            "movements.description). The natural key is (pjud_stage, "
+            "match_tipo) — the same text can be both (e.g. 'Sentencia')."
+        ),
+    ),
     _rut: str = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """Edit one mapping row (matriz_etapa / activo / nota) without a deploy."""
-    row = db.query(MatrizPjudMapeo).filter(MatrizPjudMapeo.pjud_stage == pjud_stage).first()
+    """Edit one mapping row (matriz_etapa / activo / nota / orden) without a deploy."""
+    row = (
+        db.query(MatrizPjudMapeo)
+        .filter(MatrizPjudMapeo.pjud_stage == pjud_stage, MatrizPjudMapeo.match_tipo == match_tipo)
+        .first()
+    )
     if row is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No existe un mapeo para la etapa PJUD {pjud_stage!r}",
+            detail=f"No existe un mapeo {match_tipo!r} para {pjud_stage!r}",
         )
 
     if payload.matriz_etapa is not None:
@@ -272,6 +265,8 @@ async def update_mapeo(
         row.activo = payload.activo
     if payload.nota is not None:
         row.nota = payload.nota
+    if payload.orden is not None:
+        row.orden = payload.orden
 
     db.commit()
     db.refresh(row)

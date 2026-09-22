@@ -1,34 +1,40 @@
-pjud_stage,matriz_etapa,nota
-Notificación demanda y su proveído,DEMANDA NOTIFICADA,
-Tramitación,DEMANDA NOTIFICADA,
-Inicio de la Tramitación,DEMANDA NOTIFICADA,
-Inicio tramitación,DEMANDA NOTIFICADA,
-Exhorto,DEMANDA NOTIFICADA,
-Ingreso,ASIGNACIÓN,
-Notificación,PENDIENTE DE NOTIFICACIÓN,
-Presentación de la Medida Prejudicial,EXHIBICIÓN DOCUMENTOS,
-Excepciones,INGRESO EXCEPCIONES DILATORIAS,
-Contestación Excepciones,INGRESO EXCEPCIONES DILATORIAS,
-Oposición de Excepciones,INGRESO EXCEPCIONES DILATORIAS,
-Contestación,FASE DECLARATIVA,
-Réplica,FASE DECLARATIVA,
-Término Probatorio,FASE DECLARATIVA,
-Conciliación y/o Recibe a prueba,FASE DECLARATIVA,
-Aud.Contes.y Concil./Recib. a prueba,FASE DECLARATIVA,
-Aud. Descargos y Prueba,FASE DECLARATIVA,
-Comparendo Contestación,FASE DECLARATIVA,
-Sentencia,FASE DECLARATIVA,
-Impugnación de Sentencia,FASE DECLARATIVA,
-Impugnación,FASE DECLARATIVA,
-Recursos y/o ejecución,FASE DECLARATIVA,
-Cumplimiento Corte,FASE DECLARATIVA,
-Notificación Reclamación,FASE DECLARATIVA,
-Apremio,APREMIO,
-Mandamiento,APREMIO,
-Requerimiento pago,APREMIO,
-Preparación acción desposeimiento,APREMIO,
-Notificación de cumplimiento,APREMIO,
-Oposición al remate,EMBARGO INMUEBLE,
-Tramitación Liquidación,JUDICIAL,
-"Junta, Objeciones y Periodo Extraor.",JUDICIAL,
-Terminada,CAUSA ARCHIVADA,
+pjud_stage,matriz_etapa,nota,match_tipo,orden
+Notificación demanda y su proveído,DEMANDA NOTIFICADA,,stage,0
+Tramitación,DEMANDA NOTIFICADA,,stage,0
+Inicio de la Tramitación,DEMANDA NOTIFICADA,,stage,0
+Inicio tramitación,DEMANDA NOTIFICADA,,stage,0
+Exhorto,DEMANDA NOTIFICADA,,stage,0
+Ingreso,ASIGNACIÓN,,stage,0
+Notificación,PENDIENTE DE NOTIFICACIÓN,,stage,0
+Presentación de la Medida Prejudicial,EXHIBICIÓN DOCUMENTOS,,stage,0
+Excepciones,INGRESO EXCEPCIONES DILATORIAS,,stage,0
+Contestación Excepciones,INGRESO EXCEPCIONES DILATORIAS,,stage,0
+Oposición de Excepciones,INGRESO EXCEPCIONES DILATORIAS,,stage,0
+Contestación,FASE DECLARATIVA,,stage,0
+Réplica,FASE DECLARATIVA,,stage,0
+Término Probatorio,FASE DECLARATIVA,,stage,0
+Conciliación y/o Recibe a prueba,FASE DECLARATIVA,,stage,0
+Aud.Contes.y Concil./Recib. a prueba,FASE DECLARATIVA,,stage,0
+Aud. Descargos y Prueba,FASE DECLARATIVA,,stage,0
+Comparendo Contestación,FASE DECLARATIVA,,stage,0
+Sentencia,FASE DECLARATIVA,,stage,0
+Impugnación de Sentencia,FASE DECLARATIVA,,stage,0
+Impugnación,FASE DECLARATIVA,,stage,0
+Recursos y/o ejecución,FASE DECLARATIVA,,stage,0
+Cumplimiento Corte,FASE DECLARATIVA,,stage,0
+Notificación Reclamación,FASE DECLARATIVA,,stage,0
+Apremio,APREMIO,,stage,0
+Mandamiento,APREMIO,,stage,0
+Requerimiento pago,APREMIO,,stage,0
+Preparación acción desposeimiento,APREMIO,,stage,0
+Notificación de cumplimiento,APREMIO,,stage,0
+Oposición al remate,EMBARGO INMUEBLE,,stage,0
+Tramitación Liquidación,JUDICIAL,,stage,0
+"Junta, Objeciones y Periodo Extraor.",JUDICIAL,,stage,0
+Terminada,CAUSA ARCHIVADA,,stage,0
+Archivo del expediente en el Tribunal,CAUSA ARCHIVADA,"Fallback por descripción — medido en la DB real: 314 causas con última etapa en blanco pero esta descripción (2026-09).",descripcion,1
+Cita a Audiencia,FASE DECLARATIVA,"Fallback por descripción — 99 causas medidas (2026-09).",descripcion,2
+Sentencia,FASE DECLARATIVA,"Fallback por descripción — 86 causas medidas (2026-09). Distinto de la fila 'stage' homónima: esta se compara contra movements.description, no contra movements.stage.",descripcion,3
+Da curso a la medida prejudicial,EXHIBICIÓN DOCUMENTOS,"Fallback por descripción — 54 causas medidas (2026-09).",descripcion,4
+Recibe la causa a prueba,FASE DECLARATIVA,"Fallback por descripción — 41 causas medidas (2026-09).",descripcion,5
+Se pronuncia sobre admisibilidad excep.,INGRESO EXCEPCIONES DILATORIAS,"Fallback por descripción — 23 causas medidas (2026-09).",descripcion,6

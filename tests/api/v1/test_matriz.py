@@ -175,7 +175,23 @@ class TestDistribucion:
 
         resp = client.get("/api/v1/matriz/distribucion", headers=admin_headers)
         sin_mapear = resp.json()["sin_mapear"]
-        assert {"stage": "Etapa Sin Mapeo", "causas": 1} in sin_mapear
+        assert {"stage": "Etapa Sin Mapeo", "descripcion": None, "causas": 1} in sin_mapear
+
+    def test_sin_mapear_groups_blank_stage_by_description(self, db, client, admin_headers, dataset):
+        from app.models.movement import Movement
+
+        case_4 = dataset["case_4"]
+        db.add(Movement(
+            case_id=case_4.id,
+            stage=None,
+            description="Un evento inédito sin mapear",
+            movement_date=datetime(2026, 1, 1),
+        ))
+        db.commit()
+
+        resp = client.get("/api/v1/matriz/distribucion", headers=admin_headers)
+        sin_mapear = resp.json()["sin_mapear"]
+        assert {"stage": None, "descripcion": "Un evento inédito sin mapear", "causas": 1} in sin_mapear
 
     def test_requires_auth(self, client):
         assert client.get("/api/v1/matriz/distribucion").status_code in (401, 403)
@@ -243,6 +259,53 @@ class TestMapeoEditor:
             json={"activo": False},
         )
         assert resp.status_code == 404
+
+    def test_match_tipo_disambiguates_same_text(self, db, client, admin_headers):
+        """'Sentencia' exists as BOTH a stage rule and a descripcion rule —
+        the match_tipo query param must edit exactly one of them."""
+        from app.models.matriz_pjud_mapeo import MATCH_TIPO_DESCRIPCION, MATCH_TIPO_STAGE
+
+        db.add(MatrizPjudMapeo(
+            pjud_stage="Sentencia", matriz_etapa="FASE DECLARATIVA", match_tipo=MATCH_TIPO_STAGE,
+        ))
+        db.add(MatrizPjudMapeo(
+            pjud_stage="Sentencia", matriz_etapa="FASE DECLARATIVA",
+            match_tipo=MATCH_TIPO_DESCRIPCION, orden=3,
+        ))
+        db.commit()
+
+        resp = client.put(
+            "/api/v1/matriz/mapeo/Sentencia?match_tipo=descripcion",
+            headers=admin_headers,
+            json={"activo": False, "orden": 9},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["match_tipo"] == "descripcion"
+        assert body["activo"] is False
+        assert body["orden"] == 9
+
+        # The stage-type row must be untouched.
+        stage_row = (
+            db.query(MatrizPjudMapeo)
+            .filter_by(pjud_stage="Sentencia", match_tipo=MATCH_TIPO_STAGE)
+            .first()
+        )
+        assert stage_row.activo is True
+
+    def test_list_mapeo_includes_match_tipo_and_orden(self, db, client, admin_headers):
+        from app.models.matriz_pjud_mapeo import MATCH_TIPO_DESCRIPCION
+
+        db.add(MatrizPjudMapeo(
+            pjud_stage="Cita a Audiencia", matriz_etapa="FASE DECLARATIVA",
+            match_tipo=MATCH_TIPO_DESCRIPCION, orden=2,
+        ))
+        db.commit()
+
+        resp = client.get("/api/v1/matriz/mapeo", headers=admin_headers)
+        row = next(r for r in resp.json() if r["pjud_stage"] == "Cita a Audiencia")
+        assert row["match_tipo"] == "descripcion"
+        assert row["orden"] == 2
 
 
 # ---------------------------------------------------------------------------

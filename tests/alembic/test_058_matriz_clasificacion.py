@@ -80,12 +80,13 @@ class TestModelsMatchMigration:
         cols = {c.name for c in MatrizPjudMapeo.__table__.columns}
         assert cols == {
             "id", "pjud_stage", "matriz_etapa", "nota", "activo",
-            "created_at", "updated_at",
+            "match_tipo", "orden", "created_at", "updated_at",
         }
-        stage_col = MatrizPjudMapeo.__table__.c.pjud_stage
-        assert stage_col.unique is True or any(
-            idx.unique and [c.name for c in idx.columns] == ["pjud_stage"]
-            for idx in MatrizPjudMapeo.__table__.indexes
+        # Natural key is (pjud_stage, match_tipo), not pjud_stage alone.
+        assert any(
+            set(c.name for c in uc.columns) == {"pjud_stage", "match_tipo"}
+            for uc in MatrizPjudMapeo.__table__.constraints
+            if hasattr(uc, "columns")
         )
 
     def test_case_has_matriz_columns(self):

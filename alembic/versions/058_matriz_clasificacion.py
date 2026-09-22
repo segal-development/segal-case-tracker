@@ -12,7 +12,12 @@ persisted on ``cases``.
 - ``matriz_tramite_override``: (proc_antiguo, etapa, nombre_tramite) rows
   that OVERRIDE the etapa-level matriz for a specific trámite.
 - ``matriz_pjud_mapeo``: editable PJUD-stage -> matriz-etapa mapping the
-  business tunes via the API without a deploy.
+  business tunes via the API without a deploy. ``match_tipo`` selects
+  whether ``pjud_stage`` is matched exactly against ``movements.stage``
+  (``"stage"``, default) or as an accent-insensitive substring against
+  ``movements.description`` (``"descripcion"`` — the fallback layer for
+  movements PJUD never tagged with a stage). ``orden`` gives description
+  rules a deterministic evaluation order.
 
 Revision ID: 058
 Revises: 057
@@ -73,12 +78,20 @@ def upgrade() -> None:
         sa.Column("matriz_etapa", sa.String(length=120), nullable=False),
         sa.Column("nota", sa.Text(), nullable=True),
         sa.Column("activo", sa.Boolean(), nullable=False, server_default=sa.text("true")),
+        sa.Column("match_tipo", sa.String(length=20), nullable=False, server_default=sa.text("'stage'")),
+        sa.Column("orden", sa.Integer(), nullable=False, server_default=sa.text("0")),
         sa.Column("created_at", sa.DateTime(), nullable=False),
         sa.Column("updated_at", sa.DateTime(), nullable=False),
         sa.PrimaryKeyConstraint("id"),
+        # Natural key is (pjud_stage, match_tipo), NOT pjud_stage alone — the
+        # same text can be both a PJUD etapa and a fallback description
+        # substring (e.g. "Sentencia" is both).
+        sa.UniqueConstraint(
+            "pjud_stage", "match_tipo", name="uq_matriz_pjud_mapeo_stage_match_tipo"
+        ),
     )
     op.create_index("ix_matriz_pjud_mapeo_id", "matriz_pjud_mapeo", ["id"], unique=False)
-    op.create_index("ix_matriz_pjud_mapeo_pjud_stage", "matriz_pjud_mapeo", ["pjud_stage"], unique=True)
+    op.create_index("ix_matriz_pjud_mapeo_pjud_stage", "matriz_pjud_mapeo", ["pjud_stage"], unique=False)
 
     op.add_column("cases", sa.Column("matriz", sa.String(length=20), nullable=True))
     op.add_column("cases", sa.Column("matriz_etapa", sa.String(length=80), nullable=True))

@@ -6,7 +6,7 @@ two; hand-curated for the third) and upserts them into:
 
 - ``matriz_clasificacion``   (natural key: proc_simple + etapa)
 - ``matriz_tramite_override`` (natural key: proc_antiguo + etapa + nombre_tramite)
-- ``matriz_pjud_mapeo``      (natural key: pjud_stage)
+- ``matriz_pjud_mapeo``      (natural key: pjud_stage + match_tipo)
 
 Safe to run repeatedly: rows are upserted by natural key, never duplicated.
 Existing ``matriz_pjud_mapeo`` rows are updated in place except ``activo``,
@@ -23,7 +23,7 @@ from pathlib import Path
 from sqlalchemy.orm import Session
 
 from app.models.matriz_clasificacion import MatrizClasificacion
-from app.models.matriz_pjud_mapeo import MatrizPjudMapeo
+from app.models.matriz_pjud_mapeo import MATCH_TIPO_STAGE, MatrizPjudMapeo
 from app.models.matriz_tramite_override import MatrizTramiteOverride
 
 logger = logging.getLogger(__name__)
@@ -136,11 +136,16 @@ def seed_pjud_mapeo(db: Session) -> dict[str, int]:
     """Upsert ``matriz_pjud_mapeo`` from ``mapeo_pjud.csv``.
 
     ``activo`` is only set on CREATE — re-seeding never resurrects a stage the
-    business has deliberately deactivated via the API.
+    business has deliberately deactivated via the API. Natural key is
+    (pjud_stage, match_tipo) — NOT pjud_stage alone, since the same text can
+    legitimately be both a PJUD etapa and a fallback description substring
+    (e.g. "Sentencia" is both).
     """
     rows = _read_csv(DATA_DIR / "mapeo_pjud.csv")
 
-    existing = {row.pjud_stage: row for row in db.query(MatrizPjudMapeo).all()}
+    existing = {
+        (row.pjud_stage, row.match_tipo): row for row in db.query(MatrizPjudMapeo).all()
+    }
 
     created = 0
     updated = 0
@@ -150,17 +155,27 @@ def seed_pjud_mapeo(db: Session) -> dict[str, int]:
         if not pjud_stage or not matriz_etapa:
             continue
 
-        row = existing.get(pjud_stage)
+        match_tipo = _blank_to_none(r.get("match_tipo")) or MATCH_TIPO_STAGE
+        orden = _int_or_none(r.get("orden")) or 0
         nota = _blank_to_none(r["nota"])
+
+        key = (pjud_stage, match_tipo)
+        row = existing.get(key)
         if row is None:
             row = MatrizPjudMapeo(
-                pjud_stage=pjud_stage, matriz_etapa=matriz_etapa, nota=nota, activo=True
+                pjud_stage=pjud_stage,
+                matriz_etapa=matriz_etapa,
+                nota=nota,
+                activo=True,
+                match_tipo=match_tipo,
+                orden=orden,
             )
             db.add(row)
             created += 1
         else:
             row.matriz_etapa = matriz_etapa
             row.nota = nota
+            row.orden = orden
             updated += 1
 
     db.commit()
