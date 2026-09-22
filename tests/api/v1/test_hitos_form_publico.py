@@ -9,6 +9,7 @@ from datetime import date
 
 import pytest
 
+from app.api.v1 import hitos as hitos_api
 from app.core.security import create_access_token
 from app.models.hito import Hito, HitoTipo, HITO_APROBADO, HITO_PENDIENTE
 from app.models.lawyer import Lawyer
@@ -307,25 +308,76 @@ def test_public_post_invalid_content_type_415(client, db, storage, lawyer, tipo)
 # --------------------------------------------------------------------------- #
 # Public: list own hitos
 # --------------------------------------------------------------------------- #
-def test_public_list_only_own_newest_first(client, db, lawyer, other_lawyer, tipo):
-    older = Hito(lawyer_id=lawyer.id, hito_tipo_id=tipo.id, valor_bruto=8077,
-                 fecha_hito=date(2026, 6, 1), estado=HITO_APROBADO)
-    newer = Hito(lawyer_id=lawyer.id, hito_tipo_id=tipo.id, valor_bruto=8077,
-                 fecha_hito=date(2026, 7, 20), estado="rechazado", rechazo_motivo="Falta captura")
+@pytest.fixture
+def today_2026_07(monkeypatch):
+    """Freeze "today in America/Santiago" to 2026-07-10 for the default-period tests."""
+    monkeypatch.setattr(hitos_api, "_today_santiago", lambda: date(2026, 7, 10))
+
+
+def _seed_months(db, lawyer, tipo):
+    """Two July hitos, one June (previous month), one 1-Aug (next month)."""
+    jul_early = Hito(lawyer_id=lawyer.id, hito_tipo_id=tipo.id, valor_bruto=8077,
+                     fecha_hito=date(2026, 7, 1), estado=HITO_APROBADO)
+    jul_late = Hito(lawyer_id=lawyer.id, hito_tipo_id=tipo.id, valor_bruto=8077,
+                    fecha_hito=date(2026, 7, 31), estado="rechazado", rechazo_motivo="Falta captura")
+    jun = Hito(lawyer_id=lawyer.id, hito_tipo_id=tipo.id, valor_bruto=8077,
+               fecha_hito=date(2026, 6, 30), estado=HITO_PENDIENTE)
+    aug = Hito(lawyer_id=lawyer.id, hito_tipo_id=tipo.id, valor_bruto=8077,
+               fecha_hito=date(2026, 8, 1), estado=HITO_PENDIENTE)
+    db.add_all([jul_early, jul_late, jun, aug])
+    db.commit()
+    return jul_early, jul_late, jun, aug
+
+
+def test_public_list_defaults_to_current_month_own_newest_first(client, db, today_2026_07, lawyer, other_lawyer, tipo):
+    jul_early, jul_late, jun, aug = _seed_months(db, lawyer, tipo)
     foreign = Hito(lawyer_id=other_lawyer.id, hito_tipo_id=tipo.id, valor_bruto=8077,
                    fecha_hito=date(2026, 7, 25), estado=HITO_PENDIENTE)
-    db.add_all([older, newer, foreign])
+    db.add(foreign)
     db.commit()
 
-    r = client.get(_public(lawyer.hito_form_token, "/hitos"))
+    r = client.get(_public(lawyer.hito_form_token, "/hitos"))  # no periodo → July 2026
     assert r.status_code == 200
     items = r.json()
-    assert [x["id"] for x in items] == [newer.id, older.id]
+    assert [x["id"] for x in items] == [jul_late.id, jul_early.id]  # June/August/foreign excluded
     assert items[0]["estado"] == "rechazado"
     assert items[0]["rechazo_motivo"] == "Falta captura"
     assert items[0]["tiene_evidencia"] is False
     assert items[0]["tipo_label"] == "Prescripción terminada"
     assert items[0]["valor_bruto"] == 8077
+
+
+def test_public_list_default_uses_santiago_date(client, db, monkeypatch, lawyer, tipo):
+    """The default month comes from _today_santiago (America/Santiago), not the server clock."""
+    _seed_months(db, lawyer, tipo)
+    monkeypatch.setattr(hitos_api, "_today_santiago", lambda: date(2026, 6, 30))
+    r = client.get(_public(lawyer.hito_form_token, "/hitos"))
+    assert r.status_code == 200
+    assert [x["fecha_hito"] for x in r.json()] == ["2026-06-30"]
+
+
+def test_public_list_explicit_periodo_filters(client, db, today_2026_07, lawyer, tipo):
+    jul_early, jul_late, jun, aug = _seed_months(db, lawyer, tipo)
+    r = client.get(_public(lawyer.hito_form_token, "/hitos"), params={"periodo": "2026-06"})
+    assert r.status_code == 200
+    assert [x["id"] for x in r.json()] == [jun.id]
+    r = client.get(_public(lawyer.hito_form_token, "/hitos"), params={"periodo": "2026-08"})
+    assert [x["id"] for x in r.json()] == [aug.id]
+    r = client.get(_public(lawyer.hito_form_token, "/hitos"), params={"periodo": "2026-12"})
+    assert r.json() == []
+
+
+@pytest.mark.parametrize("periodo", ["2026-7", "2026-13", "2026-00", "07-2026", "2026/07", "abc", "2026-07-01", ""])
+def test_public_list_invalid_periodo_422(client, db, lawyer, periodo):
+    r = client.get(_public(lawyer.hito_form_token, "/hitos"), params={"periodo": periodo})
+    assert r.status_code == 422
+    assert r.json()["detail"] == "Período inválido, usa YYYY-MM"
+
+
+def test_public_list_invalid_token_still_404(client, db, lawyer):
+    r = client.get(_public("nope", "/hitos"), params={"periodo": "2026-07"})
+    assert r.status_code == 404
+    assert r.json()["detail"] == LINK_INVALIDO
 
 
 # --------------------------------------------------------------------------- #
