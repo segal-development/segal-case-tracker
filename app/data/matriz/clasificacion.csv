@@ -1,0 +1,115 @@
+proc_simple_id,proc_simple,proc_antiguo_id,proc_antiguo,etapa_id,etapa_padre_id,etapa_padre,nivel_etapa,orden,etapa,estado_etapa,condicion_rol,matriz,observaciones
+1,Juicio Ejecutivo Completo,16,JUICIO EJECUTIVO,1,,,,1,ASIGNACIÓN,Activa,Cualquiera,M1 Baja,
+1,Juicio Ejecutivo Completo,16,JUICIO EJECUTIVO,2,,,,3,DEMANDA NOTIFICADA,Activa,Cualquiera,M2,"Demanda notificada y ROL vigente: hay actividad procesal real en tribunal, aunque todavía sin ejecución forzada."
+1,Juicio Ejecutivo Completo,16,JUICIO EJECUTIVO,3,,,,4,APREMIO,Activa,Cualquiera,M3,Fase de apremio: ejecución forzada.
+1,Juicio Ejecutivo Completo,16,JUICIO EJECUTIVO,4,,,,5,EXHIBICIÓN DOCUMENTOS,Activa,Cualquiera,M1 Baja,Exhibición de documentos: causa técnicamente simple.
+1,Juicio Ejecutivo Completo,16,JUICIO EJECUTIVO,5,2,DEMANDA NOTIFICADA,1,1,INGRESO EXCEPCIONES DILATORIAS,Activa,Cualquiera,M2,Excepción dilatoria en tramitación: defensa procesal activa.
+1,Juicio Ejecutivo Completo,16,JUICIO EJECUTIVO,6,2,DEMANDA NOTIFICADA,1,2,INGRESO EXCEPCIONES DE PRESCRIPCIÓN,Activa,Cualquiera,M1 Alta,Prescripción alegada con ROL vigente: se mantiene como tramitación de escrito presentado por el equipo técnico.
+1,Juicio Ejecutivo Completo,16,JUICIO EJECUTIVO,7,2,DEMANDA NOTIFICADA,1,3,INGRESO ABANDONO DE PROCEDIMIENTO 6 MESES,Activa,Cualquiera,M2,Abandono de procedimiento de 6 meses: tratamiento fijo en esta matriz por su plazo fatal de traslado.
+1,Juicio Ejecutivo Completo,16,JUICIO EJECUTIVO,8,2,DEMANDA NOTIFICADA,1,3,INGRESO ABANDONO DE PROCEDIMIENTO 3 AÑOS,Activa,Cualquiera,M1 Alta,Abandono de procedimiento de 3 años ya presentado: tramitación de escrito por el equipo técnico.
+1,Juicio Ejecutivo Completo,16,JUICIO EJECUTIVO,9,2,DEMANDA NOTIFICADA,1,4,INGRESO INCIDENTE DE NULIDAD,Activa,Cualquiera,M2,Incidente de nulidad en tramitación: defensa procesal activa.
+1,Juicio Ejecutivo Completo,16,JUICIO EJECUTIVO,10,3,APREMIO,1,1,EMBARGO BIENES MUEBLES,Activa,Cualquiera,M3,Embargo de bienes muebles: ejecución forzada.
+1,Juicio Ejecutivo Completo,16,JUICIO EJECUTIVO,11,3,APREMIO,1,2,EMBARGO INMUEBLE,Activa,Cualquiera,M3,"Embargo de inmueble, incluye preparación y remate: ejecución forzada."
+1,Juicio Ejecutivo Completo,16,JUICIO EJECUTIVO,12,4,EXHIBICIÓN DOCUMENTOS,1,1,FASE DECLARATIVA,Activa,Cualquiera,M2,Fase declarativa derivada de la exhibición: tramitación procesal activa en tribunal.
+1,Juicio Ejecutivo Completo,16,JUICIO EJECUTIVO,18,,,,2,PENDIENTE DE NOTIFICACIÓN,Activa,Cualquiera,M1 Baja,Demanda presentada pero el receptor aún no notifica: sin actividad procesal en tribunal.
+1,Juicio Ejecutivo Completo,16,JUICIO EJECUTIVO,23,,,,6,CAUSA ARCHIVADA,Activa,,,Causa archivada: sin gestión activa por regla general. Ver hoja Trámites para los estados de espera de plazo.
+2,Solo Tercería,19,REDACCIÓN,16,,,,1,ASIGNACIÓN,Activa,Cualquiera,M3,"Redacción de escritura: causa técnicamente compleja. Excepción: si la causa lleva más de 9 meses en el sistema sin cierre, baja a M1 Baja."
+2,Solo Tercería,19,REDACCIÓN,17,,,,2,FINALIZADO,Activa,,,Redacción finalizada: sin gestión activa pendiente.
+3,Insolvencia,25,INSOLVENCIA,13,,,,1,ASIGNACIÓN,Activa,Cualquiera,M3,
+3,Insolvencia,25,INSOLVENCIA,14,,,,2,JUDICIAL,Activa,Cualquiera,M3,"Insolvencia: causa técnicamente compleja, trabajo exclusivo del equipo técnico senior durante toda la fase concursal."
+3,Insolvencia,25,INSOLVENCIA,15,,,,3,CIERRE,Activa,,,Insolvencia cerrada: sin gestión activa pendiente.
+4,Cesión de Derechos,19,REDACCIÓN,16,,,,1,ASIGNACIÓN,Activa,Cualquiera,M3,"Redacción de escritura: causa técnicamente compleja. Excepción: si la causa lleva más de 9 meses en el sistema sin cierre, baja a M1 Baja."
+4,Cesión de Derechos,19,REDACCIÓN,17,,,,2,FINALIZADO,Activa,,,Redacción finalizada: sin gestión activa pendiente.
+5,Compraventa,19,REDACCIÓN,16,,,,1,ASIGNACIÓN,Activa,Cualquiera,M3,"Redacción de escritura: causa técnicamente compleja. Excepción: si la causa lleva más de 9 meses en el sistema sin cierre, baja a M1 Baja."
+5,Compraventa,19,REDACCIÓN,17,,,,2,FINALIZADO,Activa,,,Redacción finalizada: sin gestión activa pendiente.
+6,Liquidación de Sociedad Conyugal,19,REDACCIÓN,16,,,,1,ASIGNACIÓN,Activa,Cualquiera,M3,"Redacción de escritura: causa técnicamente compleja. Excepción: si la causa lleva más de 9 meses en el sistema sin cierre, baja a M1 Baja."
+6,Liquidación de Sociedad Conyugal,19,REDACCIÓN,17,,,,2,FINALIZADO,Activa,,,Redacción finalizada: sin gestión activa pendiente.
+7,Divorcio Mutuo Acuerdo,19,REDACCIÓN,16,,,,1,ASIGNACIÓN,Activa,Cualquiera,M3,"Redacción de escritura: causa técnicamente compleja. Excepción: si la causa lleva más de 9 meses en el sistema sin cierre, baja a M1 Baja."
+7,Divorcio Mutuo Acuerdo,19,REDACCIÓN,17,,,,2,FINALIZADO,Activa,,,Redacción finalizada: sin gestión activa pendiente.
+8,Juicio Arrendamiento,16,JUICIO EJECUTIVO,1,,,,1,ASIGNACIÓN,Activa,Cualquiera,M1 Baja,
+8,Juicio Arrendamiento,16,JUICIO EJECUTIVO,2,,,,3,DEMANDA NOTIFICADA,Activa,Cualquiera,M2,"Demanda notificada y ROL vigente: hay actividad procesal real en tribunal, aunque todavía sin ejecución forzada."
+8,Juicio Arrendamiento,16,JUICIO EJECUTIVO,3,,,,4,APREMIO,Activa,Cualquiera,M3,Fase de apremio: ejecución forzada.
+8,Juicio Arrendamiento,16,JUICIO EJECUTIVO,4,,,,5,EXHIBICIÓN DOCUMENTOS,Activa,Cualquiera,M1 Baja,Exhibición de documentos: causa técnicamente simple.
+8,Juicio Arrendamiento,16,JUICIO EJECUTIVO,5,2,DEMANDA NOTIFICADA,1,1,INGRESO EXCEPCIONES DILATORIAS,Activa,Cualquiera,M2,Excepción dilatoria en tramitación: defensa procesal activa.
+8,Juicio Arrendamiento,16,JUICIO EJECUTIVO,6,2,DEMANDA NOTIFICADA,1,2,INGRESO EXCEPCIONES DE PRESCRIPCIÓN,Activa,Cualquiera,M1 Alta,Prescripción alegada con ROL vigente: se mantiene como tramitación de escrito presentado por el equipo técnico.
+8,Juicio Arrendamiento,16,JUICIO EJECUTIVO,7,2,DEMANDA NOTIFICADA,1,3,INGRESO ABANDONO DE PROCEDIMIENTO 6 MESES,Activa,Cualquiera,M2,Abandono de procedimiento de 6 meses: tratamiento fijo en esta matriz por su plazo fatal de traslado.
+8,Juicio Arrendamiento,16,JUICIO EJECUTIVO,8,2,DEMANDA NOTIFICADA,1,3,INGRESO ABANDONO DE PROCEDIMIENTO 3 AÑOS,Activa,Cualquiera,M1 Alta,Abandono de procedimiento de 3 años ya presentado: tramitación de escrito por el equipo técnico.
+8,Juicio Arrendamiento,16,JUICIO EJECUTIVO,9,2,DEMANDA NOTIFICADA,1,4,INGRESO INCIDENTE DE NULIDAD,Activa,Cualquiera,M2,Incidente de nulidad en tramitación: defensa procesal activa.
+8,Juicio Arrendamiento,16,JUICIO EJECUTIVO,10,3,APREMIO,1,1,EMBARGO BIENES MUEBLES,Activa,Cualquiera,M3,Embargo de bienes muebles: ejecución forzada.
+8,Juicio Arrendamiento,16,JUICIO EJECUTIVO,11,3,APREMIO,1,2,EMBARGO INMUEBLE,Activa,Cualquiera,M3,"Embargo de inmueble, incluye preparación y remate: ejecución forzada."
+8,Juicio Arrendamiento,16,JUICIO EJECUTIVO,12,4,EXHIBICIÓN DOCUMENTOS,1,1,FASE DECLARATIVA,Activa,Cualquiera,M2,Fase declarativa derivada de la exhibición: tramitación procesal activa en tribunal.
+8,Juicio Arrendamiento,16,JUICIO EJECUTIVO,18,,,,2,PENDIENTE DE NOTIFICACIÓN,Activa,Cualquiera,M1 Baja,Demanda presentada pero el receptor aún no notifica: sin actividad procesal en tribunal.
+8,Juicio Arrendamiento,16,JUICIO EJECUTIVO,23,,,,6,CAUSA ARCHIVADA,Activa,,,Causa archivada: sin gestión activa por regla general. Ver hoja Trámites para los estados de espera de plazo.
+9,Plan Preventivo,2,PREVENTIVOS,19,,,,1,ASIGNACIÓN,Activa,Cualquiera,M1 Baja,
+10,Solo Excepciones,16,JUICIO EJECUTIVO,1,,,,1,ASIGNACIÓN,Activa,Cualquiera,M1 Baja,
+10,Solo Excepciones,16,JUICIO EJECUTIVO,2,,,,3,DEMANDA NOTIFICADA,Activa,Cualquiera,M2,"Demanda notificada y ROL vigente: hay actividad procesal real en tribunal, aunque todavía sin ejecución forzada."
+10,Solo Excepciones,16,JUICIO EJECUTIVO,3,,,,4,APREMIO,Activa,Cualquiera,M3,Fase de apremio: ejecución forzada.
+10,Solo Excepciones,16,JUICIO EJECUTIVO,4,,,,5,EXHIBICIÓN DOCUMENTOS,Activa,Cualquiera,M1 Baja,Exhibición de documentos: causa técnicamente simple.
+10,Solo Excepciones,16,JUICIO EJECUTIVO,5,2,DEMANDA NOTIFICADA,1,1,INGRESO EXCEPCIONES DILATORIAS,Activa,Cualquiera,M2,Excepción dilatoria en tramitación: defensa procesal activa.
+10,Solo Excepciones,16,JUICIO EJECUTIVO,6,2,DEMANDA NOTIFICADA,1,2,INGRESO EXCEPCIONES DE PRESCRIPCIÓN,Activa,Cualquiera,M1 Alta,Prescripción alegada con ROL vigente: se mantiene como tramitación de escrito presentado por el equipo técnico.
+10,Solo Excepciones,16,JUICIO EJECUTIVO,7,2,DEMANDA NOTIFICADA,1,3,INGRESO ABANDONO DE PROCEDIMIENTO 6 MESES,Activa,Cualquiera,M2,Abandono de procedimiento de 6 meses: tratamiento fijo en esta matriz por su plazo fatal de traslado.
+10,Solo Excepciones,16,JUICIO EJECUTIVO,8,2,DEMANDA NOTIFICADA,1,3,INGRESO ABANDONO DE PROCEDIMIENTO 3 AÑOS,Activa,Cualquiera,M1 Alta,Abandono de procedimiento de 3 años ya presentado: tramitación de escrito por el equipo técnico.
+10,Solo Excepciones,16,JUICIO EJECUTIVO,9,2,DEMANDA NOTIFICADA,1,4,INGRESO INCIDENTE DE NULIDAD,Activa,Cualquiera,M2,Incidente de nulidad en tramitación: defensa procesal activa.
+10,Solo Excepciones,16,JUICIO EJECUTIVO,10,3,APREMIO,1,1,EMBARGO BIENES MUEBLES,Activa,Cualquiera,M3,Embargo de bienes muebles: ejecución forzada.
+10,Solo Excepciones,16,JUICIO EJECUTIVO,11,3,APREMIO,1,2,EMBARGO INMUEBLE,Activa,Cualquiera,M3,"Embargo de inmueble, incluye preparación y remate: ejecución forzada."
+10,Solo Excepciones,16,JUICIO EJECUTIVO,12,4,EXHIBICIÓN DOCUMENTOS,1,1,FASE DECLARATIVA,Activa,Cualquiera,M2,Fase declarativa derivada de la exhibición: tramitación procesal activa en tribunal.
+10,Solo Excepciones,16,JUICIO EJECUTIVO,18,,,,2,PENDIENTE DE NOTIFICACIÓN,Activa,Cualquiera,M1 Baja,Demanda presentada pero el receptor aún no notifica: sin actividad procesal en tribunal.
+10,Solo Excepciones,16,JUICIO EJECUTIVO,23,,,,6,CAUSA ARCHIVADA,Activa,,,Causa archivada: sin gestión activa por regla general. Ver hoja Trámites para los estados de espera de plazo.
+11,Solo Abandono,16,JUICIO EJECUTIVO,1,,,,1,ASIGNACIÓN,Activa,Cualquiera,M1 Baja,
+11,Solo Abandono,16,JUICIO EJECUTIVO,2,,,,3,DEMANDA NOTIFICADA,Activa,Cualquiera,M2,"Demanda notificada y ROL vigente: hay actividad procesal real en tribunal, aunque todavía sin ejecución forzada."
+11,Solo Abandono,16,JUICIO EJECUTIVO,3,,,,4,APREMIO,Activa,Cualquiera,M3,Fase de apremio: ejecución forzada.
+11,Solo Abandono,16,JUICIO EJECUTIVO,4,,,,5,EXHIBICIÓN DOCUMENTOS,Activa,Cualquiera,M1 Baja,Exhibición de documentos: causa técnicamente simple.
+11,Solo Abandono,16,JUICIO EJECUTIVO,5,2,DEMANDA NOTIFICADA,1,1,INGRESO EXCEPCIONES DILATORIAS,Activa,Cualquiera,M2,Excepción dilatoria en tramitación: defensa procesal activa.
+11,Solo Abandono,16,JUICIO EJECUTIVO,6,2,DEMANDA NOTIFICADA,1,2,INGRESO EXCEPCIONES DE PRESCRIPCIÓN,Activa,Cualquiera,M1 Alta,Prescripción alegada con ROL vigente: se mantiene como tramitación de escrito presentado por el equipo técnico.
+11,Solo Abandono,16,JUICIO EJECUTIVO,7,2,DEMANDA NOTIFICADA,1,3,INGRESO ABANDONO DE PROCEDIMIENTO 6 MESES,Activa,Cualquiera,M2,Abandono de procedimiento de 6 meses: tratamiento fijo en esta matriz por su plazo fatal de traslado.
+11,Solo Abandono,16,JUICIO EJECUTIVO,8,2,DEMANDA NOTIFICADA,1,3,INGRESO ABANDONO DE PROCEDIMIENTO 3 AÑOS,Activa,Cualquiera,M1 Alta,Abandono de procedimiento de 3 años ya presentado: tramitación de escrito por el equipo técnico.
+11,Solo Abandono,16,JUICIO EJECUTIVO,9,2,DEMANDA NOTIFICADA,1,4,INGRESO INCIDENTE DE NULIDAD,Activa,Cualquiera,M2,Incidente de nulidad en tramitación: defensa procesal activa.
+11,Solo Abandono,16,JUICIO EJECUTIVO,10,3,APREMIO,1,1,EMBARGO BIENES MUEBLES,Activa,Cualquiera,M3,Embargo de bienes muebles: ejecución forzada.
+11,Solo Abandono,16,JUICIO EJECUTIVO,11,3,APREMIO,1,2,EMBARGO INMUEBLE,Activa,Cualquiera,M3,"Embargo de inmueble, incluye preparación y remate: ejecución forzada."
+11,Solo Abandono,16,JUICIO EJECUTIVO,12,4,EXHIBICIÓN DOCUMENTOS,1,1,FASE DECLARATIVA,Activa,Cualquiera,M2,Fase declarativa derivada de la exhibición: tramitación procesal activa en tribunal.
+11,Solo Abandono,16,JUICIO EJECUTIVO,18,,,,2,PENDIENTE DE NOTIFICACIÓN,Activa,Cualquiera,M1 Baja,Demanda presentada pero el receptor aún no notifica: sin actividad procesal en tribunal.
+11,Solo Abandono,16,JUICIO EJECUTIVO,23,,,,6,CAUSA ARCHIVADA,Activa,,,Causa archivada: sin gestión activa por regla general. Ver hoja Trámites para los estados de espera de plazo.
+12,Juicio Ejecutivo Completo CAE,16,JUICIO EJECUTIVO,1,,,,1,ASIGNACIÓN,Activa,Cualquiera,M1 Baja,
+12,Juicio Ejecutivo Completo CAE,16,JUICIO EJECUTIVO,2,,,,3,DEMANDA NOTIFICADA,Activa,Cualquiera,M2,"Demanda notificada y ROL vigente: hay actividad procesal real en tribunal, aunque todavía sin ejecución forzada."
+12,Juicio Ejecutivo Completo CAE,16,JUICIO EJECUTIVO,3,,,,4,APREMIO,Activa,Cualquiera,M3,Fase de apremio: ejecución forzada.
+12,Juicio Ejecutivo Completo CAE,16,JUICIO EJECUTIVO,4,,,,5,EXHIBICIÓN DOCUMENTOS,Activa,Cualquiera,M1 Baja,Exhibición de documentos: causa técnicamente simple.
+12,Juicio Ejecutivo Completo CAE,16,JUICIO EJECUTIVO,5,2,DEMANDA NOTIFICADA,1,1,INGRESO EXCEPCIONES DILATORIAS,Activa,Cualquiera,M2,Excepción dilatoria en tramitación: defensa procesal activa.
+12,Juicio Ejecutivo Completo CAE,16,JUICIO EJECUTIVO,6,2,DEMANDA NOTIFICADA,1,2,INGRESO EXCEPCIONES DE PRESCRIPCIÓN,Activa,Cualquiera,M1 Alta,Prescripción alegada con ROL vigente: se mantiene como tramitación de escrito presentado por el equipo técnico.
+12,Juicio Ejecutivo Completo CAE,16,JUICIO EJECUTIVO,7,2,DEMANDA NOTIFICADA,1,3,INGRESO ABANDONO DE PROCEDIMIENTO 6 MESES,Activa,Cualquiera,M2,Abandono de procedimiento de 6 meses: tratamiento fijo en esta matriz por su plazo fatal de traslado.
+12,Juicio Ejecutivo Completo CAE,16,JUICIO EJECUTIVO,8,2,DEMANDA NOTIFICADA,1,3,INGRESO ABANDONO DE PROCEDIMIENTO 3 AÑOS,Activa,Cualquiera,M1 Alta,Abandono de procedimiento de 3 años ya presentado: tramitación de escrito por el equipo técnico.
+12,Juicio Ejecutivo Completo CAE,16,JUICIO EJECUTIVO,9,2,DEMANDA NOTIFICADA,1,4,INGRESO INCIDENTE DE NULIDAD,Activa,Cualquiera,M2,Incidente de nulidad en tramitación: defensa procesal activa.
+12,Juicio Ejecutivo Completo CAE,16,JUICIO EJECUTIVO,10,3,APREMIO,1,1,EMBARGO BIENES MUEBLES,Activa,Cualquiera,M3,Embargo de bienes muebles: ejecución forzada.
+12,Juicio Ejecutivo Completo CAE,16,JUICIO EJECUTIVO,11,3,APREMIO,1,2,EMBARGO INMUEBLE,Activa,Cualquiera,M3,"Embargo de inmueble, incluye preparación y remate: ejecución forzada."
+12,Juicio Ejecutivo Completo CAE,16,JUICIO EJECUTIVO,12,4,EXHIBICIÓN DOCUMENTOS,1,1,FASE DECLARATIVA,Activa,Cualquiera,M2,Fase declarativa derivada de la exhibición: tramitación procesal activa en tribunal.
+12,Juicio Ejecutivo Completo CAE,16,JUICIO EJECUTIVO,18,,,,2,PENDIENTE DE NOTIFICACIÓN,Activa,Cualquiera,M1 Baja,Demanda presentada pero el receptor aún no notifica: sin actividad procesal en tribunal.
+12,Juicio Ejecutivo Completo CAE,16,JUICIO EJECUTIVO,23,,,,6,CAUSA ARCHIVADA,Activa,,,Causa archivada: sin gestión activa por regla general. Ver hoja Trámites para los estados de espera de plazo.
+13,Usufructo,19,REDACCIÓN,16,,,,1,ASIGNACIÓN,Activa,Cualquiera,M3,"Redacción de escritura: causa técnicamente compleja. Excepción: si la causa lleva más de 9 meses en el sistema sin cierre, baja a M1 Baja."
+13,Usufructo,19,REDACCIÓN,17,,,,2,FINALIZADO,Activa,,,Redacción finalizada: sin gestión activa pendiente.
+14,Preventivo Insolvencia,25,INSOLVENCIA,13,,,,1,ASIGNACIÓN,Activa,Cualquiera,M3,
+14,Preventivo Insolvencia,25,INSOLVENCIA,14,,,,2,JUDICIAL,Activa,Cualquiera,M3,"Insolvencia: causa técnicamente compleja, trabajo exclusivo del equipo técnico senior durante toda la fase concursal."
+14,Preventivo Insolvencia,25,INSOLVENCIA,15,,,,3,CIERRE,Activa,,,Insolvencia cerrada: sin gestión activa pendiente.
+15,Accion de Prescripcion,16,JUICIO EJECUTIVO,1,,,,1,ASIGNACIÓN,Activa,Cualquiera,M1 Baja,
+15,Accion de Prescripcion,16,JUICIO EJECUTIVO,2,,,,3,DEMANDA NOTIFICADA,Activa,Cualquiera,M2,"Demanda notificada y ROL vigente: hay actividad procesal real en tribunal, aunque todavía sin ejecución forzada."
+15,Accion de Prescripcion,16,JUICIO EJECUTIVO,3,,,,4,APREMIO,Activa,Cualquiera,M3,Fase de apremio: ejecución forzada.
+15,Accion de Prescripcion,16,JUICIO EJECUTIVO,4,,,,5,EXHIBICIÓN DOCUMENTOS,Activa,Cualquiera,M1 Baja,Exhibición de documentos: causa técnicamente simple.
+15,Accion de Prescripcion,16,JUICIO EJECUTIVO,5,2,DEMANDA NOTIFICADA,1,1,INGRESO EXCEPCIONES DILATORIAS,Activa,Cualquiera,M2,Excepción dilatoria en tramitación: defensa procesal activa.
+15,Accion de Prescripcion,16,JUICIO EJECUTIVO,6,2,DEMANDA NOTIFICADA,1,2,INGRESO EXCEPCIONES DE PRESCRIPCIÓN,Activa,Cualquiera,M1 Baja,Prescripción alegada con ROL vigente: se mantiene como tramitación de escrito presentado por el equipo técnico.
+15,Accion de Prescripcion,16,JUICIO EJECUTIVO,7,2,DEMANDA NOTIFICADA,1,3,INGRESO ABANDONO DE PROCEDIMIENTO 6 MESES,Activa,Cualquiera,M2,Abandono de procedimiento de 6 meses: tratamiento fijo en esta matriz por su plazo fatal de traslado.
+15,Accion de Prescripcion,16,JUICIO EJECUTIVO,8,2,DEMANDA NOTIFICADA,1,3,INGRESO ABANDONO DE PROCEDIMIENTO 3 AÑOS,Activa,Cualquiera,M1 Baja,Abandono de procedimiento de 3 años ya presentado: tramitación de escrito por el equipo técnico.
+15,Accion de Prescripcion,16,JUICIO EJECUTIVO,9,2,DEMANDA NOTIFICADA,1,4,INGRESO INCIDENTE DE NULIDAD,Activa,Cualquiera,M2,Incidente de nulidad en tramitación: defensa procesal activa.
+15,Accion de Prescripcion,16,JUICIO EJECUTIVO,10,3,APREMIO,1,1,EMBARGO BIENES MUEBLES,Activa,Cualquiera,M3,Embargo de bienes muebles: ejecución forzada.
+15,Accion de Prescripcion,16,JUICIO EJECUTIVO,11,3,APREMIO,1,2,EMBARGO INMUEBLE,Activa,Cualquiera,M3,"Embargo de inmueble, incluye preparación y remate: ejecución forzada."
+15,Accion de Prescripcion,16,JUICIO EJECUTIVO,12,4,EXHIBICIÓN DOCUMENTOS,1,1,FASE DECLARATIVA,Activa,Cualquiera,M2,Fase declarativa derivada de la exhibición: tramitación procesal activa en tribunal.
+15,Accion de Prescripcion,16,JUICIO EJECUTIVO,18,,,,2,PENDIENTE DE NOTIFICACIÓN,Activa,Cualquiera,M1 Baja,Demanda presentada pero el receptor aún no notifica: sin actividad procesal en tribunal.
+15,Accion de Prescripcion,16,JUICIO EJECUTIVO,23,,,,6,CAUSA ARCHIVADA,Activa,,,Causa archivada: sin gestión activa por regla general. Ver hoja Trámites para los estados de espera de plazo.
+16,Vive Tranquilo,2,PREVENTIVOS,19,,,,1,ASIGNACIÓN,Activa,Cualquiera,M1 Baja,
+17,Recurso de Protección,17,RECURSO DE PROTECCIÓN,20,,,,1,ASIGNACIÓN,Activa,Cualquiera,M1 Baja,
+17,Recurso de Protección,17,RECURSO DE PROTECCIÓN,21,,,,2,PRESENTADO,Activa,Cualquiera,M3,Recurso de protección presentado ante la Corte con respaldos formales: causa técnicamente compleja.
+17,Recurso de Protección,17,RECURSO DE PROTECCIÓN,22,,,,3,FINALIZADO,Activa,,,Recurso finalizado: sin gestión activa pendiente.
+18,Renegociacion,36,RENEGOCIACION,24,,,,1,ASIGNACIÓN,Activa,Cualquiera,M1 Baja,Preparación/vigilancia previa a la presentación de la solicitud de renegociación.
+18,Renegociacion,36,RENEGOCIACION,25,,,,2,SOLICITUD PRESENTADA,Activa,Cualquiera,M1 Alta,"Solicitud de renegociación presentada: procedimiento concursal, causa técnicamente compleja."
+18,Renegociacion,36,RENEGOCIACION,26,,,,3,AUDIENCIA DE DETERMINACIÓN DEL PASIVO,Activa,Cualquiera,M1 Alta,Procedimiento concursal en tramitación: causa técnicamente compleja.
+18,Renegociacion,36,RENEGOCIACION,27,,,,4,AUDIENCIA DE RENEGOCIACIÓN,Activa,Cualquiera,M1 Alta,Procedimiento concursal en tramitación: causa técnicamente compleja.
+18,Renegociacion,36,RENEGOCIACION,28,,,,5,EJECUCIÓN DEL ACUERDO,Activa,Cualquiera,M1 Alta,"Seguimiento del cumplimiento del acuerdo: procedimiento concursal, causa técnicamente compleja."
+18,Renegociacion,36,RENEGOCIACION,29,,EJECUCIÓN DEL ACUERDO,1,1,INCUMPLIMIENTO Y APERTURA DE LIQUIDACIÓN,Activa,Cualquiera,M3,Incumplimiento con apertura de liquidación de bienes: ejecución forzada.
+18,Renegociacion,36,RENEGOCIACION,30,,,,6,CIERRE,Activa,,,Procedimiento cerrado: sin gestión activa pendiente.

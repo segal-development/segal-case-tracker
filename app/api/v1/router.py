@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api.v1 import auth, cases, deadlines, movements, courts, scrapper, webhooks, pjud, pjud_ingest, sync, documents, lawyers, stats, goals, alerts, calendar, credentials, hitos, liberaciones, bono, renovaciones, redaccion_keys, evaluaciones, sysgal
+from app.api.v1 import auth, cases, deadlines, movements, courts, scrapper, webhooks, pjud, pjud_ingest, sync, documents, lawyers, stats, goals, alerts, calendar, credentials, hitos, liberaciones, bono, renovaciones, redaccion_keys, evaluaciones, sysgal, matriz
 
 api_router = APIRouter()
 
@@ -27,3 +27,4 @@ api_router.include_router(renovaciones.router, prefix="/renovaciones", tags=["re
 api_router.include_router(redaccion_keys.router, tags=["redaccion-keys"])
 api_router.include_router(evaluaciones.router, prefix="/evaluaciones", tags=["evaluaciones"])
 api_router.include_router(sysgal.router, prefix="/sysgal", tags=["sysgal-cobertura"])
+api_router.include_router(matriz.router, prefix="/matriz", tags=["matriz"])

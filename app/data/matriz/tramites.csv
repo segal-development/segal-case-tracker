@@ -1,0 +1,83 @@
+id_tramite,id_procedimiento,procedimiento_antiguo,id_etapa,etapa,id_etapa_padre,etapa_padre,nombre_del_tramite,matriz_especifica_opcional,observaciones
+1,19,REDACCIÓN,16,ASIGNACIÓN,,,Asignación Abogado,M3,"Redacción de escritura: causa técnicamente compleja. Excepción: si la causa lleva más de 9 meses en el sistema sin cierre, baja a M1 Baja."
+2,19,REDACCIÓN,16,ASIGNACIÓN,,,Bienvenida Realizada,M3,"Redacción de escritura: causa técnicamente compleja. Excepción: si la causa lleva más de 9 meses en el sistema sin cierre, baja a M1 Baja."
+3,19,REDACCIÓN,16,ASIGNACIÓN,,,Solicitud de documentos,M3,"Redacción de escritura: causa técnicamente compleja. Excepción: si la causa lleva más de 9 meses en el sistema sin cierre, baja a M1 Baja."
+4,19,REDACCIÓN,16,ASIGNACIÓN,,,Se encarga redacción,M3,"Redacción de escritura: causa técnicamente compleja. Excepción: si la causa lleva más de 9 meses en el sistema sin cierre, baja a M1 Baja."
+5,19,REDACCIÓN,16,ASIGNACIÓN,,,Redacción confeccionada,M3,"Redacción de escritura: causa técnicamente compleja. Excepción: si la causa lleva más de 9 meses en el sistema sin cierre, baja a M1 Baja."
+6,19,REDACCIÓN,16,ASIGNACIÓN,,,Trámite inscripción CBR,M3,"Redacción de escritura: causa técnicamente compleja. Excepción: si la causa lleva más de 9 meses en el sistema sin cierre, baja a M1 Baja."
+7,19,REDACCIÓN,16,ASIGNACIÓN,,,Inscripción realizada,M3,"Redacción de escritura: causa técnicamente compleja. Excepción: si la causa lleva más de 9 meses en el sistema sin cierre, baja a M1 Baja."
+8,19,REDACCIÓN,16,ASIGNACIÓN,,,Rechazo Inscripción,M3,"Redacción de escritura: causa técnicamente compleja. Excepción: si la causa lleva más de 9 meses en el sistema sin cierre, baja a M1 Baja."
+9,2,PREVENTIVOS,19,ASIGNACIÓN,,,Asignación Abogado,M1 Baja,
+10,2,PREVENTIVOS,19,ASIGNACIÓN,,,Bienvenida Realizada,M1 Baja,
+11,2,PREVENTIVOS,19,ASIGNACIÓN,,,Clave OK,M1 Baja,
+12,2,PREVENTIVOS,19,ASIGNACIÓN,,,Monitoreo e Informe,M1 Baja,
+13,16,JUICIO EJECUTIVO,1,ASIGNACIÓN,,,Asignación Abogado,M1 Baja,
+14,16,JUICIO EJECUTIVO,1,ASIGNACIÓN,,,Bienvenida Realizada,M1 Baja,
+15,16,JUICIO EJECUTIVO,5,INGRESO EXCEPCIONES DILATORIAS,2,DEMANDA NOTIFICADA,Notificación,M2,
+16,16,JUICIO EJECUTIVO,5,INGRESO EXCEPCIONES DILATORIAS,2,DEMANDA NOTIFICADA,Traslado,M2,
+17,16,JUICIO EJECUTIVO,6,INGRESO EXCEPCIONES DE PRESCRIPCIÓN,2,DEMANDA NOTIFICADA,Notificación,M1 Alta,
+18,16,JUICIO EJECUTIVO,6,INGRESO EXCEPCIONES DE PRESCRIPCIÓN,2,DEMANDA NOTIFICADA,Traslado,M1 Alta,
+19,16,JUICIO EJECUTIVO,6,INGRESO EXCEPCIONES DE PRESCRIPCIÓN,2,DEMANDA NOTIFICADA,Fallo,M1 Alta,
+20,16,JUICIO EJECUTIVO,7,INGRESO ABANDONO DE PROCEDIMIENTO 6 MESES,2,DEMANDA NOTIFICADA,Notificación,M2,Abandono de procedimiento de 6 meses: tratamiento fijo en esta matriz por su plazo fatal de traslado.
+21,16,JUICIO EJECUTIVO,7,INGRESO ABANDONO DE PROCEDIMIENTO 6 MESES,2,DEMANDA NOTIFICADA,Traslado,M2,Abandono de procedimiento de 6 meses: tratamiento fijo en esta matriz por su plazo fatal de traslado.
+22,16,JUICIO EJECUTIVO,7,INGRESO ABANDONO DE PROCEDIMIENTO 6 MESES,2,DEMANDA NOTIFICADA,Fallo,M2,Abandono de procedimiento de 6 meses: tratamiento fijo en esta matriz por su plazo fatal de traslado.
+23,16,JUICIO EJECUTIVO,8,INGRESO ABANDONO DE PROCEDIMIENTO 3 AÑOS,2,DEMANDA NOTIFICADA,Notificación,M1 Alta,
+24,16,JUICIO EJECUTIVO,8,INGRESO ABANDONO DE PROCEDIMIENTO 3 AÑOS,2,DEMANDA NOTIFICADA,Traslado,M1 Alta,
+25,16,JUICIO EJECUTIVO,8,INGRESO ABANDONO DE PROCEDIMIENTO 3 AÑOS,2,DEMANDA NOTIFICADA,Fallo,M1 Alta,
+26,16,JUICIO EJECUTIVO,9,INGRESO INCIDENTE DE NULIDAD,2,DEMANDA NOTIFICADA,Traslado,M2,
+27,16,JUICIO EJECUTIVO,9,INGRESO INCIDENTE DE NULIDAD,2,DEMANDA NOTIFICADA,Termino Probatorio,M2,
+28,16,JUICIO EJECUTIVO,9,INGRESO INCIDENTE DE NULIDAD,2,DEMANDA NOTIFICADA,Fallo,M2,
+29,16,JUICIO EJECUTIVO,3,APREMIO,,,Tercería Presentada,M3,Tercería: defensa típica de la fase de apremio/embargo.
+30,16,JUICIO EJECUTIVO,3,APREMIO,,,Termino Probatorio Tercería,M3,Tercería: defensa típica de la fase de apremio/embargo.
+31,16,JUICIO EJECUTIVO,3,APREMIO,,,Fallo Tercería,M3,Tercería: defensa típica de la fase de apremio/embargo.
+32,16,JUICIO EJECUTIVO,10,EMBARGO BIENES MUEBLES,3,APREMIO,Incidente de Nulidad,M3,
+33,16,JUICIO EJECUTIVO,10,EMBARGO BIENES MUEBLES,3,APREMIO,Reducción de Embargo,M3,
+34,16,JUICIO EJECUTIVO,10,EMBARGO BIENES MUEBLES,3,APREMIO,Termino Probatorio Reducción de Embargo,M3,
+35,16,JUICIO EJECUTIVO,10,EMBARGO BIENES MUEBLES,3,APREMIO,Fallo Reducción de Embargo,M3,
+36,16,JUICIO EJECUTIVO,11,EMBARGO INMUEBLE,3,APREMIO,Bases de Remate,M3,
+37,16,JUICIO EJECUTIVO,11,EMBARGO INMUEBLE,3,APREMIO,Objeta Mínimo de Subasta,M3,
+38,16,JUICIO EJECUTIVO,11,EMBARGO INMUEBLE,3,APREMIO,Designación de Perito,M3,
+39,16,JUICIO EJECUTIVO,11,EMBARGO INMUEBLE,3,APREMIO,Fija Fecha de Remate,M3,
+40,16,JUICIO EJECUTIVO,11,EMBARGO INMUEBLE,3,APREMIO,Remate de Inmueble,M3,
+41,16,JUICIO EJECUTIVO,4,EXHIBICIÓN DOCUMENTOS,,,Redacción Exhibición de Documentos,M1 Baja,
+42,16,JUICIO EJECUTIVO,4,EXHIBICIÓN DOCUMENTOS,,,Presentación,M1 Baja,
+43,16,JUICIO EJECUTIVO,4,EXHIBICIÓN DOCUMENTOS,,,Notificación,M1 Baja,
+44,16,JUICIO EJECUTIVO,4,EXHIBICIÓN DOCUMENTOS,,,Audiencia,M1 Baja,
+45,16,JUICIO EJECUTIVO,4,EXHIBICIÓN DOCUMENTOS,,,Sentencia,M1 Baja,
+46,16,JUICIO EJECUTIVO,12,FASE DECLARATIVA,4,EXHIBICIÓN DOCUMENTOS,Demanda Presentada,M1 Baja,"Demanda declarativa presentada, aún sin notificar."
+47,16,JUICIO EJECUTIVO,12,FASE DECLARATIVA,4,EXHIBICIÓN DOCUMENTOS,Notificación Demanda Declarativa,M2,
+48,16,JUICIO EJECUTIVO,12,FASE DECLARATIVA,4,EXHIBICIÓN DOCUMENTOS,Conciliación,M2,
+49,16,JUICIO EJECUTIVO,12,FASE DECLARATIVA,4,EXHIBICIÓN DOCUMENTOS,Termino Probatorio Juicio Declarativo,M2,
+50,16,JUICIO EJECUTIVO,12,FASE DECLARATIVA,4,EXHIBICIÓN DOCUMENTOS,Sentencia,M2,
+51,25,INSOLVENCIA,13,ASIGNACIÓN,,,Asignación Abogado,M3,
+52,25,INSOLVENCIA,13,ASIGNACIÓN,,,Bienvenida Realizada,M3,
+53,25,INSOLVENCIA,13,ASIGNACIÓN,,,Evaluación de antecedentes,M3,
+54,25,INSOLVENCIA,14,JUDICIAL,,,Presentación de insolvencia,M3,
+55,25,INSOLVENCIA,14,JUDICIAL,,,Solicitud de nominación de liquidación,M3,
+56,25,INSOLVENCIA,14,JUDICIAL,,,Resolución de liquidación,M3,
+57,25,INSOLVENCIA,14,JUDICIAL,,,Audiencia A.190,M3,
+58,25,INSOLVENCIA,14,JUDICIAL,,,Audiencia de incautación,M3,
+59,25,INSOLVENCIA,14,JUDICIAL,,,Realización de oferta directa,M3,
+60,25,INSOLVENCIA,14,JUDICIAL,,,Coordinación de retiro con martillero,M3,
+61,25,INSOLVENCIA,14,JUDICIAL,,,Remate,M3,
+62,25,INSOLVENCIA,14,JUDICIAL,,,Impugnación de créditos reconocidos,M3,
+63,25,INSOLVENCIA,14,JUDICIAL,,,Publicación del reparto,M3,
+64,25,INSOLVENCIA,14,JUDICIAL,,,Solicitud aprobación de cuenta final,M3,
+65,25,INSOLVENCIA,14,JUDICIAL,,,Publicación de cuenta final,M3,
+66,25,INSOLVENCIA,14,JUDICIAL,,,Solicitud de dictación de sentencia de término,M3,
+67,25,INSOLVENCIA,14,JUDICIAL,,,Sentencia de término,M3,
+68,25,INSOLVENCIA,14,JUDICIAL,,,Solicitud de ejecutoria,M3,
+69,25,INSOLVENCIA,15,CIERRE,,,Solicitud de eliminación,M3,Trámite administrativo de cierre del expediente concursal.
+70,19,REDACCIÓN,17,FINALIZADO,,,Proceso Terminado,,Cierre administrativo de la redacción.
+71,16,JUICIO EJECUTIVO,18,PENDIENTE DE NOTIFICACIÓN,,,Pendiente de notificación,M1 Baja,
+72,17,RECURSO DE PROTECCIÓN,20,ASIGNACIÓN,,,Asignación Abogado,M1 Baja,
+73,17,RECURSO DE PROTECCIÓN,20,ASIGNACIÓN,,,Bienvenida Realizada,M1 Baja,
+74,17,RECURSO DE PROTECCIÓN,20,ASIGNACIÓN,,,Solicitud de documentos,M1 Baja,
+75,17,RECURSO DE PROTECCIÓN,21,PRESENTADO,,,Recurso presentado,M3,
+76,17,RECURSO DE PROTECCIÓN,22,FINALIZADO,,,Recurso terminado,,Cierre administrativo del recurso.
+77,16,JUICIO EJECUTIVO,5,INGRESO EXCEPCIONES DILATORIAS,2,DEMANDA NOTIFICADA,Termino Probatorio,M2,
+78,16,JUICIO EJECUTIVO,10,EMBARGO BIENES MUEBLES,3,APREMIO,Sin Defensa de Excepciones,M3,Solo cuando exista embargos
+79,16,JUICIO EJECUTIVO,5,INGRESO EXCEPCIONES DILATORIAS,2,DEMANDA NOTIFICADA,Sentencia,M2,
+80,16,JUICIO EJECUTIVO,23,CAUSA ARCHIVADA,,,Pendiente de abandono 6 meses,M1 Baja,Causa archivada en espera de plazo de abandono: vigilancia.
+81,16,JUICIO EJECUTIVO,23,CAUSA ARCHIVADA,,,Pendiente de abandono 3 años,M1 Baja,Causa archivada en espera de plazo de abandono: vigilancia.
+82,16,JUICIO EJECUTIVO,23,CAUSA ARCHIVADA,,,Pendiente de prescripción,M1 Baja,Causa archivada en espera de plazo de prescripción: vigilancia.

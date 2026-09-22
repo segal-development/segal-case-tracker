@@ -91,6 +91,18 @@ class Case(Base):
     recommended_action_code = Column(String(50), nullable=True)  # e.g. "oponer_excepciones"
     next_review_at = Column(Date, nullable=True)  # next date this case should be manually reviewed
 
+    # Matriz de clasificación (M1 Baja/M1 Alta/M2/M3) — populated by
+    # app.services.matriz_classifier.classify_case. Advisory/derived; never
+    # blocks a sync. See that module's docstring for the precedence rules.
+    matriz = Column(String(20), nullable=True, index=True)
+    matriz_etapa = Column(String(80), nullable=True)
+    matriz_origen = Column(String(30), nullable=True)  # pjud_procedimiento|pjud_etapa|sin_detalle|no_mapeada|error
+    # Sysgal's business "procedimiento simple" (e.g. "Vive Tranquilo"). NULL
+    # until Sysgal sends it; the classifier falls back to the default
+    # "Juicio Ejecutivo Completo" map while it is NULL.
+    matriz_proc_simple = Column(String(80), nullable=True)
+    matriz_computed_at = Column(DateTime, nullable=True)
+
     # Timestamps
     filed_at = Column(DateTime, nullable=True)  # Fecha de ingreso
     last_movement_at = Column(DateTime, nullable=True)

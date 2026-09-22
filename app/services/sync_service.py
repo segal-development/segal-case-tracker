@@ -120,6 +120,7 @@ from app.scrapper.pjud.exceptions import (
 )
 from app.services.shape_cooldown import get_shape_cooldown
 from app.services.deadline_engine import DeadlineEngine, SemaforoTransition, _today_chile
+from app.services.matriz_classifier import MatrizMappingCache, classify_case
 
 
 def _scrub_nul_fields(obj) -> None:
@@ -1728,6 +1729,43 @@ def _maybe_recompute_deadlines(
         )
 
 
+def _maybe_classify_matriz(
+    db: Session, case: Case, *, mapping_cache: MatrizMappingCache
+) -> None:
+    """Recompute the matriz de clasificación (M1/M2/M3) for *case* after a
+    movement sync — same call-site pattern as ``_maybe_recompute_deadlines``.
+
+    Only processes civil competencia; silently returns for all others.
+    ``mapping_cache`` must be loaded ONCE per sync/ingest run (see call
+    sites) and shared across every case it processes — reloading it per
+    case would turn the reference-table lookups into an N+1. Never
+    re-raises — a classification failure must NOT abort the surrounding
+    sync/ingest transaction (``classify_case`` itself is also crash-proof;
+    this wrapper mirrors the sync-pipeline's defense-in-depth style).
+
+    Args:
+        db:            Active SQLAlchemy session (shared with the sync transaction).
+        case:          Case ORM instance (already flushed, not yet committed).
+        mapping_cache: Preloaded ``MatrizMappingCache`` for this run.
+    """
+    if (case.competencia or "").lower() != "civil":
+        return
+    try:
+        result = classify_case(db, case, mapping_cache=mapping_cache)
+    except Exception:
+        logger.exception(
+            "_maybe_classify_matriz failed for case_id=%s; "
+            "matriz classification skipped — sync continues",
+            getattr(case, "id", "?"),
+        )
+        return
+
+    case.matriz = result.matriz
+    case.matriz_etapa = result.matriz_etapa
+    case.matriz_origen = result.origen
+    case.matriz_computed_at = datetime.utcnow()
+
+
 def _is_transient_navigation_error(exc: BaseException) -> bool:
     """True when *exc* means the page did not load (retry, never re-auth).
 
@@ -1895,6 +1933,9 @@ async def detect_and_sync_movements(
     )
 
     sync_svc = SyncService(db)
+    # Loaded ONCE for the whole batch (see _maybe_classify_matriz) — every
+    # case in this run shares it, no per-case reference-table queries.
+    matriz_cache = MatrizMappingCache.load(db)
 
     # Consecutive per-case timeouts; reset on any success (see MAX_CONSECUTIVE_TIMEOUTS).
     consecutive_timeouts = 0
@@ -2057,6 +2098,9 @@ async def detect_and_sync_movements(
             # Shares this call's NotifyBudget (ADR-005) so a ROJO-entry/fatal
             # alert drains the same per-sync-cycle pool as movements/entities.
             _maybe_recompute_deadlines(db, db_case, budget=shared_budget)
+
+            # Recompute matriz de clasificación (civil only; flush-only; never raises).
+            _maybe_classify_matriz(db, db_case, mapping_cache=matriz_cache)
 
             # Commit entity upserts + document tokens + mark-checked + deadlines.
             # (sync_movements already committed its own changes.)
@@ -2467,6 +2511,9 @@ async def sync_via_consulta(
     errors: int = 0
 
     sync_svc = SyncService(db)
+    # Loaded ONCE for the whole batch (see _maybe_classify_matriz) — every
+    # case in this run shares it, no per-case reference-table queries.
+    matriz_cache = MatrizMappingCache.load(db)
     webhooks: list = (
         db.query(Webhook)
         .filter(Webhook.lawyer_id == lawyer.id, Webhook.is_active == True)
@@ -2595,6 +2642,7 @@ async def sync_via_consulta(
                 # Shares this call's NotifyBudget (ADR-005) — see
                 # detect_and_sync_movements for the same rationale.
                 _maybe_recompute_deadlines(db, case, budget=shared_budget)
+                _maybe_classify_matriz(db, case, mapping_cache=matriz_cache)
                 db.commit()
 
                 # Year floor: only recent cases' docs are downloaded (DOC_DOWNLOAD_MIN_YEAR).

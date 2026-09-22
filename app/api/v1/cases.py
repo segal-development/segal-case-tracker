@@ -89,6 +89,11 @@ class CaseResponse(BaseModel):
     sysgal_estado_codigo: Optional[str] = None
     sysgal_vigencia_hasta: Optional[date] = None
     sysgal_synced_at: Optional[datetime] = None
+    # Matriz de clasificación (M1 Baja/M1 Alta/M2/M3) — populated by
+    # app.services.matriz_classifier.classify_case. See app/api/v1/matriz.py.
+    matriz: Optional[str] = None
+    matriz_etapa: Optional[str] = None
+    matriz_origen: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -467,6 +472,9 @@ async def list_cases(
             "activo|moroso|caducado|sin_dato."
         ),
     ),
+    matriz: Optional[str] = Query(
+        None, description="Filter by matriz de clasificación: M1 Baja, M1 Alta, M2, M3"
+    ),
     sort_by: Optional[Literal["criticidad", "ultima_actuacion", "updated_at"]] = Query(
         None,
         description=(
@@ -540,6 +548,10 @@ async def list_cases(
     if cobertura:
         matching_ids = _sysgal_cobertura_case_ids(db, query, cobertura)
         query = query.filter(Case.id.in_(matching_ids))
+
+    # Matriz de clasificación filter.
+    if matriz:
+        query = query.filter(Case.matriz == matriz)
 
     # Get total count
     total = query.count()
@@ -616,6 +628,9 @@ async def list_cases(
             next_deadline_fatal=case.next_deadline_fatal or False,
             en_apremio=case.en_apremio or False,
             prescripcion_cumplida=case.prescripcion_cumplida or False,
+            matriz=case.matriz,
+            matriz_etapa=case.matriz_etapa,
+            matriz_origen=case.matriz_origen,
             **_sysgal_fields(sysgal_info.get(case.id)),
         ))
 
@@ -789,6 +804,9 @@ async def get_case(
         next_deadline_fatal=case.next_deadline_fatal or False,
         en_apremio=case.en_apremio or False,
         prescripcion_cumplida=case.prescripcion_cumplida or False,
+        matriz=case.matriz,
+        matriz_etapa=case.matriz_etapa,
+        matriz_origen=case.matriz_origen,
         **_sysgal_fields(sysgal_info),
     )
 

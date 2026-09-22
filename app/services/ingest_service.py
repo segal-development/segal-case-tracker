@@ -33,6 +33,7 @@ from app.services.document_persistence import (
 )
 from app.services.sync_service import (
     SyncService,
+    _maybe_classify_matriz,
     _maybe_recompute_deadlines,
     convert_api_movements_to_scraped,
     upsert_escritos,
@@ -40,6 +41,7 @@ from app.services.sync_service import (
     upsert_litigantes,
     upsert_notificaciones,
 )
+from app.services.matriz_classifier import MatrizMappingCache
 from app.utils.rut import normalize_rut
 
 logger = logging.getLogger(__name__)
@@ -426,6 +428,8 @@ class IngestService:
 
         scraper = CivilScraper(headless=True)
         sync = SyncService(self.db)
+        # Loaded ONCE for the whole batch — see _maybe_classify_matriz.
+        matriz_cache = MatrizMappingCache.load(self.db)
 
         for item in cases:
             rol = (item.get("rol") or "").strip().upper()
@@ -515,6 +519,7 @@ class IngestService:
             was_unclassified = case.semaforo is None
             case.last_detail_checked_at = datetime.utcnow()
             _maybe_recompute_deadlines(self.db, case)
+            _maybe_classify_matriz(self.db, case, mapping_cache=matriz_cache)
             self.db.commit()
 
             result["cases_processed"] += 1
