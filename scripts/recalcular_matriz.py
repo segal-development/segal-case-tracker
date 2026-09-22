@@ -47,6 +47,9 @@ def compute_distribution(db, *, dry_run: bool) -> dict:
     mapping_cache = MatrizMappingCache.load(db)
     cases = db.query(Case).filter(Case.competencia == "civil").all()
     total = len(cases)
+    # One bulk pass instead of one query per case: over the Cloud SQL proxy the
+    # per-case lookup turned a full backfill into ~15k round-trips.
+    mapping_cache.preload_latest_movements(db, [case.id for case in cases])
 
     by_matriz: Counter = Counter()
     by_origen: Counter = Counter()
