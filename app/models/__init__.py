@@ -39,6 +39,9 @@ from app.models.evaluacion import (
     Evaluacion,
     EvaluacionRespuesta,
 )
+from app.models.matriz_clasificacion import MatrizClasificacion
+from app.models.matriz_tramite_override import MatrizTramiteOverride
+from app.models.matriz_pjud_mapeo import MatrizPjudMapeo
 
 __all__ = [
     "Lawyer",
@@ -79,4 +82,7 @@ __all__ = [
     "EvaluacionEvaluable",
     "Evaluacion",
     "EvaluacionRespuesta",
+    "MatrizClasificacion",
+    "MatrizTramiteOverride",
+    "MatrizPjudMapeo",
 ]
