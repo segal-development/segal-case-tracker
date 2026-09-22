@@ -14,6 +14,7 @@ import secrets
 import unicodedata
 from datetime import date, datetime
 from typing import List, Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import StreamingResponse
@@ -225,6 +226,22 @@ _LINK_INVALIDO_DETAIL = "Link inválido o vencido"
 _EVIDENCIA_ESTADOS = (HITO_PENDIENTE, HITO_SUGERIDO, HITO_RECHAZADO)
 _EVIDENCE_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "application/pdf": "pdf"}
 _PUBLIC_LIST_LIMIT = 100
+_PERIODO_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")  # strict YYYY-MM for the public list
+_PERIODO_INVALIDO_DETAIL = "Período inválido, usa YYYY-MM"
+_CHILE_TZ = ZoneInfo("America/Santiago")
+
+
+def _today_santiago() -> date:
+    """Today's date in America/Santiago (the firm's calendar), not the server's UTC
+    date, which is a day ahead during the Chilean evening. Module-level so tests
+    can freeze it."""
+    return datetime.now(_CHILE_TZ).date()
+
+
+def _month_bounds(y: int, m: int) -> tuple[date, date]:
+    """``[first day of month, first day of next month)`` — the same window the
+    authenticated list and the resumen use for a ``periodo`` filter."""
+    return date(y, m, 1), date(y + (m == 12), (m % 12) + 1, 1)
 
 
 # --------------------------------------------------------------------------- #
@@ -718,14 +735,25 @@ async def public_create_hito(
 @router.get("/public/{token}/hitos", response_model=List[HitoResponse])
 async def public_list_hitos(
     token: str,
+    periodo: Optional[str] = Query(None, description="Mes YYYY-MM (default: mes en curso en America/Santiago)"),
     db: Session = Depends(get_db),
 ):
-    """PUBLIC (no auth). The token's lawyer's own hitos, newest first (max 100)."""
+    """PUBLIC (no auth). The token's lawyer's own hitos for ONE month (by
+    ``fecha_hito``), newest first (max 100). ``periodo`` is a strict ``YYYY-MM``;
+    omitted = the current month in America/Santiago."""
     lawyer = _lawyer_by_token(db, token)
+    if periodo is None:
+        today = _today_santiago()
+        y, m = today.year, today.month
+    else:
+        if not _PERIODO_RE.match(periodo):
+            raise HTTPException(status_code=422, detail=_PERIODO_INVALIDO_DETAIL)
+        y, m = (int(x) for x in periodo.split("-"))
+    start, end = _month_bounds(y, m)
     rows = (
         db.query(Hito)
         .options(selectinload(Hito.lawyer), selectinload(Hito.tipo))
-        .filter(Hito.lawyer_id == lawyer.id)
+        .filter(Hito.lawyer_id == lawyer.id, Hito.fecha_hito >= start, Hito.fecha_hito < end)
         .order_by(Hito.fecha_hito.desc(), Hito.id.desc())
         .limit(_PUBLIC_LIST_LIMIT)
         .all()
