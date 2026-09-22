@@ -54,6 +54,10 @@ class Lawyer(Base):
     # their fixed salary and the V1/V3 tramo tables. NULL = not in the bonus.
     nivel = Column(String(10), nullable=True)
 
+    # Secret token of this lawyer's PUBLIC hito-form link (lawyers have no app
+    # login). Generated/revoked by the admin; NULL = no link issued. Never logged.
+    hito_form_token = Column(String(64), unique=True, index=True, nullable=True)
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     last_login_at = Column(DateTime, nullable=True)
