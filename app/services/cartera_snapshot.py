@@ -28,6 +28,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from typing import Optional
 
+from sqlalchemy import insert
 from sqlalchemy.orm import Session
 
 from app.models.case import Case
@@ -45,6 +46,9 @@ ADVERTENCIA_FRESCURA = (
     "subestimar el trabajo real."
 )
 
+#: Rows per INSERT batch. Keeps each statement well inside Postgres' parameter
+#: limit while still collapsing thousands of round-trips into a handful.
+_INSERT_CHUNK = 1000
 _SIN_MATRIZ = "sin_matriz"
 _SIN_NIVEL = "sin_nivel"
 
@@ -169,30 +173,36 @@ def tomar_snapshot(
     por_matriz: Counter = Counter()
     por_nivel: Counter = Counter()
     frescura_buckets: Counter = Counter()
-    rows: list[CarteraSnapshot] = []
+    # Plain dicts, not ORM instances: a Core insert of mappings lets SQLAlchemy
+    # batch them into multi-VALUES statements (insertmanyvalues), while
+    # bulk_save_objects falls back to psycopg2's executemany, which sends one
+    # INSERT per row. Over the Cloud SQL proxy that turned a 14.5k-row snapshot
+    # into ~12 minutes of round-trips.
+    rows: list[dict] = []
 
     for c in cases:
         owner = owners.get(c.id)
         rows.append(
-            CarteraSnapshot(
-                periodo=periodo,
-                case_id=c.id,
-                lawyer_id=owner.id if owner is not None else None,
-                nivel=owner.nivel if owner is not None else None,
-                matriz=c.matriz,
-                matriz_etapa=c.matriz_etapa,
-                matriz_origen=c.matriz_origen,
-                last_movement_at=c.last_movement_at,
-                last_detail_checked_at=c.last_detail_checked_at,
-                created_at=now,
-            )
+            {
+                "periodo": periodo,
+                "case_id": c.id,
+                "lawyer_id": owner.id if owner is not None else None,
+                "nivel": owner.nivel if owner is not None else None,
+                "matriz": c.matriz,
+                "matriz_etapa": c.matriz_etapa,
+                "matriz_origen": c.matriz_origen,
+                "last_movement_at": c.last_movement_at,
+                "last_detail_checked_at": c.last_detail_checked_at,
+                "created_at": now,
+            }
         )
         por_matriz[c.matriz or _SIN_MATRIZ] += 1
         por_nivel[(owner.nivel if owner is not None and owner.nivel else _SIN_NIVEL)] += 1
         frescura_buckets[_frescura_bucket(c.last_detail_checked_at, reference=now)] += 1
 
     if rows:
-        db.bulk_save_objects(rows)
+        for start in range(0, len(rows), _INSERT_CHUNK):
+            db.execute(insert(CarteraSnapshot), rows[start : start + _INSERT_CHUNK])
 
     run = CarteraSnapshotRun(
         periodo=periodo,
