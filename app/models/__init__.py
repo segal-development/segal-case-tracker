@@ -42,6 +42,7 @@ from app.models.evaluacion import (
 from app.models.matriz_clasificacion import MatrizClasificacion
 from app.models.matriz_tramite_override import MatrizTramiteOverride
 from app.models.matriz_pjud_mapeo import MatrizPjudMapeo
+from app.models.cartera_snapshot import CarteraSnapshot, CarteraSnapshotRun
 
 __all__ = [
     "Lawyer",
@@ -85,4 +86,6 @@ __all__ = [
     "MatrizClasificacion",
     "MatrizTramiteOverride",
     "MatrizPjudMapeo",
+    "CarteraSnapshot",
+    "CarteraSnapshotRun",
 ]
