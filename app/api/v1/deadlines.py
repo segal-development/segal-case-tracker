@@ -58,7 +58,9 @@ def _resolve_deadline_alert_recipient_ids(db: Session, case: Case) -> list[int]:
     recipients = resolve_case_alert_recipients(db, case)
     if recipients:
         return [r.id for r in recipients]
-    fallback_lawyer = db.query(Lawyer).filter(Lawyer.id == case.lawyer_id).first()
+    # Business-purpose fallback (who gets notified) — follows the
+    # asignación-por-nivel override, unlike sync/provenance lookups.
+    fallback_lawyer = db.query(Lawyer).filter(Lawyer.id == case.effective_lawyer_id).first()
     return [fallback_lawyer.id] if fallback_lawyer else []
 
 # ---------------------------------------------------------------------------
@@ -400,7 +402,7 @@ async def list_audited_deadlines(
             status=dl.status,
             is_manual=dl.is_manual,
             marked_at=dl.marked_at,
-            abogado_nombre=_lawyer_name(case.lawyer_id),
+            abogado_nombre=_lawyer_name(case.effective_lawyer_id),
         )
         for dl, case in rows
     ]

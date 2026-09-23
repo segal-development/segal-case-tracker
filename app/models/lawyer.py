@@ -69,6 +69,9 @@ class Lawyer(Base):
     credential_alert_sent_at = Column(DateTime, nullable=True)
     
     # Relationships
-    cases = relationship("Case", back_populates="lawyer")
+    # Case now has two FKs to lawyers (lawyer_id + the asignación-por-nivel
+    # override assigned_lawyer_id) — pin this collection to lawyer_id only,
+    # matching Case.lawyer's own foreign_keys=[lawyer_id].
+    cases = relationship("Case", back_populates="lawyer", foreign_keys="Case.lawyer_id")
     webhooks = relationship("Webhook", back_populates="lawyer")
     alerts = relationship("Alert", back_populates="lawyer")

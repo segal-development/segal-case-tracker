@@ -94,6 +94,11 @@ class CaseResponse(BaseModel):
     matriz: Optional[str] = None
     matriz_etapa: Optional[str] = None
     matriz_origen: Optional[str] = None
+    # Asignación por nivel (override of who works this causa internally).
+    # None means "not reassigned" — see Case.effective_lawyer_id.
+    assigned_lawyer_id: Optional[int] = None
+    assigned_lawyer_nombre: Optional[str] = None
+    asignado: bool = False
 
     class Config:
         from_attributes = True
@@ -475,6 +480,13 @@ async def list_cases(
     matriz: Optional[str] = Query(
         None, description="Filter by matriz de clasificación: M1 Baja, M1 Alta, M2, M3"
     ),
+    asignado: Optional[bool] = Query(
+        None,
+        description=(
+            "Filter by asignación override: true = has assigned_lawyer_id set "
+            "(reassigned), false = not reassigned (effective lawyer = lawyer_id)."
+        ),
+    ),
     sort_by: Optional[Literal["criticidad", "ultima_actuacion", "updated_at"]] = Query(
         None,
         description=(
@@ -553,6 +565,12 @@ async def list_cases(
     if matriz:
         query = query.filter(Case.matriz == matriz)
 
+    # Asignación por nivel filter.
+    if asignado is True:
+        query = query.filter(Case.assigned_lawyer_id.isnot(None))
+    elif asignado is False:
+        query = query.filter(Case.assigned_lawyer_id.is_(None))
+
     # Get total count
     total = query.count()
 
@@ -597,6 +615,14 @@ async def list_cases(
     sysgal_ids = [c.id for c in cases if _case_in_sysgal_states(c)]
     sysgal_info = _sysgal_info_by_case(db, sysgal_ids) if sysgal_ids else {}
 
+    # Assigned-lawyer names for this page (1 query, no N+1) — asignación por nivel.
+    assigned_ids = {c.assigned_lawyer_id for c in cases if c.assigned_lawyer_id}
+    assigned_names = (
+        dict(db.query(Lawyer.id, Lawyer.name).filter(Lawyer.id.in_(assigned_ids)).all())
+        if assigned_ids
+        else {}
+    )
+
     # Build response with court info
     items = []
     for case in cases:
@@ -631,6 +657,9 @@ async def list_cases(
             matriz=case.matriz,
             matriz_etapa=case.matriz_etapa,
             matriz_origen=case.matriz_origen,
+            assigned_lawyer_id=case.assigned_lawyer_id,
+            assigned_lawyer_nombre=assigned_names.get(case.assigned_lawyer_id),
+            asignado=case.assigned_lawyer_id is not None,
             **_sysgal_fields(sysgal_info.get(case.id)),
         ))
 
@@ -807,6 +836,9 @@ async def get_case(
         matriz=case.matriz,
         matriz_etapa=case.matriz_etapa,
         matriz_origen=case.matriz_origen,
+        assigned_lawyer_id=case.assigned_lawyer_id,
+        assigned_lawyer_nombre=case.assigned_lawyer.name if case.assigned_lawyer else None,
+        asignado=case.assigned_lawyer_id is not None,
         **_sysgal_fields(sysgal_info),
     )
 
