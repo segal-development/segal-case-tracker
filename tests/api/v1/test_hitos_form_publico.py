@@ -296,7 +296,11 @@ def test_public_post_applies_dedup_rule(client, db, storage, lawyer, tipo):
     assert _post_public(client, lawyer.hito_form_token, tipo.id, extra={"descripcion": "C-9-2026"}).status_code == 201
     r = _post_public(client, lawyer.hito_form_token, tipo.id, extra={"descripcion": "C-9-2026"})
     assert r.status_code == 409
-    assert r.json()["detail"] == "Ya existe un hito de este abogado para esa causa"
+    detail = r.json()["detail"]
+    # El mensaje nombra el hito que ya cubre la causa (fecha y estado) para que
+    # quien carga entienda el rechazo sin tener que escalarlo.
+    assert detail.startswith("Ya existe un hito de este abogado para esa causa")
+    assert "pendiente" in detail
 
 
 def test_public_post_invalid_content_type_415(client, db, storage, lawyer, tipo):

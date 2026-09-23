@@ -60,6 +60,20 @@ def _normalize_rol_text(descripcion: Optional[str]) -> Optional[str]:
     return text
 
 
+def _duplicado_detail(row) -> str:
+    """Spanish 409 message naming the hito that already covers this causa."""
+    _, _, fecha_hito, estado, created_by_name = row
+    partes = ["Ya existe un hito de este abogado para esa causa"]
+    if fecha_hito is not None:
+        partes.append(f"con fecha {fecha_hito.strftime('%d-%m-%Y')}")
+    if estado:
+        partes.append(f"y está {estado}")
+    detalle = " ".join(partes)
+    if created_by_name:
+        detalle = f"{detalle}. Lo registró {created_by_name}"
+    return f"{detalle}."
+
+
 def _causa_key(descripcion: Optional[str]) -> Optional[str]:
     """Causa identifier used for hito dedup.
 
@@ -386,15 +400,24 @@ async def _create_hito(
         causa = _causa_key(descripcion)
         trib = _tribunal_key(tribunal_norm)
         prior = (
-            db.query(Hito.descripcion, Hito.tribunal)
+            db.query(Hito.descripcion, Hito.tribunal, Hito.fecha_hito, Hito.estado, Hito.created_by_name)
             .filter(Hito.lawyer_id == target_lawyer_id, Hito.rol_causa == rol_norm)
             .all()
         )
-        if any(_causa_key(d) == causa and _tribunal_collides(_tribunal_key(t), trib) for (d, t) in prior):
-            raise HTTPException(
-                status_code=409,
-                detail="Ya existe un hito de este abogado para esa causa",
-            )
+        choque = next(
+            (
+                row
+                for row in prior
+                if _causa_key(row[0]) == causa and _tribunal_collides(_tribunal_key(row[1]), trib)
+            ),
+            None,
+        )
+        if choque is not None:
+            # Name the existing hito instead of just refusing. A procurador filing
+            # through the shared link cannot see what is already loaded, so a bare
+            # "ya existe" reads like a bug and gets escalated; the date, the estado
+            # and who filed it let them close the question themselves.
+            raise HTTPException(status_code=409, detail=_duplicado_detail(choque))
 
     # Evidence is optional at creation (it can be attached later via
     # PUT /{id}/evidencia) but mandatory to approve. If provided, validate + store it.
