@@ -310,10 +310,47 @@ def test_public_post_dedup_applies(client, db, storage, link, tipo, lawyer):
     assert _post(client, _form(tipo.id, lawyer.id)).status_code == 201
     r = _post(client, _form(tipo.id, lawyer.id))
     assert r.status_code == 409
-    assert r.json()["detail"] == "Ya existe un hito de este abogado para esa causa"
+    detail = r.json()["detail"]
+    # El mensaje nombra el hito que ya cubre la causa (fecha y estado) para que
+    # quien carga entienda el rechazo sin tener que escalarlo.
+    assert detail.startswith("Ya existe un hito de este abogado para esa causa")
+    assert "pendiente" in detail
 
 
 def test_public_post_formulario_hito_requires_evidence_to_approve(client, db, storage, link, tipo, lawyer, admin):
     """A procurador-submitted hito is origen=formulario, so the approve gate applies (defensive)."""
     hid = _post(client, _form(tipo.id, lawyer.id)).json()["id"]
     assert client.post(f"/api/v1/hitos/{hid}/aprobar", headers=_h(ADMIN_RUT)).status_code == 200
+
+
+def test_duplicado_nombra_el_hito_existente(client, db, storage, link, tipo, lawyer, admin):
+    """El 409 debe decir CUÁNDO y QUIÉN cargó el hito que ya cubre la causa.
+
+    Un procurador que usa el link compartido no ve lo ya cargado, así que un
+    'ya existe' pelado se lee como un error del sistema y termina escalado.
+    """
+    from datetime import date
+
+    from app.models.hito import Hito
+
+    existente = Hito(
+        lawyer_id=lawyer.id,
+        hito_tipo_id=tipo.id,
+        valor_bruto=tipo.valor_bruto,
+        fecha_hito=date(2026, 9, 9),
+        rol_causa="C-1-2026",  # el mismo que manda _form
+        descripcion="C-13047-2025",
+        tribunal="13º Juzgado Civil de Santiago",
+        estado="aprobado",
+        created_by_name="CARLA PATRICIA LAVÍN BENITO",
+    )
+    db.add(existente)
+    db.commit()
+
+    r = _post(client, _form(tipo.id, lawyer.id, descripcion="C-13047-2025",
+                            tribunal="13º Juzgado Civil de Santiago"))
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert "09-09-2026" in detail
+    assert "aprobado" in detail
+    assert "CARLA PATRICIA LAVÍN BENITO" in detail
