@@ -171,7 +171,13 @@ async def get_por_abogado(
 ):
     """Matriz counts per firm lawyer, derived from abogado-of-record litigantes
     (same attribution model as ``resolve_case_scope`` — NOT ``Case.lawyer_id``,
-    which is only the firm's bookkeeping owner under Approach C)."""
+    which is only the firm's bookkeeping owner under Approach C).
+
+    ``_abogado_litigantes_by_case`` overlays the asignación-por-nivel override
+    (``Case.assigned_lawyer_id``) in place of the real litigante rows for a
+    reassigned causa, so a reassignment moves this table's counts too — a
+    causa reassigned to lawyer B counts toward B here, not toward whoever the
+    real litigante was (or toward nobody, if it had none)."""
     by_case = _abogado_litigantes_by_case(db)
 
     # Sets (not lists) — a lawyer can appear as both AB.DDO and AP.DDO on the

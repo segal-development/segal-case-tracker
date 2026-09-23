@@ -303,6 +303,16 @@ def resolve_case_scope(db: Session, current_lawyer: dict):
     is not a litigante on such a case gets no visibility from ``lawyer_id``
     alone.
 
+    Precedence (resolved inside ``case_ids_for_abogado`` /
+    ``app.services.lawyer_roster._abogado_litigantes_by_case`` — NOT
+    duplicated here): asignación-por-nivel override
+    (``Case.assigned_lawyer_id``) > litigante-derived attribution > nothing.
+    A reassigned causa therefore moves from the original litigante's scope to
+    the new assignee's scope automatically, including for a causa with no
+    litigante rows at all (the bootstrap-window fallback above then also
+    resolves to the new assignee via ``EFFECTIVE_LAWYER_ID``). ``Case.lawyer_id``
+    itself is never part of this precedence.
+
     Raises 401 when no subject is present and 404 when the lawyer is unknown
     (RUT lookup only — numeric-id tokens have no row to 404 against).
     """

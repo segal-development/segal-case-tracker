@@ -1,12 +1,28 @@
 """Asignación por nivel — endpoints to reassign WHO internally works a causa.
 
-Splits two concepts ``Case.lawyer_id`` used to conflate: provenance (whose
-PJUD account the causa was scraped from — see
-``app.services.sync_service.SyncService.sync_cases`` / ``existing_by_rol``,
-which this module never touches) and business assignment (which internal
-lawyer, by nivel, currently works the causa). The override lives on
-``Case.assigned_lawyer_id`` (see ``app/models/case.py`` for
-``effective_lawyer_id`` / ``EFFECTIVE_LAWYER_ID``).
+There are three distinct notions of "whose causa" in this system, and this
+module is built on getting the difference right:
+
+1. ``Case.lawyer_id`` — sync/provenance only (whose PJUD account scraped it).
+   See ``app.services.sync_service.SyncService.sync_cases`` /
+   ``existing_by_rol``. This module NEVER reads or writes it.
+2. Legal abogado-of-record attribution, derived from ``CaseLitigante`` rows
+   (``app.services.lawyer_roster._abogado_litigantes_by_case`` /
+   ``resolve_case_scope``) — what the Cartera screen, the per-lawyer matriz
+   table and a lawyer's own causas list show. Only ~37% of classified causas
+   have one yet (litigantes come from the detail modal).
+3. ``Case.assigned_lawyer_id`` — the asignación-por-nivel override this
+   module manages.
+
+The resolved owner for every business-facing read (this module's
+``desajustes``/``sugerencias`` INCLUDED) follows ONE precedence, defined once
+in ``app.services.lawyer_roster._abogado_litigantes_by_case``: the override
+REPLACES the legal attribution when present (not adds to it), which itself
+beats having no owner at all. ``Case.lawyer_id`` is never part of it. This
+module always resolves the owner via
+``app.services.lawyer_roster.resolved_owner_by_case`` so a reassignment is
+visible in exactly the same place the Cartera/matriz screens look, instead
+of silently doing nothing while claiming success.
 
 Level rules the firm operates under (checked here against ``Lawyer.nivel``):
     M1 Baja -> Junior exclusivo
@@ -19,17 +35,18 @@ auditor; mutating endpoints (``reasignar``, the DELETE override) are
 admin-only.
 """
 import logging
+from collections import Counter
 from datetime import datetime
 from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
 from app.api.deps import get_db, require_admin, require_auditor
-from app.models.case import EFFECTIVE_LAWYER_ID, Case
+from app.models.case import Case
 from app.models.lawyer import Lawyer
+from app.services.lawyer_roster import resolved_owner_by_case
 
 logger = logging.getLogger(__name__)
 
@@ -116,22 +133,16 @@ class SugerenciasResponse(BaseModel):
 # ============================================================================
 
 
-def _mismatch_clause():
-    """SQL clause: TRUE when ``Lawyer.nivel`` does not satisfy ``Case.matriz``.
+def _is_mismatch(matriz: Optional[str], nivel: Optional[str]) -> bool:
+    """True when ``nivel`` does not satisfy what ``matriz`` requires.
 
-    Built as an OR of per-matriz AND clauses so pagination/count stay exact
-    at the DB level instead of loading every classified causa into Python.
+    A ``matriz`` outside ``NIVELES_REQUERIDOS`` (None, or an unrecognized
+    value) is never a "mismatch" — there is nothing to check it against.
     """
-    from sqlalchemy import and_, or_
-
-    clauses = [
-        and_(
-            Case.matriz == matriz,
-            or_(Lawyer.nivel.is_(None), ~Lawyer.nivel.in_(niveles)),
-        )
-        for matriz, niveles in NIVELES_REQUERIDOS.items()
-    ]
-    return or_(*clauses)
+    niveles = NIVELES_REQUERIDOS.get(matriz)
+    if not niveles:
+        return False
+    return nivel not in niveles
 
 
 def _caratulado(case: Case) -> Optional[str]:
@@ -150,7 +161,11 @@ async def get_desajustes(
         None, description="Filtra por matriz: M1 Baja, M1 Alta, M2, M3"
     ),
     lawyer_id: Optional[int] = Query(
-        None, description="Filtra por el abogado efectivo actual (assigned_lawyer_id o lawyer_id)"
+        None,
+        description=(
+            "Filtra por el abogado resuelto actual (override si existe, "
+            "si no el abogado-de-registro litigante)."
+        ),
     ),
     solo_firmes: bool = Query(
         True,
@@ -164,29 +179,47 @@ async def get_desajustes(
     _rut: str = Depends(require_auditor),
     db: Session = Depends(get_db),
 ):
-    """Causas cuyo abogado efectivo tiene un nivel que no calza con su matriz."""
+    """Causas cuyo abogado resuelto (override > litigante > nada) tiene un
+    nivel que no calza con su matriz.
+
+    Resuelve el dueño con ``resolved_owner_by_case`` — la MISMA función que
+    ``resolve_case_scope``/``/matriz/por-abogado`` usan por debajo — para que
+    esta lista muestre exactamente el mismo conjunto de causas que las
+    pantallas de negocio, nunca ``Case.lawyer_id``. Una causa sin dueño
+    resoluble (sin litigante y sin reasignar) no es evidencia de un nivel
+    incorrecto — no tiene nivel que evaluar — así que no aparece aquí.
+
+    Filtra/pagina en Python: el dueño no es una columna SQL simple (puede
+    venir de una fila de ``CaseLitigante`` normalizada por RUT), así que no
+    hay forma de expresarlo como filtro de base de datos sin duplicar esa
+    lógica. El volumen (~14k causas civiles) hace esto instantáneo.
+    """
+    owners = resolved_owner_by_case(db)
+
     query = (
-        db.query(Case, Lawyer)
-        .join(Lawyer, Lawyer.id == EFFECTIVE_LAWYER_ID)
+        db.query(Case)
         .options(joinedload(Case.court))
-        .filter(Case.competencia == "civil")
-        .filter(_mismatch_clause())
+        .filter(Case.competencia == "civil", Case.matriz.isnot(None))
     )
     if solo_firmes:
         query = query.filter(Case.matriz_origen != "sin_detalle")
     if matriz:
         query = query.filter(Case.matriz == matriz)
-    if lawyer_id is not None:
-        query = query.filter(EFFECTIVE_LAWYER_ID == lawyer_id)
 
-    total = query.count()
+    mismatched: List[tuple] = []
+    for case in query.all():
+        owner = owners.get(case.id)
+        if owner is None or not _is_mismatch(case.matriz, owner.nivel):
+            continue
+        if lawyer_id is not None and owner.id != lawyer_id:
+            continue
+        mismatched.append((case, owner))
 
-    rows = (
-        query.order_by(Case.id.asc())
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-        .all()
-    )
+    mismatched.sort(key=lambda pair: pair[0].id)
+    total = len(mismatched)
+
+    start = (page - 1) * page_size
+    page_rows = mismatched[start : start + page_size]
 
     items = [
         DesajusteItem(
@@ -196,20 +229,17 @@ async def get_desajustes(
             tribunal=case.court.name if case.court else None,
             matriz=case.matriz,
             matriz_origen=case.matriz_origen,
-            lawyer_actual=LawyerActualOut(id=lawyer.id, nombre=lawyer.name, nivel=lawyer.nivel),
+            lawyer_actual=LawyerActualOut(id=owner.id, nombre=owner.name, nivel=owner.nivel),
             niveles_requeridos=NIVELES_REQUERIDOS.get(case.matriz, []),
             asignado=case.assigned_lawyer_id is not None,
         )
-        for case, lawyer in rows
+        for case, owner in page_rows
     ]
 
-    resumen_rows = (
-        query.with_entities(Case.matriz, Lawyer.nivel, func.count(Case.id))
-        .group_by(Case.matriz, Lawyer.nivel)
-        .all()
-    )
+    resumen_counts = Counter((case.matriz, owner.nivel) for case, owner in mismatched)
     resumen = [
-        ResumenItem(matriz=m, nivel_actual=n, causas=c) for m, n, c in resumen_rows
+        ResumenItem(matriz=m, nivel_actual=n, causas=c)
+        for (m, n), c in resumen_counts.items()
     ]
 
     return DesajustesResponse(
@@ -306,16 +336,14 @@ async def get_sugerencias(
 
     No arma una sugerencia por causa: entrega la lista de abogados activos
     por cada nivel requerido (junior/pleno/senior) junto a su cantidad
-    actual de causas efectivas, para que el admin balancee la carga.
+    actual de causas resueltas (override > litigante > nada — la misma
+    resolución que ``desajustes`` y las pantallas de negocio), para que el
+    admin balancee la carga.
     """
     niveles = sorted({n for req in NIVELES_REQUERIDOS.values() for n in req})
 
-    counts = dict(
-        db.query(EFFECTIVE_LAWYER_ID, func.count(Case.id))
-        .filter(Case.competencia == "civil")
-        .group_by(EFFECTIVE_LAWYER_ID)
-        .all()
-    )
+    owners = resolved_owner_by_case(db)
+    counts = Counter(lw.id for lw in owners.values())
 
     lawyers = (
         db.query(Lawyer)

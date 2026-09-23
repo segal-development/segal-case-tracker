@@ -2,7 +2,7 @@
 
 import calendar
 import re
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 from datetime import date, datetime, timedelta
 from typing import Optional
 from sqlalchemy.orm import Session
@@ -20,19 +20,48 @@ ALL_ABOGADO = DEMANDANTE_ABOGADO | DEMANDADO_ABOGADO
 
 _TRAILING_PAREN_RE = re.compile(r"\s*\([^)]*\)\s*$")
 
+# Synthetic stand-in for a real CaseLitigante row, used ONLY to represent an
+# asignación-por-nivel override inside the litigante-shaped maps below. Carries
+# just the 3 attributes every consumer of those maps actually reads
+# (rut/nombre/participante). ``participante`` is fixed to a DEMANDADO_ABOGADO
+# value purely so `in ALL_ABOGADO`/side-grouping checks keep working — it is
+# NOT a claim about which side the firm represents (see
+# app.services.deadline_engine._firm_side for the real legal-side heuristic,
+# which intentionally still reads real litigante rows, not this override).
+_AssignedAbogado = namedtuple("_AssignedAbogado", ["rut", "nombre", "participante"])
+_ASSIGNED_PARTICIPANTE = "AB.DDO"
+
 
 def _clean_nombre(nombre: str) -> str:
     return _TRAILING_PAREN_RE.sub("", nombre or "").strip()
 
 
 def _abogado_litigantes_by_case(db: Session, *, competencia: str = "civil") -> dict[int, list]:
-    """Load all abogado-coded litigantes across ALL firm cases, grouped by case_id.
+    """Load the abogado-of-record attribution for every firm case, grouped by case_id.
+
+    This is THE single source of "whose causa is this for business purposes"
+    that every function below (dashboards, matriz por-abogado,
+    ``case_ids_for_abogado``, ``resolve_case_scope`` via that function, ...)
+    is built on. Precedence, resolved HERE so it only has to be right once:
+
+        asignación-por-nivel override (``Case.assigned_lawyer_id``)
+            > legal abogado-of-record litigante (``CaseLitigante``)
+            > nothing
+
+    ``Case.lawyer_id`` (sync/provenance — see ``existing_by_rol`` in
+    ``app.services.sync_service``) never contributes here.
 
     Firm-wide (Approach C): does NOT filter by ``Case.lawyer_id`` — under the
     unified ownership model every Case's ``lawyer_id`` is the firm's bookkeeping
-    owner, not the abogado who sees/owns it. Attribution is entirely
-    litigante-derived, so the candidate case set spans every firm case
-    (bounded by ``competencia``), independent of who synced it.
+    owner, not the abogado who sees/owns it. The candidate case set spans
+    every firm case (bounded by ``competencia``), independent of who synced it.
+
+    When a causa has an override, the assigned lawyer REPLACES (not adds to)
+    whatever real litigante rows it has in the returned map — including when
+    it has NONE at all (the ~63% of the portfolio with no detail scraped
+    yet), which is exactly what lets an admin assign those causas at all.
+    This is what makes ``POST /asignacion/reasignar`` actually move
+    visibility instead of leaving every litigante-derived screen unchanged.
     """
     rows = (
         db.query(CaseLitigante)
@@ -46,7 +75,58 @@ def _abogado_litigantes_by_case(db: Session, *, competencia: str = "civil") -> d
     by_case: dict[int, list] = defaultdict(list)
     for row in rows:
         by_case[row.case_id].append(row)
+
+    overrides = (
+        db.query(Case.id, Lawyer.rut, Lawyer.name)
+        .join(Lawyer, Lawyer.id == Case.assigned_lawyer_id)
+        .filter(Case.competencia == competencia, Case.assigned_lawyer_id.isnot(None))
+        .all()
+    )
+    for case_id, rut, name in overrides:
+        by_case[case_id] = [_AssignedAbogado(rut=rut, nombre=name, participante=_ASSIGNED_PARTICIPANTE)]
+
     return dict(by_case)
+
+
+def resolved_owner_by_case(db: Session, *, competencia: str = "civil") -> dict[int, Lawyer]:
+    """Case id -> the single internal ``Lawyer`` resolved as its business owner.
+
+    Same precedence as ``_abogado_litigantes_by_case`` (which this reuses, so
+    the override-replaces-litigante rule is defined in exactly one place):
+    asignación-por-nivel override > legal abogado-of-record litigante that
+    matches an internal (``is_firm_lawyer``) ``Lawyer`` row > unresolved
+    (the case is simply omitted — no firm lawyer to evaluate a nivel for).
+
+    A case is normally attributed to at most one internal firm lawyer once
+    overridden (reasignar validates the target is a firm lawyer). Without an
+    override, if more than one internal firm lawyer happens to be an
+    abogado-of-record litigante on the SAME case (rare — e.g. co-counsel),
+    the lowest ``Lawyer.id`` wins, for a deterministic single owner.
+    """
+    by_case = _abogado_litigantes_by_case(db, competencia=competencia)
+
+    all_ruts = {normalize_rut(lit.rut) for lits in by_case.values() for lit in lits if lit.rut}
+    firm_lawyers_by_rut = (
+        {
+            normalize_rut(lw.rut): lw
+            for lw in db.query(Lawyer)
+            .filter(Lawyer.rut.in_(all_ruts), Lawyer.is_firm_lawyer.is_(True))
+            .all()
+        }
+        if all_ruts
+        else {}
+    )
+
+    resolved: dict[int, Lawyer] = {}
+    for case_id, litigantes in by_case.items():
+        matches = [
+            firm_lawyers_by_rut[normalize_rut(lit.rut)]
+            for lit in litigantes
+            if lit.rut and normalize_rut(lit.rut) in firm_lawyers_by_rut
+        ]
+        if matches:
+            resolved[case_id] = min(matches, key=lambda lw: lw.id)
+    return resolved
 
 
 def firm_lawyer_ruts(db: Session) -> set[str]:
@@ -666,7 +746,7 @@ def firm_risk_board(db: Session, account_rut: str) -> dict:
 
 
 def case_ids_for_abogado(db: Session, account_rut: str, abogado_rut: str) -> set[int]:
-    """Return case IDs where ``abogado_rut`` is an abogado-of-record litigante.
+    """Return case IDs where ``abogado_rut`` is the resolved abogado-of-record.
 
     Firm-wide attribution (Approach C): an abogado sees every case where they
     are personally an abogado-of-record (``participante`` in ``ALL_ABOGADO``),
@@ -678,6 +758,11 @@ def case_ids_for_abogado(db: Session, account_rut: str, abogado_rut: str) -> set
     membership. This intentionally replaces the previous "same side as
     account" gating, which hid legitimate cases whenever the viewing account
     was not itself a litigante on them.
+
+    "Litigante rows" here means ``_abogado_litigantes_by_case``'s output,
+    which already overlays the asignación-por-nivel override in place of the
+    real litigante rows for a reassigned causa — so a reassigned causa counts
+    for its new assignee's RUT here, not the original litigante's.
     """
     abogado_rut_norm = normalize_rut(abogado_rut)
 

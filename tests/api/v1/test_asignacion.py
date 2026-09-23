@@ -222,7 +222,8 @@ def test_reassignment_does_not_break_sync_dedup(db, lawyer_a, lawyer_b, court):
 
 
 def test_desajustes_m2_with_junior_appears(client, db, admin_headers, junior, court):
-    _make_case(db, junior, court, "C-10-2026", matriz="M2")
+    case = _make_case(db, junior, court, "C-10-2026", matriz="M2")
+    _seed_litigante(db, case, junior.rut, junior.name)  # junior is the legal abogado-of-record
     resp = client.get("/api/v1/asignacion/desajustes", headers=admin_headers)
     assert resp.status_code == 200
     body = resp.json()
@@ -230,21 +231,24 @@ def test_desajustes_m2_with_junior_appears(client, db, admin_headers, junior, co
 
 
 def test_desajustes_m3_with_pleno_appears(client, db, admin_headers, pleno, court):
-    _make_case(db, pleno, court, "C-11-2026", matriz="M3")
+    case = _make_case(db, pleno, court, "C-11-2026", matriz="M3")
+    _seed_litigante(db, case, pleno.rut, pleno.name)
     resp = client.get("/api/v1/asignacion/desajustes", headers=admin_headers)
     body = resp.json()
     assert any(i["rol"] == "C-11-2026" for i in body["items"])
 
 
 def test_desajustes_m1_baja_with_junior_does_not_appear(client, db, admin_headers, junior, court):
-    _make_case(db, junior, court, "C-12-2026", matriz="M1 Baja")
+    case = _make_case(db, junior, court, "C-12-2026", matriz="M1 Baja")
+    _seed_litigante(db, case, junior.rut, junior.name)
     resp = client.get("/api/v1/asignacion/desajustes", headers=admin_headers)
     body = resp.json()
     assert not any(i["rol"] == "C-12-2026" for i in body["items"])
 
 
 def test_desajustes_m1_alta_with_senior_does_not_appear(client, db, admin_headers, senior, court):
-    _make_case(db, senior, court, "C-13-2026", matriz="M1 Alta")
+    case = _make_case(db, senior, court, "C-13-2026", matriz="M1 Alta")
+    _seed_litigante(db, case, senior.rut, senior.name)
     resp = client.get("/api/v1/asignacion/desajustes", headers=admin_headers)
     body = resp.json()
     assert not any(i["rol"] == "C-13-2026" for i in body["items"])
@@ -253,7 +257,8 @@ def test_desajustes_m1_alta_with_senior_does_not_appear(client, db, admin_header
 def test_desajustes_solo_firmes_default_excludes_sin_detalle(client, db, admin_headers, senior, court):
     """A sin_detalle M1 Baja held by a senior is provisional, not evidence of
     a real desajuste — must NOT appear with solo_firmes default (true)."""
-    _make_case(db, senior, court, "C-14-2026", matriz="M1 Baja", matriz_origen="sin_detalle")
+    case = _make_case(db, senior, court, "C-14-2026", matriz="M1 Baja", matriz_origen="sin_detalle")
+    _seed_litigante(db, case, senior.rut, senior.name)
 
     resp = client.get("/api/v1/asignacion/desajustes", headers=admin_headers)
     body = resp.json()
@@ -266,8 +271,19 @@ def test_desajustes_solo_firmes_default_excludes_sin_detalle(client, db, admin_h
     assert any(i["rol"] == "C-14-2026" for i in body2["items"])
 
 
+def test_desajustes_no_firm_litigante_and_no_override_is_absent(client, db, admin_headers, court, lawyer_a):
+    """A classified causa with no resolvable internal owner (no litigante,
+    never reassigned) is not evidence of a WRONG level — it has no level at
+    all yet — so it must not appear in desajustes."""
+    _make_case(db, lawyer_a, court, "C-16-2026", matriz="M2")  # lawyer_a is not a nivel lawyer
+    resp = client.get("/api/v1/asignacion/desajustes", headers=admin_headers)
+    body = resp.json()
+    assert not any(i["rol"] == "C-16-2026" for i in body["items"])
+
+
 def test_desajustes_response_shape(client, db, admin_headers, junior, court):
     case = _make_case(db, junior, court, "C-15-2026", matriz="M2", plaintiff="Banco", defendant="Deudor")
+    _seed_litigante(db, case, junior.rut, junior.name)
     resp = client.get(
         "/api/v1/asignacion/desajustes", params={"matriz": "M2"}, headers=admin_headers
     )
@@ -388,7 +404,8 @@ def test_delete_missing_case_404(client, admin_headers):
 
 
 def test_sugerencias_groups_by_nivel_with_counts(client, db, auditor_headers, junior, pleno, senior, court):
-    _make_case(db, pleno, court, "C-40-2026", matriz="M2")
+    case = _make_case(db, pleno, court, "C-40-2026", matriz="M2")
+    _seed_litigante(db, case, pleno.rut, pleno.name)
 
     resp = client.get("/api/v1/asignacion/sugerencias", headers=auditor_headers)
     assert resp.status_code == 200
@@ -486,3 +503,117 @@ def test_lawyer_case_list_follows_assignment(client, db, admin_headers, lawyer_a
 
     after_b = client.get("/api/v1/cases", headers=lawyer_b_headers).json()
     assert any(c["rol"] == "C-70-2026" for c in after_b["items"])
+
+
+# ---------------------------------------------------------------------------
+# Override precedence: assignment > legal litigante attribution > nothing
+# (app/services/lawyer_roster.py::_abogado_litigantes_by_case)
+# ---------------------------------------------------------------------------
+
+
+def test_no_override_litigante_attribution_unchanged(
+    client, db, admin_headers, lawyer_a, lawyer_b, court, lawyer_a_headers
+):
+    """assigned_lawyer_id is NULL on every existing row today — this asserts
+    that is a true no-op: attribution is EXACTLY the pre-existing
+    litigante-based behavior when there is no override."""
+    case = _make_case(db, lawyer_a, court, "C-80-2026", matriz="M2")
+    _seed_litigante(db, case, lawyer_a.rut, lawyer_a.name)
+
+    own = client.get("/api/v1/cases", headers=lawyer_a_headers).json()
+    assert any(c["rol"] == "C-80-2026" for c in own["items"])
+
+    matriz_resp = client.get("/api/v1/matriz/por-abogado", headers=admin_headers).json()
+    row_a = next(r for r in matriz_resp["items"] if r["lawyer_id"] == lawyer_a.id)
+    row_b = next(r for r in matriz_resp["items"] if r["lawyer_id"] == lawyer_b.id)
+    assert row_a["total"] == 1
+    assert row_b["total"] == 0
+
+
+def test_override_wins_over_real_litigante(
+    client, db, admin_headers, lawyer_a, lawyer_b, court, lawyer_a_headers, lawyer_b_headers
+):
+    """A causa whose LEGAL litigante is lawyer A, reassigned to lawyer B, must
+    move to B and away from A in resolve_case_scope, /matriz/por-abogado, and
+    B's own causas list — the override REPLACES the litigante-derived owner,
+    it does not add to it, and the underlying CaseLitigante row is untouched."""
+    case = _make_case(db, lawyer_a, court, "C-81-2026", matriz="M2")
+    _seed_litigante(db, case, lawyer_a.rut, lawyer_a.name)
+
+    assert any(
+        c["rol"] == "C-81-2026"
+        for c in client.get("/api/v1/cases", headers=lawyer_a_headers).json()["items"]
+    )
+
+    resp = client.post(
+        "/api/v1/asignacion/reasignar",
+        json={"case_ids": [case.id], "lawyer_id": lawyer_b.id},
+        headers=admin_headers,
+    )
+    assert resp.status_code == 200
+
+    # resolve_case_scope: gone from A, present for B.
+    after_a = client.get("/api/v1/cases", headers=lawyer_a_headers).json()
+    assert not any(c["rol"] == "C-81-2026" for c in after_a["items"])
+    after_b = client.get("/api/v1/cases", headers=lawyer_b_headers).json()
+    assert any(c["rol"] == "C-81-2026" for c in after_b["items"])
+
+    # /matriz/por-abogado: moved from A to B.
+    matriz_resp = client.get("/api/v1/matriz/por-abogado", headers=admin_headers).json()
+    row_a = next(r for r in matriz_resp["items"] if r["lawyer_id"] == lawyer_a.id)
+    row_b = next(r for r in matriz_resp["items"] if r["lawyer_id"] == lawyer_b.id)
+    assert row_a["total"] == 0
+    assert row_b["total"] == 1
+
+    # The real legal record is never mutated — this is an overlay, not a rewrite.
+    litigante = db.query(CaseLitigante).filter(CaseLitigante.case_id == case.id).one()
+    assert litigante.rut == lawyer_a.rut
+
+
+def test_override_without_litigante_attributed_to_assigned(
+    client, db, admin_headers, lawyer_a, lawyer_b, court, lawyer_b_headers
+):
+    """A causa with NO firm litigante at all (the bulk of the portfolio with
+    no detail scraped yet) becomes attributable the moment it is reassigned —
+    this is how those causas get a per-lawyer owner at all."""
+    case = _make_case(db, lawyer_a, court, "C-82-2026", matriz="M3")
+    # Deliberately no CaseLitigante row — genuinely un-attributed today.
+
+    resp = client.post(
+        "/api/v1/asignacion/reasignar",
+        json={"case_ids": [case.id], "lawyer_id": lawyer_b.id},
+        headers=admin_headers,
+    )
+    assert resp.status_code == 200
+
+    assert any(
+        c["rol"] == "C-82-2026"
+        for c in client.get("/api/v1/cases", headers=lawyer_b_headers).json()["items"]
+    )
+
+    matriz_resp = client.get("/api/v1/matriz/por-abogado", headers=admin_headers).json()
+    row_b = next(r for r in matriz_resp["items"] if r["lawyer_id"] == lawyer_b.id)
+    assert row_b["total"] == 1
+
+
+def test_desajustes_uses_resolved_owner_not_stale_litigante(client, db, admin_headers, pleno, junior, court):
+    """A causa whose real litigante (pleno) satisfies M2 must NOT appear;
+    once reassigned to a junior it MUST appear under the junior — desajustes
+    has to resolve the same owner the visibility screens do, not
+    Case.lawyer_id and not the untouched litigante row."""
+    case = _make_case(db, pleno, court, "C-83-2026", matriz="M2")
+    _seed_litigante(db, case, pleno.rut, pleno.name)
+
+    resp_before = client.get("/api/v1/asignacion/desajustes", headers=admin_headers).json()
+    assert not any(i["rol"] == "C-83-2026" for i in resp_before["items"])
+
+    client.post(
+        "/api/v1/asignacion/reasignar",
+        json={"case_ids": [case.id], "lawyer_id": junior.id},
+        headers=admin_headers,
+    )
+
+    resp_after = client.get("/api/v1/asignacion/desajustes", headers=admin_headers).json()
+    item = next(i for i in resp_after["items"] if i["rol"] == "C-83-2026")
+    assert item["lawyer_actual"]["id"] == junior.id
+    assert item["lawyer_actual"]["nivel"] == "junior"
