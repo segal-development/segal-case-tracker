@@ -145,6 +145,38 @@ def _audit_validation(
         )
 
 
+def _maybe_take_cartera_snapshot(db: Session) -> None:
+    """Take the current period's cartera snapshot once, the first cycle that
+    notices none exists yet — cheap single-row check, SAFE-FAIL like the
+    credential/Sysgal scans above (a failure here must never abort the sync
+    cycle). Automatic snapshots are recorded with ``tomado_por=None`` so they
+    are distinguishable from an admin-triggered ``POST /cartera/snapshot``.
+    """
+    from app.services.cartera_snapshot import periodo_actual, tomar_snapshot
+    from app.models.cartera_snapshot import CarteraSnapshotRun
+
+    periodo = periodo_actual()
+    try:
+        exists = (
+            db.query(CarteraSnapshotRun.id)
+            .filter(CarteraSnapshotRun.periodo == periodo)
+            .first()
+            is not None
+        )
+        if exists:
+            logger.debug("Cartera snapshot %s ya existe, se omite este ciclo", periodo)
+            return
+
+        summary = tomar_snapshot(db, periodo, tomado_por=None)
+        logger.info(
+            "Cartera snapshot %s tomado automáticamente (%d causas)",
+            periodo,
+            summary["causas"],
+        )
+    except Exception:
+        logger.exception("Cartera snapshot automático falló para periodo %s (non-fatal)", periodo)
+
+
 def _credential_failure_detail(exc: InvalidCredentialsError) -> str:
     """Vault detail for a definitive credential failure.
 
@@ -593,6 +625,15 @@ async def sync_all_lawyers():
             logger.info("Sysgal cobertura sync: %s", sysgal_summary)
         except Exception:
             logger.exception("Sysgal cobertura sync failed (non-fatal)")
+
+        # Cartera del mes: take the current period's snapshot the first cycle
+        # that notices none exists yet (idempotent — cheap single-row check
+        # inside _maybe_take_cartera_snapshot). SAFE-FAIL: must never abort
+        # the sync cycle.
+        try:
+            _maybe_take_cartera_snapshot(setup_db)
+        except Exception:
+            logger.exception("Cartera snapshot check failed (non-fatal)")
 
         # Only lawyer IDs are needed downstream — sync_lawyer_cases re-resolves the
         # Lawyer row from whatever session it is handed. Ordered by staleness so
