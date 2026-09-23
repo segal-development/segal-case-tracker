@@ -249,7 +249,7 @@ ALL_CASES = _AllCasesScope()
 
 
 def _bootstrap_owned_case_ids(db: Session, lawyer_id: int) -> set:
-    """Case ids owned (``Case.lawyer_id``) by ``lawyer_id`` that have NO
+    """Case ids effectively owned by ``lawyer_id`` that have NO
     ``CaseLitigante`` row at all yet.
 
     Litigantes are populated by a separate detail fetch AFTER a case is
@@ -261,12 +261,19 @@ def _bootstrap_owned_case_ids(db: Session, lawyer_id: int) -> set:
     visibility for cases that already have litigantes: a lawyer who is not
     a litigante on a case that DOES have litigantes still gets no scope
     from this fallback.
+
+    Uses ``EFFECTIVE_LAWYER_ID`` (``COALESCE(assigned_lawyer_id, lawyer_id)``),
+    not raw ``Case.lawyer_id``: this is business-facing visibility, so a
+    causa reassigned via asignación-por-nivel before it ever gets litigantes
+    must show up for its NEW assignee, not the lawyer who originally synced
+    it. Contrast with ``existing_by_rol`` in ``app.services.sync_service``,
+    which is provenance/dedup and must stay on ``lawyer_id`` unconditionally.
     """
-    from app.models.case import Case
+    from app.models.case import EFFECTIVE_LAWYER_ID, Case
     from app.models.case_litigante import CaseLitigante
 
     own_case_ids = {
-        cid for (cid,) in db.query(Case.id).filter(Case.lawyer_id == lawyer_id).all()
+        cid for (cid,) in db.query(Case.id).filter(EFFECTIVE_LAWYER_ID == lawyer_id).all()
     }
     if not own_case_ids:
         return set()
@@ -295,6 +302,16 @@ def resolve_case_scope(db: Session, current_lawyer: dict):
     has litigantes, visibility is entirely litigante-derived — a lawyer who
     is not a litigante on such a case gets no visibility from ``lawyer_id``
     alone.
+
+    Precedence (resolved inside ``case_ids_for_abogado`` /
+    ``app.services.lawyer_roster._abogado_litigantes_by_case`` — NOT
+    duplicated here): asignación-por-nivel override
+    (``Case.assigned_lawyer_id``) > litigante-derived attribution > nothing.
+    A reassigned causa therefore moves from the original litigante's scope to
+    the new assignee's scope automatically, including for a causa with no
+    litigante rows at all (the bootstrap-window fallback above then also
+    resolves to the new assignee via ``EFFECTIVE_LAWYER_ID``). ``Case.lawyer_id``
+    itself is never part of this precedence.
 
     Raises 401 when no subject is present and 404 when the lawyer is unknown
     (RUT lookup only — numeric-id tokens have no row to 404 against).

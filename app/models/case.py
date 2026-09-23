@@ -5,12 +5,14 @@ from sqlalchemy import (
     Boolean,
     Column,
     Date,
+    Index,
     Integer,
     String,
     DateTime,
     ForeignKey,
     Text,
     UniqueConstraint,
+    func,
     text,
 )
 from sqlalchemy.orm import relationship
@@ -36,11 +38,25 @@ class Case(Base):
     rows for the same ROL being created for different lawyers, which is the
     exact bug Approach C's migration (``case_merge`` / migration 024)
     resolves for pre-existing data.
+
+    Asignación por nivel (``assigned_lawyer_id``): a THIRD, independent axis
+    on top of the two above. ``CaseLitigante``/``resolve_case_scope`` reflect
+    the LEGAL abogado-of-record (who PJUD says represents the firm on this
+    causa); ``lawyer_id`` is the sync/provenance key described above. Neither
+    tells the firm which INTERNAL lawyer (by nivel: junior/pleno/senior)
+    currently works the causa day-to-day, which the firm needs to reassign
+    freely when a causa's ``matriz`` (M1 Baja/M1 Alta/M2/M3) requires a
+    different level than the assignee. ``assigned_lawyer_id`` is that
+    override; see ``effective_lawyer_id`` and ``EFFECTIVE_LAWYER_ID`` below,
+    and ``app.api.v1.asignacion`` for the endpoints that manage it.
+    ``lawyer_id`` itself is NEVER written by that workflow — see the comment
+    on ``existing_by_rol`` in ``app.services.sync_service`` for why.
     """
 
     __tablename__ = "cases"
     __table_args__ = (
         UniqueConstraint("lawyer_id", "rol", name="uq_cases_lawyer_rol"),
+        Index("ix_cases_assigned_lawyer_matriz", "assigned_lawyer_id", "matriz"),
     )
 
     id = Column(Integer, primary_key=True, index=True)
@@ -103,6 +119,18 @@ class Case(Base):
     matriz_proc_simple = Column(String(80), nullable=True)
     matriz_computed_at = Column(DateTime, nullable=True)
 
+    # Asignación por nivel — override of WHO works this causa internally,
+    # independent of ``lawyer_id`` (sync provenance, never touched here) and
+    # of litigante-derived legal attribution. NULL means "not reassigned":
+    # the effective lawyer is ``lawyer_id`` (see ``effective_lawyer_id``).
+    # Deliberately NOT backfilled by the migration that introduced this
+    # column — NULL carries real meaning (nobody has overridden it yet) and
+    # keeps that migration instant on the full cases table.
+    assigned_lawyer_id = Column(Integer, ForeignKey("lawyers.id"), nullable=True, index=True)
+    assigned_at = Column(DateTime, nullable=True)
+    assigned_by_rut = Column(String(20), nullable=True)  # RUT of the admin who reassigned it
+    assigned_motivo = Column(String(255), nullable=True)
+
     # Timestamps
     filed_at = Column(DateTime, nullable=True)  # Fecha de ingreso
     last_movement_at = Column(DateTime, nullable=True)
@@ -111,7 +139,8 @@ class Case(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
     # Relationships
-    lawyer = relationship("Lawyer", back_populates="cases")
+    lawyer = relationship("Lawyer", back_populates="cases", foreign_keys=[lawyer_id])
+    assigned_lawyer = relationship("Lawyer", foreign_keys=[assigned_lawyer_id])
     client = relationship("Client", back_populates="cases")
     court = relationship("Court", back_populates="cases")
     movements = relationship("Movement", back_populates="case", order_by="desc(Movement.movement_date)")
@@ -128,3 +157,25 @@ class Case(Base):
         back_populates="case",
         cascade="all, delete-orphan",
     )
+
+    @property
+    def effective_lawyer_id(self) -> int:
+        """The lawyer who currently works this causa, for business reads.
+
+        ``lawyer_id`` is the sync/provenance key (see ``existing_by_rol`` in
+        ``app.services.sync_service`` — it MUST stay untouched by
+        reassignment or the next sync of the original lawyer's PJUD account
+        would not find this causa and would re-create it as a duplicate).
+        ``assigned_lawyer_id`` is an optional admin override (asignación por
+        nivel, ``app.api.v1.asignacion``). NULL means nobody has overridden
+        it, so the effective lawyer falls back to ``lawyer_id`` — this makes
+        every business read safe to switch to ``effective_lawyer_id`` today,
+        since it is currently a no-op (no row has ``assigned_lawyer_id`` set)
+        and becomes correct the moment a reassignment happens.
+        """
+        return self.assigned_lawyer_id if self.assigned_lawyer_id is not None else self.lawyer_id
+
+
+# SQL-level equivalent of ``Case.effective_lawyer_id``, for use in queries
+# (filters, joins, group-by) so no call site hand-rolls the COALESCE.
+EFFECTIVE_LAWYER_ID = func.coalesce(Case.assigned_lawyer_id, Case.lawyer_id)

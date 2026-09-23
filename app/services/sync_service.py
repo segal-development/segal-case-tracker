@@ -776,6 +776,18 @@ class SyncService:
         # the unique constraint is (lawyer_id, rol), so a case can exist
         # under a different competencia than the one being synced right now
         # and must still be matched/updated, not duplicated).
+        #
+        # Deliberately keyed on Case.lawyer_id, NEVER on the internal-
+        # assignment override (Case.assigned_lawyer_id / effective_lawyer_id
+        # — see app.api.v1.asignacion). lawyer_id is the sync/provenance
+        # key: it identifies whose PJUD account this ROL was scraped from,
+        # which is exactly what the next sync of THAT SAME account needs to
+        # find here. If this dedup ever switched to the effective lawyer,
+        # reassigning a causa to a different internal lawyer would make the
+        # originating lawyer's next sync miss it under their own account and
+        # silently re-create it as a duplicate Case row — undoing the
+        # reassignment. Business/visibility reads use the effective lawyer;
+        # this ingest path must not.
         existing_by_rol = {
             c.rol: c
             for c in self.db.query(Case).filter(Case.lawyer_id == lawyer_id).all()
@@ -976,8 +988,11 @@ class SyncService:
 
         recipients = resolve_case_alert_recipients(self.db, case)
         if not recipients:
+            # Business-purpose fallback (who gets notified), so it follows the
+            # asignación-por-nivel override — unlike existing_by_rol above,
+            # which must stay on lawyer_id.
             fallback_lawyer = (
-                self.db.query(Lawyer).filter(Lawyer.id == case.lawyer_id).first()
+                self.db.query(Lawyer).filter(Lawyer.id == case.effective_lawyer_id).first()
             )
             recipients = [fallback_lawyer] if fallback_lawyer else []
 
@@ -1623,8 +1638,9 @@ def emit_deadline_alerts(
 
     recipients = resolve_case_alert_recipients(db, case)
     if not recipients:
+        # Business-purpose fallback — follows the asignación-por-nivel override.
         fallback_lawyer = (
-            db.query(Lawyer).filter(Lawyer.id == case.lawyer_id).first()
+            db.query(Lawyer).filter(Lawyer.id == case.effective_lawyer_id).first()
         )
         recipients = [fallback_lawyer] if fallback_lawyer else []
     if not recipients:
