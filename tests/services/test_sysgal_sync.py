@@ -1,9 +1,10 @@
 """Tests for ``sync_sysgal_estados`` — batch RUT lookup + cache upsert."""
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pytest
 
+from app.config import settings
 from app.models.case import Case
 from app.models.case_litigante import CaseLitigante
 from app.models.cliente_sysgal_estado import ClienteSysgalEstado
@@ -130,28 +131,103 @@ class TestUnconfigured:
 
 
 class TestRutSelection:
-    def test_selects_only_ddo_ruts_of_state_cases(self, db, lawyer, court):
-        in_scope = _make_case(db, lawyer, court, "C-1-2025", abandono_disponible=True)
+    def test_selects_every_ddo_rut_whatever_the_case_state(self, db, lawyer, court):
+        """Scope is the WHOLE portfolio, not only the 3 states.
+
+        The prune decides whether a causa keeps being detail-scraped at all,
+        so it needs live coverage of every demandado — not only of those that
+        already reached abandono/apremio/prescripción.
+        """
+        abandono = _make_case(db, lawyer, court, "C-1-2025", abandono_disponible=True)
         apremio = _make_case(db, lawyer, court, "C-2-2025", en_apremio=True)
         presc = _make_case(db, lawyer, court, "C-3-2025", prescripcion_cumplida=True)
-        out_of_scope = _make_case(db, lawyer, court, "C-4-2025")
+        plain = _make_case(db, lawyer, court, "C-4-2025")
 
-        _add_litigante(db, in_scope.id, "DDO.", "12.345.678-9")
-        _add_litigante(db, in_scope.id, "DTE.", "99999999-9")      # demandante — excluded
-        _add_litigante(db, in_scope.id, "AB.DDO", "88888888-8")    # demandado's lawyer — excluded
-        _add_litigante(db, in_scope.id, "AP.DDO", "87777777-7")    # excluded
+        _add_litigante(db, abandono.id, "DDO.", "12.345.678-9")
+        _add_litigante(db, abandono.id, "DTE.", "99999999-9")      # demandante — excluded
+        _add_litigante(db, abandono.id, "AB.DDO", "88888888-8")    # demandado's lawyer — excluded
+        _add_litigante(db, abandono.id, "AP.DDO", "87777777-7")    # excluded
         _add_litigante(db, apremio.id, "DDOR.", "23456789-0")
         _add_litigante(db, presc.id, "DDO.", "")                    # empty rut — excluded
         _add_litigante(db, presc.id, "DDO.", "12345678-9")          # dup of first (normalized)
-        _add_litigante(db, out_of_scope.id, "DDO.", "77777777-7")   # outside 3 states — excluded
+        _add_litigante(db, plain.id, "DDO.", "77777777-7")          # no state flag — INCLUDED now
 
         client = FakeClient()
         result = sync_sysgal_estados(db, client=client)
 
         assert result["skipped"] is False
         sent = sorted(r for batch in client.batches for r in batch)
-        assert sent == ["12345678-9", "23456789-0"]
-        assert result["consultados"] == 2
+        # A valid RUT travels dotted, an invalid one canonical — existing
+        # contract of the service, unchanged by the widened scope.
+        assert sent == ["12345678-9", "23456789-0", "77.777.777-7"]
+        assert result["consultados"] == 3
+
+    def test_case_with_no_ddo_litigante_contributes_nothing(self, db, lawyer, court):
+        case = _make_case(db, lawyer, court, "C-5-2025")
+        _add_litigante(db, case.id, "DTE.", "99999999-9")
+        client = FakeClient()
+        result = sync_sysgal_estados(db, client=client)
+        assert client.batches == []
+        assert result["consultados"] == 0
+
+
+class TestCacheFreshness:
+    """Widening the scope must not multiply the per-cycle load on Sysgal.
+
+    A RUT already answered recently is not asked again: the first run fetches
+    the backlog, later runs only refresh what went stale.
+    """
+
+    def _cached(self, db, rut, days_ago):
+        row = ClienteSysgalEstado(
+            rut=clean_rut(rut),
+            encontrado=True,
+            estado_codigo="ACTIVO",
+            synced_at=datetime.utcnow() - timedelta(days=days_ago),
+        )
+        db.add(row); db.commit()
+
+    def test_skips_ruts_answered_recently(self, db, lawyer, court):
+        case = _make_case(db, lawyer, court, "C-1-2025")
+        _add_litigante(db, case.id, "DDO.", "12345678-9")
+        self._cached(db, "12345678-9", days_ago=1)
+
+        client = FakeClient()
+        result = sync_sysgal_estados(db, client=client)
+
+        assert client.batches == []
+        assert result["consultados"] == 0
+
+    def test_requeries_ruts_whose_answer_went_stale(self, db, lawyer, court):
+        case = _make_case(db, lawyer, court, "C-1-2025")
+        _add_litigante(db, case.id, "DDO.", "12345678-9")
+        self._cached(db, "12345678-9", days_ago=settings.SYSGAL_CACHE_TTL_DAYS + 1)
+
+        client = FakeClient()
+        result = sync_sysgal_estados(db, client=client)
+
+        assert result["consultados"] == 1
+        assert sorted(r for b in client.batches for r in b) == ["12345678-9"]
+
+    def test_force_ignores_the_freshness_window(self, db, lawyer, court):
+        """The admin "refresh now" button must never be a silent no-op."""
+        case = _make_case(db, lawyer, court, "C-1-2025")
+        _add_litigante(db, case.id, "DDO.", "12345678-9")
+        self._cached(db, "12345678-9", days_ago=0)
+
+        client = FakeClient()
+        result = sync_sysgal_estados(db, client=client, force=True)
+
+        assert result["consultados"] == 1
+
+    def test_requeries_ruts_never_asked(self, db, lawyer, court):
+        case = _make_case(db, lawyer, court, "C-1-2025")
+        _add_litigante(db, case.id, "DDO.", "12345678-9")
+
+        client = FakeClient()
+        result = sync_sysgal_estados(db, client=client)
+
+        assert result["consultados"] == 1
 
     def test_no_ruts_makes_no_request(self, db, lawyer, court):
         _make_case(db, lawyer, court, "C-1-2025", abandono_disponible=True)
@@ -232,8 +308,12 @@ class TestUpsert:
         _add_litigante(db, case.id, "DDO.", "12345678-9")
 
         sync_sysgal_estados(db, client=FakeClient(answers={"12345678-9": _found(code="ACTIVO")}))
+        # force=True: within the TTL the worker would skip this RUT, but an
+        # explicit refresh must still reach Sysgal.
         sync_sysgal_estados(
-            db, client=FakeClient(answers={"12345678-9": _found(code="MOROSO_INACTIVO", label="Moroso")})
+            db,
+            client=FakeClient(answers={"12345678-9": _found(code="MOROSO_INACTIVO", label="Moroso")}),
+            force=True,
         )
 
         rows = db.query(ClienteSysgalEstado).filter_by(rut="12345678-9").all()

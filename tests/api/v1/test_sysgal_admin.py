@@ -48,8 +48,9 @@ class TestSync:
 
         called = {}
 
-        def fake_sync(db):
+        def fake_sync(db, force=False):
             called["db"] = db
+            called["force"] = force
             return {
                 "skipped": False,
                 "consultados": 3,
@@ -64,6 +65,8 @@ class TestSync:
         assert resp.status_code == 200
         assert resp.json()["consultados"] == 3
         assert "db" in called
+        # An explicit refresh bypasses the per-RUT freshness window.
+        assert called["force"] is True
 
     def test_admin_unconfigured_returns_skipped(self, client, admin_headers, monkeypatch):
         from app.config import settings
