@@ -131,7 +131,7 @@ class TestUnconfigured:
 
 
 class TestRutSelection:
-    def test_selects_every_ddo_rut_whatever_the_case_state(self, db, lawyer, court):
+    def test_selects_parties_whatever_the_case_state(self, db, lawyer, court):
         """Scope is the WHOLE portfolio, not only the 3 states.
 
         The prune decides whether a causa keeps being detail-scraped at all,
@@ -144,13 +144,13 @@ class TestRutSelection:
         plain = _make_case(db, lawyer, court, "C-4-2025")
 
         _add_litigante(db, abandono.id, "DDO.", "12.345.678-9")
-        _add_litigante(db, abandono.id, "DTE.", "99999999-9")      # demandante — excluded
+        _add_litigante(db, abandono.id, "DTE.", "99999999-9")      # demandante — a party too
         _add_litigante(db, abandono.id, "AB.DDO", "88888888-8")    # demandado's lawyer — excluded
         _add_litigante(db, abandono.id, "AP.DDO", "87777777-7")    # excluded
         _add_litigante(db, apremio.id, "DDOR.", "23456789-0")
         _add_litigante(db, presc.id, "DDO.", "")                    # empty rut — excluded
         _add_litigante(db, presc.id, "DDO.", "12345678-9")          # dup of first (normalized)
-        _add_litigante(db, plain.id, "DDO.", "77777777-7")          # no state flag — INCLUDED now
+        _add_litigante(db, plain.id, "DDO.", "77777777-7")          # no state flag — included
 
         client = FakeClient()
         result = sync_sysgal_estados(db, client=client)
@@ -159,16 +159,69 @@ class TestRutSelection:
         sent = sorted(r for batch in client.batches for r in batch)
         # A valid RUT travels dotted, an invalid one canonical — existing
         # contract of the service, unchanged by the widened scope.
-        assert sent == ["12345678-9", "23456789-0", "77.777.777-7"]
-        assert result["consultados"] == 3
+        assert sent == ["12345678-9", "23456789-0", "77.777.777-7", "99.999.999-9"]
+        assert result["consultados"] == 4
 
-    def test_case_with_no_ddo_litigante_contributes_nothing(self, db, lawyer, court):
+    def test_case_with_only_representatives_contributes_nothing(self, db, lawyer, court):
         case = _make_case(db, lawyer, court, "C-5-2025")
-        _add_litigante(db, case.id, "DTE.", "99999999-9")
+        _add_litigante(db, case.id, "AB.DTE", "99999999-9")
         client = FakeClient()
         result = sync_sysgal_estados(db, client=client)
         assert client.batches == []
         assert result["consultados"] == 0
+
+
+class TestPartyScope:
+    """The client is not reliably the demandado.
+
+    Measured on the portfolio: where the demandado is a company the demandante
+    is a natural person 99.2% of the time, and where the demandado is a natural
+    person the demandante is a company 99.6% of the time. Those two populations
+    are mirror images, so the litigante roles are inverted on roughly a quarter
+    of the causas. Coverage therefore has to be asked for every party and the
+    client identified by who Sysgal recognises, never by the role label.
+    """
+
+    def test_includes_the_demandante_and_the_other_parties(self, db, lawyer, court):
+        case = _make_case(db, lawyer, court, "C-1-2025")
+        _add_litigante(db, case.id, "DDO.", "12345678-9")
+        _add_litigante(db, case.id, "DTE.", "23456789-0")
+        _add_litigante(db, case.id, "DDOR.", "34567890-1")
+        _add_litigante(db, case.id, "TER.EJ", "45678901-2")
+        _add_litigante(db, case.id, "ACRDOR", "56789012-3")
+
+        client = FakeClient()
+        result = sync_sysgal_estados(db, client=client)
+
+        assert result["consultados"] == 5
+
+    def test_excludes_lawyers_and_apoderados(self, db, lawyer, court):
+        """A representative is never the client, whatever the role spelling."""
+        case = _make_case(db, lawyer, court, "C-1-2025")
+        _add_litigante(db, case.id, "DDO.", "12345678-9")
+        _add_litigante(db, case.id, "AB.DDO", "88888888-8")
+        _add_litigante(db, case.id, "AB.DTE", "88888888-7")
+        _add_litigante(db, case.id, "AB.TER", "88888888-6")
+        _add_litigante(db, case.id, "ABG.AD", "88888888-5")
+        _add_litigante(db, case.id, "AP.DTE", "87777777-7")
+        _add_litigante(db, case.id, "AP.DDO", "87777777-6")
+
+        client = FakeClient()
+        result = sync_sysgal_estados(db, client=client)
+
+        sent = sorted(r for batch in client.batches for r in batch)
+        assert sent == ["12345678-9"]
+        assert result["consultados"] == 1
+
+    def test_an_unknown_role_is_looked_up_rather_than_dropped(self, db, lawyer, court):
+        """Missing the client costs far more than looking up a perito."""
+        case = _make_case(db, lawyer, court, "C-1-2025")
+        _add_litigante(db, case.id, "ROL.NUEVO", "12345678-9")
+
+        client = FakeClient()
+        result = sync_sysgal_estados(db, client=client)
+
+        assert result["consultados"] == 1
 
 
 class TestCacheFreshness:

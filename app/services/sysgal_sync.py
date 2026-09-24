@@ -1,10 +1,12 @@
 """sync_sysgal_estados — refresh the per-RUT Sysgal cache for demandados.
 
-Scope: DDO litigantes (``participante ILIKE 'DDO%'`` — ``DDO.``/``DDOR.``;
-this prefix excludes ``AB.DDO``/``AP.DDO``, the demandado's lawyers) of EVERY
-causa, whatever its state. The coverage answer gates whether a causa keeps
-being detail-scraped, so it cannot be known only for the subset that already
-reached abandono/apremio/prescripción.
+Scope: every PARTY of every causa — representatives excluded — whatever the
+causa's state. The coverage answer gates whether a causa keeps being
+detail-scraped, so it cannot be known only for the subset that already reached
+abandono/apremio/prescripción, and it cannot be asked only of the demandado:
+the litigante roles are inverted on roughly a quarter of the portfolio, so the
+client sits on either side. Which party is the client is decided by who Sysgal
+recognises, never by the role label.
 
 Re-asking is throttled per RUT by ``SYSGAL_CACHE_TTL_DAYS`` so the wider scope
 does not multiply the per-cycle load on Sysgal's API.
@@ -61,16 +63,33 @@ def _parse_datetime(value) -> Optional[datetime]:
     return None
 
 
-def demandado_ruts_in_scope(
+#: ``participante`` prefixes that mark a REPRESENTATIVE rather than a party:
+#: abogado (``AB.``, ``ABG.``) and apoderado (``AP.``). Everything else counts
+#: as a party and gets looked up. The asymmetry is deliberate — looking up a
+#: perito by mistake costs one slot in a 100-RUT chunk, while filtering the
+#: client out costs the coverage answer for that causa entirely, and PJUD adds
+#: role spellings we have not seen.
+_REPRESENTATIVE_PREFIXES = ("AB.", "ABG.", "AP.")
+
+
+def parte_ruts_in_scope(
     db: Session, now: Optional[datetime] = None, force: bool = False
 ) -> list[str]:
-    """Distinct canonical DDO RUTs still needing a Sysgal answer (sorted).
+    """Distinct canonical party RUTs still needing a Sysgal answer (sorted).
 
-    Scope is the WHOLE portfolio — every causa carrying a DDO litigante — not
-    only the three states (abandono/apremio/prescripción) this used to cover.
-    The coverage answer decides whether a causa keeps being detail-scraped at
-    all, so it has to be known for every demandado, not only for those that
-    already reached one of those states.
+    Scope is every party of every causa, not the demandado of the causas in
+    three states this used to cover. Two separate reasons:
+
+    * The coverage answer decides whether a causa keeps being detail-scraped,
+      so it has to be known beyond the subset that already reached
+      abandono/apremio/prescripción.
+    * **The demandado is not reliably the client.** Where the demandado is a
+      company the demandante is a natural person 99.2% of the time, and where
+      the demandado is a natural person the demandante is a company 99.6% of
+      the time — mirror-image populations, so the roles are inverted on about a
+      quarter of the causas. Asking only the demandado leaves those unanswered
+      forever, because the party recorded there is the creditor. Sysgal does
+      not model creditors at all, so such a RUT can never resolve.
 
     A RUT answered less than ``SYSGAL_CACHE_TTL_DAYS`` ago is left out: the
     widened scope would otherwise re-ask Sysgal for thousands of unchanged
@@ -81,8 +100,11 @@ def demandado_ruts_in_scope(
     rows = (
         db.query(CaseLitigante.rut)
         .filter(
-            CaseLitigante.participante.ilike("DDO%"),
             CaseLitigante.rut != "",
+            *[
+                ~CaseLitigante.participante.ilike(f"{prefix}%")
+                for prefix in _REPRESENTATIVE_PREFIXES
+            ],
         )
         .distinct()
         .all()
@@ -131,7 +153,7 @@ def sync_sysgal_estados(
     today: Optional[date] = None,
     force: bool = False,
 ) -> dict:
-    """Query Sysgal for every in-scope demandado RUT and upsert the cache.
+    """Query Sysgal for every in-scope party RUT and upsert the cache.
 
     Never raises for Sysgal-side problems: each 100-RUT chunk is safe-failed
     (logged without PII, counted in ``errores``) and the rest continues. An
@@ -147,7 +169,7 @@ def sync_sysgal_estados(
         return _empty_summary(skipped=True)
 
     summary = _empty_summary(skipped=False)
-    ruts = demandado_ruts_in_scope(db, force=force)
+    ruts = parte_ruts_in_scope(db, force=force)
     summary["consultados"] = len(ruts)
     if not ruts:
         return summary
