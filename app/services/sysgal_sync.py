@@ -1,22 +1,25 @@
 """sync_sysgal_estados — refresh the per-RUT Sysgal cache for demandados.
 
 Scope: DDO litigantes (``participante ILIKE 'DDO%'`` — ``DDO.``/``DDOR.``;
-this prefix excludes ``AB.DDO``/``AP.DDO``, the demandado's lawyers) of causas
-in any of the 3 states: abandono disponible, en apremio, prescripción cumplida.
+this prefix excludes ``AB.DDO``/``AP.DDO``, the demandado's lawyers) of EVERY
+causa, whatever its state. The coverage answer gates whether a causa keeps
+being detail-scraped, so it cannot be known only for the subset that already
+reached abandono/apremio/prescripción.
+
+Re-asking is throttled per RUT by ``SYSGAL_CACHE_TTL_DAYS`` so the wider scope
+does not multiply the per-cycle load on Sysgal's API.
 
 PRIVACY: the Sysgal answer carries nombre/email/telefono — none of it is
 stored or logged. Only status codes and counts reach the logs.
 """
 
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Optional
 
-from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.models.case import Case
 from app.models.case_litigante import CaseLitigante
 from app.models.cliente_sysgal_estado import ClienteSysgalEstado
 from app.services.sysgal_client import MAX_RUTS_PER_REQUEST, SysgalClient
@@ -58,17 +61,26 @@ def _parse_datetime(value) -> Optional[datetime]:
     return None
 
 
-def demandado_ruts_in_scope(db: Session) -> list[str]:
-    """Distinct canonical DDO RUTs of causas in the 3 states (sorted)."""
+def demandado_ruts_in_scope(
+    db: Session, now: Optional[datetime] = None, force: bool = False
+) -> list[str]:
+    """Distinct canonical DDO RUTs still needing a Sysgal answer (sorted).
+
+    Scope is the WHOLE portfolio — every causa carrying a DDO litigante — not
+    only the three states (abandono/apremio/prescripción) this used to cover.
+    The coverage answer decides whether a causa keeps being detail-scraped at
+    all, so it has to be known for every demandado, not only for those that
+    already reached one of those states.
+
+    A RUT answered less than ``SYSGAL_CACHE_TTL_DAYS`` ago is left out: the
+    widened scope would otherwise re-ask Sysgal for thousands of unchanged
+    RUTs on every worker cycle. The first run fetches the backlog; later runs
+    only refresh what went stale. ``force`` bypasses that window for an
+    explicit human refresh, which must never be a silent no-op.
+    """
     rows = (
         db.query(CaseLitigante.rut)
-        .join(Case, Case.id == CaseLitigante.case_id)
         .filter(
-            or_(
-                Case.abandono_disponible.is_(True),
-                Case.en_apremio.is_(True),
-                Case.prescripcion_cumplida.is_(True),
-            ),
             CaseLitigante.participante.ilike("DDO%"),
             CaseLitigante.rut != "",
         )
@@ -77,7 +89,18 @@ def demandado_ruts_in_scope(db: Session) -> list[str]:
     )
     ruts = {clean_rut(r) for (r,) in rows if r}
     ruts.discard("")
-    return sorted(ruts)
+
+    if force:
+        return sorted(ruts)
+
+    cutoff = (now or datetime.utcnow()) - timedelta(days=settings.SYSGAL_CACHE_TTL_DAYS)
+    fresh = {
+        rut
+        for (rut,) in db.query(ClienteSysgalEstado.rut)
+        .filter(ClienteSysgalEstado.synced_at >= cutoff)
+        .all()
+    }
+    return sorted(ruts - fresh)
 
 
 def _apply_item(row: ClienteSysgalEstado, item: dict, now: datetime) -> None:
@@ -106,12 +129,16 @@ def sync_sysgal_estados(
     db: Session,
     client: Optional[SysgalClient] = None,
     today: Optional[date] = None,
+    force: bool = False,
 ) -> dict:
     """Query Sysgal for every in-scope demandado RUT and upsert the cache.
 
     Never raises for Sysgal-side problems: each 100-RUT chunk is safe-failed
     (logged without PII, counted in ``errores``) and the rest continues. An
     unconfigured client returns ``{"skipped": True, …}`` as a no-op.
+
+    ``force`` re-asks every in-scope RUT even if its cached answer is still
+    inside ``SYSGAL_CACHE_TTL_DAYS`` — for the admin-triggered refresh.
     """
     if client is None:
         client = SysgalClient(settings.SYSGAL_BASE_URL, settings.SYSGAL_API_KEY)
@@ -120,7 +147,7 @@ def sync_sysgal_estados(
         return _empty_summary(skipped=True)
 
     summary = _empty_summary(skipped=False)
-    ruts = demandado_ruts_in_scope(db)
+    ruts = demandado_ruts_in_scope(db, force=force)
     summary["consultados"] = len(ruts)
     if not ruts:
         return summary

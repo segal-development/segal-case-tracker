@@ -42,8 +42,13 @@ async def run_sysgal_sync(
     _admin: str = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    """Run the Sysgal cache refresh now (same job the worker runs each cycle)."""
-    return sync_sysgal_estados(db)
+    """Run the Sysgal cache refresh now (same job the worker runs each cycle).
+
+    Forced: the worker skips RUTs answered inside ``SYSGAL_CACHE_TTL_DAYS``,
+    but someone pressing "refresh now" is asking for fresh answers and must
+    not get a silent no-op.
+    """
+    return sync_sysgal_estados(db, force=True)
 
 
 @router.get("/status", response_model=SysgalStatusResponse)

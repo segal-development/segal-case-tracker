@@ -85,6 +85,11 @@ class Settings(BaseSettings):
     # Both empty = integration disabled (sync is a no-op).
     SYSGAL_BASE_URL: str = ""
     SYSGAL_API_KEY: str = ""
+    # How long a cached per-RUT answer stays usable. The sync covers every
+    # demandado in the portfolio, so without this every cycle would re-ask
+    # Sysgal for thousands of RUTs that did not change; with it, the first run
+    # fetches the backlog and later runs refresh only what went stale.
+    SYSGAL_CACHE_TTL_DAYS: int = 7
 
     # Firebase (push notifications)
     FIREBASE_CREDENTIALS_PATH: str = ""
