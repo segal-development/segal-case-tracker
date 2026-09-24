@@ -122,6 +122,49 @@ def _tribunal_collides(a: Optional[str], b: Optional[str]) -> bool:
     return a == b or a is None or b is None
 
 
+def _hito_existente(
+    db: Session,
+    lawyer_id: int,
+    rol_causa: Optional[str],
+    descripcion: Optional[str],
+    tribunal: Optional[str],
+) -> Optional[tuple]:
+    """Return the row of the hito that already covers this causa for
+    ``lawyer_id``, or ``None``.
+
+    Single source of truth for the dedup rule keyed on ``(lawyer, rol_causa,
+    _causa_key(descripcion), _tribunal_collides(tribunal))`` — shared by
+    ``_create_hito`` (which turns a hit into the 409) and the public
+    ``/verificar`` preview endpoints (which turn it into a warning shown
+    before the form is filled). Both MUST call this one function: a preview
+    that reimplements the rule can drift from it, and a preview that
+    disagrees with the rejection is worse than no preview at all.
+
+    Only enforced when ``rol_causa`` (the client RUT) is given, matching
+    ``_create_hito``: without it there is nothing to key the dedup on, so no
+    causa collides.
+    """
+    rol_norm = (rol_causa or "").strip() or None
+    if rol_norm is None:
+        return None
+    tribunal_norm = (tribunal or "").strip() or None
+    causa = _causa_key(descripcion)
+    trib = _tribunal_key(tribunal_norm)
+    prior = (
+        db.query(Hito.descripcion, Hito.tribunal, Hito.fecha_hito, Hito.estado, Hito.created_by_name)
+        .filter(Hito.lawyer_id == lawyer_id, Hito.rol_causa == rol_norm)
+        .all()
+    )
+    return next(
+        (
+            row
+            for row in prior
+            if _causa_key(row[0]) == causa and _tribunal_collides(_tribunal_key(row[1]), trib)
+        ),
+        None,
+    )
+
+
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
@@ -249,6 +292,13 @@ class PublicProcuradoresFormResponse(BaseModel):
     """What the shared procuradores form needs: the tipo catalog + the lawyers to pick from."""
     tipos: List[HitoTipoResponse]
     abogados: List[PublicAbogado]
+
+
+class HitoVerificarResponse(BaseModel):
+    """Answer to 'does this hito already exist?' — nothing beyond that, since the
+    public forms are unauthenticated links and must not expose ids or lists."""
+    existe: bool
+    detalle: Optional[str] = None
 
 
 _SIN_EVIDENCIA_DETAIL = "El hito no tiene evidencia adjunta; no se puede aprobar sin evidencia."
@@ -396,28 +446,13 @@ async def _create_hito(
     # Checked before storing evidence so a rejected duplicate never uploads a file.
     rol_norm = (rol_causa or "").strip() or None
     tribunal_norm = (tribunal or "").strip() or None
-    if rol_norm is not None:
-        causa = _causa_key(descripcion)
-        trib = _tribunal_key(tribunal_norm)
-        prior = (
-            db.query(Hito.descripcion, Hito.tribunal, Hito.fecha_hito, Hito.estado, Hito.created_by_name)
-            .filter(Hito.lawyer_id == target_lawyer_id, Hito.rol_causa == rol_norm)
-            .all()
-        )
-        choque = next(
-            (
-                row
-                for row in prior
-                if _causa_key(row[0]) == causa and _tribunal_collides(_tribunal_key(row[1]), trib)
-            ),
-            None,
-        )
-        if choque is not None:
-            # Name the existing hito instead of just refusing. A procurador filing
-            # through the shared link cannot see what is already loaded, so a bare
-            # "ya existe" reads like a bug and gets escalated; the date, the estado
-            # and who filed it let them close the question themselves.
-            raise HTTPException(status_code=409, detail=_duplicado_detail(choque))
+    choque = _hito_existente(db, target_lawyer_id, rol_causa, descripcion, tribunal)
+    if choque is not None:
+        # Name the existing hito instead of just refusing. A procurador filing
+        # through the shared link cannot see what is already loaded, so a bare
+        # "ya existe" reads like a bug and gets escalated; the date, the estado
+        # and who filed it let them close the question themselves.
+        raise HTTPException(status_code=409, detail=_duplicado_detail(choque))
 
     # Evidence is optional at creation (it can be attached later via
     # PUT /{id}/evidencia) but mandatory to approve. If provided, validate + store it.
@@ -526,6 +561,25 @@ def _active_firm_lawyers(db: Session) -> list[Lawyer]:
         .order_by(Lawyer.name)
         .all()
     )
+
+
+def _procuradores_lawyer_or_422(db: Session, lawyer_id: Optional[int]) -> Lawyer:
+    """Resolve the lawyer a procurador picked on the shared form, else 422.
+
+    Shared by the POST (create) and the ``/verificar`` preview so both agree on
+    what counts as a valid selection: an active firm lawyer, same as the
+    ``abogados`` list the form itself offers.
+    """
+    lawyer = None
+    if lawyer_id is not None:
+        lawyer = (
+            db.query(Lawyer)
+            .filter(Lawyer.id == lawyer_id, Lawyer.is_active.is_(True), Lawyer.is_firm_lawyer.is_(True))
+            .first()
+        )
+    if lawyer is None:
+        raise HTTPException(status_code=422, detail=_ABOGADO_INVALIDO_DETAIL)
+    return lawyer
 
 
 def _lawyer_by_token(db: Session, token: str) -> Lawyer:
@@ -874,6 +928,30 @@ async def public_create_hito(
     return _to_response(hito)
 
 
+@router.get("/public/{token}/verificar", response_model=HitoVerificarResponse)
+async def public_verificar_duplicado(
+    token: str,
+    rol_causa: Optional[str] = Query(None, description="RUT del cliente"),
+    descripcion: Optional[str] = Query(None, description="ROL de la causa"),
+    tribunal: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    """PUBLIC (no auth). Preview: does the token's lawyer already have a hito for
+    this causa? Read-only — creates nothing.
+
+    Meant to warn BEFORE the form is filled, the moment the three fields that
+    identify the causa (RUT cliente, ROL, tribunal) are known, instead of
+    finding out only after submitting the whole form (evidence included). Uses
+    the exact same rule as ``_create_hito`` via ``_hito_existente``, so this
+    warning and the 409 it previews always agree.
+    """
+    lawyer = _lawyer_by_token(db, token)
+    choque = _hito_existente(db, lawyer.id, rol_causa, descripcion, tribunal)
+    if choque is None:
+        return HitoVerificarResponse(existe=False, detalle=None)
+    return HitoVerificarResponse(existe=True, detalle=_duplicado_detail(choque))
+
+
 # --------------------------------------------------------------------------- #
 # Shared procuradores form — NO auth dependency. One token for every procurador;
 # they pick the lawyer they work for. Deliberately NO list/evidence endpoints:
@@ -924,15 +1002,7 @@ async def public_procuradores_create_hito(
     ``created_by = Procurador (link genérico)``.
     """
     _procuradores_link_or_404(db, token)
-    lawyer = None
-    if lawyer_id is not None:
-        lawyer = (
-            db.query(Lawyer)
-            .filter(Lawyer.id == lawyer_id, Lawyer.is_active.is_(True), Lawyer.is_firm_lawyer.is_(True))
-            .first()
-        )
-    if lawyer is None:
-        raise HTTPException(status_code=422, detail=_ABOGADO_INVALIDO_DETAIL)
+    lawyer = _procuradores_lawyer_or_422(db, lawyer_id)
     hito_tipo_id, fecha_hito, rol_causa, descripcion, tribunal, procedimiento, evidencia = (
         await _validate_public_form_fields(
             hito_tipo_id, fecha_hito, rol_causa, descripcion, tribunal, procedimiento, evidencia,
@@ -946,6 +1016,28 @@ async def public_procuradores_create_hito(
         origen=ORIGEN_FORMULARIO, created_by=_PROCURADOR_CREATED_BY,
     )
     return _to_response(hito)
+
+
+@router.get("/public-procuradores/{token}/verificar", response_model=HitoVerificarResponse)
+async def public_procuradores_verificar_duplicado(
+    token: str,
+    lawyer_id: Optional[int] = Query(None),
+    rol_causa: Optional[str] = Query(None, description="RUT del cliente"),
+    descripcion: Optional[str] = Query(None, description="ROL de la causa"),
+    tribunal: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    """PUBLIC (no auth). Same preview as the per-lawyer form, but for the shared
+    procuradores link: ``lawyer_id`` comes from the query and is validated the
+    same way as the POST (422 if not an active firm lawyer) via
+    ``_procuradores_lawyer_or_422``. Read-only — creates nothing.
+    """
+    _procuradores_link_or_404(db, token)
+    lawyer = _procuradores_lawyer_or_422(db, lawyer_id)
+    choque = _hito_existente(db, lawyer.id, rol_causa, descripcion, tribunal)
+    if choque is None:
+        return HitoVerificarResponse(existe=False, detalle=None)
+    return HitoVerificarResponse(existe=True, detalle=_duplicado_detail(choque))
 
 
 @router.get("/public/{token}/hitos", response_model=List[HitoResponse])
