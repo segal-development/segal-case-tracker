@@ -44,10 +44,6 @@ from app.services.supervisor_alert_service import send_supervisor_credential_ale
 from app.config import settings
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
 logger = logging.getLogger("sync_scheduler")
 
 # Scheduler instance
@@ -814,4 +810,11 @@ async def main():
 
 
 if __name__ == "__main__":
+    # Configurar logging es tarea del punto de entrada, no del modulo: hacerlo
+    # al importar le instala handlers al root a cualquiera que importe esto,
+    # incluido el arnes de tests, y rompe la captura de logs de otros tests.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
     asyncio.run(main())
