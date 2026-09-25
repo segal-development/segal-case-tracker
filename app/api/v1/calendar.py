@@ -16,7 +16,8 @@ from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy.orm import Session
+from sqlalchemy import or_
+from sqlalchemy.orm import Session, joinedload
 
 from app.api.deps import (
     get_db,
@@ -115,32 +116,46 @@ def _caratulado(case: Case) -> str:
     return f"{case.plaintiff or ''}/{case.defendant or ''}"
 
 
-def _resolve_deadline_label(db: Session, case: Case) -> Optional[str]:
-    """Resolve the real deadline label for the case's next active deadline.
+def _deadline_labels_by_case(db: Session, cases: List[Case]) -> dict:
+    """Map ``{case_id: label}`` for the cases' next active deadline, in ONE query.
 
     Reuses the SAME resolution ``GET /cases/{id}/deadlines`` already performs
     (look up the CaseDeadline row and map its ``deadline_type`` through the
     shared ``DEADLINE_LABELS`` catalog) instead of reinventing it here — this
     endpoint stays a read-only fan-out over engine-computed state.
 
-    Returns None when no matching active row is found (e.g. a case whose
-    ``next_deadline_at`` was set without a backing CaseDeadline row — should
-    not happen via the real engine pipeline, but kept safe for callers that
-    write the denormalized column directly, such as tests/fixtures).
+    A case with no matching active row is simply absent from the map, so the
+    caller reads None (e.g. a case whose ``next_deadline_at`` was set without a
+    backing CaseDeadline row — should not happen via the real engine pipeline,
+    but kept safe for callers that write the denormalized column directly,
+    such as tests/fixtures).
+
+    Batched on purpose: the sidebar calls this endpoint on every page load, and
+    resolving the label per case cost one round trip over the Cloud SQL proxy
+    for each case carrying a deadline.
     """
-    row = (
+    wanted = {c.id: c.next_deadline_at for c in cases if c.next_deadline_at is not None}
+    if not wanted:
+        return {}
+
+    rows = (
         db.query(CaseDeadline)
         .filter(
-            CaseDeadline.case_id == case.id,
-            CaseDeadline.due_date == case.next_deadline_at,
+            CaseDeadline.case_id.in_(list(wanted)),
             CaseDeadline.status == "active",
         )
         .order_by(CaseDeadline.id.asc())
-        .first()
+        .all()
     )
-    if row is None:
-        return None
-    return DEADLINE_LABELS.get(row.deadline_type, row.deadline_type)
+
+    labels: dict = {}
+    for row in rows:
+        # Same predicate the per-case query applied: the row must match the
+        # case's own next_deadline_at, and the LOWEST id wins.
+        if row.due_date != wanted.get(row.case_id) or row.case_id in labels:
+            continue
+        labels[row.case_id] = DEADLINE_LABELS.get(row.deadline_type, row.deadline_type)
+    return labels
 
 
 @router.get("", response_model=CalendarResponse)
@@ -172,7 +187,20 @@ async def get_calendar(
     ``/cases/{id}/deadlines`` endpoint uses).
     """
     scope = resolve_case_scope(db, current_lawyer)
-    query = db.query(Case).filter(Case.status != "archived")
+    # Only cases that can actually produce an item. A causa with neither date
+    # contributes nothing to the response, so hydrating it is pure waste: on the
+    # real portfolio that is 11.959 of 14.645 rows discarded in Python, on an
+    # endpoint the sidebar calls on every page load. The horizon is NOT filtered
+    # here — an overdue item may be arbitrarily old — and it would buy almost
+    # nothing anyway (2.686 -> 2.622 rows at 30 days).
+    query = (
+        db.query(Case)
+        .options(joinedload(Case.court))
+        .filter(
+            Case.status != "archived",
+            or_(Case.next_deadline_at.isnot(None), Case.next_review_at.isnot(None)),
+        )
+    )
     query = apply_case_scope(query, scope)
 
     # Optional per-abogado narrowing (mirrors /cases): an auditor/admin can pull
@@ -188,6 +216,7 @@ async def get_calendar(
             query = query.filter(Case.id.in_(list(allowed_ids)))
 
     cases = query.all()
+    deadline_labels = _deadline_labels_by_case(db, cases)
 
     today = _today_chile()
     horizon_end = today + timedelta(days=days)
@@ -212,7 +241,7 @@ async def get_calendar(
                         court_name=court_name,
                         semaforo=case.semaforo,
                         fatal=bool(case.next_deadline_fatal),
-                        label=_resolve_deadline_label(db, case),
+                        label=deadline_labels.get(case.id),
                         overdue=overdue,
                     )
                 )
