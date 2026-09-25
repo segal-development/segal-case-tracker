@@ -18,6 +18,11 @@ costó caro:
   ``incluir_provisorias``.
 * **No pisa una asignación existente.** Una causa ya asignada es una decisión
   humana tomada con más contexto del que tiene este motor.
+* **No le saca una causa a quien ya la trabaja.** Una causa cuyo abogado de
+  récord resuelve a un abogado de la firma ya tiene dueño, aunque no tenga el
+  override escrito. Sobre la cartera real, de 6.586 causas repartibles solo
+  1.206 no tienen abogado: repartir las otras 5.024 le sacaba a un senior el
+  94% de su cartera. Se puede pedir con ``redistribuir``.
 
 Toda asignación queda marcada con ``MOTIVO_AUTOMATICO``, así que el lote
 completo se puede identificar y deshacer.
@@ -111,6 +116,7 @@ def asignar_automatico(
     *,
     actor_rut: str,
     incluir_provisorias: bool = False,
+    redistribuir: bool = False,
     limite: Optional[int] = None,
     dry_run: bool = True,
 ) -> PlanAsignacion:
@@ -123,6 +129,10 @@ def asignar_automatico(
     El reparto es determinista: dentro de cada nivel gana el abogado con menos
     carga resuelta y, ante empate, el de menor ``id``. Dos corridas sobre los
     mismos datos producen el mismo plan.
+
+    Por defecto solo reparte causas **sin abogado**. ``redistribuir=True``
+    incluye las que ya trabaja alguien por su rol de litigante, que es barajar
+    de nuevo la cartera del estudio y tiene que pedirse a propósito.
     """
     plan = PlanAsignacion()
 
@@ -130,7 +140,8 @@ def asignar_automatico(
     # Carga actual con la MISMA resolución que usa el resto del sistema
     # (override > litigante > nada), para no inventar una segunda definición
     # de "cuántas causas tiene este abogado".
-    carga = Counter(lw.id for lw in resolved_owner_by_case(db).values())
+    dueno_actual = resolved_owner_by_case(db)
+    carga = Counter(lw.id for lw in dueno_actual.values())
 
     candidatas = (
         db.query(Case)
@@ -161,6 +172,10 @@ def asignar_automatico(
 
         if not incluir_provisorias and case.matriz_origen == ORIGEN_PROVISORIO:
             plan.omitidas["clasificación provisoria"] += 1
+            continue
+
+        if not redistribuir and case.id in dueno_actual:
+            plan.omitidas["ya la trabaja un abogado"] += 1
             continue
 
         candidatos = [lw for nivel in niveles for lw in por_nivel.get(nivel, [])]

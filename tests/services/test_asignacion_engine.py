@@ -13,6 +13,7 @@ import pytest
 from app.models.case import Case
 from app.models.court import Court
 from app.models.lawyer import Lawyer
+from app.models.case_litigante import CaseLitigante
 from app.services.asignacion_engine import (
     MOTIVO_AUTOMATICO,
     asignar_automatico,
@@ -220,3 +221,48 @@ class TestLimite:
 
         assert plan.asignadas == 2
         assert db.query(Case).filter(Case.assigned_lawyer_id.isnot(None)).count() == 2
+
+
+class TestNoLeSacaCausasAQuienLasTrabaja:
+    """El motor arma carteras; no baraja de nuevo el estudio.
+
+    Sobre la base real, de 6.586 causas repartibles solo 1.206 no tienen
+    abogado hoy: las otras 5.024 ya las trabaja alguien por su rol de
+    litigante. Repartirlas sin pedirlo le sacaba a un senior el 94% de su
+    cartera.
+    """
+
+    def _litigante(self, db, case, lawyer):
+        db.add(CaseLitigante(
+            case_id=case.id, participante="AB.DDO", rut=lawyer.rut,
+            persona_type="NATURAL", nombre=lawyer.name,
+            natural_key=f"{case.id}-{lawyer.rut}",
+        ))
+        db.commit()
+
+    def test_por_defecto_solo_reparte_las_huerfanas(self, db, court):
+        trabajador = _lawyer(db, "11111111-1", "Ya la trabaja", "junior")
+        _lawyer(db, "22222222-2", "Con menos carga", "junior")
+        suya = _causa(db, court, "C-1-2026", matriz="M1 Baja")
+        self._litigante(db, suya, trabajador)
+        huerfana = _causa(db, court, "C-2-2026", matriz="M1 Baja")
+
+        plan = asignar_automatico(db, actor_rut="admin", dry_run=False)
+
+        db.refresh(suya); db.refresh(huerfana)
+        assert suya.assigned_lawyer_id is None, "le sacó una causa a quien la trabaja"
+        assert huerfana.assigned_lawyer_id is not None
+        assert plan.asignadas == 1
+        assert plan.omitidas.get("ya la trabaja un abogado") == 1
+
+    def test_redistribuir_hay_que_pedirlo(self, db, court):
+        trabajador = _lawyer(db, "11111111-1", "Ya la trabaja", "junior")
+        _lawyer(db, "22222222-2", "Con menos carga", "junior")
+        suya = _causa(db, court, "C-1-2026", matriz="M1 Baja")
+        self._litigante(db, suya, trabajador)
+
+        plan = asignar_automatico(db, actor_rut="admin", dry_run=False, redistribuir=True)
+
+        db.refresh(suya)
+        assert suya.assigned_lawyer_id is not None
+        assert plan.asignadas == 1

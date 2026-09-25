@@ -137,6 +137,12 @@ class AsignacionAutomaticaRequest(BaseModel):
         description="Incluye causas cuya matriz es un valor por defecto porque "
         "nunca se les scrapeó un movimiento. Por defecto quedan afuera.",
     )
+    redistribuir: bool = Field(
+        False,
+        description="Incluye causas que ya trabaja un abogado por su rol de "
+        "litigante. Es barajar de nuevo la cartera del estudio: por defecto "
+        "solo se reparten las causas sin abogado.",
+    )
     limite: Optional[int] = Field(
         None, ge=1, description="Tope de causas a repartir en esta corrida."
     )
@@ -415,14 +421,17 @@ async def asignacion_automatica(
     sin escribir nada. Recién con ``dry_run: false`` se aplica.
 
     Lo que el motor no hace, y está en ``app.services.asignacion_engine``:
-    nunca toca ``Case.lawyer_id``, no pisa una asignación existente y no
-    reparte causas cuya matriz es un valor por defecto. Todo lo que asigna
-    queda marcado con el mismo motivo, así que el lote se puede revertir.
+    nunca toca ``Case.lawyer_id``, no pisa una asignación existente, no
+    reparte causas cuya matriz es un valor por defecto, y **no le saca una
+    causa a quien ya la trabaja** (para eso hay que pedir ``redistribuir``).
+    Todo lo que asigna queda marcado con el mismo motivo, así que el lote se
+    puede revertir.
     """
     plan = asignar_automatico(
         db,
         actor_rut=admin_rut,
         incluir_provisorias=body.incluir_provisorias,
+        redistribuir=body.redistribuir,
         limite=body.limite,
         dry_run=body.dry_run,
     )
