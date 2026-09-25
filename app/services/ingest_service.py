@@ -214,9 +214,9 @@ class IngestService:
                     Case.lawyer_id == owner_id, Case.rol.in_(all_rols)
                 )
             }
-            sighted_at = datetime.utcnow()
-            for case_id in case_ids_by_rol.values():
-                self._upsert_case_lawyer_source(case_id, syncing_lawyer_id, sighted_at)
+            self._bulk_upsert_case_lawyer_source(
+                case_ids_by_rol.values(), syncing_lawyer_id, datetime.utcnow()
+            )
             self.db.commit()
 
         # Record this ingest as a completed sync for the syncing lawyer —
@@ -285,6 +285,48 @@ class IngestService:
             )
         else:
             row.last_seen_at = seen_at
+
+    def _bulk_upsert_case_lawyer_source(
+        self, case_ids, lawyer_id: int, seen_at: datetime
+    ) -> None:
+        """Upsert the ``(case_id, lawyer_id)`` sightings for MANY cases at once.
+
+        Same semantics as ``_upsert_case_lawyer_source``: the first sighting
+        stamps both ``first_seen_at``/``last_seen_at``, later ones refresh only
+        ``last_seen_at``. Flush-only — caller commits.
+
+        Batched because the caller passes a lawyer's FULL "Mis Causas" listing
+        and the firm has an account with ~2.085 causas: resolving one row at a
+        time meant that many round trips over the Cloud SQL proxy, with the
+        extension waiting on the response.
+        """
+        ids = list(dict.fromkeys(int(cid) for cid in case_ids))
+        if not ids:
+            return
+
+        existing = {
+            row.case_id: row
+            for row in self.db.query(CaseLawyerSource).filter(
+                CaseLawyerSource.lawyer_id == lawyer_id,
+                CaseLawyerSource.case_id.in_(ids),
+            )
+        }
+        nuevos = []
+        for case_id in ids:
+            row = existing.get(case_id)
+            if row is None:
+                nuevos.append(
+                    CaseLawyerSource(
+                        case_id=case_id,
+                        lawyer_id=lawyer_id,
+                        first_seen_at=seen_at,
+                        last_seen_at=seen_at,
+                    )
+                )
+            else:
+                row.last_seen_at = seen_at
+        if nuevos:
+            self.db.add_all(nuevos)
 
     def get_pending_detail(
         self, *, lawyer_rut: str, competencia: str, limit: int
