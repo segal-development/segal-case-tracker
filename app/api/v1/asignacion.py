@@ -46,6 +46,11 @@ from sqlalchemy.orm import Session, joinedload
 from app.api.deps import get_db, require_admin, require_auditor
 from app.models.case import Case
 from app.models.lawyer import Lawyer
+from app.services.asignacion_engine import (
+    MOTIVO_AUTOMATICO,
+    NIVELES_REQUERIDOS,
+    asignar_automatico,
+)
 from app.services.lawyer_roster import resolved_owner_by_case
 
 logger = logging.getLogger(__name__)
@@ -54,13 +59,6 @@ router = APIRouter()
 
 MAX_REASIGNAR_BATCH = 500
 
-# Nivel(es) que puede operar cada matriz. Ver docstring del módulo.
-NIVELES_REQUERIDOS: Dict[str, List[str]] = {
-    "M1 Baja": ["junior"],
-    "M1 Alta": ["pleno", "senior"],
-    "M2": ["pleno", "senior"],
-    "M3": ["senior"],
-}
 
 
 # ============================================================================
@@ -126,6 +124,39 @@ class SugerenciaLawyer(BaseModel):
 
 class SugerenciasResponse(BaseModel):
     por_nivel: Dict[str, List[SugerenciaLawyer]]
+
+
+class AsignacionAutomaticaRequest(BaseModel):
+    dry_run: bool = Field(
+        True,
+        description="Solo devuelve el plan sin escribir nada. Por defecto true: "
+        "la operación toca miles de causas y conviene mirarla antes.",
+    )
+    incluir_provisorias: bool = Field(
+        False,
+        description="Incluye causas cuya matriz es un valor por defecto porque "
+        "nunca se les scrapeó un movimiento. Por defecto quedan afuera.",
+    )
+    limite: Optional[int] = Field(
+        None, ge=1, description="Tope de causas a repartir en esta corrida."
+    )
+
+
+class AsignacionPropuestaItem(BaseModel):
+    case_id: int
+    rol: str
+    matriz: Optional[str] = None
+    lawyer_id: int
+    lawyer_name: str
+    nivel: Optional[str] = None
+
+
+class AsignacionAutomaticaResponse(BaseModel):
+    aplicado: bool
+    asignadas: int
+    omitidas: Dict[str, int]
+    carga_final: Dict[int, int]
+    detalle: List[AsignacionPropuestaItem]
 
 
 # ============================================================================
@@ -368,3 +399,43 @@ async def get_sugerencias(
         )
 
     return SugerenciasResponse(por_nivel=por_nivel)
+
+
+@router.post("/automatica", response_model=AsignacionAutomaticaResponse)
+async def asignacion_automatica(
+    body: AsignacionAutomaticaRequest,
+    admin_rut: str = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Reparte la cartera sin asignar entre los abogados del nivel que exige
+    cada matriz, balanceando la carga (admin only).
+
+    **``dry_run`` viene en true por defecto**: la respuesta trae el plan
+    completo —qué causa iría a qué abogado y cómo queda la carga de cada uno—
+    sin escribir nada. Recién con ``dry_run: false`` se aplica.
+
+    Lo que el motor no hace, y está en ``app.services.asignacion_engine``:
+    nunca toca ``Case.lawyer_id``, no pisa una asignación existente y no
+    reparte causas cuya matriz es un valor por defecto. Todo lo que asigna
+    queda marcado con el mismo motivo, así que el lote se puede revertir.
+    """
+    plan = asignar_automatico(
+        db,
+        actor_rut=admin_rut,
+        incluir_provisorias=body.incluir_provisorias,
+        limite=body.limite,
+        dry_run=body.dry_run,
+    )
+    return AsignacionAutomaticaResponse(
+        aplicado=plan.aplicado,
+        asignadas=plan.asignadas,
+        omitidas=dict(plan.omitidas),
+        carga_final=plan.carga_final,
+        detalle=[
+            AsignacionPropuestaItem(
+                case_id=i.case_id, rol=i.rol, matriz=i.matriz,
+                lawyer_id=i.lawyer_id, lawyer_name=i.lawyer_name, nivel=i.nivel,
+            )
+            for i in plan.detalle
+        ],
+    )

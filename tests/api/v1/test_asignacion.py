@@ -617,3 +617,55 @@ def test_desajustes_uses_resolved_owner_not_stale_litigante(client, db, admin_he
     item = next(i for i in resp_after["items"] if i["rol"] == "C-83-2026")
     assert item["lawyer_actual"]["id"] == junior.id
     assert item["lawyer_actual"]["nivel"] == "junior"
+
+
+class TestAsignacionAutomatica:
+    """POST /asignacion/automatica — reparto por nivel, admin only."""
+
+    def test_auditor_no_puede(self, client, auditor_headers):
+        resp = client.post("/api/v1/asignacion/automatica", json={}, headers=auditor_headers)
+        assert resp.status_code == 403
+
+    def test_abogado_no_puede(self, client, lawyer_a_headers):
+        resp = client.post("/api/v1/asignacion/automatica", json={}, headers=lawyer_a_headers)
+        assert resp.status_code == 403
+
+    def test_por_defecto_no_escribe(self, client, db, admin_headers, junior, lawyer_a, court):
+        """El cuerpo vacío es un ensayo: la operación toca miles de causas."""
+        causa = _make_case(db, lawyer_a, court, "C-AUTO-1-2026", matriz="M1 Baja")
+
+        resp = client.post("/api/v1/asignacion/automatica", json={}, headers=admin_headers)
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["aplicado"] is False
+        assert body["asignadas"] == 1
+        assert body["detalle"][0]["lawyer_id"] == junior.id
+        db.refresh(causa)
+        assert causa.assigned_lawyer_id is None
+
+    def test_aplicar_reparte_por_nivel(self, client, db, admin_headers, junior, senior, lawyer_a, court):
+        baja = _make_case(db, lawyer_a, court, "C-AUTO-2-2026", matriz="M1 Baja")
+        m3 = _make_case(db, lawyer_a, court, "C-AUTO-3-2026", matriz="M3")
+
+        resp = client.post(
+            "/api/v1/asignacion/automatica", json={"dry_run": False}, headers=admin_headers
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["aplicado"] is True
+        db.refresh(baja); db.refresh(m3)
+        assert baja.assigned_lawyer_id == junior.id
+        assert m3.assigned_lawyer_id == senior.id
+
+    def test_informa_lo_que_deja_afuera(self, client, db, admin_headers, junior, lawyer_a, court):
+        _make_case(db, lawyer_a, court, "C-AUTO-4-2026", matriz="M1 Baja", matriz_origen="sin_detalle")
+        _make_case(db, lawyer_a, court, "C-AUTO-5-2026", matriz=None)
+
+        body = client.post(
+            "/api/v1/asignacion/automatica", json={}, headers=admin_headers
+        ).json()
+
+        assert body["asignadas"] == 0
+        assert body["omitidas"]["clasificación provisoria"] == 1
+        assert body["omitidas"]["matriz sin regla de nivel"] == 1
