@@ -5,9 +5,12 @@ Mirrors the fast bulk-insert approach from scripts/import_cases_html.py
 bulk_insert_mappings) instead of the slow per-case SyncService.sync_cases.
 """
 
+import re
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 
 import pytest
+from sqlalchemy import event
 from sqlalchemy.exc import IntegrityError
 
 from app.models.alert import Alert
@@ -21,6 +24,26 @@ from app.models.sync_history import SyncHistory
 from app.services.ingest_service import IngestParseError, IngestService
 
 FIRM_RUT = "16021492-9"
+
+
+@contextmanager
+def count_selects(table: str):
+    """Count SELECTs issued against *table* while the block runs."""
+    from tests.conftest import engine
+
+    pattern = re.compile(r"\bFROM\s+" + re.escape(table) + r"\b", re.IGNORECASE)
+    counter = {"count": 0}
+
+    def _listener(conn, cursor, statement, parameters, context, executemany):
+        stripped = statement.strip()
+        if stripped[:6].upper() == "SELECT" and pattern.search(stripped):
+            counter["count"] += 1
+
+    event.listen(engine, "before_cursor_execute", _listener)
+    try:
+        yield counter
+    finally:
+        event.remove(engine, "before_cursor_execute", _listener)
 
 
 @pytest.fixture(autouse=True)
@@ -227,6 +250,44 @@ class TestIngestCasesFirmOwnership:
             )
 
         assert db.query(Case).count() == 0
+
+    def test_sighting_rows_resolve_in_one_query(self, db):
+        """One SELECT for the whole payload, not one per ROL.
+
+        The payload is a lawyer's FULL "Mis Causas" listing — the firm has an
+        account with ~2.085 causas — and the extension waits for the response,
+        so a query per ROL is that many round trips over the Cloud SQL proxy.
+        """
+        page = _mis_causas_page([
+            _case_row(f"TK{i}", f"C-90{i:02d}-2026", "1 Juzgado Civil de Santiago", "A / B")
+            for i in range(14)
+        ])
+        service = IngestService(db)
+
+        with count_selects("case_lawyer_source") as counter:
+            service.ingest_cases(lawyer_rut="11111111-1", competencia="civil", pages=[page])
+
+        assert db.query(CaseLawyerSource).count() == 14
+        assert counter["count"] <= 1, (
+            f"one SELECT per ROL on case_lawyer_source: {counter['count']} for 14 causas"
+        )
+
+    def test_second_ingest_also_resolves_in_one_query(self, db):
+        """The update path batches too — a re-sync is the common case."""
+        page = _mis_causas_page([
+            _case_row(f"TK{i}", f"C-91{i:02d}-2026", "1 Juzgado Civil de Santiago", "A / B")
+            for i in range(14)
+        ])
+        service = IngestService(db)
+        service.ingest_cases(lawyer_rut="11111111-1", competencia="civil", pages=[page])
+
+        with count_selects("case_lawyer_source") as counter:
+            service.ingest_cases(lawyer_rut="11111111-1", competencia="civil", pages=[page])
+
+        assert db.query(CaseLawyerSource).count() == 14
+        assert counter["count"] <= 1, (
+            f"one SELECT per ROL on re-sync: {counter['count']} for 14 causas"
+        )
 
     def test_ingest_writes_case_lawyer_source_for_syncing_lawyer(self, db):
         service = IngestService(db)
