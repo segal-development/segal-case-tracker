@@ -54,13 +54,13 @@ def _make_case(db, lawyer, court, rol, **flags):
     return obj
 
 
-def _add_litigante(db, case_id, participante, rut):
+def _add_litigante(db, case_id, participante, rut, persona_type="NATURAL"):
     db.add(
         CaseLitigante(
             case_id=case_id,
             participante=participante,
             rut=rut,
-            persona_type="NATURAL",
+            persona_type=persona_type,
             nombre="Test",
             natural_key=f"{case_id}-{participante}-{rut}",
         )
@@ -126,6 +126,50 @@ def dataset(db, admin, court):
 
 def _by_id(resp):
     return {item["id"]: item for item in resp.json()["items"]}
+
+
+@pytest.fixture
+def creditor_dataset(db, admin, court):
+    """Causas whose demandado is a company — i.e. the creditor, not the client.
+
+    Measured on the portfolio: 93.9% of JURIDICA demandados are unknown to
+    Sysgal versus 9.1% of natural persons, and a handful of them sit as
+    demandado on hundreds of causas each (a credit issuer appears as demandado
+    on 338 and as demandante on 437). The party recorded there is the
+    counterparty, so its commercial state must never be read as the client's.
+    """
+    mixta = _make_case(db, admin, court, "C-7-2025", abandono_disponible=True)
+    solo_empresa = _make_case(db, admin, court, "C-8-2025", abandono_disponible=True)
+
+    # The creditor resolves in Sysgal and looks healthy; the real client lapsed.
+    _add_litigante(db, mixta.id, "DDO.", "77777777-7", persona_type="JURIDICA")
+    _add_litigante(db, mixta.id, "DDO.", "88888888-8")
+    _add_litigante(db, solo_empresa.id, "DDO.", "77777777-7", persona_type="JURIDICA")
+
+    _cache(db, "77777777-7", "ACTIVO", hasta=date(2099, 12, 31))
+    _cache(db, "88888888-8", "ACTIVO", hasta=date(2020, 1, 1))  # vencido -> caducado
+
+    return {"mixta": mixta, "solo_empresa": solo_empresa}
+
+
+class TestCreditorIsNotTheClient:
+    def test_company_party_never_supplies_the_cobertura(self, authed_client, creditor_dataset):
+        """The healthy creditor must not mask the lapsed client.
+
+        Today the rule keeps the BEST cobertura among the demandados, so the
+        creditor's ACTIVO wins over the client's caducado.
+        """
+        items = _by_id(authed_client.get("/api/v1/cases?per_page=100"))
+        assert items[creditor_dataset["mixta"].id]["sysgal_cobertura"] == "caducado"
+
+    def test_only_company_parties_report_nothing(self, authed_client, creditor_dataset):
+        """No natural party means no client to report on — say nothing, not the
+        counterparty's commercial state."""
+        item = _by_id(authed_client.get("/api/v1/cases?per_page=100"))[
+            creditor_dataset["solo_empresa"].id
+        ]
+        assert item["sysgal_cobertura"] is None
+        assert item["sysgal_estado_codigo"] is None
 
 
 class TestListEnrichment:

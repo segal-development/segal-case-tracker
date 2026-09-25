@@ -306,15 +306,30 @@ def _sysgal_info_by_case(db: Session, case_ids, today: Optional[date] = None) ->
     (may carry dots) while the cache is keyed by the canonical form.
 
     Returns ``{case_id: {"cobertura", "estado_codigo", "vigencia_hasta",
-    "synced_at"}}`` only for cases that have at least one DDO RUT. A DDO RUT
-    with no cache row derives to ``sin_dato`` (other fields None). Callers
-    must restrict ``case_ids`` to cases in the 3 states.
+    "synced_at"}}`` only for cases that have at least one usable DDO RUT. Such
+    a RUT with no cache row derives to ``sin_dato`` (other fields None).
+    Callers must restrict ``case_ids`` to cases in the 3 states.
+
+    **Company parties are skipped: the demandado recorded there is often the
+    creditor, not the client.** Measured on the portfolio, 93.9% of JURIDICA
+    demandados are unknown to Sysgal versus 9.1% of natural persons, and a
+    handful sit as demandado on hundreds of causas each — one credit issuer
+    appears as demandado on 338 and as demandante on 437. Since the rule below
+    keeps the BEST cobertura among the parties, a creditor that resolves as
+    ACTIVO would mask a client whose contract lapsed. A causa left with no
+    natural party reports nothing, which is the honest answer: we do not know
+    who the client is. ``rut_cliente`` from Sysgal's upcoming causas endpoint
+    replaces this inference altogether.
+
+    The filter excludes what is known to be a company rather than allowing a
+    closed list, so an unforeseen ``persona_type`` still gets looked at.
     """
     lit_rows = (
         db.query(CaseLitigante.case_id, CaseLitigante.rut)
         .filter(
             CaseLitigante.case_id.in_(case_ids),
             CaseLitigante.participante.ilike("DDO%"),
+            CaseLitigante.persona_type != "JURIDICA",
             CaseLitigante.rut != "",
         )
         .all()
