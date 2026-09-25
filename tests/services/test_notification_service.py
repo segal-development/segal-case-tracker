@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, patch, call
 import pytest
 
 from app.services.notification_service import NotificationService
+from tests.support.logs import warning_messages
 
 
 # ---------------------------------------------------------------------------
@@ -112,16 +113,18 @@ class TestSendEmailAlert:
         alert = _make_alert()
         lawyer = _make_lawyer()
 
-        with patch("app.services.notification_service.settings") as mock_settings:
+        with (
+            patch("app.services.notification_service.settings") as mock_settings,
+            patch("app.services.notification_service.logger") as mock_logger,
+        ):
             mock_settings.SMTP_HOST = ""
             mock_settings.FROM_EMAIL = "from@segal.cl"
 
-            with caplog.at_level(logging.WARNING, logger="app.services.notification_service"):
-                result = service.send_email_alert(alert, lawyer)
+            result = service.send_email_alert(alert, lawyer)
 
         assert result is False
         assert alert.email_sent is False
-        assert any("smtp" in r.message.lower() for r in caplog.records), \
+        assert any("smtp" in m.lower() for m in warning_messages(mock_logger)), \
             "Expected a warning log about missing SMTP config"
 
     def test_happy_path_sends_via_smtp_and_sets_alert_fields(self, service):
@@ -232,19 +235,21 @@ class TestSendWebhook:
         mock_response = MagicMock()
         mock_response.status_code = 200
 
-        with patch("app.services.notification_service.httpx") as mock_httpx:
+        with (
+            patch("app.services.notification_service.httpx") as mock_httpx,
+            patch("app.services.notification_service.logger") as mock_logger,
+        ):
             mock_client = MagicMock()
             mock_httpx.Client.return_value.__enter__.return_value = mock_client
             mock_httpx.Client.return_value.__exit__.return_value = False
             mock_client.post.return_value = mock_response
 
-            with caplog.at_level(logging.WARNING, logger="app.services.notification_service"):
-                result = service.send_webhook(webhook, payload)
+            result = service.send_webhook(webhook, payload)
 
         assert result is True
         call_kwargs = mock_client.post.call_args.kwargs
         assert "X-Webhook-Signature" not in call_kwargs["headers"]
-        assert len(caplog.records) > 0, "Expected a warning about missing secret"
+        assert warning_messages(mock_logger), "Expected a warning about missing secret"
 
 
 # ---------------------------------------------------------------------------

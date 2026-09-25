@@ -15,11 +15,15 @@ from app.core.database import SessionLocal
 from app.services.deadline_engine import _today_chile
 from app.services.hito_detector import HitoDetectorService
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 def main() -> None:
+    # Configurar logging es tarea del punto de entrada, no del modulo: hacerlo
+    # al importar le instala handlers al root a cualquiera que importe esto,
+    # incluido el arnes de tests, y rompe la captura de logs de otros tests.
+    logging.basicConfig(level=logging.INFO)
+
     parser = argparse.ArgumentParser(description="Detector de hitos desde PJUD.")
     parser.add_argument(
         "--dry-run", action="store_true",
