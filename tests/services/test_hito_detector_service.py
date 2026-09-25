@@ -5,8 +5,11 @@ Siembra un escenario completo (causa + abogado de récord + movimiento resoluci�
 sugerido correcto, con idempotencia, ventana temporal, cierre y atribución.
 """
 import datetime as dt
+import re
+from contextlib import contextmanager
 
 import pytest
+from sqlalchemy import event
 
 from app.models.bono_cierre import BonoCierre, CIERRE_CERRADO
 from app.models.case import Case
@@ -176,3 +179,84 @@ def test_dry_run_desglosa_por_confianza(db, esc, monkeypatch):
 def _run_dry(db, monkeypatch, texto=FAVORABLE, periodo=PERIODO):
     monkeypatch.setattr(hito_detector, "extraer_texto_pdf", lambda b: texto)
     return HitoDetectorService(db, storage=FakeStorage()).detectar(periodo, dry_run=True)
+
+
+# ---------------------------------------------------------------------------
+# Costo del mapa case → abogado
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _count_selects(table: str):
+    """Count SELECTs issued against *table* while the block runs."""
+    from tests.conftest import engine
+
+    pattern = re.compile(r"\bFROM\s+" + re.escape(table) + r"\b", re.IGNORECASE)
+    counter = {"count": 0}
+
+    def _listener(conn, cursor, statement, parameters, context, executemany):
+        stripped = statement.strip()
+        if stripped[:6].upper() == "SELECT" and pattern.search(stripped):
+            counter["count"] += 1
+
+    event.listen(engine, "before_cursor_execute", _listener)
+    try:
+        yield counter
+    finally:
+        event.remove(engine, "before_cursor_execute", _listener)
+
+
+def _abogado_con_causa(db, court, i):
+    """Un abogado de la firma con una causa propia donde es abogado de récord."""
+    lw = Lawyer(rut=f"1000000{i}-{i}", name=f"Abogado {i}", role="lawyer",
+                is_firm_lawyer=True, is_active=True)
+    db.add(lw); db.commit(); db.refresh(lw)
+    case = Case(lawyer_id=lw.id, court_id=court.id, rol=f"C-70{i}-2026", status="active",
+                competencia="civil", created_at=FECHA, updated_at=FECHA)
+    db.add(case); db.commit(); db.refresh(case)
+    db.add(CaseLitigante(case_id=case.id, participante="AB.DDO", rut=lw.rut,
+                         persona_type="NATURAL", nombre=lw.name,
+                         natural_key=f"{case.id}-{lw.rut}"))
+    db.commit()
+    return lw, case
+
+
+class TestMapaCaseLawyerCost:
+    """El detector corre en el cron diario. Nadie espera, pero compite por el
+    mismo proxy que el scraping, y re-escanear la cartera entera una vez por
+    abogado multiplica ese costo por la cantidad de abogados."""
+
+    def test_un_solo_escaneo_para_todos_los_abogados(self, db):
+        court = Court(code="TCOST", name="Juzgado Costo", region="RM", type="civil")
+        db.add(court); db.commit(); db.refresh(court)
+        esperados = {}
+        for i in range(8):
+            lw, case = _abogado_con_causa(db, court, i)
+            esperados[case.id] = lw.id
+
+        svc = HitoDetectorService(db, storage=FakeStorage())
+        with _count_selects("case_litigantes") as counter:
+            mapa = svc._mapa_case_lawyer()
+
+        assert mapa == esperados
+        assert counter["count"] <= 1, (
+            f"la cartera se re-escanea una vez por abogado: {counter['count']} para 8 abogados"
+        )
+
+    def test_gana_el_primer_abogado_de_la_causa(self, db):
+        """Dos abogados de récord en la misma causa cuentan una sola vez."""
+        court = Court(code="TDOS", name="Juzgado Dos", region="RM", type="civil")
+        db.add(court); db.commit(); db.refresh(court)
+        lw_a, case = _abogado_con_causa(db, court, 1)
+        lw_b = Lawyer(rut="20000002-2", name="Segundo", role="lawyer",
+                      is_firm_lawyer=True, is_active=True)
+        db.add(lw_b); db.commit(); db.refresh(lw_b)
+        db.add(CaseLitigante(case_id=case.id, participante="AB.DTE", rut=lw_b.rut,
+                             persona_type="NATURAL", nombre=lw_b.name,
+                             natural_key=f"{case.id}-{lw_b.rut}"))
+        db.commit()
+
+        mapa = HitoDetectorService(db, storage=FakeStorage())._mapa_case_lawyer()
+
+        assert list(mapa) == [case.id]
+        assert mapa[case.id] in (lw_a.id, lw_b.id)
