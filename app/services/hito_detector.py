@@ -221,8 +221,28 @@ class HitoDetectorService:
         return self._storage
 
     def _mapa_case_lawyer(self) -> dict:
-        """case_id → lawyer_id del abogado de récord (litigante), primer abogado gana."""
-        from app.services.lawyer_roster import case_ids_for_abogado
+        """case_id → lawyer_id del abogado de récord (litigante), primer abogado gana.
+
+        La cartera se recorre UNA vez, no una vez por abogado.
+        ``case_ids_for_abogado`` reconstruye el mapa completo de litigantes en
+        cada llamada, así que preguntarle abogado por abogado multiplicaba ese
+        escaneo por la cantidad de abogados de la firma. Es el mismo hoisting
+        que ya hace ``/matriz/por-abogado``.
+
+        La precedencia no cambia: ``_abogado_litigantes_by_case`` ya superpone
+        la asignación-por-nivel sobre los litigantes reales, y el orden del
+        bucle de abogados se conserva porque decide quién gana un empate.
+        """
+        from collections import defaultdict
+
+        from app.services.lawyer_roster import ALL_ABOGADO, _abogado_litigantes_by_case
+        from app.utils.rut import normalize_rut
+
+        ids_por_rut: dict[str, set] = defaultdict(set)
+        for case_id, litigantes in _abogado_litigantes_by_case(self.db).items():
+            for lit in litigantes:
+                if lit.participante in ALL_ABOGADO and lit.rut:
+                    ids_por_rut[normalize_rut(lit.rut)].add(case_id)
 
         mapa: dict = {}
         lawyers = (
@@ -231,7 +251,7 @@ class HitoDetectorService:
             .all()
         )
         for lw in lawyers:
-            for cid in case_ids_for_abogado(self.db, lw.rut, lw.rut):
+            for cid in ids_por_rut.get(normalize_rut(lw.rut), ()):
                 mapa.setdefault(cid, lw.id)
         return mapa
 
