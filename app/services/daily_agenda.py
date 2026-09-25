@@ -25,8 +25,11 @@ from datetime import date, datetime, timedelta
 from email.message import EmailMessage
 from typing import Optional
 
+from sqlalchemy.orm import joinedload
+
 from app.config import settings
-from app.api.v1.calendar import _caratulado, _resolve_deadline_label
+
+from app.api.v1.calendar import _caratulado, _deadline_labels_by_case
 from app.core.decision_rules import resolve_rule
 from app.models.alert import Alert
 from app.models.case import Case
@@ -119,9 +122,11 @@ def lawyer_day_agenda(db, lawyer: Lawyer, day: date) -> DayAgenda:
 
     cases = (
         db.query(Case)
+        .options(joinedload(Case.court))
         .filter(Case.id.in_(list(ids)), Case.status != "archived")
         .all()
     )
+    deadline_labels = _deadline_labels_by_case(db, cases)
 
     deadlines: list[AgendaItem] = []
     reviews: list[AgendaItem] = []
@@ -135,7 +140,7 @@ def lawyer_day_agenda(db, lawyer: Lawyer, day: date) -> DayAgenda:
                     rol=case.rol,
                     caratulado=caratulado,
                     court_name=court_name,
-                    label=_resolve_deadline_label(db, case),
+                    label=deadline_labels.get(case.id),
                     fatal=bool(case.next_deadline_fatal),
                     case_id=case.id,
                 )

@@ -6,8 +6,12 @@ scoped cases, sorted by date ascending. Reuses data already denormalized on
 ``next_deadline_fatal``, ``next_review_at``, ``recommended_action_code``.
 """
 
+import re
+from contextlib import contextmanager
+
 import pytest
 from datetime import date, datetime, timedelta
+from sqlalchemy import event
 
 from app.api.deps import get_current_lawyer
 from app.main import app
@@ -18,6 +22,52 @@ from app.models.court import Court
 from app.models.lawyer import Lawyer
 
 TODAY = date(2026, 7, 9)
+
+
+@contextmanager
+def capture_selects(table: str):
+    """Capture the SELECT statements issued against *table* while the block
+    runs. The conftest engine is shared by ``db`` and ``client``, so a listener
+    on it sees what the endpoint itself emits."""
+    from tests.conftest import engine
+
+    pattern = re.compile(r"\bFROM\s+" + re.escape(table) + r"\b", re.IGNORECASE)
+    captured: list[str] = []
+
+    def _listener(conn, cursor, statement, parameters, context, executemany):
+        stripped = statement.strip()
+        if stripped[:6].upper() == "SELECT" and pattern.search(stripped):
+            captured.append(stripped)
+
+    event.listen(engine, "before_cursor_execute", _listener)
+    try:
+        yield captured
+    finally:
+        event.remove(engine, "before_cursor_execute", _listener)
+
+
+@contextmanager
+def count_selects(table: str):
+    """Count SELECTs issued against *table* while the block runs.
+
+    The conftest engine is shared by the ``db`` and ``client`` fixtures, so a
+    listener on it sees the statements the endpoint itself emits.
+    """
+    from tests.conftest import engine
+
+    pattern = re.compile(r"\bFROM\s+" + re.escape(table) + r"\b", re.IGNORECASE)
+    counter = {"count": 0}
+
+    def _listener(conn, cursor, statement, parameters, context, executemany):
+        stripped = statement.strip()
+        if stripped[:6].upper() == "SELECT" and pattern.search(stripped):
+            counter["count"] += 1
+
+    event.listen(engine, "before_cursor_execute", _listener)
+    try:
+        yield counter
+    finally:
+        event.remove(engine, "before_cursor_execute", _listener)
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +156,81 @@ def authed_client(client, lawyer):
     app.dependency_overrides[get_current_lawyer] = _mock
     yield client
     app.dependency_overrides.pop(get_current_lawyer, None)
+
+
+class TestQueryCost:
+    """The sidebar calls this endpoint on every page load, so its cost is paid
+    constantly and by every admin. Two shapes are pinned here:
+
+    * the deadline label must NOT be resolved one query per case;
+    * cases that can never produce an item — no ``next_deadline_at`` and no
+      ``next_review_at`` — must not be loaded at all. On the real portfolio
+      that is 11.959 of 14.645 rows hydrated to be discarded in Python.
+    """
+
+    def test_deadline_labels_resolve_in_one_query(self, authed_client, db, lawyer, court):
+        for i in range(12):
+            case = _make_case(
+                db, lawyer, court, f"C-Q{i}-2025",
+                next_deadline_at=TODAY + timedelta(days=3),
+            )
+            db.add(CaseDeadline(
+                case_id=case.id,
+                deadline_type="excepciones",
+                due_date=TODAY + timedelta(days=3),
+                triggered_at=TODAY,
+                status="active",
+            ))
+        db.commit()
+
+        with count_selects("case_deadlines") as counter:
+            resp = authed_client.get("/api/v1/calendar?days=30")
+
+        assert resp.status_code == 200
+        assert len(resp.json()["items"]) == 12
+        assert counter["count"] <= 1, (
+            f"one SELECT per case on case_deadlines: {counter['count']} for 12 cases"
+        )
+
+    def test_cases_without_dates_are_filtered_in_sql(self, authed_client, db, lawyer, court):
+        """A causa with neither date can never produce an item, so it must be
+        excluded by the query and not hydrated to be discarded in Python."""
+        _make_case(db, lawyer, court, "C-CON-2025", next_review_at=TODAY + timedelta(days=5))
+        for i in range(20):
+            _make_case(db, lawyer, court, f"C-SIN-{i}-2025")
+
+        with capture_selects("cases") as statements:
+            resp = authed_client.get("/api/v1/calendar?days=30")
+
+        assert resp.status_code == 200
+        assert len(resp.json()["items"]) == 1
+        assert statements, "the endpoint issued no SELECT against cases"
+        main = max(statements, key=len)
+        assert "next_deadline_at IS NOT NULL" in main and "next_review_at IS NOT NULL" in main, (
+            "the cases query does not filter out rows without any date:\n" + main
+        )
+
+    def test_court_name_is_not_lazy_loaded_per_case(self, authed_client, db, lawyer, court):
+        # One court PER case: sharing a court would let SQLAlchemy's identity
+        # map serve the lazy load from memory and hide the N+1 entirely.
+        for i in range(10):
+            own_court = Court(code=f"T-CT{i}", name=f"Juzgado {i}", region="RM", type="civil")
+            db.add(own_court)
+            db.commit()
+            db.refresh(own_court)
+            _make_case(
+                db, lawyer, own_court, f"C-CT{i}-2025",
+                next_review_at=TODAY + timedelta(days=4),
+            )
+
+        with count_selects("courts") as counter:
+            resp = authed_client.get("/api/v1/calendar?days=30")
+
+        assert resp.status_code == 200
+        assert len(resp.json()["items"]) == 10
+        assert counter["count"] <= 1, (
+            f"court loaded separately {counter['count']} times — expected a join"
+        )
 
 
 # ---------------------------------------------------------------------------
