@@ -626,6 +626,22 @@ async def sync_all_lawyers():
         except Exception:
             logger.exception("Sysgal cobertura sync failed (non-fatal)")
 
+        # Salud del scraping: mirar sync_history y avisar si viene fallando.
+        # Va al FINAL del ciclo, cuando las corridas de esta vuelta ya quedaron
+        # registradas, para que la evaluacion incluya lo que acaba de pasar.
+        # LIMITE CONOCIDO: esto detecta que el scraping falla, no que el proceso
+        # murio — un proceso muerto no se avisa a si mismo. Para eso esta
+        # GET /health/scraping, que expone el mismo estado a un chequeo externo.
+        # SAFE-FAIL: una alerta que rompe el worker es peor que no tener alerta.
+        try:
+            from app.services.scraping_health import revisar_y_avisar
+
+            salud = revisar_y_avisar(setup_db)
+            if salud.requiere_aviso:
+                logger.warning("Salud del scraping: %s — %s", salud.estado, salud.motivo)
+        except Exception:
+            logger.exception("Scraping health check failed (non-fatal)")
+
         # Cartera del mes: take the current period's snapshot the first cycle
         # that notices none exists yet (idempotent — cheap single-row check
         # inside _maybe_take_cartera_snapshot). SAFE-FAIL: must never abort

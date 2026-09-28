@@ -84,6 +84,29 @@ async def health_check():
     }
 
 
+@app.get("/health/scraping")
+async def scraping_health(db=Depends(get_db)):
+    """Estado del scraping, para un chequeo externo.
+
+    Existe porque el worker no puede avisar de su propia muerte: la alerta que
+    corre dentro del ciclo detecta que el scraping FALLA, no que el proceso se
+    cayo. Algo externo consulta esto y cubre ese caso.
+
+    Devuelve solo el estado, sin detalle operativo, porque no lleva
+    autenticacion: un monitor tiene que poder consultarlo sin credenciales. El
+    detalle vive en los logs y en la tabla sync_history.
+
+    Responde 503 cuando el scraping no esta sano, para que un monitor comun lo
+    trate como caida sin tener que interpretar el cuerpo.
+    """
+    from app.services.scraping_health import ESTADO_OK, evaluar_salud_scraping
+
+    salud = evaluar_salud_scraping(db)
+    if salud.estado != ESTADO_OK:
+        raise HTTPException(status_code=503, detail=salud.estado)
+    return {"scraping": salud.estado}
+
+
 @app.get("/readyz")
 async def readiness_check(db=Depends(get_db)):
     """Readiness probe: verifies the app can reach the database. Returns 503 if

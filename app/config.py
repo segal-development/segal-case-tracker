@@ -81,6 +81,19 @@ class Settings(BaseSettings):
     SMTP_FROM: str = ""
     SUPERVISOR_EMAIL: str = ""
 
+    # Alerta operativa de scraping. Casilla propia y NO SUPERVISOR_EMAIL: el
+    # aviso de credencial vencida le sirve a quien coordina abogados, mientras
+    # que "el scraping lleva horas sin completar" le sirve a quien opera el
+    # sistema. Mezclarlos entrena a ignorar los dos.
+    SCRAPING_ALERT_EMAIL: str = ""
+    #: Horas sin una corrida exitosa para considerar el scraping caído.
+    SCRAPING_STALE_HOURS: int = 6
+    #: Corridas fallidas seguidas para considerarlo en falla. El incidente del
+    #: 26-09-2026 acumuló 29 antes de que alguien lo viera.
+    SCRAPING_MAX_FALLAS: int = 5
+    #: Espera mínima entre dos avisos del mismo tipo.
+    SCRAPING_ALERT_COOLDOWN_HOURS: int = 6
+
     # Sysgal CRM (read-only client-coverage lookup by demandado RUT).
     # Both empty = integration disabled (sync is a no-op).
     SYSGAL_BASE_URL: str = ""
