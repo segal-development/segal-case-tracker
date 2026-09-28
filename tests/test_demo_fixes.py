@@ -27,6 +27,7 @@ from app.models.case import Case
 from app.models.court import Court
 from app.models.lawyer import Lawyer
 from app.models.webhook import Webhook
+from tests.support.logs import warnings_text
 from app.scrapper.pjud.base import PJUDCase
 from app.services.notification_service import NotificationService
 from app.services.sync_service import (
@@ -131,25 +132,22 @@ class TestNotificationCap:
     - A WARNING is logged that mentions the 3 skipped notifications.
     """
 
-    def test_cap_dispatches_only_up_to_limit(
-        self, sqlite_db, lawyer_case_webhook, caplog
-    ):
+    def test_cap_dispatches_only_up_to_limit(self, sqlite_db, lawyer_case_webhook):
         db = sqlite_db
         case = lawyer_case_webhook["case"]
 
         movements = [_movement(folio=str(i), desc=f"desc-{i}") for i in range(5)]
 
-        with patch("app.services.sync_service.settings") as mock_cfg:
+        with (
+            patch("app.services.sync_service.settings") as mock_cfg,
+            patch("app.services.sync_service.NotificationService") as MockNotif,
+            patch("app.services.sync_service.logger") as mock_logger,
+        ):
             mock_cfg.NOTIFY_MAX_PER_SYNC = 2
+            mock_instance = MockNotif.return_value
 
-            with patch("app.services.sync_service.NotificationService") as MockNotif:
-                mock_instance = MockNotif.return_value
-
-                with caplog.at_level(
-                    logging.WARNING, logger="app.services.sync_service"
-                ):
-                    sync = SyncService(db)
-                    new_count, alert_count = sync.sync_movements(case.id, movements)
+            sync = SyncService(db)
+            new_count, alert_count = sync.sync_movements(case.id, movements)
 
         # Every movement is new.
         assert new_count == 5
@@ -161,9 +159,7 @@ class TestNotificationCap:
             f"{mock_instance.notify_new_movement.call_count}"
         )
         # A warning must be logged mentioning the 3 skipped notifications.
-        warning_texts = " ".join(
-            r.message for r in caplog.records if r.levelno >= logging.WARNING
-        )
+        warning_texts = warnings_text(mock_logger)
         assert warning_texts, "Expected a warning about the notification cap"
         assert "3" in warning_texts or "skip" in warning_texts.lower(), (
             f"Warning should mention '3' skipped; got: {warning_texts!r}"

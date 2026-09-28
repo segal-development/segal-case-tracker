@@ -103,6 +103,13 @@ class TestSendSupervisorCredentialAlert:
             patch.object(svc.settings, "SUPERVISOR_EMAIL", "supervisor@segal.cl"),
             patch.object(svc.settings, "SMTP_USER", "user@example.com"),
             patch.object(svc.settings, "SMTP_PASSWORD", "secret"),
+            # Fijar TLS explicitamente: el test afirma que se llamo a starttls,
+            # que solo ocurre con SMTP_USE_TLS activo. Sin este patch el
+            # resultado depende del .env de la maquina — en CI no hay archivo y
+            # gana el default True, mientras que una estacion con
+            # SMTP_USE_TLS=false lo hacia fallar. Un test no puede depender de
+            # donde corre.
+            patch.object(svc.settings, "SMTP_USE_TLS", True),
             patch("smtplib.SMTP", return_value=mock_smtp_cm) as mock_smtp_class,
         ):
             result = await svc.send_supervisor_credential_alert(lawyer, "invalid credentials")

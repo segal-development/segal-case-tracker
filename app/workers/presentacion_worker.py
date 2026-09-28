@@ -41,10 +41,6 @@ from app.models.presentacion import (
 )
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
 logger = logging.getLogger("presentacion_worker")
 
 # Per-request timeout for document downloads (seconds).
@@ -317,4 +313,11 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    # Configurar logging es tarea del punto de entrada, no del modulo: hacerlo
+    # al importar le instala handlers al root a cualquiera que importe esto,
+    # incluido el arnes de tests, y rompe la captura de logs de otros tests.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
     asyncio.run(main())
