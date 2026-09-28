@@ -99,8 +99,20 @@ class Settings(BaseSettings):
     #: Espera mínima entre dos avisos del mismo tipo.
     SCRAPING_ALERT_COOLDOWN_HOURS: int = 6
 
-    # Sysgal CRM (read-only client-coverage lookup by demandado RUT).
+    # Sysgal CRM (read-only client-coverage lookup by party RUT).
     # Both empty = integration disabled (sync is a no-op).
+    #
+    # ATENCION — SYSGAL NO TIENE AMBIENTE DE PRUEBAS.
+    # Sysgal Defensoria corre en una sola instalacion: la URL que usamos es
+    # PRODUCCION y la credencial abre la base real del estudio. Confirmado por
+    # su equipo el 28-09-2026. Importa decirlo aca porque estas variables viven
+    # en un archivo llamado `.env.qa`, y sin esta advertencia cualquiera asume
+    # que apuntan a un sandbox donde se puede experimentar.
+    #
+    # Lo que consultamos es de solo lectura, asi que no podemos modificar nada
+    # de ellos — pero son datos de clientes reales y cada llamada queda en sus
+    # registros de produccion. Para probar conectividad esta
+    # GET /api_sync/health, que no pide autenticacion ni toca la base.
     SYSGAL_BASE_URL: str = ""
     SYSGAL_API_KEY: str = ""
     # How long a cached per-RUT answer stays usable. The sync covers every
