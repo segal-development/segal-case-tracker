@@ -224,7 +224,9 @@ def _cuerpo(salud: SaludScraping) -> tuple[str, str]:
     return f"[Case Tracker] {titulo}", texto
 
 
-def enviar_alerta_scraping(db: Session, salud: SaludScraping) -> bool:
+def enviar_alerta_scraping(
+    db: Session, salud: SaludScraping, *, ahora: Optional[datetime] = None
+) -> bool:
     """Avisa por correo si corresponde. Devuelve True solo si se envió.
 
     Nunca levanta: una alerta que rompe el worker es peor que no tener alerta.
@@ -240,7 +242,7 @@ def enviar_alerta_scraping(db: Session, salud: SaludScraping) -> bool:
         )
         return False
 
-    if alerta_en_cooldown(db, TIPO_SCRAPING):
+    if alerta_en_cooldown(db, TIPO_SCRAPING, ahora=ahora):
         return False
 
     asunto, texto = _cuerpo(salud)
@@ -262,14 +264,20 @@ def enviar_alerta_scraping(db: Session, salud: SaludScraping) -> bool:
         logger.exception("No se pudo enviar la alerta de scraping")
         return False
 
-    registrar_alerta_enviada(db, TIPO_SCRAPING, salud.motivo, estado=salud.estado)
+    registrar_alerta_enviada(
+        db, TIPO_SCRAPING, salud.motivo, estado=salud.estado, ahora=ahora
+    )
     logger.warning("Alerta de scraping enviada (%s): %s", salud.estado, salud.motivo)
     return True
 
 
-def revisar_y_avisar(db: Session) -> SaludScraping:
-    """Evalúa la salud y avisa si hace falta. Punto de entrada del worker."""
-    salud = evaluar_salud_scraping(db)
+def revisar_y_avisar(db: Session, *, ahora: Optional[datetime] = None) -> SaludScraping:
+    """Evalúa la salud y avisa si hace falta. Punto de entrada del worker.
+
+    ``ahora`` se puede inyectar: una función que lee el reloj por dentro no se
+    puede verificar sin depender de la hora a la que corran los tests.
+    """
+    salud = evaluar_salud_scraping(db, ahora=ahora)
     if salud.requiere_aviso:
-        enviar_alerta_scraping(db, salud)
+        enviar_alerta_scraping(db, salud, ahora=ahora)
     return salud
