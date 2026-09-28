@@ -1,5 +1,6 @@
 """SQLAlchemy models."""
 
+from app.models.alerta_operativa import AlertaOperativa
 from app.models.lawyer import Lawyer
 from app.models.court import Court
 from app.models.client import Client
