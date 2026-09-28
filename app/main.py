@@ -81,6 +81,10 @@ async def health_check():
     return {
         "status": "healthy",
         "scheduler": "running" if is_scheduler_running() else "disabled",
+        # Commit efectivamente corriendo. El deploy lo compara contra el que
+        # quiso desplegar; sin esto un despliegue del commit equivocado se
+        # reporta en verde porque la app responde igual.
+        "commit": settings.APP_COMMIT or "desconocido",
     }
 
 
