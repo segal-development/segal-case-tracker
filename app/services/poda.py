@@ -127,7 +127,7 @@ def coberturas_por_causa(db: Session, case_ids: List[int]) -> Dict[int, Dict[str
 
     Expuesto para reporting (p. ej. ``scripts/poda_dry_run.py``): toda la
     lógica de qué es una parte evaluable y cómo se deriva su cobertura vive
-    acá, así el script que la imprime no reimplementa nada.
+    aquí, así el script que la imprime no reimplementa nada.
     """
     if not case_ids:
         return {}
