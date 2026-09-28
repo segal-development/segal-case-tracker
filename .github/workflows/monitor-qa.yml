@@ -1,0 +1,65 @@
+name: Monitor QA
+
+# Vigilancia DESDE AFUERA de la VM.
+#
+# La alerta que corre dentro del worker detecta que el scraping falla, pero no
+# que el proceso murio: un proceso muerto no se avisa a si mismo. Esto lo mira
+# desde la infraestructura de GitHub, asi que sigue funcionando aunque la
+# maquina entera se caiga.
+#
+# LIMITES conocidos, para que nadie confie de mas:
+#  - GitHub no garantiza puntualidad en los crons; puede correr con retraso.
+#  - Desactiva los workflows agendados tras 60 dias sin actividad en el repo.
+#  - El aviso es la falla del workflow, que GitHub notifica por correo. No hay
+#    escalamiento ni SMS: para eso hace falta un servicio dedicado.
+on:
+  schedule:
+    # Cada 30 minutos. El umbral de la alerta interna son 6 horas, asi que no
+    # hace falta mas frecuencia — y menos frecuencia significa menos ruido
+    # cuando algo esta caido de verdad.
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+jobs:
+  vigilar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Consultar la salud de QA
+        env:
+          VM_IP: ${{ secrets.QA_VM_IP }}
+        run: |
+          # Tres intentos espaciados antes de declarar una caida: un hipo de red
+          # o un reinicio de contenedor no son un incidente, y una alerta que
+          # salta por eso se vuelve ruido.
+          for intento in 1 2 3; do
+            VIVA=""
+            SCRAPING=""
+
+            if curl -fsS --max-time 15 "http://$VM_IP:8000/readyz" >/dev/null 2>&1; then
+              VIVA="si"
+            fi
+
+            CODIGO=$(curl -s -o /tmp/resp.json -w "%{http_code}" --max-time 15 \
+              "http://$VM_IP:8000/health/scraping" || echo "000")
+            [ "$CODIGO" = "200" ] && SCRAPING="si"
+
+            if [ -n "$VIVA" ] && [ -n "$SCRAPING" ]; then
+              echo "QA sana en el intento $intento — $(cat /tmp/resp.json 2>/dev/null)"
+              curl -fsS --max-time 15 "http://$VM_IP:8000/health" || true
+              exit 0
+            fi
+
+            echo "intento $intento: app=${VIVA:-no} scraping=${SCRAPING:-no} (HTTP $CODIGO)"
+            [ "$intento" -lt 3 ] && sleep 20
+          done
+
+          echo "::error::QA no respondio sana en tres intentos."
+          if [ -z "$VIVA" ]; then
+            echo "La aplicacion no responde: la VM o el contenedor api estan caidos." >&2
+          else
+            echo "La aplicacion responde pero el scraping no esta sano (HTTP $CODIGO):" >&2
+            cat /tmp/resp.json >&2 2>/dev/null || true
+            echo "" >&2
+            echo "Revisar la estacion de scraping y las ultimas corridas en sync_history." >&2
+          fi
+          exit 1
