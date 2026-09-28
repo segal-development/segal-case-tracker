@@ -528,6 +528,70 @@ class TestSelectCasesForDetailRotation:
             "with flag off, filed_at DESC decides order regardless of pending-doc count"
         )
 
+    def test_podada_case_excluded_from_rotation(self, db):
+        """A case with poda_at set is never selected — it stopped consuming scraping budget."""
+        from app.services.sync_service import _select_cases_for_detail_rotation
+
+        lawyer = Lawyer(rut="00000014-4", name="Lawyer Poda", is_active=True)
+        db.add(lawyer)
+        db.flush()
+
+        court = db.query(Court).first()
+        if not court:
+            court = Court(code="PODA-COURT", name="Poda Court", region="RM", type="civil")
+            db.add(court)
+            db.flush()
+
+        c_active = Case(
+            lawyer_id=lawyer.id, court_id=court.id, rol="C-ACTIVE-1", competencia="civil",
+            status="active", last_detail_checked_at=None,
+        )
+        c_podada = Case(
+            lawyer_id=lawyer.id, court_id=court.id, rol="C-PODADA-1", competencia="civil",
+            status="active", last_detail_checked_at=None,
+            poda_at=datetime(2026, 1, 1), poda_motivo="sysgal_caducado", poda_por_rut="11111111-1",
+        )
+        db.add_all([c_active, c_podada])
+        db.commit()
+
+        api_cases = [_make_api_case("C-ACTIVE-1"), _make_api_case("C-PODADA-1")]
+        result = _select_cases_for_detail_rotation(db, lawyer.id, "civil", api_cases, batch_size=10)
+
+        rols = [ac.rol for ac in result]
+        assert "C-PODADA-1" not in rols, "podada case must never be selected for detail rotation"
+        assert "C-ACTIVE-1" in rols
+
+    def test_all_cases_podadas_returns_empty_not_fallback(self, db):
+        """When every DB case for this lawyer+competencia is podada, must NOT fall back to
+        live api_cases — that would defeat the whole purpose of poda (re-scraping causas
+        with no commercial coverage). Distinct from the empty-DB case, which legitimately
+        falls back so the worker is never starved."""
+        from app.services.sync_service import _select_cases_for_detail_rotation
+
+        lawyer = Lawyer(rut="00000015-5", name="Lawyer AllPodadas", is_active=True)
+        db.add(lawyer)
+        db.flush()
+
+        court = db.query(Court).first()
+        if not court:
+            court = Court(code="ALLPODA-COURT", name="AllPoda Court", region="RM", type="civil")
+            db.add(court)
+            db.flush()
+
+        for i in range(3):
+            db.add(Case(
+                lawyer_id=lawyer.id, court_id=court.id, rol=f"C-ALLPODA-{i}", competencia="civil",
+                status="active", last_detail_checked_at=None,
+                poda_at=datetime(2026, 1, 1), poda_motivo="sysgal_caducado", poda_por_rut="11111111-1",
+            ))
+        db.commit()
+
+        # api_cases includes live tokens for the same ROLs — must still be skipped.
+        api_cases = [_make_api_case(f"C-ALLPODA-{i}") for i in range(3)]
+        result = _select_cases_for_detail_rotation(db, lawyer.id, "civil", api_cases, batch_size=10)
+
+        assert result == [], "all-podadas lawyer must return empty, not fall back to live api_cases"
+
     def test_reserved_first_false_preserves_existing_order(self, db):
         """reserved_first=False (default) leaves sort order unchanged — NULL still first."""
         from app.services.sync_service import _select_cases_for_detail_rotation

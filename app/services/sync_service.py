@@ -1486,11 +1486,17 @@ def _select_cases_for_detail_rotation(
         api_cases: Live PJUD case list from ``get_my_cases``.
         batch_size: Maximum number of cases to return.
 
+    Podada cases (``Case.poda_at`` not null — see ``app.services.poda``) are
+    excluded: a podada causa has no commercial coverage left, so scraping it
+    would burn budget on causas the poda explicitly decided to stop watching.
+
     Returns:
         List of PJUDCase objects (subset of *api_cases*) in rotation order,
         skipping DB cases absent from *api_cases* or without a ``case_token``.
         If no Case rows exist in DB for this lawyer+competencia, returns
-        ``api_cases[:batch_size]`` so the caller is never starved.
+        ``api_cases[:batch_size]`` so the caller is never starved. If DB rows
+        exist but EVERY one is podada, returns ``[]`` instead of falling
+        back — see the comment at the empty-result branch below for why.
     """
     # Year scope: only detail-scrape cases whose ROL year (the YYYY in "C-N-YYYY")
     # is >= settings.DETAIL_MIN_YEAR. 0 disables the filter. Unparseable ROLs are
@@ -1543,15 +1549,30 @@ def _select_cases_for_detail_rotation(
             .scalar_subquery()
         )
         order_clauses.insert(0, pending_docs.desc())
+
+    base_filter = (Case.lawyer_id == lawyer_id, Case.competencia == competencia)
+
     db_cases = (
         db.query(Case)
-        .filter(Case.lawyer_id == lawyer_id, Case.competencia == competencia)
+        .filter(*base_filter, Case.poda_at.is_(None))  # podadas no consumen presupuesto de scraping
         .order_by(*order_clauses)
         .all()
     )
 
-    # Empty DB for this lawyer+competencia — fall back to live cases.
     if not db_cases:
+        # Distinguish "no Case rows at all for this lawyer+competencia" (DB
+        # truly empty for this scope — legitimate to fall back to live cases so
+        # the worker is never starved) from "every row is podada" (poda
+        # explicitly decided these causas are not worth scraping; falling back
+        # there would re-scrape them and make poda pointless). The existence
+        # check only runs on this cold branch, never on the hot rotation path.
+        has_any_case = db.query(Case.id).filter(*base_filter).first() is not None
+        if has_any_case:
+            # Every DB case for this lawyer+competencia is podada — nothing to
+            # scrape ON PURPOSE. Do NOT fall back to live api_cases here, or
+            # poda would be undone every single rotation cycle.
+            return []
+        # Empty DB for this lawyer+competencia — fall back to live cases.
         return fallback
 
     result = []
