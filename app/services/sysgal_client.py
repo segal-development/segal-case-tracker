@@ -1,5 +1,10 @@
 """SysgalClient — read-only HTTP connector to the Sysgal CRM.
 
+ATENCION: Sysgal no tiene ambiente de pruebas. La URL configurada es
+PRODUCCION y la credencial abre la base real del estudio (confirmado por su
+equipo el 28-09-2026). Todo lo que se consulta aca son datos de clientes
+reales y cada llamada queda en sus registros.
+
 Only the batch endpoint ``POST {BASE}/api_sync/clientes_estado`` is used.
 
 PRIVACY: responses carry ``nombre``/``email``/``telefono``. This module never
