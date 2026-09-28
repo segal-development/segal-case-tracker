@@ -131,6 +131,15 @@ class Case(Base):
     assigned_by_rut = Column(String(20), nullable=True)  # RUT of the admin who reassigned it
     assigned_motivo = Column(String(255), nullable=True)
 
+    # Poda — exclusión del scraping para causas sin cobertura comercial
+    # (ver app.services.poda). ``poda_at`` no nulo significa "excluida del
+    # scraping": _select_cases_for_detail_rotation la salta. La causa NO se
+    # borra ni pierde su historial; solo deja de consumir presupuesto de
+    # scraping mientras siga sin cobertura.
+    poda_at = Column(DateTime, nullable=True)
+    poda_motivo = Column(String(255), nullable=True)
+    poda_por_rut = Column(String(20), nullable=True)  # RUT de quien ejecutó la poda
+
     # Timestamps
     filed_at = Column(DateTime, nullable=True)  # Fecha de ingreso
     last_movement_at = Column(DateTime, nullable=True)
