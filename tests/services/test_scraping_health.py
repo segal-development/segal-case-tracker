@@ -181,7 +181,7 @@ class TestEnvioDelAviso:
         monkeypatch.setattr(mod.smtplib, "SMTP", _smtp_falso(enviados), raising=False)
         self._fallando(db, lawyer)
 
-        salud = mod.revisar_y_avisar(db)
+        salud = mod.revisar_y_avisar(db, ahora=AHORA)
 
         assert salud.estado == ESTADO_FALLANDO
         assert len(enviados) == 1
@@ -195,8 +195,8 @@ class TestEnvioDelAviso:
         monkeypatch.setattr(mod.smtplib, "SMTP", _smtp_falso(enviados), raising=False)
         self._fallando(db, lawyer)
 
-        mod.revisar_y_avisar(db)
-        mod.revisar_y_avisar(db)
+        mod.revisar_y_avisar(db, ahora=AHORA)
+        mod.revisar_y_avisar(db, ahora=AHORA)
 
         assert len(enviados) == 1, "el segundo ciclo del worker volvió a avisar"
 
@@ -207,7 +207,7 @@ class TestEnvioDelAviso:
         monkeypatch.setattr(cfg, "SCRAPING_ALERT_EMAIL", "")
         self._fallando(db, lawyer)
 
-        salud = mod.revisar_y_avisar(db)  # no debe levantar
+        salud = mod.revisar_y_avisar(db, ahora=AHORA)  # no debe levantar
 
         assert salud.estado == ESTADO_FALLANDO
         assert db.query(AlertaOperativa).count() == 0
@@ -221,7 +221,7 @@ class TestEnvioDelAviso:
         monkeypatch.setattr(mod.smtplib, "SMTP", _explota, raising=False)
         self._fallando(db, lawyer)
 
-        salud = mod.revisar_y_avisar(db)  # no debe levantar
+        salud = mod.revisar_y_avisar(db, ahora=AHORA)  # no debe levantar
 
         assert salud.estado == ESTADO_FALLANDO
         # No se registra el aviso: no se envió, así que se puede reintentar.
@@ -234,7 +234,7 @@ class TestEnvioDelAviso:
         monkeypatch.setattr(mod.smtplib, "SMTP", _smtp_falso(enviados), raising=False)
         _corrida(db, lawyer, status="completed", hace_horas=0.5)
 
-        mod.revisar_y_avisar(db)
+        mod.revisar_y_avisar(db, ahora=AHORA)
 
         assert enviados == []
 
@@ -264,12 +264,32 @@ def _smtp_falso(enviados: list):
     return _FakeSMTP
 
 
+def _corrida_real(db, lawyer, *, status: str, hace_horas: float):
+    """Como `_corrida`, pero anclada al reloj REAL.
+
+    El endpoint evalua con `datetime.utcnow()` y no hay por donde inyectarle
+    otro reloj: la peticion entra por HTTP. Anclar estas filas a un `AHORA`
+    fijo hacia que los tests pasaran o fallaran segun la hora del dia a la que
+    corriera la suite — y asi fue: pasaban al mediodia y fallaban a la tarde,
+    cuando la distancia superaba el umbral de 6 horas.
+    """
+    inicio = datetime.utcnow() - timedelta(hours=hace_horas)
+    db.add(SyncHistory(
+        lawyer_id=lawyer.id,
+        competencia="civil",
+        status=status,
+        started_at=inicio,
+        completed_at=inicio + timedelta(seconds=30),
+    ))
+    db.commit()
+
+
 class TestEndpointExterno:
     """`GET /health/scraping` es lo unico que puede detectar que el worker
     murio: un proceso muerto no se avisa a si mismo."""
 
     def test_sano_responde_200(self, client, db, lawyer):
-        _corrida(db, lawyer, status="completed", hace_horas=0.5)
+        _corrida_real(db, lawyer, status="completed", hace_horas=0.5)
 
         resp = client.get("/health/scraping")
 
@@ -277,9 +297,9 @@ class TestEndpointExterno:
         assert resp.json() == {"scraping": ESTADO_OK}
 
     def test_fallando_responde_503(self, client, db, lawyer):
-        _corrida(db, lawyer, status="completed", hace_horas=9)
+        _corrida_real(db, lawyer, status="completed", hace_horas=9)
         for h in (5, 4, 3, 2, 1):
-            _corrida(db, lawyer, status="failed", hace_horas=h)
+            _corrida_real(db, lawyer, status="failed", hace_horas=h)
 
         resp = client.get("/health/scraping")
 
@@ -288,7 +308,7 @@ class TestEndpointExterno:
     def test_no_filtra_detalle_operativo(self, client, db, lawyer):
         """Va sin autenticacion, asi que no puede contar como esta armado
         el sistema por dentro."""
-        _corrida(db, lawyer, status="completed", hace_horas=0.5)
+        _corrida_real(db, lawyer, status="completed", hace_horas=0.5)
 
         cuerpo = client.get("/health/scraping").text
 
