@@ -48,6 +48,7 @@ services:
     env_file: .env.qa
     environment:
       - ENABLE_SCHEDULER=false
+      - APP_COMMIT=${APP_COMMIT:-}
     volumes:
       - ./sa-key.json:/secrets/sa-key.json:ro
     depends_on:
@@ -69,6 +70,7 @@ services:
     env_file: .env.qa
     environment:
       - ENABLE_SCHEDULER=true
+      - APP_COMMIT=${APP_COMMIT:-}
     volumes:
       - ./sa-key.json:/secrets/sa-key.json:ro
     depends_on:

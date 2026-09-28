@@ -56,32 +56,44 @@ jobs:
           VM_USER: ${{ secrets.QA_VM_USER }}
         run: |
           set -euo pipefail
-          git archive --format=tar.gz -o /tmp/casetracker-qa.tar.gz main
+          # Se empaqueta el SHA que disparó esta corrida y NO la rama `main`.
+          # Con `main`, cada corrida armaba el paquete desde lo que esa rama
+          # apuntara en su runner: con varios deploys en cola, el que terminaba
+          # último ganaba aunque fuera el más viejo. El 28-09-2026 eso desplegó
+          # un commit anterior encima del nuevo y el workflow lo reportó en
+          # verde, porque efectivamente había desplegado algo.
+          git archive --format=tar.gz -o /tmp/casetracker-qa.tar.gz "$GITHUB_SHA"
           scp -i ~/.ssh/id_deploy /tmp/casetracker-qa.tar.gz "$VM_USER@$VM_IP:~/casetracker-qa.tar.gz"
-          ssh -i ~/.ssh/id_deploy "$VM_USER@$VM_IP" '
+          ssh -i ~/.ssh/id_deploy "$VM_USER@$VM_IP" "
             set -e
             cd ~/casetracker
             tar xzf ~/casetracker-qa.tar.gz
-            sudo docker compose -f docker-compose.qa.yml up -d --build
+            export APP_COMMIT='$GITHUB_SHA'
+            sudo -E docker compose -f docker-compose.qa.yml up -d --build
             sudo docker compose -f docker-compose.qa.yml ps
-          '
+          "
 
       - name: Health check
         env:
           VM_IP: ${{ secrets.QA_VM_IP }}
         run: |
-          # Retry the probe: the API (2 uvicorn workers) can take longer than a
-          # fixed sleep to accept connections after `up -d`, which otherwise
-          # marks a healthy deploy as failed. /readyz also verifies DB access.
-          for i in $(seq 1 12); do
+          # Se espera a que la app responda Y a que el commit que reporta sea
+          # el que se quiso desplegar. Antes solo se consultaba /readyz, que
+          # contesta igual de bien con codigo de la semana pasada: por eso un
+          # deploy que subio el commit equivocado quedo en verde.
+          for i in $(seq 1 24); do
             if curl -fsS "http://$VM_IP:8000/readyz" >/dev/null 2>&1; then
-              echo "QA ready (DB ok) after ~$((i * 5))s"
-              curl -fsS "http://$VM_IP:8000/health" && echo "" && echo "QA live"
-              exit 0
+              CORRIENDO=$(curl -fsS "http://$VM_IP:8000/health" | jq -r '.commit // "desconocido"')
+              if [ "$CORRIENDO" = "$GITHUB_SHA" ]; then
+                echo "QA corriendo ${GITHUB_SHA:0:7} — desplegado y verificado (~$((i * 5))s)"
+                exit 0
+              fi
+              echo "  responde, pero corre ${CORRIENDO:0:7} y se esperaba ${GITHUB_SHA:0:7}..."
+            else
+              echo "  esperando que QA levante... (~$((i * 5))s)"
             fi
-            echo "  waiting for QA to come up... (~$((i * 5))s)"
             sleep 5
           done
-          echo "QA did not become ready within 60s" >&2
-          curl -fsS "http://$VM_IP:8000/readyz"  # final attempt surfaces the error
+          echo "QA no quedo corriendo $GITHUB_SHA dentro de 120s" >&2
+          echo "Reporta: $(curl -fsS "http://$VM_IP:8000/health" || echo 'sin respuesta')" >&2
           exit 1

@@ -85,6 +85,11 @@ class Settings(BaseSettings):
     # aviso de credencial vencida le sirve a quien coordina abogados, mientras
     # que "el scraping lleva horas sin completar" le sirve a quien opera el
     # sistema. Mezclarlos entrena a ignorar los dos.
+    # Commit desplegado, inyectado por el deploy. Permite verificar QUE quedo
+    # corriendo en vez de solo que la app responde: un deploy que sube el
+    # commit equivocado contesta /readyz igual de bien que el correcto.
+    APP_COMMIT: str = ""
+
     SCRAPING_ALERT_EMAIL: str = ""
     #: Horas sin una corrida exitosa para considerar el scraping caído.
     SCRAPING_STALE_HOURS: int = 6
