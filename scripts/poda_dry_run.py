@@ -111,7 +111,7 @@ def main() -> int:
         print(f"  salteadas por movimiento reciente: {resultado['salteadas_por_movimiento']}")
 
         if resultado["dry_run"]:
-            print("\nDRY-RUN: no se escribió nada en la base de datos. Corré con --apply para aplicar.")
+            print("\nDRY-RUN: no se escribió nada en la base de datos. Ejecuta con --apply para aplicar.")
         else:
             print(f"\nAplicado: {resultado['podadas']} causas marcadas como podadas (actor={args.actor_rut}).")
 
