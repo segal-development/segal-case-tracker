@@ -122,6 +122,111 @@ class TestSyncAllLawyersSessionIsolation:
         outer_db.close.assert_called_once()
 
 
+class TestSyncAllLawyersPjudScrapingGate:
+    """PJUD_SCRAPING_ENABLED=False must skip only the PJUD lawyer-sync loop.
+
+    Sysgal cobertura refresh and the scraping health check are per-cycle
+    maintenance that must keep running on every deployment, including the
+    cloud VM where PJUD scraping itself is disabled — that's the regression
+    this gate could introduce if placed in the wrong spot.
+    """
+
+    @pytest.mark.asyncio
+    async def test_scraping_disabled_does_not_sync_any_lawyer(self):
+        """Uses the same needs_sync=True / real lawyer loop wiring as the
+        enabled-default test below, so that — without the guard — this test
+        would actually enter the loop and fail (not pass vacuously)."""
+        from app.workers.sync_scheduler import sync_all_lawyers
+
+        outer_db = MagicMock()
+        work_db = MagicMock()
+
+        mock_sync_service = MagicMock()
+        mock_sync_service.return_value.needs_sync.return_value = True
+
+        with patch("app.workers.sync_scheduler.SessionLocal", side_effect=[outer_db, work_db]), \
+             patch("app.workers.sync_scheduler._active_lawyer_ids_by_staleness", return_value=[1, 2]), \
+             patch("app.workers.sync_scheduler.COMPETENCIAS", ["civil"]), \
+             patch("app.workers.sync_scheduler.settings.PJUD_SCRAPING_ENABLED", False), \
+             patch("app.services.credential_audit.scan_credential_changes", return_value=0), \
+             patch("app.services.sysgal_sync.sync_sysgal_estados", return_value={}), \
+             patch("app.services.scraping_health.revisar_y_avisar") as mock_salud, \
+             patch("app.workers.sync_scheduler.SyncService", mock_sync_service), \
+             patch("app.workers.sync_scheduler.asyncio.sleep", new_callable=AsyncMock), \
+             patch("app.workers.sync_scheduler.sync_lawyer_cases", new_callable=AsyncMock) as mock_sync:
+            mock_salud.return_value = MagicMock(requiere_aviso=False)
+
+            await sync_all_lawyers()
+
+        mock_sync.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_scraping_disabled_still_refreshes_sysgal(self):
+        from app.workers.sync_scheduler import sync_all_lawyers
+
+        mock_db = MagicMock()
+
+        with patch("app.workers.sync_scheduler.SessionLocal", return_value=mock_db), \
+             patch("app.workers.sync_scheduler._active_lawyer_ids_by_staleness", return_value=[1]), \
+             patch("app.workers.sync_scheduler.settings.PJUD_SCRAPING_ENABLED", False), \
+             patch("app.services.credential_audit.scan_credential_changes", return_value=0), \
+             patch("app.services.sysgal_sync.sync_sysgal_estados", return_value={"ok": True}) as mock_sysgal, \
+             patch("app.services.scraping_health.revisar_y_avisar") as mock_salud, \
+             patch("app.workers.sync_scheduler.sync_lawyer_cases", new_callable=AsyncMock):
+            mock_salud.return_value = MagicMock(requiere_aviso=False)
+
+            await sync_all_lawyers()
+
+        mock_sysgal.assert_called_once_with(mock_db)
+
+    @pytest.mark.asyncio
+    async def test_scraping_disabled_still_runs_health_check(self):
+        from app.workers.sync_scheduler import sync_all_lawyers
+
+        mock_db = MagicMock()
+
+        with patch("app.workers.sync_scheduler.SessionLocal", return_value=mock_db), \
+             patch("app.workers.sync_scheduler._active_lawyer_ids_by_staleness", return_value=[1]), \
+             patch("app.workers.sync_scheduler.settings.PJUD_SCRAPING_ENABLED", False), \
+             patch("app.services.credential_audit.scan_credential_changes", return_value=0), \
+             patch("app.services.sysgal_sync.sync_sysgal_estados", return_value={}), \
+             patch("app.services.scraping_health.revisar_y_avisar") as mock_salud, \
+             patch("app.workers.sync_scheduler.sync_lawyer_cases", new_callable=AsyncMock):
+            mock_salud.return_value = MagicMock(requiere_aviso=False)
+
+            await sync_all_lawyers()
+
+        mock_salud.assert_called_once_with(mock_db)
+
+    @pytest.mark.asyncio
+    async def test_scraping_enabled_default_keeps_syncing_lawyers(self):
+        """PJUD_SCRAPING_ENABLED=True (the default) must not change today's
+        behavior: the lawyer sync loop still runs."""
+        from app.workers.sync_scheduler import sync_all_lawyers
+
+        outer_db = MagicMock()
+        work_db = MagicMock()
+
+        mock_sync_service = MagicMock()
+        mock_sync_service.return_value.needs_sync.return_value = True
+
+        with patch("app.workers.sync_scheduler.SessionLocal", side_effect=[outer_db, work_db]), \
+             patch("app.workers.sync_scheduler._active_lawyer_ids_by_staleness", return_value=[1]), \
+             patch("app.workers.sync_scheduler.COMPETENCIAS", ["civil"]), \
+             patch("app.services.credential_audit.scan_credential_changes", return_value=0), \
+             patch("app.services.sysgal_sync.sync_sysgal_estados", return_value={}), \
+             patch("app.services.scraping_health.revisar_y_avisar") as mock_salud, \
+             patch("app.workers.sync_scheduler.SyncService", mock_sync_service), \
+             patch("app.workers.sync_scheduler.asyncio.sleep", new_callable=AsyncMock), \
+             patch("app.workers.sync_scheduler.sync_lawyer_cases", new_callable=AsyncMock) as mock_sync:
+            mock_salud.return_value = MagicMock(requiere_aviso=False)
+            mock_sync.return_value = {"success": True}
+
+            await sync_all_lawyers()
+
+        mock_sync.assert_awaited_once_with(1, "civil", work_db)
+
+
 class TestSyncLawyerCasesSessionLookup:
     """sync_lawyer_cases must await store.get_session_by_lawyer (S1-T10)."""
 

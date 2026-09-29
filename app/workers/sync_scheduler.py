@@ -656,6 +656,26 @@ async def sync_all_lawyers():
         # Release the setup connection BEFORE the long loop — never held idle.
         setup_db.close()
 
+    # PJUD is behind F5 Shape, which blocks datacenter IPs unconditionally: a
+    # cloud VM (e.g. the QA/prod worker container) can NEVER authenticate
+    # against PJUD, no matter how many times it tries. Letting it try anyway
+    # just fills sync_history with guaranteed failures until
+    # scraping_health's alert becomes noise nobody trusts (see 2026-09-29
+    # incident: 33/50 runs failed, 503 fired twice for a structural,
+    # unavoidable reason). Real PJUD scraping runs only from the dedicated
+    # station on a residential IP. This guard must stay AFTER the maintenance
+    # block above (credential scan, Sysgal refresh, health check, cartera
+    # snapshot) — those still have to run on every deployment — and only
+    # skips the PJUD lawyer-sync loop below.
+    if not settings.PJUD_SCRAPING_ENABLED:
+        logger.info(
+            "PJUD scraping is disabled in this deployment (PJUD_SCRAPING_ENABLED=false); "
+            "skipping the lawyer sync loop. This is expected on cloud VMs, which PJUD's "
+            "F5 Shape protection always blocks — the real scraping runs from the dedicated "
+            "station. Sysgal refresh and the scraping health check above already ran."
+        )
+        return
+
     if not lawyer_ids:
         logger.info("No active lawyers found, nothing to sync")
         return
