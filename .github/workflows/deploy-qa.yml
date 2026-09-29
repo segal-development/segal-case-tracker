@@ -43,7 +43,34 @@ jobs:
         with:
           fetch-depth: 0  # full history so `git archive main` works
 
+      # El job `test` tarda varios minutos y corre ANTES de tomar el lock de
+      # `deploy-qa`, asi que dos corridas pueden llegar a la cola en orden
+      # distinto al de los commits. Paso de verdad el 29-09-2026: el deploy de
+      # acff50b (commit viejo) termino 13 minutos DESPUES del de f1ff53e y dejo
+      # QA corriendo codigo anterior. Las dos corridas quedaron en verde y los
+      # dos health checks dijeron la verdad en su momento, porque cada uno
+      # verifica su propio commit al final de su propia corrida.
+      #
+      # No se usa `cancel-in-progress: true` a proposito: cancelar un deploy a
+      # mitad de un `docker compose up --build` puede dejar la VM con
+      # contenedores a medio construir. Un deploy obsoleto se descarta solo.
+      - name: Descartar el deploy si ya no es la punta de main
+        id: vigencia
+        run: |
+          set -euo pipefail
+          git fetch origin main --quiet
+          PUNTA=$(git rev-parse origin/main)
+          if [ "$PUNTA" = "$GITHUB_SHA" ]; then
+            echo "vigente=true" >> "$GITHUB_OUTPUT"
+            echo "Este commit (${GITHUB_SHA:0:7}) es la punta de main: se despliega."
+          else
+            echo "vigente=false" >> "$GITHUB_OUTPUT"
+            echo "Obsoleto: main ya esta en ${PUNTA:0:7} y esta corrida es ${GITHUB_SHA:0:7}."
+            echo "Se descarta para no pisar QA con codigo viejo; la corrida de ${PUNTA:0:7} lo despliega."
+          fi
+
       - name: Configure SSH
+        if: steps.vigencia.outputs.vigente == 'true'
         run: |
           mkdir -p ~/.ssh
           printf '%s\n' "${{ secrets.QA_SSH_KEY }}" > ~/.ssh/id_deploy
@@ -51,6 +78,7 @@ jobs:
           ssh-keyscan -H "${{ secrets.QA_VM_IP }}" >> ~/.ssh/known_hosts 2>/dev/null
 
       - name: Build archive and deploy to QA VM
+        if: steps.vigencia.outputs.vigente == 'true'
         env:
           VM_IP: ${{ secrets.QA_VM_IP }}
           VM_USER: ${{ secrets.QA_VM_USER }}
@@ -74,6 +102,7 @@ jobs:
           "
 
       - name: Health check
+        if: steps.vigencia.outputs.vigente == 'true'
         env:
           VM_IP: ${{ secrets.QA_VM_IP }}
         run: |
