@@ -3,7 +3,7 @@
 import calendar
 import re
 from collections import defaultdict, namedtuple
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Optional
 from sqlalchemy.orm import Session
 
@@ -712,11 +712,26 @@ def firm_risk_board(db: Session, account_rut: str) -> dict:
         }
 
     def _sort_key(c) -> tuple:
+        # Sorting by next_deadline_at ASCENDING (oldest date first) used to
+        # bury anything recent behind cases stalled since 2022: with 203+
+        # "rojo" cases and only 15 slots, the board filled up with ancient
+        # deadlines and nothing from the last few months ever surfaced
+        # (measured 2026-09-29: a rojo case with its own deadline due
+        # 2026-10-05 ranked #195 of 14,760 — invisible to Dirección Jurídica).
+        # What matters is ACTIONABILITY, not calendar age: a deadline that
+        # hasn't lapsed yet can still be met, and one that lapsed last week
+        # may still be remediable, while one from years ago is not. So we
+        # rank by absolute distance from today (soonest-to-act first),
+        # putting the "not yet due" group ahead of the "already overdue"
+        # group so upcoming work is never buried behind old backlog.
         has_deadline = c.next_deadline_at is not None
+        is_overdue = has_deadline and c.next_deadline_at < today
+        days_from_today = abs((c.next_deadline_at - today).days) if has_deadline else 0
         return (
             0 if c.semaforo == "rojo" else 1,
             0 if has_deadline else 1,
-            c.next_deadline_at if has_deadline else date.max,
+            1 if is_overdue else 0,
+            days_from_today,
             0 if c.next_deadline_fatal else 1,
         )
 

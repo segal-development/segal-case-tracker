@@ -325,6 +325,99 @@ class TestFirmRiskBoardTopCritical:
         rols = [c["rol"] for c in result["top_critical"]]
         assert rols.index("C-9307-2025") < rols.index("C-9308-2025")
 
+    def test_upcoming_deadline_ranks_before_ancient_overdue(self, db, firm_account, court):
+        # Regression for the "arqueología" bug: a deadline that is still
+        # actionable (due tomorrow) must outrank one that lapsed years ago —
+        # nothing can be done about 2022 anymore, but tomorrow can still be met.
+        today = date.today()
+        upcoming = _make_case(
+            db, firm_account, court, "C-9309-2025", semaforo="rojo",
+            next_deadline_at=today + timedelta(days=1),
+        )
+        ancient_overdue = _make_case(
+            db, firm_account, court, "C-9310-2025", semaforo="rojo",
+            next_deadline_at=today - timedelta(days=1000),
+        )
+        _seed_abogado(db, upcoming, LAWYER_A_RUT, "Lawyer A")
+        _seed_abogado(db, ancient_overdue, LAWYER_A_RUT, "Lawyer A")
+        result = firm_risk_board(db, ACCOUNT_RUT)
+        rols = [c["rol"] for c in result["top_critical"]]
+        assert rols.index("C-9309-2025") < rols.index("C-9310-2025")
+
+    def test_sooner_upcoming_ranks_before_later_upcoming(self, db, firm_account, court):
+        # Within the still-open group the old ascending order and the new
+        # distance-based one agree, so this is the case most likely to be
+        # dropped when someone reworks the ranking. It is still part of the
+        # contract: the deadline you have to meet first is shown first.
+        today = date.today()
+        sooner = _make_case(
+            db, firm_account, court, "C-9317-2025", semaforo="rojo",
+            next_deadline_at=today + timedelta(days=2),
+        )
+        later = _make_case(
+            db, firm_account, court, "C-9318-2025", semaforo="rojo",
+            next_deadline_at=today + timedelta(days=30),
+        )
+        _seed_abogado(db, sooner, LAWYER_A_RUT, "Lawyer A")
+        _seed_abogado(db, later, LAWYER_A_RUT, "Lawyer A")
+        result = firm_risk_board(db, ACCOUNT_RUT)
+        rols = [c["rol"] for c in result["top_critical"]]
+        assert rols.index("C-9317-2025") < rols.index("C-9318-2025")
+
+    def test_more_recently_overdue_ranks_before_older_overdue(self, db, firm_account, court):
+        # Among already-lapsed deadlines, the one that broke most recently is
+        # still plausibly remediable; something from years ago is not.
+        today = date.today()
+        recently_overdue = _make_case(
+            db, firm_account, court, "C-9311-2025", semaforo="rojo",
+            next_deadline_at=today - timedelta(days=5),
+        )
+        long_overdue = _make_case(
+            db, firm_account, court, "C-9312-2025", semaforo="rojo",
+            next_deadline_at=today - timedelta(days=500),
+        )
+        _seed_abogado(db, recently_overdue, LAWYER_A_RUT, "Lawyer A")
+        _seed_abogado(db, long_overdue, LAWYER_A_RUT, "Lawyer A")
+        result = firm_risk_board(db, ACCOUNT_RUT)
+        rols = [c["rol"] for c in result["top_critical"]]
+        assert rols.index("C-9311-2025") < rols.index("C-9312-2025")
+
+    def test_all_upcoming_rank_before_any_overdue_same_semaforo(self, db, firm_account, court):
+        # Even the furthest-out upcoming deadline outranks the most recently
+        # lapsed one: a still-open deadline is always more actionable.
+        today = date.today()
+        far_upcoming = _make_case(
+            db, firm_account, court, "C-9313-2025", semaforo="rojo",
+            next_deadline_at=today + timedelta(days=90),
+        )
+        barely_overdue = _make_case(
+            db, firm_account, court, "C-9314-2025", semaforo="rojo",
+            next_deadline_at=today - timedelta(days=1),
+        )
+        _seed_abogado(db, far_upcoming, LAWYER_A_RUT, "Lawyer A")
+        _seed_abogado(db, barely_overdue, LAWYER_A_RUT, "Lawyer A")
+        result = firm_risk_board(db, ACCOUNT_RUT)
+        rols = [c["rol"] for c in result["top_critical"]]
+        assert rols.index("C-9313-2025") < rols.index("C-9314-2025")
+
+    def test_rojo_still_outranks_non_rojo_with_closer_deadline(self, db, firm_account, court):
+        # semaforo stays the primary ranking signal even under the new
+        # distance-based ordering: it is the study's own urgency flag.
+        today = date.today()
+        rojo_far = _make_case(
+            db, firm_account, court, "C-9315-2025", semaforo="rojo",
+            next_deadline_at=today + timedelta(days=200),
+        )
+        verde_close = _make_case(
+            db, firm_account, court, "C-9316-2025", semaforo="verde",
+            next_deadline_at=today + timedelta(days=1),
+        )
+        _seed_abogado(db, rojo_far, LAWYER_A_RUT, "Lawyer A")
+        _seed_abogado(db, verde_close, LAWYER_A_RUT, "Lawyer A")
+        result = firm_risk_board(db, ACCOUNT_RUT)
+        rols = [c["rol"] for c in result["top_critical"]]
+        assert rols.index("C-9315-2025") < rols.index("C-9316-2025")
+
     def test_top_critical_capped_at_15(self, db, firm_account, court):
         for i in range(20):
             c = _make_case(
