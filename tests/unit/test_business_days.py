@@ -3,9 +3,15 @@
 CRITICAL: días hábiles errors = legal liability.
 All expected dates are manually verified against Chilean feriados.
 
+Counting rule under test (art. 66 CPC): SATURDAY IS a día hábil. Only
+Sundays and Chilean feriados are excluded. See _is_business_day's docstring
+for the legal source.
+
 Feriados used in these tests (verified for the relevant years):
 - 2026-09-18 Fiestas Patrias (Friday)
-- 2026-09-19 Glorias del Ejército (Saturday → weekend anyway)
+- 2026-09-19 Glorias del Ejército (Saturday feriado — excluded because it is
+             a feriado, not because it falls on a Saturday; the "feriado"
+             gana" over the "Saturday is hábil" rule)
 - 2026-09-21 NOT a feriado in holidays.Chile — Ley 21.169 (Día de la Unidad
              Nacional) is a conditional/optional feriado that the `holidays`
              library does NOT include by default.  Sep 21 is therefore counted
@@ -13,6 +19,8 @@ Feriados used in these tests (verified for the relevant years):
              system ever treats it as a feriado, a Slice B override table will
              be required (see deferred work note in deadline_engine.py).
 - 2026-04-03 Viernes Santo (Good Friday 2026)
+- 2026-04-04 Sábado Santo (Holy Saturday 2026) — also a CL feriado, so it is
+             excluded regardless of the "Saturday is hábil" rule.
 - 2026-01-01 Año Nuevo
 - 2025-01-01 Año Nuevo
 """
@@ -21,7 +29,11 @@ from datetime import date
 
 import pytest
 
-from app.services.business_days import add_business_days, count_business_days_remaining
+from app.services.business_days import (
+    _is_business_day,
+    add_business_days,
+    count_business_days_remaining,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -39,88 +51,97 @@ class TestAddBusinessDays:
         assert result == date(2026, 6, 16)
 
     def test_apelacion_5d_standard(self) -> None:
-        """APELACION_5D: 5 días hábiles from 2026-06-16 (Tuesday) → 2026-06-23.
+        """APELACION_5D: 5 días hábiles from 2026-06-16 (Tuesday) → 2026-06-22.
 
         Spec scenario: trigger_date=2026-06-16, no intervening holiday.
-        Count: Wed 17, Thu 18, Fri 19, Mon 22, Tue 23.
+        Count: Wed 17(1), Thu 18(2), Fri 19(3), Sat 20(4, hábil), [Sun 21 skip],
+               Mon 22(5). = 5 ✓
         """
         result = add_business_days(date(2026, 6, 16), 5)
-        assert result == date(2026, 6, 23)
+        assert result == date(2026, 6, 22)
 
     def test_traslado_4d_crosses_weekend(self) -> None:
-        """TRASLADO_EJECUTANTE_4D: 4 días hábiles from 2026-07-01 (Wed) → 2026-07-07.
+        """TRASLADO_EJECUTANTE_4D: 4 días hábiles from 2026-07-01 (Wed) → 2026-07-06.
 
-        Spec scenario: skips Sat 04, Sun 05.
-        Count: Thu 02, Fri 03, Mon 06, Tue 07.
+        Spec scenario: Saturday counts as hábil, only Sunday is skipped.
+        Count: Thu 02(1), Fri 03(2), Sat 04(3, hábil), [Sun 05 skip], Mon 06(4). = 4 ✓
         """
         result = add_business_days(date(2026, 7, 1), 4)
-        assert result == date(2026, 7, 7)
+        assert result == date(2026, 7, 6)
 
     def test_excepciones_8d_crosses_fiestas_patrias(self) -> None:
-        """EXCEPCIONES_8D: 8 días hábiles from 2026-09-10 (Thu) → 2026-09-23.
+        """EXCEPCIONES_8D: 8 días hábiles from 2026-09-10 (Thu) → 2026-09-22.
 
         Spec scenario: Fiestas Patrias (Sep 18, Friday) excluded.
-        Sep 19 is Saturday (already excluded as weekend).
-        Count: Fri 11, Mon 14, Tue 15, Wed 16, Thu 17,
-               [Fri 18 FERIADO], [Sat 19 weekend], [Sun 20 weekend],
-               Mon 21, Tue 22, Wed 23.
-        Days counted: 11,14,15,16,17,21,22,23 = 8 ✓
+        Sep 19 is a Saturday FERIADO (Glorias del Ejército) — excluded because
+        it is a feriado, not because it is a Saturday.
+        Count: Fri 11(1), Sat 12(2, hábil), [Sun 13 skip],
+               Mon 14(3), Tue 15(4), Wed 16(5), Thu 17(6),
+               [Fri 18 FERIADO], [Sat 19 FERIADO], [Sun 20 skip],
+               Mon 21(7), Tue 22(8).
+        Days counted: 11,12,14,15,16,17,21,22 = 8 ✓
         """
         result = add_business_days(date(2026, 9, 10), 8)
-        assert result == date(2026, 9, 23)
+        assert result == date(2026, 9, 22)
 
     def test_termino_probatorio_10d_crosses_semana_santa(self) -> None:
-        """TERMINO_PROBATORIO_10D: 10 días hábiles from 2026-03-24 (Tue) → 2026-04-08.
+        """TERMINO_PROBATORIO_10D: 10 días hábiles from 2026-03-24 (Tue) → 2026-04-07.
 
-        Viernes Santo 2026-04-03 excluded.
-        Count: Wed 25, Thu 26, Fri 27, [Sat 28], [Sun 29],
-               Mon 30, Tue 31, Wed Apr 1, Thu Apr 2,
-               [Fri Apr 3 VIERNES SANTO], [Sat 4], [Sun 5],
-               Mon Apr 6, Tue Apr 7, Wed Apr 8.
-        Days counted: 25,26,27,30,31,Apr1,Apr2,Apr6,Apr7,Apr8 = 10 ✓
+        Viernes Santo (Apr 3, Friday) and Sábado Santo (Apr 4, Saturday) are
+        BOTH CL feriados, so Apr 4 is excluded despite being a Saturday.
+        Count: Wed 25(1), Thu 26(2), Fri 27(3), Sat 28(4, hábil), [Sun 29 skip],
+               Mon 30(5), Tue 31(6), Wed Apr 1(7), Thu Apr 2(8),
+               [Fri Apr 3 VIERNES SANTO], [Sat Apr 4 SÁBADO SANTO], [Sun Apr 5 skip],
+               Mon Apr 6(9), Tue Apr 7(10).
+        Days counted: 25,26,27,28,30,31,Apr1,Apr2,Apr6,Apr7 = 10 ✓
         """
         result = add_business_days(date(2026, 3, 24), 10)
-        assert result == date(2026, 4, 8)
+        assert result == date(2026, 4, 7)
 
     def test_sentencia_10d_standard(self) -> None:
-        """SENTENCIA_10D: 10 días hábiles from 2026-05-04 (Mon) → 2026-05-18.
+        """SENTENCIA_10D: 10 días hábiles from 2026-05-04 (Mon) → 2026-05-15.
 
         No feriados in the period.
-        Count: Tue 5, Wed 6, Thu 7, Fri 8, Mon 11, Tue 12,
-               Wed 13, Thu 14, Fri 15, Mon 18. = 10 ✓
+        Count: Tue 5(1), Wed 6(2), Thu 7(3), Fri 8(4), Sat 9(5, hábil),
+               [Sun 10 skip], Mon 11(6), Tue 12(7), Wed 13(8), Thu 14(9),
+               Fri 15(10). = 10 ✓
         """
         result = add_business_days(date(2026, 5, 4), 10)
-        assert result == date(2026, 5, 18)
+        assert result == date(2026, 5, 15)
 
     def test_observaciones_6d_crosses_glorias_navales(self) -> None:
-        """OBSERVACIONES_PRUEBA_6D: 6 días hábiles from 2026-05-18 (Mon) → 2026-05-27.
+        """OBSERVACIONES_PRUEBA_6D: 6 días hábiles from 2026-05-18 (Mon) → 2026-05-26.
 
-        May 21 = Glorias Navales (feriado).
-        Count: Tue 19, Wed 20, [Thu 21 FERIADO], Fri 22, Mon 25, Tue 26, Wed 27. = 6 ✓
+        May 21 (Thursday) = Glorias Navales (feriado).
+        Count: Tue 19(1), Wed 20(2), [Thu 21 FERIADO], Fri 22(3),
+               Sat 23(4, hábil), [Sun 24 skip], Mon 25(5), Tue 26(6). = 6 ✓
         """
         result = add_business_days(date(2026, 5, 18), 6)
-        assert result == date(2026, 5, 27)
+        assert result == date(2026, 5, 26)
 
     def test_year_boundary_new_year(self) -> None:
         """Correctly skips Jan 1 across the year boundary."""
-        # Start: 2025-12-30 (Tuesday), 3 days → skip Jan 1 (feriado)
-        # Count: Wed Dec 31, [Thu Jan 1 FERIADO], Fri Jan 2, Mon Jan 5 = 3
+        # Start: 2025-12-30 (Tuesday), 3 days.
+        # Count: Wed Dec 31(1), [Thu Jan 1 FERIADO], Fri Jan 2(2),
+        #        Sat Jan 3(3, hábil). = 3 ✓
         result = add_business_days(date(2025, 12, 30), 3)
-        assert result == date(2026, 1, 5)
+        assert result == date(2026, 1, 3)
 
     def test_weekend_only_skip(self) -> None:
-        """2 days starting Friday — crosses weekend, lands on Tuesday."""
-        # Start: 2026-06-12 (Fri), count: Mon 15, Tue 16 = 2
+        """2 days starting Friday — Saturday counts, Sunday is skipped."""
+        # Start: 2026-06-12 (Fri), count: Sat 13(1, hábil), [Sun 14 skip],
+        # Mon 15(2). = 2 ✓
         result = add_business_days(date(2026, 6, 12), 2)
-        assert result == date(2026, 6, 16)
+        assert result == date(2026, 6, 15)
 
     @pytest.mark.parametrize(
         "n,expected",
         [
-            (4, date(2026, 7, 7)),   # TRASLADO
-            (5, date(2026, 7, 8)),   # APELACION (+1)
-            (8, date(2026, 7, 13)),  # EXCEPCIONES
-            (10, date(2026, 7, 15)), # TERMINO_PROB
+            # 2026-07-01 is Wed; Sat 07-04 is hábil, Sun 07-05 is skipped.
+            (4, date(2026, 7, 6)),   # TRASLADO: Thu02,Fri03,Sat04,Mon06
+            (5, date(2026, 7, 7)),   # APELACION (+1): ...,Tue07
+            (8, date(2026, 7, 10)),  # EXCEPCIONES: ...,Wed08,Thu09,Fri10
+            (10, date(2026, 7, 13)), # TERMINO_PROB: ...,Sat11,Mon13
         ],
     )
     def test_all_deadline_types_from_same_start(
@@ -128,6 +149,62 @@ class TestAddBusinessDays:
     ) -> None:
         """All deadline day counts produce distinct expected dates from 2026-07-01."""
         assert add_business_days(date(2026, 7, 1), n) == expected
+
+
+# ---------------------------------------------------------------------------
+# Art. 66 CPC regression guard: Saturday is hábil, Sunday and feriados are not.
+# ---------------------------------------------------------------------------
+
+
+class TestSaturdayIsBusinessDay:
+    """Pins the art. 66 CPC rule so it cannot regress silently.
+
+    Without these tests, a future reader could "fix" _is_business_day back
+    to excluding Saturday, reintroducing the bug this change corrects.
+    """
+
+    def test_saturday_without_feriado_is_dia_habil(self) -> None:
+        """2026-06-13 is a Saturday and NOT a Chilean feriado → hábil."""
+        assert _is_business_day(date(2026, 6, 13)) is True
+
+    def test_sunday_is_never_dia_habil(self) -> None:
+        """2026-06-14 is a Sunday → inhábil, regardless of feriado status."""
+        assert _is_business_day(date(2026, 6, 14)) is False
+
+    def test_weekday_feriado_is_not_dia_habil(self) -> None:
+        """2026-09-18 (Friday) = Fiestas Patrias → inhábil."""
+        assert _is_business_day(date(2026, 9, 18)) is False
+
+    def test_saturday_feriado_is_not_dia_habil(self) -> None:
+        """2026-09-19 (Saturday) = Glorias del Ejército.
+
+        The feriado wins: this date is inhábil because it is a feriado,
+        not because it falls on a Saturday.
+        """
+        assert _is_business_day(date(2026, 9, 19)) is False
+
+    def test_add_business_days_one_day_lands_on_saturday(self) -> None:
+        """Friday 2026-06-12 + 1 día hábil = Saturday 2026-06-13.
+
+        Saturday must be reachable as day 1: it counts as hábil.
+        """
+        result = add_business_days(date(2026, 6, 12), 1)
+        assert result == date(2026, 6, 13)
+
+    def test_add_business_days_crosses_weekend_counting_saturday(self) -> None:
+        """Deadline crossing a weekend counts Saturday, skips Sunday.
+
+        Start Fri 2026-06-12 (day 0), n=3:
+        Sat 13(1, hábil), [Sun 14 skip], Mon 15(2), Tue 16(3). = 3 ✓
+        """
+        result = add_business_days(date(2026, 6, 12), 3)
+        assert result == date(2026, 6, 16)
+
+    def test_count_business_days_remaining_counts_saturday(self) -> None:
+        """A due date that falls on the very next Saturday is 1 día hábil away."""
+        today = date(2026, 6, 12)  # Friday
+        due = date(2026, 6, 13)  # Saturday — counts as hábil
+        assert count_business_days_remaining(due, today) == 1
 
 
 # ---------------------------------------------------------------------------

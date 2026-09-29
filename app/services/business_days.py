@@ -6,7 +6,9 @@ surface DEADLINE_DISCLAIMER from app.core.deadlines_config to end-users.
 Counting convention (CPC):
 - The trigger/event date is day 0 (NOT counted).
 - The first business day after the event is day 1.
-- Weekends (Saturday/Sunday) and Chilean feriados are excluded.
+- Only Sundays and Chilean feriados are excluded. Saturday IS a día hábil
+  (art. 66 CPC: terms are suspended only on feriados — for this purpose,
+  feriados means Sundays and holidays — Saturday is not a feriado).
 
 Feriado source: ``holidays`` library (Chile), pinned to ^0.58 in
 pyproject.toml.  The library covers fixed + moveable feriados (Viernes
@@ -35,8 +37,19 @@ def _cl_holidays_cached(year: int) -> holidays.HolidayBase:
 
 
 def _is_business_day(d: date) -> bool:
-    """Return True when *d* is a weekday that is NOT a Chilean feriado."""
-    if d.weekday() >= 5:  # Saturday=5, Sunday=6
+    """Return True when *d* is a día hábil (business day) under art. 66 CPC.
+
+    INTENTIONAL: Saturday counts as hábil. Art. 66 CPC suspends judicial
+    terms only during "feriados", and for this purpose feriados means
+    Sundays and holidays (Dirección Jurídica, "Flujo de excepciones
+    dilatorias", confirmado 2026-09-29). Saturday is NOT a feriado in
+    Chilean civil procedure, so it must NOT be excluded here. Do not
+    "fix" this back to `d.weekday() >= 5` — that reintroduces a bug that
+    silently lengthened every deadline. Measured against the QA database
+    on 2026-09-29: 779 of 973 active deadlines carried a due_date later
+    than the legal one, by up to 13 days.
+    """
+    if d.weekday() == 6:  # Sunday=6
         return False
     cl = _cl_holidays_cached(d.year)
     return d not in cl
