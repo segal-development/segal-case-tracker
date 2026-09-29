@@ -175,6 +175,7 @@ class Settings(BaseSettings):
     PJUD_VIEWPORT_WIDTH: int = 1920         # Browser viewport width (default full-HD)
     PJUD_VIEWPORT_HEIGHT: int = 1080        # Browser viewport height
     PJUD_ALERTS_ENABLED: bool = True        # Enable/disable alert webhooks
+    PJUD_SCRAPING_ENABLED: bool = True      # False where the IP can't authenticate against PJUD (cloud VM)
 
     # Document storage (Slice 2)
     DOC_STORAGE_BACKEND: str = "local"          # "local" or "gcs"
