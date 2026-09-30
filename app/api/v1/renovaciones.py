@@ -29,6 +29,15 @@ router = APIRouter()
 MONTO_DEFAULT = 25_000
 
 
+def _parece_url(texto: object) -> bool:
+    """True if a client name is really a pasted link. A person's name never
+    contains "://" nor starts with http(s)://. Deliberately narrow: no length,
+    word-count or charset rules, since an odd surname must never be rejected.
+    Shared by the form validator and the spreadsheet import."""
+    t = str(texto).strip().lower()
+    return "://" in t or t.startswith(("http://", "https://"))
+
+
 # --------------------------------------------------------------------------- #
 # Schemas
 # --------------------------------------------------------------------------- #
@@ -46,6 +55,16 @@ class RenovacionCreate(BaseModel):
         if not v or not v.strip():
             raise ValueError("campo obligatorio")
         return v.strip()
+
+    @field_validator("cliente_nombre")
+    @classmethod
+    def _nombre_no_es_enlace(cls, v: str) -> str:
+        if _parece_url(v):
+            raise ValueError(
+                "El nombre del cliente no puede ser un enlace. "
+                "Pega el nombre de la persona, no la URL."
+            )
+        return v
 
 
 class RenovacionResponse(BaseModel):
@@ -451,6 +470,11 @@ async def importar_excel(
             if not nombre or not str(nombre).strip() or _norm(nombre) == "NOMBRE":
                 continue
             total += 1
+            if _parece_url(nombre):
+                # A pasted link instead of a name (bypasses the form validator
+                # because rows are built directly): skip it and count it as an error.
+                err += 1
+                continue
             desde = row[4]
             if not isinstance(desde, datetime):
                 err += 1
