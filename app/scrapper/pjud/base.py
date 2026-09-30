@@ -37,6 +37,7 @@ from app.scrapper.pjud.exceptions import (
     InvalidCredentialsError,
     LoginError,
     LoginPageError,
+    PartialListingError,
     ScrapingError,
     SessionExpiredError,
     SessionNotAuthenticatedError,
@@ -1415,10 +1416,25 @@ class PJUDBaseScraper(ABC):
 
                 # Resilient wrapper guarantees a non-``ERROR:`` body or raises
                 # (it retries transient PJUD ``ERROR:`` responses internally).
-                html = await self._fetch_cases_page_resilient(
-                    page, rut_num, dv, tipo_causa, year,
-                    fecha_desde, fecha_hasta, current_page
-                )
+                try:
+                    html = await self._fetch_cases_page_resilient(
+                        page, rut_num, dv, tipo_causa, year,
+                        fecha_desde, fecha_hasta, current_page
+                    )
+                except ScrapingError as page_err:
+                    # Retries exhausted. Keep what we already have instead of
+                    # losing it all (the sync upserts, so a partial list is safe).
+                    # Nothing fetched yet (page 1) -> generic error, as before.
+                    # Session/Shape errors are not ScrapingError: untouched.
+                    if not all_cases:
+                        raise
+                    raise PartialListingError(
+                        str(page_err),
+                        cases=all_cases,
+                        failed_page=current_page,
+                        total_pages=total_pages,
+                        cause=page_err,
+                    ) from page_err
 
                 # Parse total on first page
                 if total_pages is None:

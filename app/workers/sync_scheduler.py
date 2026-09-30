@@ -30,6 +30,7 @@ from app.scrapper.pjud.exceptions import (
     CredentialExpiredError,
     InvalidCredentialsError,
     LoginPageError,
+    PartialListingError,
     SessionNotAuthenticatedError,
     ShapeChallengeError,
 )
@@ -462,12 +463,32 @@ async def sync_lawyer_cases(
         scraper = get_scraper(competencia)
         session = pjud_session  # PJUDSession object from Redis
 
+        # Set when PJUD cut the listing short: the run is then recorded as
+        # "partial" with a message naming the page, never as "completed".
+        listing_incomplete_msg: Optional[str] = None
+
         # Scrape cases
         try:
             cases = await scraper.get_my_cases(
                 session=session,
                 year="",  # All years
                 max_pages=0,  # All pages
+            )
+        except PartialListingError as partial_exc:
+            # A list page failed for good AFTER some were fetched. sync_cases only
+            # upserts (never archives/deletes absent causas), so syncing the
+            # partial list is safe and avoids throwing away what we already have.
+            # The cut is surfaced in sync_history.error_message below so it stays
+            # visible instead of being hidden behind a "completed" run.
+            cases = partial_exc.cases
+            total_txt = partial_exc.total_pages if partial_exc.total_pages else "?"
+            listing_incomplete_msg = (
+                f"Listado incompleto: se cortó en la página {partial_exc.failed_page} "
+                f"de {total_txt}. Se guardaron {len(cases)} causas."
+            )
+            logger.warning(
+                "sync_lawyer_cases: %s (lawyer_id=%s, %s)",
+                listing_incomplete_msg, lawyer_id, competencia,
             )
         except ShapeChallengeError:
             # ShapeChallengeError subclasses SessionNotAuthenticatedError but is a
@@ -556,6 +577,13 @@ async def sync_lawyer_cases(
         # Shape block, session), with the real stop reason — operators read
         # sync_history.error_message, not the worker log.
         stop_reason = _batch_stop_reason(mov_errors)
+        if listing_incomplete_msg:
+            # The listing cut goes FIRST so the 1024-char cap never drops it.
+            stop_reason = (
+                f"{listing_incomplete_msg} {stop_reason}"
+                if stop_reason
+                else listing_incomplete_msg
+            )
         if movements_new > 0 or stop_reason:
             last_sync_history = (
                 db.query(SyncHistory)
