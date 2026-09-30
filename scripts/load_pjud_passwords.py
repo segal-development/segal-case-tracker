@@ -44,6 +44,7 @@ def main() -> int:
                 skipped += 1
                 continue
             lawyer.encrypted_pjud_password = encrypt_pjud_password(clave)
+            lawyer.credential_alert_sent_at = None  # a future failure alerts again
             loaded += 1
             print(f"  ✓ {rut}: 2ª clave encrypted + stored")  # never logs the clave
     db.commit()
