@@ -50,6 +50,7 @@ def main() -> int:
                 clave = confirm = ""
                 continue
             lawyer.encrypted_pjud_password = encrypt_pjud_password(clave)
+            lawyer.credential_alert_sent_at = None  # a future failure alerts again
             db.commit()
             clave = confirm = ""  # drop plaintext from memory right away
             loaded += 1

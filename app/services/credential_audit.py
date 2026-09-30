@@ -78,7 +78,13 @@ def record_validation(
 
     last = _latest_event(db, lawyer_id, credential_type, _VALIDATION_EVENTS)
     if last is not None and last.event_type == event_type:
-        return None  # outcome unchanged — dedup
+        # Same outcome as before: dedup — unless the credential changed since
+        # that result. Then the old result is stale (see ``_is_stale``) and this
+        # one is the first verdict on the NEW key; dropping it would leave the
+        # vault on "pending_validation" forever.
+        last_change = _latest_event(db, lawyer_id, credential_type, ["value_changed"])
+        if not _is_stale(last.occurred_at, last_change):
+            return None  # outcome unchanged — dedup
 
     event = CredentialAuditEvent(
         lawyer_id=lawyer_id,
@@ -134,6 +140,17 @@ def scan_credential_changes(db: Session) -> int:
     return recorded
 
 
+def _is_stale(verdict_at: datetime, last_changed: Optional[CredentialAuditEvent]) -> bool:
+    """True if the credential changed at or after ``verdict_at``.
+
+    A validation result (or failure alert) older than the last key change says
+    nothing about the current key. On equal timestamps the change counts as
+    LATER: the real case is "changed the key right after it failed", and a tie
+    is far more likely to mean that than the reverse.
+    """
+    return last_changed is not None and last_changed.occurred_at >= verdict_at
+
+
 def _sub_status(db: Session, lawyer: Lawyer, credential_type: str) -> dict:
     """Build the safe per-credential-type status. No credential value leaks."""
     ciphertext = getattr(lawyer, _ENCRYPTED_FIELD[credential_type], None)
@@ -149,10 +166,20 @@ def _sub_status(db: Session, lawyer: Lawyer, credential_type: str) -> dict:
         # Shown as "No cargada"; the validation timestamps stay as history.
         health = "never_validated"
     elif latest_validation is not None:
-        health = "valid" if latest_validation.event_type == "validation_ok" else "failing"
+        if _is_stale(latest_validation.occurred_at, last_changed):
+            # The key was replaced after that result: it describes a key that
+            # no longer exists. We neither claim it fails nor that it works —
+            # the new key has not been tried against PJUD yet.
+            health = "pending_validation"
+        else:
+            health = "valid" if latest_validation.event_type == "validation_ok" else "failing"
     elif getattr(lawyer, "credential_alert_sent_at", None) is not None:
-        # No recorded validation yet, but a failure-episode alert is active.
-        health = "failing"
+        # No recorded validation yet, but a failure-episode alert is active —
+        # unless the key was replaced after that alert went out.
+        if _is_stale(lawyer.credential_alert_sent_at, last_changed):
+            health = "pending_validation"
+        else:
+            health = "failing"
     else:
         health = "never_validated"
 

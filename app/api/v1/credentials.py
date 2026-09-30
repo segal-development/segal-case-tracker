@@ -24,7 +24,7 @@ class CredentialSubStatus(BaseModel):
     """Safe per-credential-type status — no value/ciphertext/fingerprint."""
 
     present: bool
-    health: str  # "valid" | "failing" | "never_validated"
+    health: str  # "valid" | "failing" | "pending_validation" | "never_validated"
     last_validation_ok_at: Optional[datetime]
     last_failed_at: Optional[datetime]
     last_changed_at: Optional[datetime]
