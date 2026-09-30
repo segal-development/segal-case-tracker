@@ -30,6 +30,8 @@ from app.scrapper.pjud.exceptions import (
     CredentialExpiredError,
     InvalidCredentialsError,
     LoginPageError,
+    SessionNotAuthenticatedError,
+    ShapeChallengeError,
 )
 from app.services.sync_service import (
     DETAIL_ROTATION_REASON_MARKER,
@@ -443,16 +445,59 @@ async def sync_lawyer_cases(
             logger.warning(f"Skipping lawyer {lawyer_id}: {reason}")
             return {"skipped": True, "reason": reason}
 
+    # Reauth callback shared by the listing phase (below) and the detail phase
+    # (detect_and_sync_movements), so both recover from a session that PJUD
+    # invalidated server-side without coupling the service to scheduler auth.
+    async def _reauth_for_lawyer() -> Optional[PJUDSession]:
+        if lawyer is None:
+            logger.warning(
+                "sync_lawyer_cases: cannot reauth — lawyer_id=%s not found in DB",
+                lawyer_id,
+            )
+            return None
+        new_session, _reason = await _reauth(lawyer, store)
+        return new_session
+
     try:
         scraper = get_scraper(competencia)
         session = pjud_session  # PJUDSession object from Redis
 
         # Scrape cases
-        cases = await scraper.get_my_cases(
-            session=session,
-            year="",  # All years
-            max_pages=0,  # All pages
-        )
+        try:
+            cases = await scraper.get_my_cases(
+                session=session,
+                year="",  # All years
+                max_pages=0,  # All pages
+            )
+        except ShapeChallengeError:
+            # ShapeChallengeError subclasses SessionNotAuthenticatedError but is a
+            # PJUD/Shape BLOCK on the egress IP, not a credential problem. A
+            # re-login would hammer the flagged IP and deepen the block (same
+            # contract as detect_and_sync_movements). Propagate untouched.
+            raise
+        except SessionNotAuthenticatedError as auth_exc:
+            # The session exists in Redis but PJUD no longer honors it. Drop the
+            # stale session, re-authenticate and retry the listing ONCE. A second
+            # failure (or no fresh session) propagates: no loops.
+            logger.warning(
+                "sync_lawyer_cases: cached session rejected by PJUD for lawyer_id=%s "
+                "during listing; re-authenticating once: %s",
+                lawyer_id,
+                auth_exc,
+            )
+            await store.adelete_session(session.session_id)
+            fresh_session = await _reauth_for_lawyer()
+            # _reauth may change lawyer.credential_alert_sent_at; persist it
+            # regardless of the outcome, like the no-session path above.
+            db.commit()
+            if fresh_session is None:
+                raise
+            session = fresh_session
+            cases = await scraper.get_my_cases(
+                session=session,
+                year="",  # All years
+                max_pages=0,  # All pages
+            )
 
         # Convert to ScrapedCase objects
         scraped_cases = convert_api_cases_to_scraped([
@@ -487,18 +532,6 @@ async def sync_lawyer_cases(
             api_cases=cases,
             batch_size=settings.DETAIL_BATCH_SIZE,
         )
-
-        # Slice 2: inject a reauth callback so the service can recover from
-        # mid-batch session expiry without coupling to the scheduler auth logic.
-        async def _reauth_for_lawyer() -> Optional[PJUDSession]:
-            if lawyer is None:
-                logger.warning(
-                    "sync_lawyer_cases: cannot reauth — lawyer_id=%s not found in DB",
-                    lawyer_id,
-                )
-                return None
-            new_session, _reason = await _reauth(lawyer, store)
-            return new_session
 
         # S4-T3/S4-T5: movement detection — reuse the shared implementation.
         # selected_cases drives the rotation (replaces the old front-of-list [:5] cap).
@@ -656,23 +689,19 @@ async def sync_all_lawyers():
         # Release the setup connection BEFORE the long loop — never held idle.
         setup_db.close()
 
-    # PJUD is behind F5 Shape, which blocks datacenter IPs unconditionally: a
-    # cloud VM (e.g. the QA/prod worker container) can NEVER authenticate
-    # against PJUD, no matter how many times it tries. Letting it try anyway
-    # just fills sync_history with guaranteed failures until
-    # scraping_health's alert becomes noise nobody trusts (see 2026-09-29
-    # incident: 33/50 runs failed, 503 fired twice for a structural,
-    # unavoidable reason). Real PJUD scraping runs only from the dedicated
-    # station on a residential IP. This guard must stay AFTER the maintenance
-    # block above (credential scan, Sysgal refresh, health check, cartera
-    # snapshot) — those still have to run on every deployment — and only
-    # skips the PJUD lawyer-sync loop below.
+    # PJUD_SCRAPING_ENABLED lets a deployment switch the PJUD scraping loop off
+    # when it is not wanted or does not work there (e.g. a worker that should
+    # only run maintenance). It is an operational switch, not a claim about what
+    # the environment can do: cloud VMs do authenticate against PJUD (verified
+    # 2026-09-30: 12 successful logins vs 2 failures in 12h from a GCP IP, no
+    # proxy). This guard must stay AFTER the maintenance block above (credential
+    # scan, Sysgal refresh, health check, cartera snapshot) — those still have to
+    # run on every deployment — and only skips the PJUD lawyer-sync loop below.
     if not settings.PJUD_SCRAPING_ENABLED:
         logger.info(
             "PJUD scraping is disabled in this deployment (PJUD_SCRAPING_ENABLED=false); "
-            "skipping the lawyer sync loop. This is expected on cloud VMs, which PJUD's "
-            "F5 Shape protection always blocks — the real scraping runs from the dedicated "
-            "station. Sysgal refresh and the scraping health check above already ran."
+            "skipping the lawyer sync loop. Sysgal refresh and the scraping health "
+            "check above already ran."
         )
         return
 
