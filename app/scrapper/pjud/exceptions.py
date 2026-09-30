@@ -69,6 +69,28 @@ class ScrapingError(PJUDError):
     pass
 
 
+class PartialListingError(ScrapingError):
+    """Raised when the list pagination dies AFTER some pages were fetched.
+
+    Carries what was already fetched so the caller can keep it instead of
+    losing the whole lawyer's listing. Subclasses ``ScrapingError`` on purpose:
+    existing ``except ScrapingError`` callers keep behaving exactly as before.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        cases: list,
+        failed_page: int,
+        total_pages: int | None = None,
+        cause: Exception | None = None,
+    ):
+        super().__init__(message, cause)
+        self.cases = cases
+        self.failed_page = failed_page
+        self.total_pages = total_pages
+
+
 class SelectorNotFoundError(PJUDError):
     """Raised when a required selector is not found in the page."""
     

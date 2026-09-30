@@ -179,3 +179,70 @@ class TestListingPhaseReauth:
         assert h.scraper.get_my_cases.await_args.kwargs["session"] is new
         h.store.adelete_session.assert_not_awaited()
         assert h.detect.await_args.kwargs["pjud_session"] is new
+
+
+class TestPartialListing:
+    """A listing cut short by PJUD keeps what was fetched and stays VISIBLE."""
+
+    @staticmethod
+    def _partial(n_cases=2):
+        from app.scrapper.pjud.exceptions import PartialListingError
+
+        cases = [
+            MagicMock(rol=f"C-{i}-2024", tribunal="t", caratulado="a/b",
+                      fecha_ingreso="01/01/2024", estado_cuaderno="Tramitación",
+                      cuaderno="1 Principal", institucion="i")
+            for i in range(n_cases)
+        ]
+        return PartialListingError(
+            "list page 4: failed after 3 retries",
+            cases=cases, failed_page=4, total_pages=139,
+        ), cases
+
+    @pytest.mark.asyncio
+    async def test_partial_listing_syncs_the_cases_already_fetched(self):
+        err, cases = self._partial()
+        h = _Harness(redis_session=MagicMock(session_id="s"),
+                     get_my_cases_effects=[err], reauth_result=(None, None))
+        result = await h.run()
+        assert result.get("success") is True
+        # the detail phase receives the partial list, nothing was discarded
+        assert h.detect.await_args.kwargs["api_cases"] == cases
+
+    @pytest.mark.asyncio
+    async def test_partial_listing_marks_run_partial_and_names_the_page(self):
+        err, _ = self._partial()
+        h = _Harness(redis_session=MagicMock(session_id="s"),
+                     get_my_cases_effects=[err], reauth_result=(None, None))
+        history = SyncHistory(lawyer_id=1, competencia="civil")
+        h.db.query.return_value.filter.return_value.order_by.return_value.first.return_value = history
+        await h.run()
+        assert history.status == "partial"
+        assert history.error_message.startswith(
+            "Listado incompleto: se cortó en la página 4 de 139. Se guardaron 2 causas."
+        )
+
+    @pytest.mark.asyncio
+    async def test_listing_message_survives_a_detail_stop_reason(self):
+        err, _ = self._partial()
+        h = _Harness(redis_session=MagicMock(session_id="s"),
+                     get_my_cases_effects=[err], reauth_result=(None, None))
+        h.detect.return_value = (0, 0, ["Red o PJUD no disponible: x; lote detenido"])
+        history = SyncHistory(lawyer_id=1, competencia="civil")
+        h.db.query.return_value.filter.return_value.order_by.return_value.first.return_value = history
+        await h.run()
+        assert history.status == "partial"
+        assert "página 4 de 139" in history.error_message
+        assert "lote detenido" in history.error_message
+
+    @pytest.mark.asyncio
+    async def test_happy_path_unchanged(self):
+        h = _Harness(redis_session=MagicMock(session_id="s"),
+                     get_my_cases_effects=[[]], reauth_result=(None, None))
+        history = SyncHistory(lawyer_id=1, competencia="civil")
+        history.status = "completed"
+        h.db.query.return_value.filter.return_value.order_by.return_value.first.return_value = history
+        result = await h.run()
+        assert result["success"] is True
+        assert history.status == "completed"
+        assert history.error_message is None
