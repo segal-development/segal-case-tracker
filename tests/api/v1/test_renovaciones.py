@@ -183,6 +183,44 @@ def test_create_rejects_bad_amount_and_blank(client, admin, abogado):
     assert blank.status_code == 422
 
 
+URL_COPIADA = (
+    "https://sysgal.segal.cl/defensoria/12f403cd/3/5/3/769880"
+    "#:~:text=John%20Paul%20Ruz%20Guerra"
+)
+
+
+def _crear(client, abogado, nombre, contrato="C-URL", rut="18314383-2"):
+    return client.post("/api/v1/renovaciones", headers=_h(ADMIN_RUT), json={
+        "numero_contrato": contrato, "cliente_rut": rut, "cliente_nombre": nombre,
+        "lawyer_id": abogado.id,
+    })
+
+
+@pytest.mark.parametrize("nombre", [
+    URL_COPIADA,
+    "HTTP://SYSGAL.SEGAL.CL/x",
+    "   https://sysgal.segal.cl/x   ",
+    "Http://ejemplo.cl",
+])
+def test_create_rechaza_nombre_que_es_una_url(client, admin, abogado, nombre):
+    r = _crear(client, abogado, nombre)
+    assert r.status_code == 422
+    assert "no puede ser un enlace" in r.text
+
+
+@pytest.mark.parametrize("nombre", [
+    "John Paul Luis Ruz Guerra",
+    "María José Núñez Peña",
+    "Juan O'Higgins",
+    "Ana-Sofía Muñoz",
+    "Sociedad Agrícola http Ltda",
+])
+def test_create_acepta_nombres_normales_y_raros(client, admin, abogado, nombre):
+    r = _crear(client, abogado, nombre)
+    assert r.status_code == 201
+    assert r.json()["cliente_nombre"] == nombre
+
+
 def test_list_filter_and_resumen(client, admin, abogado):
     # Distinct client RUTs — a client can't repeat within a period.
     for i, m in enumerate(("2026-07-05", "2026-07-20", "2026-08-01")):
@@ -273,6 +311,33 @@ def test_importar_excel_maps_and_dedups(client, admin, abogado):
     febrero = client.get("/api/v1/renovaciones?periodo=2026-02", headers=_h(ADMIN_RUT)).json()["items"]
     assert febrero[0]["renovador"] == "MVERA"
     assert febrero[0]["lawyer_id"] is None
+
+
+def test_importar_saltea_fila_con_url_y_sigue_con_el_resto(client, admin, abogado):
+    """El agujero real: la importación no pasa por el validador del formulario.
+    La fila con una URL en el nombre se saltea y se reporta en `errores`; las
+    filas buenas de la misma planilla se importan igual."""
+    from datetime import datetime as dt
+    rows = [
+        ["17098014-k", "Cliente Uno", "C-100", 12, dt(2026, 1, 5), dt(2027, 1, 5), "EVENEGAS", 20000],
+        ["18314383-2", URL_COPIADA, "1000033412", 12, dt(2026, 2, 1), dt(2027, 2, 1), "EVENEGAS", 25000],
+        ["18314383-2", "  HTTPS://sysgal.segal.cl/x ", "C-102", 12, dt(2026, 2, 2), dt(2027, 2, 2), "EVENEGAS", 25000],
+        ["12345678-5", "Cliente Dos", "C-101", 12, dt(2026, 3, 10), dt(2027, 3, 10), "MVERA", 25000],
+    ]
+    r = client.post(
+        "/api/v1/renovaciones/importar", headers=_h(ADMIN_RUT),
+        files={"archivo": ("reno.xlsx", _make_xlsx(rows), _XLSX_MIME)},
+    )
+    assert r.status_code == 200
+    b = r.json()
+    assert b["total_leidas"] == 4
+    assert b["creadas"] == 2
+    assert b["errores"] == 2
+
+    todas = client.get("/api/v1/renovaciones?per_page=100", headers=_h(ADMIN_RUT)).json()["items"]
+    nombres = {x["cliente_nombre"] for x in todas}
+    assert nombres == {"Cliente Uno", "Cliente Dos"}
+    assert not any("://" in n for n in nombres)
 
 
 def test_importar_matchea_username_de_procurador(client, admin, abogado, db):
