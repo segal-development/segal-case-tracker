@@ -8,6 +8,9 @@ from datetime import date
 import pytest
 
 from app.core.security import create_access_token
+from app.models.case import Case
+from app.models.case_litigante import CaseLitigante
+from app.models.court import Court
 from app.models.lawyer import Lawyer
 
 ADMIN_RUT = "16021492-9"
@@ -504,3 +507,151 @@ def test_resumen_incluye_por_abogado(client, db, admin):
     assert pa[0]["cantidad"] == 2 and pa[0]["total"] == 600_000 and pa[0]["comision"] == 20_800
     assert pa[1]["cantidad"] == 1 and pa[1]["total"] == 480_000 and pa[1]["comision"] == 10_400
     assert pa[2]["lawyer_id"] is None and pa[2]["comision"] == 10_400
+
+
+# --------------------------------------------------------------------------- #
+# Búsqueda por ROL de causa
+# --------------------------------------------------------------------------- #
+FECHA_BUSQUEDA = date(2026, 7, 1)
+
+
+def _renovar(client, abogado, rut, contrato, nombre="Cliente Uno", desde="2026-07-10"):
+    r = client.post("/api/v1/renovaciones", headers=_h(ADMIN_RUT), json={
+        "numero_contrato": contrato, "cliente_rut": rut, "cliente_nombre": nombre,
+        "lawyer_id": abogado.id, "monto_cuota": 25000, "fecha_desde": desde,
+    })
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def _causa(db, rol, litigante_rut=None):
+    """Crea una causa con ese ROL y, si se indica, un litigante con ese RUT tal cual."""
+    court = db.query(Court).first()
+    if court is None:
+        court = Court(code="TBUS", name="Juzgado Busqueda", region="RM", type="civil")
+        db.add(court)
+        db.commit()
+        db.refresh(court)
+    lw = db.query(Lawyer).filter(Lawyer.role == "lawyer").first()
+    case = Case(lawyer_id=lw.id, court_id=court.id, rol=rol, status="active",
+                competencia="civil", created_at=FECHA_BUSQUEDA, updated_at=FECHA_BUSQUEDA)
+    db.add(case)
+    db.commit()
+    db.refresh(case)
+    if litigante_rut is not None:
+        db.add(CaseLitigante(case_id=case.id, participante="DTE.", rut=litigante_rut,
+                             persona_type="NATURAL", nombre="Parte",
+                             natural_key=f"{case.id}-{litigante_rut}"))
+        db.commit()
+    return case
+
+
+def _buscar(client, **params):
+    r = client.get("/api/v1/renovaciones", headers=_h(ADMIN_RUT), params=params)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+class TestBusquedaPorRol:
+    def test_rol_devuelve_la_renovacion_del_cliente_que_es_parte(self, client, admin, abogado, db):
+        _renovar(client, abogado, "12345678-5", "K-1")
+        _causa(db, "C-7007-2026", "12345678-5")
+        body = _buscar(client, q="C-7007-2026")
+        assert [i["numero_contrato"] for i in body["items"]] == ["K-1"]
+        assert body["total"] == 1
+
+    def test_renovacion_ligada_a_dos_causas_sale_una_sola_vez(self, client, admin, abogado, db):
+        _renovar(client, abogado, "12345678-5", "K-2")
+        _causa(db, "C-5988-2026", "12345678-5")
+        _causa(db, "C-7213-2026", "12345678-5")
+        # Un patrón que matchea ambas causas: con un JOIN saldría duplicada.
+        body = _buscar(client, q="C-%-2026")
+        assert [i["numero_contrato"] for i in body["items"]] == ["K-2"]
+        assert body["total"] == 1
+
+    def test_rol_no_devuelve_clientes_que_no_son_parte(self, client, admin, abogado, db):
+        _renovar(client, abogado, "12345678-5", "K-3")
+        _renovar(client, abogado, "11111111-1", "K-4", nombre="Otro Cliente")
+        _causa(db, "C-7007-2026", "12345678-5")
+        _causa(db, "C-8000-2026", "11111111-1")
+        body = _buscar(client, q="C-7007-2026")
+        assert [i["numero_contrato"] for i in body["items"]] == ["K-3"]
+
+    def test_rut_del_litigante_con_puntos_y_espacios_matchea(self, client, admin, abogado, db):
+        _renovar(client, abogado, "12345678-5", "K-5")
+        _causa(db, "C-7007-2026", "12.345.678-5")
+        assert _buscar(client, q="C-7007-2026")["total"] == 1
+        _causa(db, "C-7008-2026", " 12 345 678-5 ")
+        assert _buscar(client, q="C-7008-2026")["total"] == 1
+
+    def test_rut_del_litigante_con_k_minuscula_matchea(self, client, admin, abogado, db):
+        _renovar(client, abogado, "17098014-k", "K-6")  # se guarda como ...-K
+        _causa(db, "C-7007-2026", "17.098.014-k")
+        assert _buscar(client, q="C-7007-2026")["total"] == 1
+
+    def test_causa_sin_litigantes_no_trae_nada(self, client, admin, abogado, db):
+        _renovar(client, abogado, "12345678-5", "K-7")
+        _causa(db, "C-7007-2026")
+        assert _buscar(client, q="C-7007-2026")["total"] == 0
+
+    def test_los_tres_campos_de_siempre_siguen_funcionando(self, client, admin, abogado, db):
+        _renovar(client, abogado, "12345678-5", "CONTRATO-ABC", nombre="Maria Soto")
+        _renovar(client, abogado, "11111111-1", "OTRO-1", nombre="Pedro Rojas")
+        assert [i["numero_contrato"] for i in _buscar(client, q="maria")["items"]] == ["CONTRATO-ABC"]
+        assert [i["numero_contrato"] for i in _buscar(client, q="12345678")["items"]] == ["CONTRATO-ABC"]
+        assert [i["numero_contrato"] for i in _buscar(client, q="contrato-abc")["items"]] == ["CONTRATO-ABC"]
+
+    def test_con_periodo_la_busqueda_por_rol_queda_acotada(self, client, admin, abogado, db):
+        _renovar(client, abogado, "12345678-5", "K-JUL", desde="2026-07-10")
+        _renovar(client, abogado, "12345678-5", "K-AGO", desde="2026-08-10")
+        _causa(db, "C-7007-2026", "12345678-5")
+        body = _buscar(client, q="C-7007-2026", periodo="2026-07")
+        assert [i["numero_contrato"] for i in body["items"]] == ["K-JUL"]
+
+    def test_sin_periodo_la_busqueda_por_rol_abarca_todos_los_periodos(self, client, admin, abogado, db):
+        _renovar(client, abogado, "12345678-5", "K-JUL", desde="2026-07-10")
+        _renovar(client, abogado, "12345678-5", "K-AGO", desde="2026-08-10")
+        _causa(db, "C-7007-2026", "12345678-5")
+        body = _buscar(client, q="C-7007-2026")
+        assert {i["numero_contrato"] for i in body["items"]} == {"K-JUL", "K-AGO"}
+
+    def test_resumen_no_responde_a_la_busqueda(self, client, admin, abogado, db):
+        _renovar(client, abogado, "12345678-5", "K-8")
+        _renovar(client, abogado, "11111111-1", "K-9", nombre="Otro Cliente")
+        _causa(db, "C-7007-2026", "12345678-5")
+        res = client.get("/api/v1/renovaciones/resumen?periodo=2026-07&q=C-7007-2026",
+                         headers=_h(ADMIN_RUT)).json()
+        assert res["count"] == 2
+
+
+class TestBusquedaNombreSinAcentos:
+    """La búsqueda por nombre ignora tildes y eñes en ambos sentidos."""
+
+    @pytest.fixture(autouse=True)
+    def _renovaciones(self, client, admin, abogado):
+        _renovar(client, abogado, "11111111-1", "A-1", nombre="Andrés Soto Vidal")
+        _renovar(client, abogado, "22222222-2", "A-2", nombre="María GARCÍA Pérez")
+        _renovar(client, abogado, "33333333-3", "A-3", nombre="Juan Briceño Ñuñoa")
+        _renovar(client, abogado, "44444444-4", "A-4", nombre="Pedro Rojas")
+        _renovar(client, abogado, "55555555-5", "A-5", nombre="Ángela Müller")
+
+    @pytest.mark.parametrize("termino,contrato", [
+        ("andres", "A-1"),        # sin tilde encuentra con tilde
+        ("Andrés", "A-1"),        # con tilde encuentra con tilde
+        ("ANDRÉS", "A-1"),        # mayúscula con tilde
+        ("garcia", "A-2"),        # el nombre guardado trae mayúscula con tilde
+        ("García", "A-2"),
+        ("brice", "A-3"),
+        ("briceño", "A-3"),
+        ("nunoa", "A-3"),         # ñ ~ n
+        ("angela", "A-5"),        # Á inicial
+        ("muller", "A-5"),        # ü ~ u
+        ("pedro", "A-4"),         # regresión: sin acentos sigue igual
+        ("Rojas", "A-4"),
+    ])
+    def test_encuentra_sin_importar_acentos(self, client, termino, contrato):
+        body = _buscar(client, q=termino)
+        assert [i["numero_contrato"] for i in body["items"]] == [contrato]
+
+    def test_no_matchea_lo_que_no_corresponde(self, client):
+        assert _buscar(client, q="andres rojas")["total"] == 0

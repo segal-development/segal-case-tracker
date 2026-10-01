@@ -14,11 +14,13 @@ from typing import List, Optional
 from dateutil.relativedelta import relativedelta
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from pydantic import BaseModel, field_validator
-from sqlalchemy import or_
+from sqlalchemy import exists, func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.api.deps import get_current_lawyer, get_db, require_admin
 from app.services.bono_calc import V2_POR_RENOVACION
+from app.models.case import Case
+from app.models.case_litigante import CaseLitigante
 from app.models.lawyer import Lawyer
 from app.models.renovacion import Renovacion, CUOTAS_RENOVACION
 from app.utils.rut import format_rut, normalize_rut
@@ -27,6 +29,38 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 MONTO_DEFAULT = 25_000
+
+
+# Spanish accents folded to their base letter. Kept to the Spanish set on
+# purpose: this is not a Unicode table. Upper and lower case are both mapped so
+# ILIKE (ASCII case-insensitive on SQLite) finishes the job.
+_ACENTOS = {
+    "á": "a", "é": "e", "í": "i", "ó": "o", "ú": "u", "ü": "u", "ñ": "n",
+    "Á": "A", "É": "E", "Í": "I", "Ó": "O", "Ú": "U", "Ü": "U", "Ñ": "N",
+}
+_TABLA_ACENTOS = str.maketrans(_ACENTOS)
+
+
+def _sin_acentos_sql(columna):
+    """SQL expression that strips accents from a column, nesting ``replace()``
+    the same portable way the RUT is normalized (no ``unaccent`` extension: it is
+    not installed in Postgres and does not exist in the SQLite test DB).
+
+    WHY this exists: the screen used to filter client-side with an accent-blind
+    comparison, so "andres" found "Andrés". Moving the search to the backend
+    would silently lose that, since ILIKE is accent-sensitive. About 23% of the
+    renewals (631 of 2,721 measured) have a tilde or ñ in the client name, so
+    removing this normalization is a user-visible regression, not a cleanup.
+    Costs an index on the column (a LIKE '%x%' could not use one anyway).
+    """
+    for con, sin in _ACENTOS.items():
+        columna = func.replace(columna, con, sin)
+    return columna
+
+
+def _sin_acentos(texto: str) -> str:
+    """Same folding for the search term, done in Python."""
+    return texto.translate(_TABLA_ACENTOS)
 
 
 def _parece_url(texto: object) -> bool:
@@ -288,7 +322,7 @@ async def create_renovacion(
 async def list_renovaciones(
     periodo: Optional[str] = Query(None, description="Filtrar por mes YYYY-MM (fecha de renovación)"),
     lawyer_id: Optional[int] = Query(None),
-    q: Optional[str] = Query(None, description="Buscar por nombre, RUT o N° contrato"),
+    q: Optional[str] = Query(None, description="Buscar por nombre, RUT, N° contrato o ROL de causa"),
     page: int = Query(1, ge=1),
     per_page: int = Query(500, ge=1, le=2000),
     db: Session = Depends(get_db),
@@ -308,10 +342,24 @@ async def list_renovaciones(
         query = query.filter(Renovacion.lawyer_id == lawyer_id)
     if q and q.strip():
         like = f"%{q.strip()}%"
+        like_nombre = f"%{_sin_acentos(q.strip())}%"
+        # Fourth way in: the client is a party (litigante) of a case whose ROL
+        # matches. The RUT is the only link; litigante RUTs come with dots or
+        # spaces, renovacion RUTs are normalized. EXISTS, not JOIN: a renewal can
+        # be tied to several cases and must come out once.
+        rut_litigante = func.upper(
+            func.replace(func.replace(CaseLitigante.rut, ".", ""), " ", "")
+        )
+        es_parte_de_causa = exists().where(
+            CaseLitigante.case_id == Case.id,
+            Case.rol.ilike(like),
+            rut_litigante == Renovacion.cliente_rut,
+        )
         query = query.filter(
-            Renovacion.cliente_nombre.ilike(like)
+            _sin_acentos_sql(Renovacion.cliente_nombre).ilike(like_nombre)
             | Renovacion.cliente_rut.ilike(like)
             | Renovacion.numero_contrato.ilike(like)
+            | es_parte_de_causa
         )
     # Count the filtered set BEFORE offset/limit, then page over a DETERMINISTIC
     # order so slices are stable across requests.
