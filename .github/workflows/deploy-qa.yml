@@ -24,8 +24,15 @@ jobs:
       - name: Install dependencies
         run: poetry install --no-interaction --no-root
 
+      # En paralelo solo en CI (no en addopts): en local la salida entremezclada
+      # de varios workers vuelve molesto depurar una falla.
+      # 4 workers = los 4 vCPU de un runner ubuntu-latest en repos publicos
+      # (este repo lo es). La suite espera mucho disco (SQLite create/drop por
+      # test), asi que escala bien hasta ahi; medido en local: -n 4 y -n 8
+      # tardan lo mismo (116s vs 222s en serie), mas workers no ayudan.
+      # Cada worker usa su propio test-gwN.db (ver tests/conftest.py).
       - name: Run tests (unit, no integration)
-        run: poetry run pytest -m "not integration" -q
+        run: poetry run pytest -m "not integration" -q -n 4
 
       - name: Type-check core
         run: poetry run mypy app/core

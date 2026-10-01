@@ -17,8 +17,18 @@ from app.core.database import Base
 from app.core.security import create_access_token
 
 
-# Use SQLite for tests
-SQLALCHEMY_DATABASE_URL = "sqlite:///./test.db"
+# Use SQLite for tests.
+#
+# El archivo de la base depende del worker de pytest-xdist. El fixture `db`
+# hace create_all()/drop_all() sobre este archivo en CADA test: si varios
+# procesos compartieran un solo `test.db`, uno borraria las tablas bajo los
+# pies de otro y apareceria una lluvia de fallas falsas. xdist expone el
+# identificador del proceso (gw0, gw1, ...) en PYTEST_XDIST_WORKER; en una
+# corrida en serie la variable no existe y se usa `test.db` como siempre.
+# No lo "simplifiques" a un nombre fijo: rompe la ejecucion en paralelo.
+_WORKER = os.environ.get("PYTEST_XDIST_WORKER")
+_DB_FILE = f"test-{_WORKER}.db" if _WORKER else "test.db"
+SQLALCHEMY_DATABASE_URL = f"sqlite:///./{_DB_FILE}"
 engine = create_engine(
     SQLALCHEMY_DATABASE_URL,
     connect_args={"check_same_thread": False},
