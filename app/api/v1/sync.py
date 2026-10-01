@@ -3,6 +3,7 @@ Sync endpoints - Synchronize data from PJUD to database.
 
 POST /sync          - Trigger manual sync
 GET  /sync/status   - Get last sync status
+GET  /sync/frescura - How fresh the detail-rotation universe is
 """
 
 import logging
@@ -13,7 +14,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import and_
 from pydantic import BaseModel
 
-from app.api.deps import get_db, get_current_lawyer, _resolve_lawyer_id
+from app.api.deps import get_db, get_current_lawyer, require_auditor, _resolve_lawyer_id
 from app.models.sync_history import SyncHistory
 from app.models.lawyer import Lawyer
 from app.services.sync_service import (
@@ -21,6 +22,7 @@ from app.services.sync_service import (
     SyncResult,
     convert_api_cases_to_scraped,
     detect_and_sync_movements,
+    rol_year_ok,
 )
 from app.services.session_store import get_session_store
 
@@ -39,6 +41,17 @@ class SyncRequest(BaseModel):
     year: Optional[str] = None  # Filter by year
     session_id: str  # PJUD session ID from login
     rol: Optional[str] = None  # If set, only fetch movements for this ROL (demo scoping)
+
+
+class FrescuraResponse(BaseModel):
+    """How fresh the portfolio is, measured over the detail-rotation universe."""
+    causas_en_alcance: int
+    nunca_revisadas: int
+    revisadas_7d: int
+    revisadas_30d: int
+    ritmo_diario: float
+    # None when there was no activity in the window (no rate to extrapolate from).
+    dias_vuelta_completa: Optional[int] = None
 
 
 class SyncStatusResponse(BaseModel):
@@ -322,3 +335,59 @@ async def get_sync_history(
         )
         for h in history
     ]
+
+
+
+# Window used for the daily rate (calendar days, see get_frescura).
+FRESCURA_VENTANA_RITMO_DIAS = 14
+
+
+@router.get("/frescura", response_model=FrescuraResponse)
+async def get_frescura(
+    _auditor: str = Depends(require_auditor),
+    db: Session = Depends(get_db),
+):
+    """Freshness of the portfolio over the universe the detail rotation walks.
+
+    Scope mirrors ``_select_cases_for_detail_rotation``: civil competencia,
+    ``poda_at IS NULL`` and the ``DETAIL_MIN_YEAR`` floor on the ROL's ``-YYYY``
+    suffix (fail-open for ROLs without a recognizable year). The year check
+    reuses ``rol_year_ok`` in Python because parsing the ROL in SQL is not
+    portable across Postgres and SQLite.
+
+    ``last_detail_checked_at`` keeps only the LAST check of each case, so the
+    rate counts distinct cases checked in the window, not repeated checks.
+    """
+    from app.models.case import Case
+
+    now = datetime.utcnow()
+    rows = (
+        db.query(Case.rol, Case.last_detail_checked_at)
+        .filter(Case.competencia == "civil", Case.poda_at.is_(None))
+        .all()
+    )
+    checks = [checked for rol, checked in rows if rol_year_ok(rol or "")]
+    en_alcance = len(checks)
+    nunca = sum(1 for c in checks if c is None)
+
+    def _desde(dias: int) -> int:
+        limite = now - timedelta(days=dias)
+        return sum(1 for c in checks if c is not None and c >= limite)
+
+    revisadas_7d = _desde(7)
+    revisadas_30d = _desde(30)
+
+    # DECISION: the rate divides by 14 CALENDAR days, NOT by the number of days
+    # that had activity. The scraping station does not work every day, but the
+    # portfolio ages all the same. Dividing by active days gives an optimistic
+    # number that does not describe reality. Do not "fix" this.
+    ritmo = _desde(FRESCURA_VENTANA_RITMO_DIAS) / FRESCURA_VENTANA_RITMO_DIAS
+
+    return FrescuraResponse(
+        causas_en_alcance=en_alcance,
+        nunca_revisadas=nunca,
+        revisadas_7d=revisadas_7d,
+        revisadas_30d=revisadas_30d,
+        ritmo_diario=round(ritmo, 2),
+        dias_vuelta_completa=round(en_alcance / ritmo) if ritmo > 0 else None,
+    )
