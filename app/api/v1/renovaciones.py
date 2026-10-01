@@ -343,6 +343,13 @@ async def list_renovaciones(
     if q and q.strip():
         like = f"%{q.strip()}%"
         like_nombre = f"%{_sin_acentos(q.strip())}%"
+        # cliente_rut is stored without dots, but the screen shows it WITH dots,
+        # so that is the form people paste. Strip dots/spaces from the term for
+        # this column only. normalize_rut/clean_rut are not usable here: they
+        # append a hyphen before the last digit, which turns the partial search
+        # "16096207" into "1609620-7" and stops it from matching.
+        # A term that is only dots/spaces must not collapse into "%%" (match all).
+        like_rut = f"%{q.replace('.', '').replace(' ', '') or q.strip()}%"
         # Fourth way in: the client is a party (litigante) of a case whose ROL
         # matches. The RUT is the only link; litigante RUTs come with dots or
         # spaces, renovacion RUTs are normalized. EXISTS, not JOIN: a renewal can
@@ -357,7 +364,7 @@ async def list_renovaciones(
         )
         query = query.filter(
             _sin_acentos_sql(Renovacion.cliente_nombre).ilike(like_nombre)
-            | Renovacion.cliente_rut.ilike(like)
+            | Renovacion.cliente_rut.ilike(like_rut)
             | Renovacion.numero_contrato.ilike(like)
             | es_parte_de_causa
         )

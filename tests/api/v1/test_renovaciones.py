@@ -655,3 +655,48 @@ class TestBusquedaNombreSinAcentos:
 
     def test_no_matchea_lo_que_no_corresponde(self, client):
         assert _buscar(client, q="andres rojas")["total"] == 0
+
+
+class TestBusquedaPorRut:
+    """El RUT se busca igual con o sin puntos: la pantalla lo muestra con puntos."""
+
+    @pytest.fixture(autouse=True)
+    def _renovaciones(self, client, admin, abogado):
+        _renovar(client, abogado, "16096207-0", "R-1", nombre="Cliente Uno")
+        _renovar(client, abogado, "11111111-1", "R-2", nombre="Otro Cliente")
+
+    @pytest.mark.parametrize("termino", [
+        "16.096.207-0",   # tal como lo muestra la pantalla (el bug)
+        "16096207-0",     # tal como está guardado
+        "16096207",       # parcial sin guion (la regresión a evitar)
+        "16.096.207",     # parcial con puntos
+        "16.096",         # parcial corto con puntos
+        " 16.096.207-0 ", # con espacios alrededor
+    ])
+    def test_encuentra_el_rut_en_cualquier_forma(self, client, termino):
+        body = _buscar(client, q=termino)
+        assert [i["numero_contrato"] for i in body["items"]] == ["R-1"]
+
+    def test_rut_inexistente_devuelve_vacio(self, client):
+        assert _buscar(client, q="99.999.999-9")["total"] == 0
+
+    @pytest.mark.parametrize("termino", ["", "   ", "\t"])
+    def test_q_vacio_o_solo_espacios_equivale_a_no_buscar(self, client, termino):
+        sin_q = _buscar(client)
+        con_q = _buscar(client, q=termino)
+        assert sin_q["total"] == 2
+        assert con_q["items"] == sin_q["items"]
+        assert con_q["total"] == sin_q["total"]
+
+    def test_espacios_alrededor_de_un_termino_real_siguen_buscando(self, client):
+        body = _buscar(client, q="  16096207  ")
+        assert [i["numero_contrato"] for i in body["items"]] == ["R-1"]
+
+    def test_solo_puntos_no_devuelve_todo(self, client):
+        assert _buscar(client, q="...")["total"] == 0
+
+    def test_nombre_contrato_y_rol_siguen_igual(self, client, db):
+        _causa(db, "C-9009-2026", "16.096.207-0")
+        assert [i["numero_contrato"] for i in _buscar(client, q="cliente uno")["items"]] == ["R-1"]
+        assert [i["numero_contrato"] for i in _buscar(client, q="r-1")["items"]] == ["R-1"]
+        assert [i["numero_contrato"] for i in _buscar(client, q="C-9009-2026")["items"]] == ["R-1"]
