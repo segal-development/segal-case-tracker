@@ -18,7 +18,13 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_db, require_admin
 from app.models.bono import BonoVariables
 from app.models.bono_cierre import BonoCierre, CIERRE_ABIERTO, CIERRE_CERRADO
-from app.models.hito import Hito, HITO_APROBADO
+from app.models.hito import (
+    HITO_APROBADO,
+    HITO_PENDIENTE,
+    HITO_RECHAZADO,
+    HITO_SUGERIDO,
+    Hito,
+)
 from app.models.lawyer import Lawyer
 from app.services import bono_calc
 from app.services import bono_cierre_service as cierre_svc
@@ -478,6 +484,22 @@ def _add_cuadratura_sheet(wb, data: "LiquidacionResponse", rut_by_id: dict):
     return ws
 
 
+def _estado_hito_label(estado: str | None) -> str:
+    """Etiqueta del estado de un hito para el libro de RRHH.
+
+    Solo es texto del archivo: ``aprobado`` se rotula "Aceptado" (no es un estado
+    nuevo del sistema). El resto va con la primera letra en mayúscula y uno
+    desconocido se deja tal cual viene.
+    """
+    if not estado:
+        return ""
+    if estado == HITO_APROBADO:
+        return "Aceptado"
+    if estado in (HITO_PENDIENTE, HITO_RECHAZADO, HITO_SUGERIDO):
+        return estado.capitalize()
+    return estado
+
+
 def _add_detalle_sheets(wb, db: Session, start: date, end: date, rows_by_lawyer: dict):
     """Add DETAIL sheets to the RRHH workbook so they see WHAT is being paid:
     'Detalle Hitos' (every approved hito) + 'Detalle Renovaciones' (each counted).
@@ -560,8 +582,8 @@ def _add_detalle_sheets(wb, db: Session, start: date, end: date, rows_by_lawyer:
     # --- Detalle Hitos: cada hito aprobado del período (lo que suma "Hitos H1") ---
     ws_h, hmoney = _sheet(
         "Detalle Hitos",
-        ["Abogado", "Fecha", "Tipo de hito", "RUT/ROL", "Causa (ROL)", "Valor bruto"],
-        [30, 12, 34, 16, 18, 14], {6},
+        ["Fecha", "Abogado", "Tipo de hito", "Causa (ROL)", "RUT/ROL", "ESTADO", "Valor bruto"],
+        [12, 30, 34, 18, 16, 12, 14], {7},  # {7} = "Valor bruto" (formato de pesos)
     )
     hitos = (
         db.query(Hito)
@@ -572,9 +594,12 @@ def _add_detalle_sheets(wb, db: Session, start: date, end: date, rows_by_lawyer:
     )
     r = 2
     for h in hitos:
-        vals = [lawyer_name.get(h.lawyer_id, ""), h.fecha_hito,
-                h.tipo.label if h.tipo else "", h.rol_causa or "",
-                h.descripcion or "", h.valor_bruto]
+        # OJO: los nombres de los campos engañan. En la base ``descripcion`` guarda el
+        # ROL de la causa y ``rol_causa`` guarda el RUT del cliente. El orden de abajo
+        # es el correcto para RRHH: NO lo "enderecen" o se cruzan las columnas.
+        vals = [h.fecha_hito, lawyer_name.get(h.lawyer_id, ""),
+                h.tipo.label if h.tipo else "", h.descripcion or "",
+                h.rol_causa or "", _estado_hito_label(h.estado), h.valor_bruto]
         for j, v in enumerate(vals, start=1):
             cell = ws_h.cell(row=r, column=j, value=v)
             if j in hmoney:
