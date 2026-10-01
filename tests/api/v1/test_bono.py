@@ -504,6 +504,71 @@ def test_export_incluye_hojas_de_detalle(client, db, admin, junior):
     assert "Cliente X" in rflat and 10_400 in rflat
 
 
+def _detalle_hitos_sheet(client, db, junior, estado=HITO_APROBADO):
+    """Exporta el libro con un hito y devuelve (libro, hoja 'Detalle Hitos')."""
+    import io
+    from openpyxl import load_workbook
+    tipo = HitoTipo(code="j_ord", label="Conversión preventiva", nivel="junior", valor_bruto=3000, orden=1)
+    db.add(tipo); db.commit(); db.refresh(tipo)
+    db.add(Hito(lawyer_id=junior.id, hito_tipo_id=tipo.id, valor_bruto=3000,
+                fecha_hito=date(2026, 7, 5), estado=estado,
+                rol_causa="12.345.678-5", descripcion="C-100-2026"))
+    db.commit()
+    r = client.get("/api/v1/bono/liquidacion/export?periodo=2026-07", headers=_h(ADMIN_RUT))
+    assert r.status_code == 200
+    wb = load_workbook(io.BytesIO(r.content))
+    return wb, wb["Detalle Hitos"]
+
+
+def test_detalle_hitos_encabezados_en_el_orden_de_rrhh(client, db, admin, junior):
+    _, ws = _detalle_hitos_sheet(client, db, junior)
+    assert [c.value for c in ws[1]] == [
+        "Fecha", "Abogado", "Tipo de hito", "Causa (ROL)", "RUT/ROL", "ESTADO", "Valor bruto",
+    ]
+
+
+def test_detalle_hitos_causa_es_descripcion_y_rut_es_rol_causa(client, db, admin, junior):
+    # En la base `descripcion` guarda el ROL de la causa y `rol_causa` el RUT del cliente.
+    _, ws = _detalle_hitos_sheet(client, db, junior)
+    row = {ws.cell(row=1, column=j).value: ws.cell(row=2, column=j).value for j in range(1, 8)}
+    assert row["Causa (ROL)"] == "C-100-2026"
+    assert row["RUT/ROL"] == "12.345.678-5"
+    assert row["Abogado"] == junior.name
+    assert row["Tipo de hito"] == "Conversión preventiva"
+    assert row["Valor bruto"] == 3000
+    assert row["Fecha"] is not None and row["Fecha"].year == 2026 and row["Fecha"].day == 5
+
+
+def test_detalle_hitos_estado_aprobado_se_muestra_aceptado(client, db, admin, junior):
+    _, ws = _detalle_hitos_sheet(client, db, junior)
+    assert ws.cell(row=2, column=6).value == "Aceptado"
+
+
+def test_detalle_hitos_valor_bruto_conserva_formato_de_moneda(client, db, admin, junior):
+    _, ws = _detalle_hitos_sheet(client, db, junior)
+    assert ws.cell(row=2, column=7).number_format == "#,##0"
+    assert ws.cell(row=2, column=6).number_format != "#,##0"
+
+
+def test_detalle_hitos_etiqueta_de_estado_se_deriva_del_estado_real():
+    from app.api.v1.bono import _estado_hito_label
+    assert _estado_hito_label("aprobado") == "Aceptado"
+    assert _estado_hito_label("pendiente") == "Pendiente"
+    assert _estado_hito_label("rechazado") == "Rechazado"
+    assert _estado_hito_label("sugerido") == "Sugerido"
+    assert _estado_hito_label("raro") == "raro"
+    assert _estado_hito_label(None) == ""
+
+
+def test_export_otras_hojas_no_cambian_encabezados(client, db, admin, junior):
+    wb, _ = _detalle_hitos_sheet(client, db, junior)
+    assert [c.value for c in wb["Detalle V1"][1]] == [
+        "Abogado", "Nivel", "Clientes M-2", "Activos", "% Activación", "$/Cliente", "V1 bruto"]
+    assert [c.value for c in wb["Detalle Renovaciones"][1]] == [
+        "Abogado", "Fecha", "N° contrato", "Cliente", "RUT cliente", "Bono ($)"]
+    assert [c.value for c in wb["Resumen Renovaciones"][1]] == ["Abogado", "Cantidad"]
+
+
 def test_export_resumen_renovaciones_cuenta_todos(client, db, admin, junior):
     """El resumen (tipo tabla dinámica) cuenta renovaciones por persona, incluidos
     los renovadores sin matchear a un abogado, con fila TOTAL."""
