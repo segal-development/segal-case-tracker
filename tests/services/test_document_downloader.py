@@ -394,3 +394,229 @@ class TestAsyncSleepLimiter:
             await limiter.wait()
 
         mock_sleep.assert_called_once_with(0.5)
+
+
+# ---------------------------------------------------------------------------
+# Observability: the ORIGINAL exception must always reach the log
+# ---------------------------------------------------------------------------
+
+class _PoisonableSession:
+    """Fake SQLAlchemy session reproducing the poisoned-session cascade.
+
+    The first ``commit()`` fails with a recognisable proxy-cut error, which
+    leaves the session needing a ``rollback()``. Until that rollback happens,
+    every further ``commit()`` raises ``PendingRollbackError`` — exactly what
+    a real Session does after a failed flush.
+    """
+
+    def __init__(self, original_exc: Exception, fail_first_n_commits: int = 1):
+        from sqlalchemy.exc import PendingRollbackError
+
+        self._original_exc = original_exc
+        self._remaining_failures = fail_first_n_commits
+        self._pending_rollback_error = PendingRollbackError
+        self.needs_rollback = False
+        self.commits_ok = 0
+        self.rollbacks = 0
+
+    @property
+    def is_poisoned(self) -> bool:
+        return self.needs_rollback
+
+    def commit(self):
+        if self.needs_rollback:
+            raise self._pending_rollback_error(
+                "This Session's transaction has been rolled back due to a "
+                "previous exception during flush."
+            )
+        if self._remaining_failures > 0:
+            self._remaining_failures -= 1
+            self.needs_rollback = True
+            raise self._original_exc
+        self.commits_ok += 1
+
+    def rollback(self):
+        self.rollbacks += 1
+        self.needs_rollback = False
+
+
+class _ExpiredAttrDoc:
+    """Document-like object whose ``id`` needs a DB refresh (expired attribute).
+
+    After a successful commit SQLAlchemy expires loaded attributes; reading
+    one while the session is poisoned raises ``PendingRollbackError``.
+    """
+
+    def __init__(self, session: _PoisonableSession, doc_id: int):
+        self._session = session
+        self._id = doc_id
+        self.status = "pending"
+        self.pjud_endpoint = "documentos/newebookcivil.php"
+        self.pjud_token = "FAKE_TOKEN"
+        self.doc_type = "ebook"
+        self.failed_at = None
+        self.gcs_path = None
+        self.texto = None
+        self.text_extracted_at = None
+
+    @property
+    def id(self):
+        if self._session.is_poisoned:
+            from sqlalchemy.exc import PendingRollbackError
+
+            raise PendingRollbackError(
+                "This Session's transaction has been rolled back due to a "
+                "previous exception during flush."
+            )
+        return self._id
+
+
+def _proxy_cut_error():
+    from sqlalchemy.exc import OperationalError
+
+    return OperationalError(
+        "INSERT INTO documents ...",
+        {},
+        Exception("server closed the connection unexpectedly"),
+    )
+
+
+class TestDocumentDownloaderLogsOriginalException:
+    @pytest.mark.asyncio
+    async def test_commit_failure_logs_original_error_not_just_the_cascade(
+        self, caplog
+    ):
+        """The proxy cut during commit must be visible in the log by type and
+        message, not hidden behind PendingRollbackError."""
+        from app.services.document_downloader import DocumentDownloader
+
+        session = _PoisonableSession(_proxy_cut_error())
+        doc = _ExpiredAttrDoc(session, 7)
+
+        with caplog.at_level("DEBUG", logger="app.services.document_downloader"):
+            await DocumentDownloader().download_and_store(
+                pending_docs=[doc],
+                scraper=_make_scraper([b"%PDF-1.4 fake"]),
+                pjud_session=MagicMock(),
+                db=session,
+                storage_service=_make_storage_svc(),
+                limiter=_make_limiter(),
+                enabled=True,
+            )
+
+        logged = "\n".join(
+            r.getMessage() + (r.exc_text or "") + _format_exc_info(r)
+            for r in caplog.records
+        )
+        assert "OperationalError" in logged
+        assert "server closed the connection unexpectedly" in logged
+
+    @pytest.mark.asyncio
+    async def test_original_exception_is_attached_with_traceback(self, caplog):
+        from app.services.document_downloader import DocumentDownloader
+
+        session = _PoisonableSession(_proxy_cut_error())
+        doc = _ExpiredAttrDoc(session, 7)
+
+        with caplog.at_level("DEBUG", logger="app.services.document_downloader"):
+            await DocumentDownloader().download_and_store(
+                pending_docs=[doc],
+                scraper=_make_scraper([b"%PDF-1.4 fake"]),
+                pjud_session=MagicMock(),
+                db=session,
+                storage_service=_make_storage_svc(),
+                limiter=_make_limiter(),
+                enabled=True,
+            )
+
+        with_exc = [r for r in caplog.records if r.exc_info]
+        assert any(
+            r.exc_info[0].__name__ == "OperationalError" for r in with_exc
+        ), "no log record carries the original exception's exc_info"
+
+    @pytest.mark.asyncio
+    async def test_failure_state_is_written_even_when_session_is_poisoned(self):
+        """The handler must roll back first so marking the doc as failed does
+        not blow up with PendingRollbackError and mask the original error."""
+        from app.services.document_downloader import DocumentDownloader
+
+        session = _PoisonableSession(_proxy_cut_error())
+        doc = _ExpiredAttrDoc(session, 7)
+
+        await DocumentDownloader().download_and_store(
+            pending_docs=[doc],
+            scraper=_make_scraper([b"%PDF-1.4 fake"]),
+            pjud_session=MagicMock(),
+            db=session,
+            storage_service=_make_storage_svc(),
+            limiter=_make_limiter(),
+            enabled=True,
+        )
+
+        assert session.rollbacks >= 1
+        assert doc.status == "failed"
+        assert doc.failed_at is not None
+        assert session.commits_ok == 1  # the failure-state commit succeeded
+
+    @pytest.mark.asyncio
+    async def test_poisoned_doc_does_not_stop_the_following_docs(self):
+        from app.services.document_downloader import DocumentDownloader
+
+        session = _PoisonableSession(_proxy_cut_error())
+        doc1 = _ExpiredAttrDoc(session, 1)
+        doc2 = _ExpiredAttrDoc(session, 2)
+
+        await DocumentDownloader().download_and_store(
+            pending_docs=[doc1, doc2],
+            scraper=_make_scraper([b"%PDF-1.4 a", b"%PDF-1.4 b"]),
+            pjud_session=MagicMock(),
+            db=session,
+            storage_service=_make_storage_svc(),
+            limiter=_make_limiter(),
+            enabled=True,
+        )
+
+        assert doc1.status == "failed"
+        # doc2 went through the happy path: upload + successful commit.
+        assert session.commits_ok == 2  # doc1 failure-state + doc2 stored
+
+    @pytest.mark.asyncio
+    async def test_unusable_session_still_leaves_original_in_log_and_continues(
+        self, caplog
+    ):
+        """Even if the rollback itself fails (dead connection), the original
+        error is logged, nothing propagates, and the next doc is processed."""
+        from app.services.document_downloader import DocumentDownloader
+
+        session = _PoisonableSession(_proxy_cut_error())
+
+        def _broken_rollback():
+            raise RuntimeError("connection is gone")
+
+        session.rollback = _broken_rollback
+        doc1 = _ExpiredAttrDoc(session, 1)
+        scraper = _make_scraper([b"%PDF-1.4 a"])
+
+        with caplog.at_level("DEBUG", logger="app.services.document_downloader"):
+            await DocumentDownloader().download_and_store(
+                pending_docs=[doc1],
+                scraper=scraper,
+                pjud_session=MagicMock(),
+                db=session,
+                storage_service=_make_storage_svc(),
+                limiter=_make_limiter(),
+                enabled=True,
+            )
+
+        logged = "\n".join(
+            r.getMessage() + _format_exc_info(r) for r in caplog.records
+        )
+        assert "server closed the connection unexpectedly" in logged
+
+
+def _format_exc_info(record) -> str:
+    import traceback
+
+    if not record.exc_info:
+        return ""
+    return "".join(traceback.format_exception(*record.exc_info))

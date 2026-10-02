@@ -493,3 +493,74 @@ class TestCrossCaseSharedTokenHash:
         )
         # The phase must have succeeded (not rolled back to [] on a collision).
         assert docs_b, "case B document phase returned [] — an INSERT likely collided"
+
+
+# ---------------------------------------------------------------------------
+# (f) Observability: the ORIGINAL document-phase error must reach the log
+# ---------------------------------------------------------------------------
+
+class TestOriginalErrorIsLogged:
+    @staticmethod
+    def _logged_text(caplog) -> str:
+        import traceback
+
+        parts = []
+        for r in caplog.records:
+            parts.append(r.getMessage())
+            if r.exc_info:
+                parts.append("".join(traceback.format_exception(*r.exc_info)))
+        return "\n".join(parts)
+
+    def test_flush_failure_logs_original_error_type_message_and_traceback(
+        self, mem_db: Session, lawyer_and_court, caplog
+    ) -> None:
+        lawyer, court = lawyer_and_court
+        case = _seed_case(mem_db, lawyer, court, "C-0400-2026")
+        mem_db.commit()
+        detail = _build_detail(case.rol, 0)
+
+        with caplog.at_level("DEBUG", logger="app.services.document_persistence"):
+            result = DocumentPersistenceService().persist_from_detail(
+                detail, None, mem_db  # type: ignore[arg-type]
+            )
+
+        assert result == []
+        assert any(
+            r.exc_info and r.exc_info[0].__name__ == "IntegrityError"
+            for r in caplog.records
+        ), "the original flush error must be logged with its traceback"
+        assert "documents.case_id" in self._logged_text(caplog)
+
+    def test_original_error_is_logged_even_if_savepoint_rollback_fails(
+        self, mem_db: Session, lawyer_and_court, caplog, monkeypatch
+    ) -> None:
+        """A dead connection makes the savepoint rollback raise too; that
+        secondary error must not replace or hide the original one."""
+        lawyer, court = lawyer_and_court
+        case = _seed_case(mem_db, lawyer, court, "C-0401-2026")
+        mem_db.commit()
+        detail = _build_detail(case.rol, 0)
+
+        real_begin_nested = mem_db.begin_nested
+
+        def _begin_nested_with_broken_rollback():
+            savepoint = real_begin_nested()
+
+            def _boom():
+                raise RuntimeError("connection is gone")
+
+            monkeypatch.setattr(savepoint, "rollback", _boom)
+            return savepoint
+
+        monkeypatch.setattr(mem_db, "begin_nested", _begin_nested_with_broken_rollback)
+
+        with caplog.at_level("DEBUG", logger="app.services.document_persistence"):
+            # The rollback failure still propagates (unchanged behaviour: the
+            # caller's handler deals with a dead session) ...
+            with pytest.raises(RuntimeError, match="connection is gone"):
+                DocumentPersistenceService().persist_from_detail(
+                    detail, None, mem_db  # type: ignore[arg-type]
+                )
+
+        # ... but the ORIGINAL error was already logged before it.
+        assert "documents.case_id" in self._logged_text(caplog)

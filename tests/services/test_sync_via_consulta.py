@@ -376,3 +376,140 @@ async def test_consulta_session_expired_reauth_returns_none_counts_as_error(seed
     assert reserved == 0
     db.refresh(case)
     assert case.consulta_reserved is False, "session expiry must NOT set consulta_reserved"
+
+
+# ---------------------------------------------------------------------------
+# Observability: the ORIGINAL error must reach the log
+# ---------------------------------------------------------------------------
+
+
+class _PoisonableCase:
+    """Case-like object whose ORM attributes raise once the session is poisoned.
+
+    Mimics an expired attribute on a session that needs a rollback: reading
+    ``id`` raises something that is NOT an AttributeError, so ``getattr(obj,
+    "id", "?")`` does not protect the log call.
+    """
+
+    rol = "C-4242-2025"
+    court_id = 1
+    consulta_reserved = False
+
+    def __init__(self, court):
+        self.court = court
+        self.poisoned = False
+
+    @property
+    def id(self):
+        if self.poisoned:
+            from sqlalchemy.exc import PendingRollbackError
+
+            raise PendingRollbackError(
+                "This Session's transaction has been rolled back due to a "
+                "previous exception during flush."
+            )
+        return 42
+
+
+def _proxy_cut_error():
+    from sqlalchemy.exc import OperationalError
+
+    return OperationalError(
+        "INSERT ...", {}, Exception("server closed the connection unexpectedly")
+    )
+
+
+def _logged_text(caplog) -> str:
+    import traceback
+
+    parts = []
+    for r in caplog.records:
+        parts.append(r.getMessage())
+        if r.exc_info:
+            parts.append("".join(traceback.format_exception(*r.exc_info)))
+    return "\n".join(parts)
+
+
+@pytest.mark.asyncio
+async def test_failure_log_survives_case_id_read_raising_non_attribute_error(
+    seeded, caplog
+):
+    """Reading case.id raises PendingRollbackError after the failure; the log
+    call must not depend on it (getattr's default only covers AttributeError)."""
+    db = seeded["db"]
+    case = _PoisonableCase(seeded["court"])
+
+    async def _fail(*args, **kwargs):
+        case.poisoned = True
+        raise _proxy_cut_error()
+
+    scraper = MagicMock()
+    scraper.consulta_by_rol = AsyncMock(side_effect=_fail)
+
+    with caplog.at_level("DEBUG", logger="app.services.sync_service"):
+        result = await sync_via_consulta(
+            db, seeded["lawyer"], scraper, MagicMock(), [case]
+        )
+
+    assert result[3] == 1  # counted as an error, batch not aborted
+    text = _logged_text(caplog)
+    assert "server closed the connection unexpectedly" in text
+    assert "C-4242-2025" in text
+
+
+@pytest.mark.asyncio
+async def test_original_error_logged_even_if_rollback_explodes(
+    seeded, caplog, monkeypatch
+):
+    db = seeded["db"]
+    case = seeded["case"]
+
+    def _broken_rollback():
+        raise RuntimeError("connection is gone")
+
+    async def _fail(*args, **kwargs):
+        monkeypatch.setattr(db, "rollback", _broken_rollback)
+        raise _proxy_cut_error()
+
+    scraper = MagicMock()
+    scraper.consulta_by_rol = AsyncMock(side_effect=_fail)
+
+    with caplog.at_level("DEBUG", logger="app.services.sync_service"):
+        with pytest.raises(RuntimeError, match="connection is gone"):
+            await sync_via_consulta(
+                db, seeded["lawyer"], scraper, MagicMock(), [case]
+            )
+
+    assert "server closed the connection unexpectedly" in _logged_text(caplog)
+
+
+@pytest.mark.asyncio
+async def test_dead_connection_at_loop_start_fails_one_case_not_the_batch(
+    seeded, caplog
+):
+    """A case whose identity cannot be read must count as ONE failure.
+
+    The identity capture has to live INSIDE the try. Hoisted above it, a
+    connection already dead from a previous iteration makes that read raise
+    outside the handler and the whole lawyer's batch aborts, losing every
+    remaining case instead of just the broken one.
+    """
+    db = seeded["db"]
+    muerta = _PoisonableCase(seeded["court"])
+    muerta.poisoned = True  # identity unreadable before the body even runs
+    sana = seeded["case"]
+
+    detail = MagicMock()
+    detail.movements = []
+    scraper = MagicMock()
+    scraper.consulta_by_rol = AsyncMock(return_value=detail)
+
+    with caplog.at_level("DEBUG", logger="app.services.sync_service"):
+        result = await sync_via_consulta(
+            db, seeded["lawyer"], scraper, MagicMock(), [muerta, sana]
+        )
+
+    assert result[3] == 1, "the unreadable case must count as exactly one error"
+    # The healthy case that came after it was still processed.
+    assert scraper.consulta_by_rol.await_count == 1
+    assert "PendingRollbackError" in _logged_text(caplog)
