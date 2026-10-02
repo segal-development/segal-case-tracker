@@ -35,6 +35,22 @@ export PYTHONPATH="$(pwd)"
 export DOC_DOWNLOAD_ENABLED="${DOWNLOAD_PDFS:-${DOC_DOWNLOAD_ENABLED:-true}}"
 export DETAIL_BATCH_SIZE="${DETAIL_BATCH:-${DETAIL_BATCH_SIZE:-30}}"
 export SYNC_INTERVAL_HOURS="${SYNC_INTERVAL:-${SYNC_INTERVAL_HOURS:-4}}"
-# DETAIL_PENDING_DOCS_FIRST is read straight from the environment by pydantic.
+
+# The two below are set UNCONDITIONALLY, on purpose. `source .env.qa` above runs
+# with `set -a`, so it OVERWRITES anything the LaunchAgent put in the
+# environment. Settings that share a name between the plist and .env.qa would
+# therefore be silently decided by .env.qa, and changing the plist would do
+# nothing. That is why the lines above rename (DETAIL_BATCH -> DETAIL_BATCH_SIZE)
+# instead of reusing the app's own name. These two follow the same rule: the
+# plist's short name wins, and the fallback is the value WE want, not whatever
+# .env.qa happens to carry.
+#
+# DETAIL_PENDING_DOCS_FIRST orders the detail rotation by "most pending PDFs
+# first", i.e. it picks the most EXPENSIVE causas every cycle. It is a PDF
+# backfill mode and it collapses freshness while on; default off.
+export DETAIL_PENDING_DOCS_FIRST="${PENDING_DOCS_FIRST:-false}"
+# Dispatch budget per sync. Alerts are ALWAYS persisted — this gates only the
+# email/webhook send, so lowering it loses no data.
+export NOTIFY_MAX_PER_SYNC="${NOTIFY_MAX:-25}"
 
 exec "$VENV" -m app.workers.sync_scheduler
