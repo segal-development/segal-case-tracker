@@ -234,10 +234,15 @@ class DocumentPersistenceService:
             return results
 
         except Exception as exc:
-            savepoint.rollback()
+            # Log the original error BEFORE rolling back: if the connection died,
+            # the rollback can raise too and would otherwise hide the real cause.
             logger.warning(
-                "Failed to persist documents for case_id=%s: %s", case_id, exc
+                "Failed to persist documents for case_id=%s: %s",
+                case_id,
+                exc,
+                exc_info=True,
             )
+            savepoint.rollback()
             return []
 
     # ------------------------------------------------------------------

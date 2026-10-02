@@ -90,6 +90,10 @@ class DocumentDownloader:
                 db.commit()
                 continue
 
+            # Captured while the session is healthy; the failure handler must not
+            # read ORM attributes from a possibly poisoned session.
+            doc_id = doc.id
+
             # Rate-limit between downloads.
             await limiter.wait()
 
@@ -131,14 +135,39 @@ class DocumentDownloader:
                 # Swallowing it here would burn O(N) scraper calls against a dead session.
                 raise
             except Exception as exc:  # noqa: BLE001 — failure isolation
+                # Log the ORIGINAL exception first, with type and traceback, and
+                # without touching ORM attributes: after a failed flush/commit the
+                # session is poisoned and reading an expired ``doc.id`` would raise
+                # PendingRollbackError, hiding the real cause. ``doc_id`` was
+                # captured before the try for that reason.
                 logger.warning(
                     "DocumentDownloader: failed to download/store doc %s: %s",
-                    doc.id,
+                    doc_id,
                     exc,
+                    exc_info=True,
                 )
-                doc.status = "failed"
-                doc.failed_at = datetime.utcnow()
-                db.commit()
+                _mark_failed_after_error(db, doc, doc_id)
+
+
+def _mark_failed_after_error(db, doc: "Document", doc_id) -> None:
+    """Roll back, then persist ``status="failed"`` without masking the cause.
+
+    The rollback must come first: if the failure happened in ``db.commit()`` the
+    session needs a rollback and the failure-state commit would otherwise raise
+    PendingRollbackError. Any error here is logged and swallowed so one broken
+    document never aborts the loop.
+    """
+    try:
+        db.rollback()
+        doc.status = "failed"
+        doc.failed_at = datetime.utcnow()
+        db.commit()
+    except Exception:  # noqa: BLE001 — failure isolation
+        logger.warning(
+            "DocumentDownloader: could not record failed status for doc %s",
+            doc_id,
+            exc_info=True,
+        )
 
 
 class AsyncSleepLimiter:

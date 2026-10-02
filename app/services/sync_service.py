@@ -2470,6 +2470,16 @@ async def detect_and_sync_movements(
                 break
 
         except Exception as exc:
+            # Log the ORIGINAL error first: every recovery step below (rollback,
+            # attribute write on an expired ORM object, commit) can itself raise on
+            # a dead connection and would otherwise hide the root cause.
+            # ``api_case`` is a scraped dataclass, so ``.rol`` is safe to read.
+            logger.error(
+                "detect_and_sync_movements: failed to fetch/process for %s: %s",
+                api_case.rol,
+                exc,
+                exc_info=True,
+            )
             # Rollback any partial entity/alert rows flushed (but not yet committed)
             # during the try block.  Without this, the except's db.commit() would
             # silently persist half-written entity state alongside the mark-checked
@@ -2492,11 +2502,6 @@ async def detect_and_sync_movements(
                     db.commit()
                 except Exception:
                     db.rollback()
-            logger.error(
-                "detect_and_sync_movements: failed to fetch/process for %s: %s",
-                api_case.rol,
-                exc,
-            )
             errors.append(f"Movement fetch failed for {api_case.rol}: {str(exc)}")
 
         if delay_between_fetches > 0:
@@ -2559,7 +2564,20 @@ async def sync_via_consulta(
     notification_svc = NotificationService(db)
 
     for case in cases:
+        # Identity for the failure log, captured inside the try while the session
+        # is healthy: after a failed flush/commit the ORM attributes are expired
+        # and reading them raises, which would make the failure log itself explode
+        # (``getattr(..., default)`` only covers AttributeError).
+        #
+        # The capture CANNOT sit above the try: a connection already dead from a
+        # previous iteration makes that read raise outside the handler, aborting
+        # the whole batch instead of counting one failed case. Pre-seeded to None
+        # so the log always has something to print, even if the capture is what
+        # failed.
+        case_id = case_rol = None
         try:
+            case_id = case.id
+            case_rol = case.rol
             corte = case.court.pjud_corte
             if corte is None:
                 logger.warning(
@@ -2714,11 +2732,14 @@ async def sync_via_consulta(
                 )
 
         except Exception as exc:
-            db.rollback()
+            # Log the ORIGINAL error before the rollback: on a dead connection the
+            # rollback can raise too and would hide the root cause.
             logger.error(
                 "sync_via_consulta: failed for case_id=%s rol=%s: %s",
-                getattr(case, "id", "?"), getattr(case, "rol", "?"), exc,
+                case_id, case_rol, exc,
+                exc_info=True,
             )
+            db.rollback()
             errors += 1
             continue
 

@@ -295,3 +295,62 @@ class TestPerCaseTimeoutRecovery:
         # Two isolated timeouts recorded, one per hung case.
         timeout_errors = [e for e in errors if "timeout" in e.lower()]
         assert len(timeout_errors) == 2
+
+
+class TestOriginalErrorIsLoggedBeforeRecovery:
+    """The handler's recovery work (rollback, write, commit) can itself raise on
+    a dead connection; the ORIGINAL error must already be in the log by then."""
+
+    @pytest.mark.asyncio
+    async def test_original_error_logged_even_if_rollback_explodes(
+        self, db, monkeypatch, caplog
+    ):
+        import traceback
+
+        from sqlalchemy.exc import OperationalError
+
+        from app.services.sync_service import detect_and_sync_movements
+
+        _patch_shape_cooldown(monkeypatch)
+        _reset_detail_circuit_breaker()
+
+        lawyer, court = _seed_lawyer_and_court(db, "31000002-2", "TO-COURT2")
+        _seed_case(db, lawyer, court, "C-LOG-ORIG")
+        api_case = _make_api_case("C-LOG-ORIG", "token-orig")
+
+        original = OperationalError(
+            "INSERT ...", {}, Exception("server closed the connection unexpectedly")
+        )
+
+        def _broken_rollback():
+            raise RuntimeError("connection is gone")
+
+        async def _fail_and_kill_connection(**kwargs):
+            # From here on the connection is dead: rollback raises too.
+            monkeypatch.setattr(db, "rollback", _broken_rollback)
+            raise original
+
+        scraper = MagicMock()
+        scraper.get_case_detail = AsyncMock(side_effect=_fail_and_kill_connection)
+
+        with caplog.at_level("DEBUG", logger="app.services.sync_service"):
+            with pytest.raises(RuntimeError, match="connection is gone"):
+                await detect_and_sync_movements(
+                    db=db,
+                    scraper=scraper,
+                    pjud_session=MagicMock(),
+                    lawyer_id=lawyer.id,
+                    api_cases=[api_case],
+                    selected_cases=[api_case],
+                )
+
+        records = [
+            r
+            for r in caplog.records
+            if r.exc_info and r.exc_info[0] is OperationalError
+        ]
+        assert records, "original OperationalError was never logged with exc_info"
+        text = records[0].getMessage() + "".join(
+            traceback.format_exception(*records[0].exc_info)
+        )
+        assert "server closed the connection unexpectedly" in text
