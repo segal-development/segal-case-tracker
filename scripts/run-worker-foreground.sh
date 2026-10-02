@@ -9,7 +9,8 @@
 # or reboot. The Cloud SQL proxy runs in its own agent (com.segal.sqlproxy).
 #
 # Backfill knobs come from the LaunchAgent's EnvironmentVariables (plist):
-#   DETAIL_PENDING_DOCS_FIRST, DETAIL_BATCH, SYNC_INTERVAL, DOWNLOAD_PDFS.
+#   DETAIL_PENDING_DOCS_FIRST, DETAIL_BATCH, SYNC_INTERVAL, DOWNLOAD_PDFS,
+#   ROTATION_SCOPE.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -36,12 +37,12 @@ export DOC_DOWNLOAD_ENABLED="${DOWNLOAD_PDFS:-${DOC_DOWNLOAD_ENABLED:-true}}"
 export DETAIL_BATCH_SIZE="${DETAIL_BATCH:-${DETAIL_BATCH_SIZE:-30}}"
 export SYNC_INTERVAL_HOURS="${SYNC_INTERVAL:-${SYNC_INTERVAL_HOURS:-4}}"
 
-# The two below are set UNCONDITIONALLY, on purpose. `source .env.qa` above runs
+# The three below are set UNCONDITIONALLY, on purpose. `source .env.qa` above runs
 # with `set -a`, so it OVERWRITES anything the LaunchAgent put in the
 # environment. Settings that share a name between the plist and .env.qa would
 # therefore be silently decided by .env.qa, and changing the plist would do
 # nothing. That is why the lines above rename (DETAIL_BATCH -> DETAIL_BATCH_SIZE)
-# instead of reusing the app's own name. These two follow the same rule: the
+# instead of reusing the app's own name. These three follow the same rule: the
 # plist's short name wins, and the fallback is the value WE want, not whatever
 # .env.qa happens to carry.
 #
@@ -52,5 +53,10 @@ export DETAIL_PENDING_DOCS_FIRST="${PENDING_DOCS_FIRST:-false}"
 # Dispatch budget per sync. Alerts are ALWAYS persisted — this gates only the
 # email/webhook send, so lowering it loses no data.
 export NOTIFY_MAX_PER_SYNC="${NOTIFY_MAX:-25}"
+# Which side of the freshness/backlog cut this station works on: all | fresh |
+# backlog (see DETAIL_ROTATION_SCOPE in app/config.py). "all" = no cut. An invalid
+# value makes the worker fail at startup on purpose. Turning on the freshness
+# station is a deliberate, per-station decision: the plist does not set it yet.
+export DETAIL_ROTATION_SCOPE="${ROTATION_SCOPE:-all}"
 
 exec "$VENV" -m app.workers.sync_scheduler

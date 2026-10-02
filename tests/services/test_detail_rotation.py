@@ -1273,3 +1273,164 @@ class TestReauthMidBatch:
         assert case_b.last_detail_checked_at is None, (
             "case_b must not be processed — batch stops after double session error"
         )
+
+
+# ===========================================================================
+# DETAIL_ROTATION_SCOPE: the freshness / backlog cut between the two stations
+# ===========================================================================
+
+class TestDetailRotationScope:
+    """The scope only ADDS a cut (by last_detail_checked_at); it never replaces
+    the year floor, the poda exclusion, or the ordering."""
+
+    CHECKED = datetime(2025, 1, 1)
+
+    @pytest.fixture
+    def lawyer_id(self, db):
+        lawyer = Lawyer(rut="00000077-7", name="Scope Lawyer", is_active=True)
+        db.add(lawyer)
+        db.flush()
+        return lawyer.id
+
+    def _seed(self, db, lawyer_id):
+        """Two never-detailed + two detailed cases, all in year scope."""
+        _seed_case(db, lawyer_id, "civil", "C-1-2024", filed_at=datetime(2024, 1, 1))
+        _seed_case(db, lawyer_id, "civil", "C-2-2024", filed_at=datetime(2024, 2, 1))
+        _seed_case(db, lawyer_id, "civil", "C-3-2024", filed_at=datetime(2024, 3, 1),
+                   last_detail_checked_at=datetime(2025, 3, 1))
+        _seed_case(db, lawyer_id, "civil", "C-4-2024", filed_at=datetime(2024, 4, 1),
+                   last_detail_checked_at=datetime(2025, 2, 1))
+        db.commit()
+        return [_make_api_case(f"C-{n}-2024") for n in (1, 2, 3, 4)]
+
+    def _select(self, db, lawyer_id, api_cases, scope, monkeypatch, batch=10):
+        from app.services import sync_service
+
+        monkeypatch.setattr(sync_service.settings, "DETAIL_ROTATION_SCOPE", scope)
+        result = sync_service._select_cases_for_detail_rotation(
+            db, lawyer_id, "civil", api_cases, batch_size=batch
+        )
+        return [ac.rol for ac in result]
+
+    def test_default_scope_is_all(self):
+        from app.config import Settings
+
+        assert Settings(_env_file=None).DETAIL_ROTATION_SCOPE == "all"
+
+    def test_all_is_identical_to_unscoped_behavior(self, db, lawyer_id, monkeypatch):
+        """Protects everyone who configures nothing: never-detailed first
+        (newest filed first), then least recently checked."""
+        api = self._seed(db, lawyer_id)
+        rols = self._select(db, lawyer_id, api, "all", monkeypatch)
+        assert rols == ["C-2-2024", "C-1-2024", "C-4-2024", "C-3-2024"]
+
+    def test_fresh_never_selects_never_detailed(self, db, lawyer_id, monkeypatch):
+        api = self._seed(db, lawyer_id)
+        rols = self._select(db, lawyer_id, api, "fresh", monkeypatch)
+        # least recently checked first
+        assert rols == ["C-4-2024", "C-3-2024"]
+
+    def test_backlog_selects_only_never_detailed(self, db, lawyer_id, monkeypatch):
+        api = self._seed(db, lawyer_id)
+        rols = self._select(db, lawyer_id, api, "backlog", monkeypatch)
+        assert rols == ["C-2-2024", "C-1-2024"]
+
+    @pytest.mark.parametrize("scope", ["fresh", "backlog"])
+    def test_podada_excluded_in_any_scope(self, db, lawyer_id, monkeypatch, scope):
+        checked = self.CHECKED if scope == "fresh" else None
+        _seed_case(db, lawyer_id, "civil", "C-1-2024", last_detail_checked_at=checked)
+        podada = _seed_case(db, lawyer_id, "civil", "C-2-2024", last_detail_checked_at=checked)
+        podada.poda_at = datetime(2026, 1, 1)
+        podada.poda_motivo = "sysgal_caducado"
+        podada.poda_por_rut = "11111111-1"
+        db.commit()
+        api = [_make_api_case("C-1-2024"), _make_api_case("C-2-2024")]
+        assert self._select(db, lawyer_id, api, scope, monkeypatch) == ["C-1-2024"]
+
+    @pytest.mark.parametrize("scope", ["fresh", "backlog"])
+    def test_year_floor_still_applies_in_any_scope(self, db, lawyer_id, monkeypatch, scope):
+        checked = self.CHECKED if scope == "fresh" else None
+        _seed_case(db, lawyer_id, "civil", "C-1-2024", last_detail_checked_at=checked)
+        _seed_case(db, lawyer_id, "civil", "C-2-2019", last_detail_checked_at=checked)
+        db.commit()
+        api = [_make_api_case("C-1-2024"), _make_api_case("C-2-2019")]
+        assert self._select(db, lawyer_id, api, scope, monkeypatch) == ["C-1-2024"]
+
+    def test_fresh_with_only_backlog_in_db_returns_empty_not_everything(
+        self, db, lawyer_id, monkeypatch
+    ):
+        """Cut leaves zero rows -> [] (no fallback to the whole live list)."""
+        _seed_case(db, lawyer_id, "civil", "C-1-2024")
+        _seed_case(db, lawyer_id, "civil", "C-2-2024")
+        db.commit()
+        api = [_make_api_case("C-1-2024"), _make_api_case("C-2-2024")]
+        assert self._select(db, lawyer_id, api, "fresh", monkeypatch) == []
+
+    def test_backlog_with_only_fresh_in_db_returns_empty(self, db, lawyer_id, monkeypatch):
+        _seed_case(db, lawyer_id, "civil", "C-1-2024", last_detail_checked_at=self.CHECKED)
+        db.commit()
+        api = [_make_api_case("C-1-2024")]
+        assert self._select(db, lawyer_id, api, "backlog", monkeypatch) == []
+
+    @pytest.mark.parametrize("scope", ["fresh", "backlog"])
+    def test_ghost_guard_does_not_fall_back_out_of_scope(self, db, lawyer_id, monkeypatch, scope):
+        """In-scope DB rows exist but none is live in PJUD. The ghost-case guard
+        would return the live list (which holds out-of-scope causas)."""
+        checked = self.CHECKED if scope == "fresh" else None
+        other = None if scope == "fresh" else self.CHECKED
+        _seed_case(db, lawyer_id, "civil", "C-1-2024", last_detail_checked_at=checked)  # ghost
+        _seed_case(db, lawyer_id, "civil", "C-2-2024", last_detail_checked_at=other)    # live, other side
+        db.commit()
+        api = [_make_api_case("C-2-2024")]
+        assert self._select(db, lawyer_id, api, scope, monkeypatch) == []
+
+    def test_all_keeps_ghost_guard_fallback(self, db, lawyer_id, monkeypatch):
+        """Unchanged legacy behavior under the default scope."""
+        _seed_case(db, lawyer_id, "civil", "C-1-2024")  # ghost
+        db.commit()
+        api = [_make_api_case("C-9-2024")]
+        assert self._select(db, lawyer_id, api, "all", monkeypatch) == ["C-9-2024"]
+
+    def test_fresh_with_empty_db_does_not_adopt_live_cases(self, db, lawyer_id, monkeypatch):
+        """Empty-DB fallback hands out never-detailed causas: not for fresh."""
+        api = [_make_api_case("C-9-2024")]
+        assert self._select(db, lawyer_id, api, "fresh", monkeypatch) == []
+
+    def test_backlog_with_empty_db_keeps_live_fallback(self, db, lawyer_id, monkeypatch):
+        api = [_make_api_case("C-9-2024")]
+        assert self._select(db, lawyer_id, api, "backlog", monkeypatch) == ["C-9-2024"]
+
+    def test_scope_logs_selected_and_left_outside(self, db, lawyer_id, monkeypatch, caplog):
+        api = self._seed(db, lawyer_id)
+        # an out-of-year never-detailed case must NOT count as "left by the cut"
+        _seed_case(db, lawyer_id, "civil", "C-5-2019")
+        db.commit()
+        with caplog.at_level("INFO", logger="app.services.sync_service"):
+            self._select(db, lawyer_id, api, "fresh", monkeypatch, batch=1)
+        msgs = [r.getMessage() for r in caplog.records if "rotation scope" in r.getMessage()]
+        assert len(msgs) == 1
+        assert "scope=fresh" in msgs[0]
+        assert "selected=1" in msgs[0]
+        assert "left_outside_cut=2" in msgs[0]  # C-1, C-2 (never detailed, in year)
+
+    def test_scope_all_logs_nothing_extra(self, db, lawyer_id, monkeypatch, caplog):
+        api = self._seed(db, lawyer_id)
+        with caplog.at_level("INFO", logger="app.services.sync_service"):
+            self._select(db, lawyer_id, api, "all", monkeypatch)
+        assert not [r for r in caplog.records if "rotation scope" in r.getMessage()]
+
+
+class TestDetailRotationScopeSetting:
+    """An unknown value must fail at startup, never degrade silently."""
+
+    def test_invalid_value_fails_at_startup(self):
+        from pydantic import ValidationError
+        from app.config import Settings
+
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None, DETAIL_ROTATION_SCOPE="frescura")
+
+    def test_value_is_normalized(self):
+        from app.config import Settings
+
+        assert Settings(_env_file=None, DETAIL_ROTATION_SCOPE=" Fresh ").DETAIL_ROTATION_SCOPE == "fresh"
