@@ -41,6 +41,17 @@
     <string>80</string>
     <key>SYNC_INTERVAL</key>
     <string>2</string>
+
+    <!-- Email dispatch budget per sync, TEMPORARILY lowered from 25 while the
+         rotation speeds up. The reordered rotation now visits causas unseen for
+         ~30 days (or never), so each one dumps a month of backed-up movements at
+         once: measured on 2026-10-02, the 25 ceiling was already being hit 14
+         times in two days, and a single causa produced 38 notifications.
+         Alerts are ALWAYS persisted and still show in the app's activity feed —
+         this gates only the email/webhook send, so nothing is lost. Raise it
+         back once the daily mail volume is known. -->
+    <key>NOTIFY_MAX</key>
+    <string>5</string>
   </dict>
 
   <key>RunAtLoad</key>

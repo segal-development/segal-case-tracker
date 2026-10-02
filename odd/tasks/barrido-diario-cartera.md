@@ -60,6 +60,27 @@ sabemos por diferencia.
       plist decía "sacar las 3 claves", pero eso restauraría los defaults
       30/4h, que son MÁS LENTOS. Lo que estorbaba era el orden, no el tamaño
       del lote ni la frecuencia. Efecto al reiniciar la estación.
+- [x] **T1c · Hacer que el plist mande sobre `.env.qa`** (2026-10-02).
+      `run-worker-foreground.sh:29` hace `set -a; source .env.qa; set +a`, que
+      **PISA** lo que el LaunchAgent puso en el entorno. Las variables que
+      comparten nombre entre plist y `.env.qa` las decidía `.env.qa` en
+      silencio — por eso las líneas de al lado renombran (`DETAIL_BATCH` →
+      `DETAIL_BATCH_SIZE`). `DETAIL_PENDING_DOCS_FIRST` usaba el MISMO nombre,
+      así que T1b podría no haber servido de nada. Ahora el wrapper exporta
+      `DETAIL_PENDING_DOCS_FIRST` y `NOTIFY_MAX_PER_SYNC` **incondicionalmente**
+      después del source, con el nombre corto del plist ganando. Verificado
+      simulando que `.env.qa` impone `true`/`25`: el wrapper fuerza
+      `false`/`5`.
+- [x] **T3b · Amortiguador de correo** (2026-10-02). `NOTIFY_MAX=5` en el plist
+      (era 25), temporal. Medido ese día: el tope de 25 se tocaba **14 veces en
+      dos días** y una sola causa generó **38 notificaciones**; con la rotación
+      reordenada visitando causas de ~30 días de atraso, cada una vuelca un mes
+      de movimientos junto. **No se pierde nada**: el código dice textual
+      *"Alerts are ALWAYS persisted; only the email/webhook DISPATCH is gated"*,
+      y los movimientos siguen saliendo en el feed `activity` de la app
+      (`new_movement` no está en `ACTIONABLE_ALERT_TYPES`, y el filtro de
+      `activity` es `notin_(ACTIONABLE_ALERT_TYPES)`). Subirlo cuando se sepa
+      el volumen diario real.
 - [ ] **T2 · Cerrar el tiempo inactivo** para que el barrido corra a diario.
       Candidatos: `SYNC_INTERVAL_HOURS`, `MAX_DATA_AGE_HOURS` (guard
       `needs_sync`), `DETAIL_BATCH_SIZE`, `DETAIL_BATCH_MAX_SECONDS`.
@@ -140,5 +161,8 @@ Repetir estas mismas mediciones tras un día con el cambio, y mirar
 ## Progreso
 
 - 2026-10-02 — Medido el costo real por causa y por documento sobre el log.
-  Hallazgo principal: 9% de utilización. Diseño completo recibido; ver arriba.
-  **Pendiente decisión de Marcelo sobre el orden de ejecución.**
+  Hallazgo principal: 9% de utilización. Diseño completo recibido.
+  Marcelo eligió sacar el modo backfill primero. Entregado: PR #311
+  (orden de rotación) y el plist/wrapper deterministas + tope de correo.
+  **Efecto al reiniciar la estación. Próximo paso: medir un día y comparar
+  contra la línea base de arriba.**
