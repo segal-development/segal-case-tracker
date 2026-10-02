@@ -22,11 +22,21 @@
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>HOME</key>
     <string>/Users/marcelo</string>
-    <!-- PDF backfill (moderate pace): prioritize cases with the most pending
-         docs, larger batch, shorter cycle. Remove these 3 keys once the
-         pending-PDF backlog is drained to return to normal monitoring cadence. -->
-    <key>DETAIL_PENDING_DOCS_FIRST</key>
-    <string>true</string>
+    <!-- Daily-sweep mode. The goal is to answer "which causas moved today",
+         which needs the WHOLE portfolio visited often, not a drained PDF queue.
+
+         DETAIL_PENDING_DOCS_FIRST is deliberately NOT set here. It ordered the
+         rotation by "most pending PDFs first", i.e. it picked the most
+         EXPENSIVE causas on every cycle: measured on this station, a causa with
+         no new movements costs 1.1s while its PDFs cost 3.5s each. That
+         ordering is a direct cause of the ~80-day full lap. Without it the
+         rotation falls back to "least recently detailed first", which is what a
+         sweep wants. Turn it back on only to drain a PDF backlog, and expect
+         freshness to collapse while it is on.
+
+         The larger batch and shorter cycle below are KEPT on purpose: the old
+         defaults (30 / 4h) are slower, and a daily sweep needs more throughput,
+         not less. Do not "restore the defaults" without re-reading this. -->
     <key>DETAIL_BATCH</key>
     <string>80</string>
     <key>SYNC_INTERVAL</key>
