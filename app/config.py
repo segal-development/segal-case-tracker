@@ -2,7 +2,9 @@ import base64
 from functools import lru_cache
 
 from cryptography.fernet import Fernet, MultiFernet
-from pydantic import model_validator
+from typing import Literal
+
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -197,6 +199,12 @@ class Settings(BaseSettings):
     DETAIL_FETCH_DELAY: float = 2.0  # Seconds between consecutive detail fetches
     DETAIL_MIN_YEAR: int = 2021    # Only detail-scrape cases with ROL year >= this (0 = all)
     DETAIL_PENDING_DOCS_FIRST: bool = False  # when true, detail rotation prioritizes cases with the most pending documents (PDF backfill)
+    # Which side of the freshness/backlog cut this station works on. "all" = no cut
+    # (default, legacy behavior); "fresh" = only causas already detailed
+    # (last_detail_checked_at NOT NULL); "backlog" = only never-detailed ones.
+    # An unknown value FAILS AT STARTUP: silently degrading to "all" would make a
+    # freshness station sweep the whole backlog.
+    DETAIL_ROTATION_SCOPE: Literal["all", "fresh", "backlog"] = "all"
 
     # Notifications
     NOTIFY_MAX_PER_SYNC: int = 25           # Max notifications dispatched per sync_movements call
@@ -251,6 +259,11 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # Fail-fast secrets validation
     # ------------------------------------------------------------------
+
+    @field_validator("DETAIL_ROTATION_SCOPE", mode="before")
+    @classmethod
+    def _normalize_rotation_scope(cls, v):
+        return v.strip().lower() if isinstance(v, str) else v
 
     @model_validator(mode="after")
     def validate_production_secrets(self) -> "Settings":

@@ -1531,6 +1531,9 @@ def _select_cases_for_detail_rotation(
     order_clauses = []
     if reserved_first:
         order_clauses.append(Case.consulta_reserved.desc())
+    # NULLS FIRST only matters for scope "all" (never-detailed go first). Under
+    # "fresh" there are no NULLs in the set, so this reads as "least recently
+    # checked first"; under "backlog" every row is NULL, so filed_at DESC decides.
     order_clauses.extend([
         Case.last_detail_checked_at.asc().nullsfirst(),
         Case.filed_at.desc(),
@@ -1552,9 +1555,38 @@ def _select_cases_for_detail_rotation(
 
     base_filter = (Case.lawyer_id == lawyer_id, Case.competencia == competencia)
 
+    # Freshness/backlog cut (DETAIL_ROTATION_SCOPE). It is ADDED to the filters
+    # above; "all" adds nothing.
+    scope = settings.DETAIL_ROTATION_SCOPE
+    if scope == "fresh":
+        scope_filter = (Case.last_detail_checked_at.isnot(None),)
+        outside_filter = (Case.last_detail_checked_at.is_(None),)
+    elif scope == "backlog":
+        scope_filter = (Case.last_detail_checked_at.is_(None),)
+        outside_filter = (Case.last_detail_checked_at.isnot(None),)
+    else:
+        scope_filter = outside_filter = ()
+
+    def _log_scope(selected: int) -> None:
+        if scope == "all":
+            return
+        # Causas on the other side of the cut that passed every other filter
+        # (not podada, year in scope). One extra query per selection, not per case.
+        outside_rols = (
+            db.query(Case.rol)
+            .filter(*base_filter, Case.poda_at.is_(None), *outside_filter)
+            .all()
+        )
+        left_outside = sum(1 for (rol,) in outside_rols if _year_ok(rol))
+        logger.info(
+            "Detail rotation scope: scope=%s lawyer_id=%s competencia=%s selected=%d "
+            "left_outside_cut=%d (other side of the cut, waiting for the other station)",
+            scope, lawyer_id, competencia, selected, left_outside,
+        )
+
     db_cases = (
         db.query(Case)
-        .filter(*base_filter, Case.poda_at.is_(None))  # podadas no consumen presupuesto de scraping
+        .filter(*base_filter, Case.poda_at.is_(None), *scope_filter)  # podadas no consumen presupuesto de scraping
         .order_by(*order_clauses)
         .all()
     )
@@ -1571,8 +1603,15 @@ def _select_cases_for_detail_rotation(
             # Every DB case for this lawyer+competencia is podada — nothing to
             # scrape ON PURPOSE. Do NOT fall back to live api_cases here, or
             # poda would be undone every single rotation cycle.
+            _log_scope(0)
             return []
-        # Empty DB for this lawyer+competencia — fall back to live cases.
+        # Empty DB for this lawyer+competencia — fall back to live cases. Those
+        # are by definition never-detailed, so only "all"/"backlog" may adopt
+        # them; "fresh" must not.
+        if scope == "fresh":
+            _log_scope(0)
+            return []
+        _log_scope(len(fallback))
         return fallback
 
     result = []
@@ -1590,8 +1629,14 @@ def _select_cases_for_detail_rotation(
     # sit permanently at the front of the rotation order and starve live cases.
     # Fall back to live api_cases so rotation is not blocked by ghost rows.
     if not result and db_cases:
+        if scope != "all":
+            # The live list is NOT scope-aware (it carries no detail timestamps):
+            # falling back would hand out causas from the other side of the cut.
+            _log_scope(0)
+            return []
         return fallback
 
+    _log_scope(len(result))
     return result
 
 
