@@ -606,8 +606,9 @@ class DeadlineEngine:
 
         Parallel on purpose (see ``PARALLEL_DEADLINES``): it does not move the
         procedural state and is not an actionable plazo, so it never drives the
-        semáforo, ``next_deadline_at`` or any alert (the resolution does not
-        say which party it addresses — pending that, it is display-only).
+        semáforo or ``next_deadline_at``. Its alert (only when the obligation is
+        provably ours) is emitted separately by
+        ``sync_service.emit_ratification_alert``.
 
         CONSCIOUS DEBT: when a SECOND parallel plazo shows up, refactor
         ``ClassifierRule`` (optional next_state + parallel triggers) instead of
