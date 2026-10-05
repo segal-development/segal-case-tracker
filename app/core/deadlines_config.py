@@ -251,11 +251,12 @@ CLASSIFIER_RULES: list[ClassifierRule] = [
     ),
     # Rule 2 — Notificación exitosa de la demanda → NOTIFICADO + EXCEPCIONES_8D
     # Real data: "NOTIFICACIÓN DE DEMANDA (Exitosa) Diligencia:..."
-    # Must NOT match "(Certificación)" attempts.
+    # "(Realizada)" is also a notification that worked. Must NOT match the
+    # failed variants "(Certificación)" / "(Búsqueda negativa)".
     ClassifierRule(
         description_regex=(
             r"(NOTIFICACI[ÓO]N DE DEMANDA|Notificaci[oó]n [Dd]emanda)"
-            r".*[Ee]xitosa"
+            r".*(?:[Ee]xitosa|\(Realizada\))"
         ),
         stage_regex="",
         event=ProcEvent.NOTIFICACION_EXITOSA,

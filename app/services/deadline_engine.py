@@ -46,7 +46,7 @@ from app.models.case import Case
 from app.models.case_deadline import CaseDeadline
 from app.models.movement import Movement
 from app.services.business_days import add_business_days, count_business_days_remaining
-from app.services.procedural_classifier import MovementClassifier
+from app.services.procedural_classifier import MovementClassifier, anchor_date
 
 logger = logging.getLogger(__name__)
 
@@ -648,12 +648,10 @@ class DeadlineEngine:
         """Extract a ``date`` from either a Movement object or a pre-computed date."""
         if isinstance(trigger, date):
             return trigger
-        mv_dt = getattr(trigger, "movement_date", None)
-        if mv_dt is None:
+        if getattr(trigger, "movement_date", None) is None:
             raise ValueError(f"Trigger has no movement_date: {trigger!r}")
-        if hasattr(mv_dt, "date"):
-            return mv_dt.date()
-        return mv_dt
+        # Anchors to the "Diligencia:" date when present (see anchor_date).
+        return anchor_date(trigger)
 
     @classmethod
     def _compute_en_apremio(cls, db: Session, case: "Case") -> bool:

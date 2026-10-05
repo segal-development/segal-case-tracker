@@ -82,7 +82,11 @@ def _seed_civil_case_with_notification(db) -> Case:
     mv = Movement(
         case_id=case.id,
         stage="Gestión",
-        description="NOTIFICACIÓN DE DEMANDA (Exitosa) Diligencia:15/06/2026",
+        # Diligencia is the anchor now, so keep it relative to today as well.
+        description=(
+            "NOTIFICACIÓN DE DEMANDA (Exitosa) Diligencia:"
+            f"{TODAY_NOTIF:%d/%m/%Y} 10:00"
+        ),
         procedure="Actuación Receptor",
         movement_date=TODAY_NOTIF,
     )
@@ -178,3 +182,30 @@ class TestDeadlineEnginePersistence:
         assert case.procedural_state == ProceduralState.INDETERMINATE.value
         rows = db.query(CaseDeadline).filter(CaseDeadline.case_id == case.id).all()
         assert rows == []
+
+
+@pytest.mark.integration
+class TestDiligenciaAnchorPersistence:
+    def test_late_publication_persists_an_already_expired_deadline(self, db) -> None:
+        """PJUD published 20 days after the diligencia: the plazo is already past due."""
+        case = _seed_civil_case_with_notification(db)
+        mv = db.query(Movement).filter(Movement.case_id == case.id).one()
+        diligencia = TODAY_DT - timedelta(days=20)
+        mv.description = (
+            f"NOTIFICACIÓN DE DEMANDA (Exitosa) Diligencia:{diligencia:%d/%m/%Y} 10:00"
+        )
+        mv.movement_date = TODAY_DT
+        db.flush()
+
+        DeadlineEngine.recompute_case(db, case)
+
+        row = (
+            db.query(CaseDeadline)
+            .filter(
+                CaseDeadline.case_id == case.id,
+                CaseDeadline.deadline_type == DeadlineType.EXCEPCIONES_8D.value,
+            )
+            .one()
+        )
+        assert row.triggered_at == diligencia.date()
+        assert row.due_date < TODAY_DT.date()
