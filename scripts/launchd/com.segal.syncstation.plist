@@ -52,6 +52,19 @@
          back once the daily mail volume is known. -->
     <key>NOTIFY_MAX</key>
     <string>5</string>
+
+    <!-- Historical PDFs downloaded per causa visit. Measured on 2026-10-05 over a
+         118 min cycle: documents took 67 min (33 downloading 511 docs at 3.3s,
+         34 waiting 511 x 4s DOCUMENT_INTER_DELAY), 57% of the clock, against 23
+         min processing movements for 39 causas. The rotation now hits the most
+         overdue causas and each brings ~13 documents, so the pace fell to ~20
+         causas/hour versus ~440 baseline. With 3, PDFs of movements dated in the
+         last 30 days (DOC_RECENT, default) are STILL all downloaded (last
+         week's resolution); only the older ones are limited. Deferred docs stay pending and need
+         another visit to the causa (their JWT lives 1 hour); the worker log
+         line "document cap active" reports how many were deferred. 0 = no cap. -->
+    <key>DOC_MAX</key>
+    <string>3</string>
   </dict>
 
   <key>RunAtLoad</key>
