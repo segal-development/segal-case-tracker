@@ -108,12 +108,14 @@ class DeadlineType(str, Enum):
     #    artículo 49 del Código de Procedimiento Civil apercíbase al demandado
     #    para que en el plazo de tres días hábiles señale domicilio conocido..."
     #    (2º Letras Civil de Antofagasta, C-2491-2026)
-    # is_fatal stays False ON PURPOSE. The apercibimiento is "tener por no
-    # presentado el escrito": if that escrito were the excepciones, not
-    # ratifying means LOSING the defense. That suggests it is fatal, but it is
-    # pending confirmation by Dirección Jurídica; flipping it changes the
-    # semáforo and the alerts, which is a lawyer's decision, not ours.
-    ACREDITAR_PODER_3D = ("acreditar_poder_3d", 3, "art. 7 CPC · art. 7 Ley 20.886 (mod. Ley 21.394)", False)
+    # is_fatal=True: Dirección Jurídica CONFIRMED on 2026-10-05 that this plazo
+    # is fatal. The apercibimiento is "tener por no presentado el escrito": if
+    # that escrito is the excepciones, not ratifying means LOSING the defense.
+    # NOTE the flag is inert for the semáforo / next_deadline_fatal (those only
+    # read ACTIONABLE rows and this type is informational); it is surfaced by
+    # the deadlines catalog API. The alert path is separate: see
+    # ``sync_service.emit_ratification_alert``.
+    ACREDITAR_PODER_3D = ("acreditar_poder_3d", 3, "art. 7 CPC · art. 7 Ley 20.886 (mod. Ley 21.394)", True)
 
 
 # ---------------------------------------------------------------------------
@@ -144,13 +146,13 @@ OPTIONAL_ACTIONABLE: frozenset[DeadlineType] = frozenset({
     DeadlineType.REPOSICION_AUTO_PRUEBA_3D,
 })
 ACTIONABLE_DEADLINES: frozenset[DeadlineType] = MANDATORY_ACTIONABLE | OPTIONAL_ACTIONABLE
-#     · ACREDITAR_PODER_3D — shown, but deliberately NOT actionable yet: the
+#     · ACREDITAR_PODER_3D — shown, but deliberately NOT actionable: the
 #       resolution does not say WHICH party it is addressed to (the
-#       ejecutante's abogado or ours). Alerting on all ~2,200 cases would bury
-#       the lawyers in noise about the counterparty's obligations, and noise
-#       kills an alert faster than its absence. Being outside the actionable
-#       sets is what keeps it out of the semáforo, next_deadline_at and every
-#       alert / daily-agenda path. Promote it only once the addressee is known.
+#       ejecutante's abogado or ours). Putting it in the actionable sets would
+#       turn ~2,200 cases ROJO over the counterparty's obligations. Staying
+#       outside them keeps it out of the semáforo and next_deadline_at. The
+#       subset that is provably ours gets its own alert type
+#       ("ratificar_firma"), emitted outside the semáforo.
 INFORMATIONAL_DEADLINES: frozenset[DeadlineType] = frozenset({
     DeadlineType.EXCEPCIONES_8D,
     DeadlineType.SENTENCIA_10D,

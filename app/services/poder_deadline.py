@@ -102,3 +102,53 @@ def find_poder_obligation(movements: list) -> PoderObligation | None:
         for m in movements
     )
     return PoderObligation(trigger=trigger, fulfilled=fulfilled)
+
+
+# ---------------------------------------------------------------------------
+# Whose obligation is it? (HEURISTIC)
+#
+# The "Previo a proveer" text does not name its addressee. In a juicio ejecutivo
+# the excepciones are the ejecutado's, so when the firm is on the ejecutado's
+# side (checked by the caller) and an excepciones filing exists BEFORE the
+# resolution, we treat the ratification as ours.
+#
+# HEURISTIC = "an [Escrito] 'Opone excepciones' exists at any earlier point (by
+# date, ties by id)". We first required it to be the movement IMMEDIATELY before
+# the resolution (the court answers the escrito just before it: "A folio 8:"),
+# but measured on QA that missed 414 of 1,358 causas (30%): another escrito had
+# been filed in between. Reasoning for widening: if that in-between escrito is
+# OURS, the duty to ratify is ours whichever of our escritos the resolution
+# answers. We would be wrong only if the in-between escrito were the
+# counterparty's, which cannot be told apart from the movement. That risk was
+# accepted on purpose: on a FATAL plazo a false positive costs an email, a
+# false negative costs the defense.
+#
+# PRECISE PATH (not implemented): parse the folio from the resolution's PDF text
+# and match it to the movement with that folio. Extracted text exists for only
+# ~40% of cases (1,053 of 2,663; 837 mention the folio), so it is a later
+# refinement, not a replacement.
+# ---------------------------------------------------------------------------
+_EXCEPCIONES_RE = re.compile(r"^\s*opone excepciones", re.IGNORECASE)
+
+
+def _order_key(movement: object) -> tuple:
+    return (_day(movement), getattr(movement, "id", None) or 0)
+
+
+def is_excepciones_filing(movement: object) -> bool:
+    """An ``Escrito`` "Opone excepciones" (the party's filing, not the ruling)."""
+    procedure = (getattr(movement, "procedure", None) or "").strip().lower()
+    return (
+        procedure == "escrito"
+        and bool(_EXCEPCIONES_RE.search(_description(movement)))
+        and not _NULO_RE.search(_description(movement))
+    )
+
+
+def responds_to_excepciones_filing(movements: list, trigger: object) -> bool:
+    """True when an excepciones filing precedes the resolution (any distance)."""
+    key = _order_key(trigger)
+    return any(
+        m is not trigger and _order_key(m) < key and is_excepciones_filing(m)
+        for m in movements
+    )
