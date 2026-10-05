@@ -95,15 +95,25 @@ class DeadlineType(str, Enum):
     APELACION_5D = ("apelacion_5d", 5, "art. 475 CPC", True)
     # PARALLEL plazo: it is NOT started by a ClassifierRule (see
     # app/services/poder_deadline.py and DeadlineEngine's parallel step).
-    # Court resolution "Apercibimiento poder y/o título": acreditar patrocinio
-    # y poder within 3 días hábiles (requested by Dirección Jurídica).
-    # TODO(Dirección Jurídica): confirm the exact article of Ley 18.120 (sobre
-    # comparecencia en juicio) before showing a more specific citation. Do NOT
-    # guess one: a miscopied citation has already propagated in this repo.
-    # is_fatal stays False ON PURPOSE: the apercibimiento usually means the
-    # escrito is tenido por no presentado, which suggests it is serious, but no
-    # abogado has confirmed it yet. Flip only after that confirmation.
-    ACREDITAR_PODER_3D = ("acreditar_poder_3d", 3, "Ley 18.120", False)
+    # Court resolution "Previo a proveer" ordering to ratify the signature /
+    # acreditar patrocinio y poder within 3 días hábiles (Dirección Jurídica).
+    # Sources, verbatim from two real PJUD resolutions:
+    #   "En atención a la modificación introducida por la Ley N° 21.394 al
+    #    artículo 7 de la Ley N° 20.886, previo a resolver, ratifíquese la firma
+    #    electrónica simple ante el señor Secretario del tribunal... Cumpla lo
+    #    ordenado, dentro del tercer día, bajo apercibimiento de tener por no
+    #    presentado el escrito."  (30º Civil de Santiago, C-8844-2026)
+    #   "Atendido lo dispuesto en el artículo 7 del Código de Procedimiento
+    #    Civil, ratifíquense la firma de don [X]... De conformidad lo dispone el
+    #    artículo 49 del Código de Procedimiento Civil apercíbase al demandado
+    #    para que en el plazo de tres días hábiles señale domicilio conocido..."
+    #    (2º Letras Civil de Antofagasta, C-2491-2026)
+    # is_fatal stays False ON PURPOSE. The apercibimiento is "tener por no
+    # presentado el escrito": if that escrito were the excepciones, not
+    # ratifying means LOSING the defense. That suggests it is fatal, but it is
+    # pending confirmation by Dirección Jurídica; flipping it changes the
+    # semáforo and the alerts, which is a lawyer's decision, not ours.
+    ACREDITAR_PODER_3D = ("acreditar_poder_3d", 3, "art. 7 CPC · art. 7 Ley 20.886 (mod. Ley 21.394)", False)
 
 
 # ---------------------------------------------------------------------------
@@ -135,8 +145,8 @@ OPTIONAL_ACTIONABLE: frozenset[DeadlineType] = frozenset({
 })
 ACTIONABLE_DEADLINES: frozenset[DeadlineType] = MANDATORY_ACTIONABLE | OPTIONAL_ACTIONABLE
 #     · ACREDITAR_PODER_3D — shown, but deliberately NOT actionable yet: the
-#       apercibimiento movement does not say WHICH party it is addressed to (the
-#       ejecutante's abogado or ours). Alerting on all ~6,300 cases would bury
+#       resolution does not say WHICH party it is addressed to (the
+#       ejecutante's abogado or ours). Alerting on all ~2,200 cases would bury
 #       the lawyers in noise about the counterparty's obligations, and noise
 #       kills an alert faster than its absence. Being outside the actionable
 #       sets is what keeps it out of the semáforo, next_deadline_at and every

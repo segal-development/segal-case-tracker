@@ -611,7 +611,7 @@ async def get_case_deadlines(
     # Próxima acción = nearest active deadline (first in the ASC-ordered list),
     # EXCLUDING the parallel ones. A parallel deadline is shown in the timeline
     # above but never recommended as the next action: the movement that starts it
-    # does not say WHICH party it is addressed to (the apercibimiento de poder can
+    # does not say WHICH party it is addressed to (the "Previo a proveer" can
     # target either side's lawyer), and "próxima acción" tells the reader what to
     # DO — same reason these types emit no alert. Drop the filter once the
     # addressee is known and the obligation can be attributed to the firm.

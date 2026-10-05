@@ -526,7 +526,7 @@ class DeadlineEngine:
 
         Parallel on purpose (see ``PARALLEL_DEADLINES``): it does not move the
         procedural state and is not an actionable plazo, so it never drives the
-        semáforo, ``next_deadline_at`` or any alert (the apercibimiento does not
+        semáforo, ``next_deadline_at`` or any alert (the resolution does not
         say which party it addresses — pending that, it is display-only).
 
         CONSCIOUS DEBT: when a SECOND parallel plazo shows up, refactor
@@ -574,7 +574,7 @@ class DeadlineEngine:
                     existing.status = "cumplido" if obligation.fulfilled else "active"
                     existing.computed_at = datetime.now(timezone.utc)
 
-            # Any other still-active automatic row is stale (a newer apercibimiento
+            # Any other still-active automatic row is stale (a newer resolution
             # replaced it, or the only one was annulled).
             stale = (
                 db.query(CaseDeadline)

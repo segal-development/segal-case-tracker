@@ -24,7 +24,7 @@ from app.models.movement import Movement
 from app.services.deadline_engine import DeadlineEngine
 from app.services.sync_service import NotifyBudget, emit_deadline_alerts
 
-APERCIBIMIENTO = "Apercibimiento poder y/o título"
+PREVIO = "Previo a proveer"
 PODER = "acreditar_poder_3d"
 
 
@@ -43,10 +43,13 @@ def case(db) -> Case:
     return c
 
 
-def _add(db, case: Case, when: datetime, description: str, stage: str = "Inicio de la Tramitación") -> Movement:
+def _add(
+    db, case: Case, when: datetime, description: str,
+    stage: str = "Inicio de la Tramitación", procedure: str = "Resolución",
+) -> Movement:
     mv = Movement(
         case_id=case.id, stage=stage, description=description,
-        procedure="Resolución", movement_date=when,
+        procedure=procedure, movement_date=when,
     )
     db.add(mv)
     db.flush()
@@ -69,29 +72,55 @@ def _make_demandante(db, case: Case) -> None:
 
 
 class TestCreation:
-    def test_apercibimiento_creates_plazo_3_business_days_from_its_date(self, db, case) -> None:
-        _add(db, case, datetime(2026, 6, 1), APERCIBIMIENTO)  # Monday
+    def test_previo_a_proveer_creates_plazo_3_business_days_from_its_date(self, db, case) -> None:
+        _add(db, case, datetime(2026, 6, 1), PREVIO)  # Monday
         DeadlineEngine.recompute_case(db, case)
         (row,) = _rows(db, case, PODER)
         assert row.status == "active"
         assert row.triggered_at == date(2026, 6, 1)
         assert row.due_date == date(2026, 6, 4)  # Thursday
-        assert row.legal_basis == "Ley 18.120"
+        assert row.legal_basis == "art. 7 CPC · art. 7 Ley 20.886 (mod. Ley 21.394)"
 
     def test_saturday_counts_as_business_day(self, db, case) -> None:
-        _add(db, case, datetime(2026, 6, 4), APERCIBIMIENTO)  # Thursday
+        _add(db, case, datetime(2026, 6, 4), PREVIO)  # Thursday
         DeadlineEngine.recompute_case(db, case)
         (row,) = _rows(db, case, PODER)
         # Fri(1) Sat(2) Mon(3); the Sunday is skipped. Excluding Saturday would give Tuesday 06-09.
         assert row.due_date == date(2026, 6, 8)
 
-    def test_nulo_apercibimiento_creates_no_plazo(self, db, case) -> None:
-        _add(db, case, datetime(2026, 6, 1), f"[Nulo] {APERCIBIMIENTO}")
+    def test_nulo_previo_a_proveer_creates_no_plazo(self, db, case) -> None:
+        _add(db, case, datetime(2026, 6, 1), f"[Nulo] {PREVIO}")
         DeadlineEngine.recompute_case(db, case)
         assert _rows(db, case, PODER) == []
 
+    def test_real_case_wednesday_to_saturday_counting_saturday(self, db, case) -> None:
+        """Real PJUD capture (Dirección Jurídica): resolución Previo a proveer on
+        Wednesday 09/09/2026, Acredita Poder on Saturday 12/09/2026.
+
+        Three días hábiles COUNTING the Saturday: Thu 10, Fri 11, Sat 12. It was
+        due on the 12th and they complied on the 12th, the very last day. Without
+        counting Saturday the numbers do not add up, so this validates
+        business_days.py against a real case.
+        """
+        _add(db, case, datetime(2026, 9, 9), PREVIO)
+        _add(db, case, datetime(2026, 9, 12), "Acredita Poder", procedure="Escrito")
+        DeadlineEngine.recompute_case(db, case)
+        (row,) = _rows(db, case, PODER)
+        assert row.due_date == date(2026, 9, 12)
+        assert row.status == "cumplido"
+
+    def test_escrito_previo_a_proveer_creates_no_plazo(self, db, case) -> None:
+        _add(db, case, datetime(2026, 6, 1), PREVIO, procedure="Escrito")
+        DeadlineEngine.recompute_case(db, case)
+        assert _rows(db, case, PODER) == []
+
+    def test_blank_procedure_previo_a_proveer_creates_plazo(self, db, case) -> None:
+        _add(db, case, datetime(2026, 6, 1), PREVIO, procedure="")
+        DeadlineEngine.recompute_case(db, case)
+        assert len(_rows(db, case, PODER)) == 1
+
     def test_recompute_is_idempotent(self, db, case) -> None:
-        _add(db, case, datetime(2026, 6, 1), APERCIBIMIENTO)
+        _add(db, case, datetime(2026, 6, 1), PREVIO)
         DeadlineEngine.recompute_case(db, case)
         DeadlineEngine.recompute_case(db, case)
         assert len(_rows(db, case, PODER)) == 1
@@ -99,7 +128,7 @@ class TestCreation:
 
 class TestCompliance:
     def test_later_acredita_poder_marks_cumplido(self, db, case) -> None:
-        _add(db, case, datetime(2026, 6, 1), APERCIBIMIENTO)
+        _add(db, case, datetime(2026, 6, 1), PREVIO)
         _add(db, case, datetime(2026, 6, 3), "Acredita Poder")
         DeadlineEngine.recompute_case(db, case)
         (row,) = _rows(db, case, PODER)
@@ -107,13 +136,13 @@ class TestCompliance:
 
     def test_earlier_acredita_poder_does_not_mark_cumplido(self, db, case) -> None:
         _add(db, case, datetime(2026, 5, 20), "Acredita Poder")
-        _add(db, case, datetime(2026, 6, 1), APERCIBIMIENTO)
+        _add(db, case, datetime(2026, 6, 1), PREVIO)
         DeadlineEngine.recompute_case(db, case)
         (row,) = _rows(db, case, PODER)
         assert row.status == "active"
 
     def test_compliance_arriving_on_a_later_sync_flips_active_to_cumplido(self, db, case) -> None:
-        _add(db, case, datetime(2026, 6, 1), APERCIBIMIENTO)
+        _add(db, case, datetime(2026, 6, 1), PREVIO)
         DeadlineEngine.recompute_case(db, case)
         _add(db, case, datetime(2026, 6, 3), "Delega poder")
         DeadlineEngine.recompute_case(db, case)
@@ -121,7 +150,7 @@ class TestCompliance:
         assert row.status == "cumplido"
 
     def test_auditor_no_cumplido_is_never_overwritten(self, db, case) -> None:
-        _add(db, case, datetime(2026, 6, 1), APERCIBIMIENTO)
+        _add(db, case, datetime(2026, 6, 1), PREVIO)
         DeadlineEngine.recompute_case(db, case)
         (row,) = _rows(db, case, PODER)
         row.status = "no_cumplido"
@@ -131,20 +160,20 @@ class TestCompliance:
         db.refresh(row)
         assert row.status == "no_cumplido"
 
-    def test_annulled_apercibimiento_later_supersedes_the_plazo(self, db, case) -> None:
+    def test_annulled_previo_a_proveer_later_supersedes_the_plazo(self, db, case) -> None:
         """If the only apercibimiento disappears (annulled), the stale row must not stay active."""
-        mv = _add(db, case, datetime(2026, 6, 1), APERCIBIMIENTO)
+        mv = _add(db, case, datetime(2026, 6, 1), PREVIO)
         DeadlineEngine.recompute_case(db, case)
-        mv.description = f"[Nulo] {APERCIBIMIENTO}"
+        mv.description = f"[Nulo] {PREVIO}"
         db.flush()
         DeadlineEngine.recompute_case(db, case)
         (row,) = _rows(db, case, PODER)
         assert row.status == "superseded"
 
-    def test_new_apercibimiento_supersedes_the_previous_row(self, db, case) -> None:
-        _add(db, case, datetime(2026, 6, 1), APERCIBIMIENTO)
+    def test_new_previo_a_proveer_supersedes_the_previous_row(self, db, case) -> None:
+        _add(db, case, datetime(2026, 6, 1), PREVIO)
         DeadlineEngine.recompute_case(db, case)
-        _add(db, case, datetime(2026, 6, 10), APERCIBIMIENTO)
+        _add(db, case, datetime(2026, 6, 10), PREVIO)
         DeadlineEngine.recompute_case(db, case)
         old, new = _rows(db, case, PODER)
         assert (old.status, new.status) == ("superseded", "active")
@@ -161,7 +190,7 @@ class TestParallelWithExcepciones:
 
     def test_poder_and_excepciones_coexist_without_overwriting_each_other(self, db, case) -> None:
         now = datetime.now()
-        _add(db, case, now - timedelta(days=3), APERCIBIMIENTO)
+        _add(db, case, now - timedelta(days=3), PREVIO)
         self._notification(db, case, now - timedelta(days=1))
         DeadlineEngine.recompute_case(db, case)
         statuses = {r.deadline_type: r.status for r in _rows(db, case)}
@@ -175,7 +204,7 @@ class TestParallelWithExcepciones:
         excepciones_8d from the triggers; the poder row must stay active.
         """
         now = datetime.now()
-        _add(db, case, now - timedelta(days=3), APERCIBIMIENTO)
+        _add(db, case, now - timedelta(days=3), PREVIO)
         self._notification(db, case, now - timedelta(days=2))
         DeadlineEngine.recompute_case(db, case)
         assert case.procedural_state == "notificado"
@@ -194,7 +223,7 @@ class TestNeverAlerts:
         _make_demandante(db, case)
         now = datetime.now()
         _add(db, case, now - timedelta(days=60), "Ordena despachar mandamiento", stage="Mandamiento")
-        _add(db, case, now - timedelta(days=30), APERCIBIMIENTO)  # long overdue, never fulfilled
+        _add(db, case, now - timedelta(days=30), PREVIO)  # long overdue, never fulfilled
 
         transition = DeadlineEngine.recompute_case(db, case)
 
