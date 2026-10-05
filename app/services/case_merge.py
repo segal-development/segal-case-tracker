@@ -338,6 +338,8 @@ def _merge_movements(db: Session, loser_id: int, winner_id: int) -> None:
                 doc.movement_id = canonical.id
             for deadline in db.query(CaseDeadline).filter(CaseDeadline.source_movement_id == row.id).all():
                 deadline.source_movement_id = canonical.id
+            for deadline in db.query(CaseDeadline).filter(CaseDeadline.verdict_movement_id == row.id).all():
+                deadline.verdict_movement_id = canonical.id
             for alert in db.query(Alert).filter(Alert.movement_id == row.id).all():
                 alert.movement_id = canonical.id
             to_delete.append(row)
