@@ -345,6 +345,36 @@ class TestDeadlinesTimeline:
 class TestProximaAccion:
     """proxima_accion is the nearest active deadline with a human description."""
 
+    def test_parallel_deadline_is_shown_but_never_the_proxima_accion(
+        self, authed_client: TestClient, case_with_active_deadline: Case, db
+    ):
+        """A nearer poder deadline must NOT become the recommended next action.
+
+        The movement that starts it does not say WHICH party it is addressed to,
+        so recommending it could send a lawyer chasing the counterparty's
+        obligation. It stays visible in the timeline — that is the whole point of
+        computing it — but "próxima acción" says what to DO.
+        """
+        mas_cerca = date.today() + timedelta(days=1)
+        db.add(CaseDeadline(
+            case_id=case_with_active_deadline.id,
+            deadline_type=DeadlineType.ACREDITAR_PODER_3D.value,
+            legal_basis="Ley 18.120",
+            due_date=mas_cerca,
+            triggered_at=date.today() - timedelta(days=2),
+            status="active",
+            computed_at=datetime.utcnow(),
+        ))
+        db.commit()
+
+        data = authed_client.get(
+            f"/api/v1/cases/{case_with_active_deadline.id}/deadlines"
+        ).json()
+
+        tipos = [d["deadline_type"] for d in data["active_deadlines"]]
+        assert DeadlineType.ACREDITAR_PODER_3D.value in tipos, "debe seguir visible"
+        assert data["proxima_accion"]["deadline_type"] == DeadlineType.EXCEPCIONES_8D.value
+
     def test_proxima_accion_present_when_active_deadline_exists(
         self, authed_client: TestClient, case_with_active_deadline: Case
     ):

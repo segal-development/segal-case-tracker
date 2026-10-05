@@ -93,6 +93,27 @@ class DeadlineType(str, Enum):
     # dual-basis "art. 187/475 CPC" (which mixed in the ejecutante's ambos-
     # efectos rule the firm never actually exercises).
     APELACION_5D = ("apelacion_5d", 5, "art. 475 CPC", True)
+    # PARALLEL plazo: it is NOT started by a ClassifierRule (see
+    # app/services/poder_deadline.py and DeadlineEngine's parallel step).
+    # Court resolution "Previo a proveer" ordering to ratify the signature /
+    # acreditar patrocinio y poder within 3 días hábiles (Dirección Jurídica).
+    # Sources, verbatim from two real PJUD resolutions:
+    #   "En atención a la modificación introducida por la Ley N° 21.394 al
+    #    artículo 7 de la Ley N° 20.886, previo a resolver, ratifíquese la firma
+    #    electrónica simple ante el señor Secretario del tribunal... Cumpla lo
+    #    ordenado, dentro del tercer día, bajo apercibimiento de tener por no
+    #    presentado el escrito."  (30º Civil de Santiago, C-8844-2026)
+    #   "Atendido lo dispuesto en el artículo 7 del Código de Procedimiento
+    #    Civil, ratifíquense la firma de don [X]... De conformidad lo dispone el
+    #    artículo 49 del Código de Procedimiento Civil apercíbase al demandado
+    #    para que en el plazo de tres días hábiles señale domicilio conocido..."
+    #    (2º Letras Civil de Antofagasta, C-2491-2026)
+    # is_fatal stays False ON PURPOSE. The apercibimiento is "tener por no
+    # presentado el escrito": if that escrito were the excepciones, not
+    # ratifying means LOSING the defense. That suggests it is fatal, but it is
+    # pending confirmation by Dirección Jurídica; flipping it changes the
+    # semáforo and the alerts, which is a lawyer's decision, not ours.
+    ACREDITAR_PODER_3D = ("acreditar_poder_3d", 3, "art. 7 CPC · art. 7 Ley 20.886 (mod. Ley 21.394)", False)
 
 
 # ---------------------------------------------------------------------------
@@ -123,10 +144,29 @@ OPTIONAL_ACTIONABLE: frozenset[DeadlineType] = frozenset({
     DeadlineType.REPOSICION_AUTO_PRUEBA_3D,
 })
 ACTIONABLE_DEADLINES: frozenset[DeadlineType] = MANDATORY_ACTIONABLE | OPTIONAL_ACTIONABLE
+#     · ACREDITAR_PODER_3D — shown, but deliberately NOT actionable yet: the
+#       resolution does not say WHICH party it is addressed to (the
+#       ejecutante's abogado or ours). Alerting on all ~2,200 cases would bury
+#       the lawyers in noise about the counterparty's obligations, and noise
+#       kills an alert faster than its absence. Being outside the actionable
+#       sets is what keeps it out of the semáforo, next_deadline_at and every
+#       alert / daily-agenda path. Promote it only once the addressee is known.
 INFORMATIONAL_DEADLINES: frozenset[DeadlineType] = frozenset({
     DeadlineType.EXCEPCIONES_8D,
     DeadlineType.SENTENCIA_10D,
+    DeadlineType.ACREDITAR_PODER_3D,
 })
+
+# Plazos computed by DeadlineEngine OUTSIDE the classifier's "one state, one set
+# of plazos" model. The engine must never supersede these from the classifier
+# bookkeeping (step 5): they live and die by their own detection.
+#
+# CONSCIOUS DEBT: a parallel path exists because extending ClassifierRule
+# (optional next_state + parallel triggers) would touch the state machine that
+# computes the FATAL plazos. Pay it when a SECOND parallel plazo appears: refactor
+# ClassifierRule then, instead of adding a third code path.
+PARALLEL_DEADLINES: frozenset[DeadlineType] = frozenset({DeadlineType.ACREDITAR_PODER_3D})
+PARALLEL_DEADLINE_VALUES: frozenset[str] = frozenset(d.value for d in PARALLEL_DEADLINES)
 
 # String-value views (CaseDeadline.deadline_type stores the .value string).
 MANDATORY_ACTIONABLE_VALUES: frozenset[str] = frozenset(d.value for d in MANDATORY_ACTIONABLE)
@@ -179,6 +219,7 @@ DEADLINE_LABELS: dict[str, str] = {
     "observaciones_prueba_6d": "Observaciones a la prueba",
     "sentencia_10d": "Plazo para dictar sentencia",
     "apelacion_5d": "Apelación (solo efecto devolutivo)",
+    "acreditar_poder_3d": "Acreditar patrocinio y poder",
 }
 
 

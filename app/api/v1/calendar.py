@@ -26,7 +26,7 @@ from app.api.deps import (
     apply_case_scope,
 )
 from app.core.decision_rules import resolve_rule
-from app.core.deadlines_config import DEADLINE_LABELS
+from app.core.deadlines_config import DEADLINE_LABELS, PARALLEL_DEADLINE_VALUES
 from app.models.case import Case
 from app.models.case_deadline import CaseDeadline
 from app.models.lawyer import Lawyer
@@ -143,6 +143,9 @@ def _deadline_labels_by_case(db: Session, cases: List[Case]) -> dict:
         .filter(
             CaseDeadline.case_id.in_(list(wanted)),
             CaseDeadline.status == "active",
+            # next_deadline_at only ever comes from an ACTIONABLE plazo; a parallel
+            # (display-only) row sharing its due_date must not lend its label.
+            CaseDeadline.deadline_type.notin_(PARALLEL_DEADLINE_VALUES),
         )
         .order_by(CaseDeadline.id.asc())
         .all()

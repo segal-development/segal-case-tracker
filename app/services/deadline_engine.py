@@ -39,6 +39,7 @@ from app.core.deadlines_config import (
     DeadlineType,
     MANDATORY_ACTIONABLE_VALUES,
     OPTIONAL_ACTIONABLE_VALUES,
+    PARALLEL_DEADLINE_VALUES,
     ProceduralState,
     actionable_sets,
 )
@@ -46,6 +47,7 @@ from app.models.case import Case
 from app.models.case_deadline import CaseDeadline
 from app.models.movement import Movement
 from app.services.business_days import add_business_days, count_business_days_remaining
+from app.services.poder_deadline import find_poder_obligation
 from app.services.procedural_classifier import MovementClassifier, anchor_date
 
 logger = logging.getLogger(__name__)
@@ -360,6 +362,10 @@ class DeadlineEngine:
                 CaseDeadline.case_id == case.id,
                 CaseDeadline.status == "active",
                 CaseDeadline.is_manual == False,  # noqa: E712
+                # PARALLEL plazos are not in the classifier's triggers by design;
+                # without this exclusion they would be superseded on the next
+                # recompute (silently: no error, no log). Owned by step 5c.
+                CaseDeadline.deadline_type.notin_(PARALLEL_DEADLINE_VALUES),
             )
             .all()
         )
@@ -400,6 +406,11 @@ class DeadlineEngine:
                 if row.due_date < today and latest_mv_date > row.due_date:
                     row.status = "superseded"
             db.flush()
+
+        # Step 5c: parallel plazos (outside the "one state, one set of plazos"
+        # model). Runs AFTER steps 5/5b so nothing above can touch these rows.
+        cls._sync_parallel_deadlines(db, movements)
+        db.flush()
 
         # Step 6: REBELDÍA post-transition.
         # Only applies when the firm is DEMANDANTE (creditor): the debtor's
@@ -505,6 +516,85 @@ class DeadlineEngine:
         # less battle-tested) DecisionEngine must never break the deadline
         # computation that already succeeded.
         cls._recompute_decision(db, case, today)
+
+    @classmethod
+    def _sync_parallel_deadlines(cls, db: Session, movements: list) -> None:
+        """Upsert ACREDITAR_PODER_3D from the raw movements. NEVER raises.
+
+        Own safe-fail boundary: a bug here must not push the whole case to GRIS
+        or disturb the fatal plazos computed by the classifier path.
+
+        Parallel on purpose (see ``PARALLEL_DEADLINES``): it does not move the
+        procedural state and is not an actionable plazo, so it never drives the
+        semáforo, ``next_deadline_at`` or any alert (the resolution does not
+        say which party it addresses — pending that, it is display-only).
+
+        CONSCIOUS DEBT: when a SECOND parallel plazo shows up, refactor
+        ``ClassifierRule`` (optional next_state + parallel triggers) instead of
+        adding a third code path next to this one.
+        """
+        try:
+            if not movements:
+                return
+            case_id = movements[0].case_id
+            dtype = DeadlineType.ACREDITAR_PODER_3D
+            obligation = find_poder_obligation(movements)
+
+            current_trigger: Optional[date] = None
+            if obligation is not None:
+                current_trigger = cls._triggered_at_date(obligation.trigger)
+                due_date = add_business_days(current_trigger, dtype.dias_habiles)
+                existing = (
+                    db.query(CaseDeadline)
+                    .filter(
+                        CaseDeadline.case_id == case_id,
+                        CaseDeadline.deadline_type == dtype.value,
+                        CaseDeadline.triggered_at == current_trigger,
+                    )
+                    .first()
+                )
+                if existing is None:
+                    db.add(CaseDeadline(
+                        case_id=case_id,
+                        deadline_type=dtype.value,
+                        legal_basis=dtype.legal_basis,
+                        due_date=due_date,
+                        triggered_at=current_trigger,
+                        status="cumplido" if obligation.fulfilled else "active",
+                        source_movement_id=getattr(obligation.trigger, "id", None),
+                        computed_at=datetime.now(timezone.utc),
+                    ))
+                elif not existing.is_manual and existing.status == "active":
+                    # Only "active" rows are refreshed. Audited (cumplido /
+                    # no_cumplido) and manual rows are the auditor's call, and a
+                    # "superseded" row is deliberately NOT resurrected: that keeps
+                    # the step-5 exclusion the single guard against silent loss
+                    # (a self-healing upsert here would mask a broken exclusion).
+                    existing.due_date = due_date
+                    existing.status = "cumplido" if obligation.fulfilled else "active"
+                    existing.computed_at = datetime.now(timezone.utc)
+
+            # Any other still-active automatic row is stale (a newer resolution
+            # replaced it, or the only one was annulled).
+            stale = (
+                db.query(CaseDeadline)
+                .filter(
+                    CaseDeadline.case_id == case_id,
+                    CaseDeadline.deadline_type == dtype.value,
+                    CaseDeadline.status == "active",
+                    CaseDeadline.is_manual == False,  # noqa: E712
+                )
+                .all()
+            )
+            for row in stale:
+                if current_trigger is None or row.triggered_at != current_trigger:
+                    row.status = "superseded"
+        except Exception as exc:  # pragma: no cover - defensive boundary
+            logger.exception(
+                "parallel deadline sync failed for case_id=%s: %s — skipping",
+                getattr(movements[0], "case_id", "?") if movements else "?",
+                exc,
+            )
 
     @classmethod
     def _recompute_decision(cls, db: Session, case: Case, today: date) -> None:

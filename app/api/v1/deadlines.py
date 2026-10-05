@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
 from sqlalchemy.sql import nullslast
 
 from app.api.deps import (
@@ -27,7 +28,12 @@ from app.api.deps import (
     resolve_case_scope,
     apply_case_scope,
 )
-from app.core.deadlines_config import DEADLINE_DISCLAIMER, DEADLINE_LABELS, DeadlineType
+from app.core.deadlines_config import (
+    DEADLINE_DISCLAIMER,
+    DEADLINE_LABELS,
+    PARALLEL_DEADLINE_VALUES,
+    DeadlineType,
+)
 from app.core.decision_rules import RECOMMENDATION_DISCLAIMER, resolve_rule
 from app.models.alert import Alert
 from app.models.case import Case
@@ -366,7 +372,16 @@ async def list_audited_deadlines(
     rows_query = (
         db.query(CaseDeadline, Case)
         .join(Case, CaseDeadline.case_id == Case.id)
-        .filter(CaseDeadline.status.in_(status_filter))
+        .filter(
+            CaseDeadline.status.in_(status_filter),
+            # Parallel plazos get status "cumplido" from the ENGINE (detected
+            # compliance, no marked_at): ~5.5k rows that are not audits and would
+            # flood this list. A human-marked one (marked_at set) still shows.
+            or_(
+                CaseDeadline.deadline_type.notin_(PARALLEL_DEADLINE_VALUES),
+                CaseDeadline.marked_at.isnot(None),
+            ),
+        )
     )
     rows = (
         apply_case_scope(rows_query, scope)
@@ -593,10 +608,20 @@ async def get_case_deadlines(
         for row in deadline_rows
     ]
 
-    # Próxima acción = nearest active deadline (first in the ASC-ordered list)
+    # Próxima acción = nearest active deadline (first in the ASC-ordered list),
+    # EXCLUDING the parallel ones. A parallel deadline is shown in the timeline
+    # above but never recommended as the next action: the movement that starts it
+    # does not say WHICH party it is addressed to (the "Previo a proveer" can
+    # target either side's lawyer), and "próxima acción" tells the reader what to
+    # DO — same reason these types emit no alert. Drop the filter once the
+    # addressee is known and the obligation can be attributed to the firm.
     proxima_accion: Optional[ProximaAccionResponse] = None
-    if active_deadlines:
-        nearest = active_deadlines[0]
+    accionables = [
+        d for d in active_deadlines
+        if d.deadline_type not in PARALLEL_DEADLINE_VALUES
+    ]
+    if accionables:
+        nearest = accionables[0]
         proxima_accion = ProximaAccionResponse(
             deadline_type=nearest.deadline_type,
             label=nearest.label,
