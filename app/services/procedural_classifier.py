@@ -23,7 +23,8 @@ Key design points:
 from __future__ import annotations
 
 import logging
-from datetime import date
+import re
+from datetime import date, datetime
 from typing import Union
 
 from app.core.deadlines_config import (
@@ -35,6 +36,54 @@ from app.core.deadlines_config import (
 from app.services.business_days import add_business_days
 
 logger = logging.getLogger(__name__)
+
+# ``Diligencia:DD/MM/YYYY HH:MM`` is the date the receptor actually performed
+# the act; PJUD publishes the movement later (after the diligencia in 64% of
+# 3,985 real successful notifications, ~4 days on average, never before).
+_DILIGENCIA_RE = re.compile(r"Diligencia:\s*(\d{2})/(\d{2})/(\d{4})")
+
+
+def parse_diligencia_date(description: object) -> date | None:
+    """Return the ``Diligencia:`` date in *description*, or None if absent/invalid."""
+    if not isinstance(description, str):
+        return None
+    m = _DILIGENCIA_RE.search(description)
+    if m is None:
+        return None
+    day, month, year = (int(g) for g in m.groups())
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
+def anchor_date(movement: object) -> date:
+    """Date a legal deadline counts from for a trigger movement.
+
+    Anchors to the ``Diligencia:`` date when present and not later than the
+    publication date; otherwise falls back to ``movement_date``.
+
+    Scope decision (general, not excepciones-only): every deadline trigger
+    whose movement carries ``Diligencia:`` is a notification performed by a
+    receptor (demanda -> EXCEPCIONES_8D; resolution that receives the case to
+    prueba -> TERMINO_PROBATORIO_10D and its siblings; notification of the
+    sentencia -> APELACION_5D). Those deadlines legally run from the
+    notification, so the diligencia date is the correct anchor for all of
+    them. Court-issued resolutions (citacion, sentencia dictada, stage
+    transitions) carry no ``Diligencia:`` and keep ``movement_date``.
+
+    OPERATIONAL CONSEQUENCE: on recompute, deadlines for ~2,535 notifications
+    (64% of the successful ones in QA) move EARLIER, and some go from "vigente"
+    to "vencido" (160 cases were already expired when first shown). That is the
+    real situation surfacing, not a regression.
+    """
+    mv_dt = movement.movement_date  # type: ignore[attr-defined]
+    published = mv_dt.date() if isinstance(mv_dt, datetime) else mv_dt
+    dil = parse_diligencia_date(getattr(movement, "description", None))
+    if dil is not None and dil <= published:
+        return dil
+    return published
+
 
 # Type alias — a deadline trigger is either a movement (has movement_date)
 # or a pre-computed date (for derived deadlines like OBSERVACIONES).
@@ -150,7 +199,7 @@ class MovementClassifier:
 
                 # OBSERVACIONES_PRUEBA_6D is derived from TERMINO_PROBATORIO_10D.
                 if deadline_type == DeadlineType.TERMINO_PROBATORIO_10D:
-                    trigger_date = self._movement_date(movement)
+                    trigger_date = anchor_date(movement)
                     tp_due = add_business_days(trigger_date, DeadlineType.TERMINO_PROBATORIO_10D.dias_habiles)
                     triggers[DeadlineType.OBSERVACIONES_PRUEBA_6D] = tp_due
                     # LISTA_TESTIGOS_2D (art. 320 CPC) and REPOSICION_AUTO_PRUEBA_3D
