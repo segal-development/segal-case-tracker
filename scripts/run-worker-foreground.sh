@@ -10,7 +10,7 @@
 #
 # Backfill knobs come from the LaunchAgent's EnvironmentVariables (plist):
 #   DETAIL_PENDING_DOCS_FIRST, DETAIL_BATCH, SYNC_INTERVAL, DOWNLOAD_PDFS,
-#   ROTATION_SCOPE.
+#   ROTATION_SCOPE, DOC_MAX, DOC_RECENT.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -37,12 +37,12 @@ export DOC_DOWNLOAD_ENABLED="${DOWNLOAD_PDFS:-${DOC_DOWNLOAD_ENABLED:-true}}"
 export DETAIL_BATCH_SIZE="${DETAIL_BATCH:-${DETAIL_BATCH_SIZE:-30}}"
 export SYNC_INTERVAL_HOURS="${SYNC_INTERVAL:-${SYNC_INTERVAL_HOURS:-4}}"
 
-# The three below are set UNCONDITIONALLY, on purpose. `source .env.qa` above runs
+# The ones below are set UNCONDITIONALLY, on purpose. `source .env.qa` above runs
 # with `set -a`, so it OVERWRITES anything the LaunchAgent put in the
 # environment. Settings that share a name between the plist and .env.qa would
 # therefore be silently decided by .env.qa, and changing the plist would do
 # nothing. That is why the lines above rename (DETAIL_BATCH -> DETAIL_BATCH_SIZE)
-# instead of reusing the app's own name. These three follow the same rule: the
+# instead of reusing the app's own name. These follow the same rule: the
 # plist's short name wins, and the fallback is the value WE want, not whatever
 # .env.qa happens to carry.
 #
@@ -58,5 +58,10 @@ export NOTIFY_MAX_PER_SYNC="${NOTIFY_MAX:-25}"
 # value makes the worker fail at startup on purpose. Turning on the freshness
 # station is a deliberate, per-station decision: the plist does not set it yet.
 export DETAIL_ROTATION_SCOPE="${ROTATION_SCOPE:-all}"
+# Historical PDFs downloaded per causa visit (0 = no cap). PDFs tied to the
+# movements dated within DOC_RECENT_DAYS are never capped. Deferred ones stay pending.
+export DOC_MAX_PER_CASE="${DOC_MAX:-0}"
+# A PDF is never capped when its movement is newer than this many days.
+export DOC_RECENT_DAYS="${DOC_RECENT:-30}"
 
 exec "$VENV" -m app.workers.sync_scheduler

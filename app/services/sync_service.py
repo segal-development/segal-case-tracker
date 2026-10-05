@@ -19,7 +19,7 @@ import random
 import re
 import time
 from dataclasses import dataclass, field, fields as dataclass_fields
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable, List, Optional, Tuple, Awaitable, TypeVar
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, func, select
@@ -289,6 +289,59 @@ def doc_download_year_ok(rol: str) -> bool:
     ``Document.pjud_url``) and can be fetched on demand later.
     """
     return _rol_year_at_least(rol, settings.DOC_DOWNLOAD_MIN_YEAR)
+
+
+def _cap_historical_documents(
+    pending_docs: list,
+    *,
+    recent_days: int,
+    cap: int,
+    rol: str,
+) -> list:
+    """Pick which pending documents to download on this visit.
+
+    Documents whose movement is dated within the last ``recent_days`` are always
+    kept: they are what the lawyer needs now. The rest (older movements, and
+    case-level documents with no date) are limited to ``cap``. ``cap <= 0`` means
+    no cap and returns the list untouched.
+
+    Recency is judged by date, not by "new to our DB": on a first visit every
+    movement is new, so a "new" rule would cap nothing exactly where it matters.
+    (A "new-and-recent" OR clause would be redundant: it is a subset of "recent".)
+
+    Deferred documents are NOT modified: they stay ``pending``. Their JWT lives one
+    hour, so a later visit to the case (which re-opens the detail) is needed to
+    download them; the log line below makes that backlog measurable.
+
+    A document attached to a movement but WITHOUT a date is treated as recent
+    (fail-open). ``document_date`` comes from parsing PJUD's ``DD/MM/YYYY`` and is
+    documented there as "tolerable to miss — it is metadata, not identity"; that
+    stopped being true the moment it started deciding what gets deferred. PJUD has
+    changed field formats underneath us before (the login field rotation), and the
+    failure we must not have is urgent documents being deferred in silence. A
+    case-level document (no movement) has no date BY DESIGN — texto_demanda,
+    cert_envio and the multi-MB ebook — so it stays historical and capped.
+    """
+    if cap <= 0:
+        return pending_docs
+    cutoff = datetime.utcnow() - timedelta(days=recent_days)
+
+    def _is_recent(d) -> bool:
+        if d.document_date is not None:
+            return d.document_date >= cutoff
+        return d.movement_id is not None
+
+    recent = [d for d in pending_docs if _is_recent(d)]
+    historical = [d for d in pending_docs if d not in recent]
+    kept = historical[:cap]
+    deferred = len(historical) - len(kept)
+    if deferred:
+        logger.info(
+            "detect_and_sync_movements: %s document cap active (DOC_MAX_PER_CASE=%d): "
+            "downloading %d (%d recent + %d historical), deferred %d still pending",
+            rol, cap, len(recent) + len(kept), len(recent), len(kept), deferred,
+        )
+    return recent + kept
 
 
 # ---------------------------------------------------------------------------
@@ -2205,6 +2258,12 @@ async def detect_and_sync_movements(
                 pending_docs = [
                     d for d in persisted_docs if d.status in ("pending", "failed")
                 ]
+                pending_docs = _cap_historical_documents(
+                    pending_docs,
+                    recent_days=settings.DOC_RECENT_DAYS,
+                    cap=settings.DOC_MAX_PER_CASE,
+                    rol=api_case.rol,
+                )
                 if pending_docs:
                     storage_svc = StorageService(get_storage_backend(settings))
                     await DocumentDownloader().download_and_store(

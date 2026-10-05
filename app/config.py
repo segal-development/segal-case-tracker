@@ -190,6 +190,11 @@ class Settings(BaseSettings):
     # covers all DETAIL_MIN_YEAR+ cases; older docs stay in PJUD (we keep pjud_url)
     # and can be fetched on demand. 0 = download for all detailed cases.
     DOC_DOWNLOAD_MIN_YEAR: int = 2024
+    # Max HISTORICAL documents downloaded per causa visit (0 = no cap). Documents of recent
+    # movements (see DOC_RECENT_DAYS) are never capped. Deferred ones stay pending.
+    DOC_MAX_PER_CASE: int = 0
+    # A document is never capped when its movement is newer than this many days.
+    DOC_RECENT_DAYS: int = 30
 
     # PJUD session lifetime
     PJUD_SESSION_EXPIRY_MINUTES: int = 90  # Measured session lasts ≥2h; 90 min is conservative
