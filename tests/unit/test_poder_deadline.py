@@ -42,12 +42,12 @@ def _mv(
 
 
 class TestDeadlineTypeConfig:
-    def test_three_business_days_not_fatal_and_cited_without_article(self) -> None:
+    def test_three_business_days_fatal_and_cited_without_article(self) -> None:
         dt = DeadlineType.ACREDITAR_PODER_3D
         assert dt.value == "acreditar_poder_3d"
         assert dt.dias_habiles == 3
-        # Pending Dirección Jurídica: never claim fatality without a lawyer confirming it.
-        assert dt.is_fatal is False
+        # Confirmed fatal by Dirección Jurídica on 2026-10-05.
+        assert dt.is_fatal is True
         assert dt.legal_basis == "art. 7 CPC · art. 7 Ley 20.886 (mod. Ley 21.394)"
 
     def test_has_a_display_label(self) -> None:
