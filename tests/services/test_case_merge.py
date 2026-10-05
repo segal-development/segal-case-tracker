@@ -544,6 +544,7 @@ class TestCollisionAwareMergeAcrossAllConstrainedTables:
             case_id=loser.id, deadline_type="replica",
             due_date=shared_triggered_at, triggered_at=shared_triggered_at + timedelta(days=1),
             source_movement_id=loser_movement.id,
+            verdict_movement_id=loser_movement.id,
         )
         db.add(deadline_on_loser_movement)
 
@@ -609,6 +610,7 @@ class TestCollisionAwareMergeAcrossAllConstrainedTables:
         assert refreshed_deadline is not None
         assert refreshed_deadline.case_id == winner.id
         assert refreshed_deadline.source_movement_id == surviving_movement.id
+        assert refreshed_deadline.verdict_movement_id == surviving_movement.id
 
         refreshed_alert = db.query(Alert).filter(Alert.id == alert_id).first()
         assert refreshed_alert is not None

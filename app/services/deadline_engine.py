@@ -47,6 +47,7 @@ from app.models.case import Case
 from app.models.case_deadline import CaseDeadline
 from app.models.movement import Movement
 from app.services.business_days import add_business_days, count_business_days_remaining
+from app.services.deadline_verdict import evaluate_deadline
 from app.services.poder_deadline import find_poder_obligation
 from app.services.procedural_classifier import MovementClassifier, anchor_date
 
@@ -348,6 +349,9 @@ class DeadlineEngine:
                 existing.due_date = due_date
                 existing.status = "active"
                 existing.computed_at = datetime.now(timezone.utc)
+                # A live plazo has no verdict yet; one left from an earlier
+                # closure (row revived from superseded) would be stale.
+                cls._clear_verdict(existing)
 
         db.flush()
 
@@ -371,7 +375,16 @@ class DeadlineEngine:
         )
         for row in all_active:
             current_trigger = new_trigger_keys.get(row.deadline_type)
-            if current_trigger is None or row.triggered_at != current_trigger:
+            if current_trigger is None:
+                # The plazo closed because the case moved on: judge it BEFORE
+                # superseding, or the evidence is lost with the row's status.
+                cls._record_verdict(row, movements, today)
+                row.status = "superseded"
+            elif row.triggered_at != current_trigger:
+                # Re-anchored (e.g. the diligencia-date change): a NEW row for
+                # the same plazo carries the verdict. This row's due_date is
+                # stale, so a verdict on it would be wrong by construction.
+                cls._clear_verdict(row)
                 row.status = "superseded"
         db.flush()
 
@@ -404,6 +417,7 @@ class DeadlineEngine:
             )
             for row in still_active:
                 if row.due_date < today and latest_mv_date > row.due_date:
+                    cls._record_verdict(row, movements, today)
                     row.status = "superseded"
             db.flush()
 
@@ -455,8 +469,26 @@ class DeadlineEngine:
                 and not has_excepciones_movement
             ):
                 proc_state = ProceduralState.REBELDE
+                cls._record_verdict(exc_row, movements, today)
                 exc_row.status = "expired"
                 db.flush()
+
+        # Step 6b: an overdue plazo that is still active (nothing moved on yet)
+        # is already a closed question: record it now instead of waiting for it
+        # to be superseded. A plazo still in force stays sin determinar.
+        overdue_active = (
+            db.query(CaseDeadline)
+            .filter(
+                CaseDeadline.case_id == case.id,
+                CaseDeadline.status == "active",
+                CaseDeadline.is_manual == False,  # noqa: E712
+                CaseDeadline.due_date < today,
+            )
+            .all()
+        )
+        for row in overdue_active:
+            cls._record_verdict(row, movements, today)
+        db.flush()
 
         # Step 7a: compute semáforo from nearest active deadline.
         semaforo = cls._compute_semaforo(
@@ -516,6 +548,54 @@ class DeadlineEngine:
         # less battle-tested) DecisionEngine must never break the deadline
         # computation that already succeeded.
         cls._recompute_decision(db, case, today)
+
+    @staticmethod
+    def _clear_verdict(row: CaseDeadline) -> None:
+        row.verdict = None
+        row.verdict_movement_id = None
+        row.verdict_acted_on = None
+        row.verdict_computed_at = None
+
+    @classmethod
+    def _record_verdict(
+        cls, row: CaseDeadline, movements: list[Movement], today: date
+    ) -> None:
+        """Persist the verdict of a plazo that is closing (or already overdue).
+
+        Separate from ``status`` on purpose. Auditor marks always win: manual
+        rows and rows the auditor set to cumplido / no_cumplido are never
+        touched. Types without a detector stay sin determinar.
+        """
+        if row.is_manual or row.status in ("cumplido", "no_cumplido"):
+            return
+        result = evaluate_deadline(
+            row.deadline_type, cls._current_due_date(row), movements, today
+        )
+        if result.verdict is None:
+            cls._clear_verdict(row)
+            return
+        row.verdict = result.verdict.value
+        row.verdict_movement_id = result.movement_id
+        row.verdict_acted_on = result.acted_on
+        row.verdict_computed_at = datetime.now(timezone.utc)
+
+    @staticmethod
+    def _current_due_date(row: CaseDeadline) -> date:
+        """due_date the plazo SHOULD have today.
+
+        A row created before the diligencia-date anchor change can still carry
+        the old due_date when it closes (it is never revisited once the type
+        leaves the triggers). Re-derive it from the source notification so the
+        verdict is judged against the current rule. Row fields are not touched.
+        """
+        source = row.source_movement
+        if source is None:
+            return row.due_date
+        try:
+            dtype = DeadlineType(row.deadline_type)
+        except ValueError:
+            return row.due_date
+        return add_business_days(anchor_date(source), dtype.dias_habiles)
 
     @classmethod
     def _sync_parallel_deadlines(cls, db: Session, movements: list) -> None:
