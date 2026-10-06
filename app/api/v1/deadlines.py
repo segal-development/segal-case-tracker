@@ -38,6 +38,7 @@ from app.core.decision_rules import RECOMMENDATION_DISCLAIMER, resolve_rule
 from app.models.alert import Alert
 from app.models.case import Case
 from app.models.case_deadline import CaseDeadline
+from app.models.case_litigante import CaseLitigante
 from app.models.lawyer import Lawyer
 from app.services.business_days import count_business_days_remaining, add_business_days
 
@@ -310,6 +311,12 @@ class DeadlineVerdictResponse(BaseModel):
     # the measurement error from one inside PJUD's ~4-day publication lag.
     verdict_acted_on: Optional[date]
     abogado_nombre: Optional[str]
+    # Defendant RUTs, so the screen can be searched by RUT: the global case
+    # search matches only rol/plaintiff/defendant, and the row shows no RUT.
+    # A list because 89 causas have two defendants and 6 have three; keeping
+    # only one would make the others unfindable.  Empty for the ~5% of causas
+    # with no defendant on record.
+    ruts: list[str]
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +485,25 @@ async def list_deadline_verdicts(
         .all()
     )
 
+    # Defendant RUTs for every case in one query, same reasoning as the names
+    # below: a per-case lookup over ~1.6k rows would be unusable.
+    case_ids = {case.id for _, case in rows}
+    ruts_by_case: dict[int, list[str]] = {}
+    if case_ids:
+        rut_rows = (
+            db.query(CaseLitigante.case_id, CaseLitigante.rut)
+            .filter(
+                CaseLitigante.case_id.in_(case_ids),
+                CaseLitigante.participante == "DDO.",
+                CaseLitigante.rut.isnot(None),
+                CaseLitigante.rut != "",
+            )
+            .distinct()
+            .all()
+        )
+        for cid, rut in rut_rows:
+            ruts_by_case.setdefault(cid, []).append(rut)
+
     # One query for every name rather than one per lawyer: this list is
     # firm-wide for admin/auditor, so the per-id lookup the audited endpoint
     # uses would be ~24 round trips through the Cloud SQL proxy.
@@ -502,6 +528,7 @@ async def list_deadline_verdicts(
             verdict=dl.verdict,
             verdict_acted_on=dl.verdict_acted_on,
             abogado_nombre=names.get(case.effective_lawyer_id),
+            ruts=sorted(ruts_by_case.get(case.id, [])),
         )
         for dl, case in rows
     ]

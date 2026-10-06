@@ -140,3 +140,49 @@ def test_admin_sees_the_whole_firm(client, db, case) -> None:
 
     assert resp.status_code == 200
     assert [r["verdict"] for r in resp.json()] == ["registro_tardio"]
+
+
+def test_payload_carries_the_defendant_ruts_for_searching(client, db, case, lawyer) -> None:
+    """The screen needs a RUT search: the global search matches only
+    rol/plaintiff/defendant, and the row itself shows no RUT.
+
+    It is a LIST, not a field: 89 causas in QA have two defendant RUTs and 6
+    have three.  Collapsing them to one would make the other defendants
+    unfindable.
+    """
+    from app.models.case_litigante import CaseLitigante
+
+    def _lit(participante: str, rut: str, nombre: str) -> CaseLitigante:
+        return CaseLitigante(
+            case_id=case.id, participante=participante, rut=rut, nombre=nombre,
+            persona_type="NATURAL", natural_key=f"{participante}|{rut}",
+        )
+
+    db.add_all([
+        _lit("DDO.", "12345678-9", "Demandado Uno"),
+        _lit("DDO.", "9876543-K", "Demandado Dos"),
+        # The plaintiff must not leak into the defendant RUT list.
+        _lit("DTE.", "11111111-1", "Demandante"),
+    ])
+    db.add(_dl(case, verdict="fuera_de_plazo", verdict_acted_on=date(2026, 6, 20)))
+    # Queried as admin: once a causa HAS litigantes, a regular lawyer's
+    # visibility is entirely litigante-derived (Approach C, see
+    # resolve_case_scope), and the defendants added above are not abogados.
+    # Dirección Jurídica is the real caller for this screen anyway.
+    db.add(Lawyer(rut="88888888-8", name="Dirección Jurídica", role="admin"))
+    db.commit()
+
+    resp = client.get("/api/v1/cases/deadlines/verdicts", headers=_headers("88888888-8"))
+
+    assert sorted(resp.json()[0]["ruts"]) == ["12345678-9", "9876543-K"]
+
+
+def test_ruts_is_empty_when_the_causa_has_no_defendant_on_record(client, db, case) -> None:
+    """~5% of verdict rows have no defendant RUT. They must still be returned,
+    with an empty list, not omitted and not null."""
+    db.add(_dl(case, verdict="cumplido", verdict_acted_on=date(2026, 5, 8)))
+    db.commit()
+
+    resp = client.get("/api/v1/cases/deadlines/verdicts", headers=_headers(RUT))
+
+    assert resp.json()[0]["ruts"] == []
