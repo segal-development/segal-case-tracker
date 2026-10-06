@@ -70,6 +70,18 @@ services:
     env_file: .env.qa
     environment:
       - ENABLE_SCHEDULER=true
+      # El scraping de PJUD lo hace la ESTACION (un Mac en red residencial), no
+      # esta VM. Desde la IP de GCP, Shape rechaza la sesion restaurada y cada
+      # ciclo terminaba `{'synced': 0, 'skipped': 11, 'failed': 12}`, con dos
+      # efectos: inflaba `evaluar_salud_scraping` hasta disparar la alerta de
+      # "20 corridas fallaron seguidas", y quemaba 12 intentos de login contra
+      # PJUD cada 4 horas desde una IP marcada.
+      #
+      # El scheduler sigue ENCENDIDO a proposito: el bloque de mantenimiento
+      # (refresco de cobertura Sysgal, snapshot de cartera, chequeo de salud)
+      # corre ANTES del guard y si sirve desde aca. Lo unico que se apaga es el
+      # bucle de abogados. Ver el guard en app/workers/sync_scheduler.py.
+      - PJUD_SCRAPING_ENABLED=false
       - APP_COMMIT=${APP_COMMIT:-}
     volumes:
       - ./sa-key.json:/secrets/sa-key.json:ro
