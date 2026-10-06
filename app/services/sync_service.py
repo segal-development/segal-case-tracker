@@ -19,7 +19,7 @@ import random
 import re
 import time
 from dataclasses import dataclass, field, fields as dataclass_fields
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Callable, List, Optional, Tuple, Awaitable, TypeVar
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, func, select
@@ -1753,6 +1753,41 @@ def emit_deadline_alerts(
     if not (transition.entered_rojo or transition.fatal_appeared):
         return 0
 
+    tribunal = case.court.name if case.court else "tribunal no especificado"
+    plazo_txt = _plazo_texto(case.next_deadline_at)
+
+    events: list[tuple[str, str, str]] = []
+    if transition.entered_rojo:
+        events.append((
+            "semaforo_rojo",
+            f"⚠️ Causa {case.rol} pasó a ROJO",
+            f"La causa {case.rol} ante {tribunal} pasó a estado ROJO. {plazo_txt}",
+        ))
+    if transition.fatal_appeared:
+        events.append((
+            "deadline_fatal",
+            f"⏰ Plazo fatal en causa {case.rol}",
+            f"La causa {case.rol} ante {tribunal} tiene un plazo fatal próximo. {plazo_txt}",
+        ))
+
+    return _fan_out_case_alerts(db, case, events, budget=budget)
+
+
+def _fan_out_case_alerts(
+    db: Session,
+    case: Case,
+    events: list,
+    *,
+    budget: Optional[NotifyBudget] = None,
+) -> int:
+    """Persist one Alert per (event, recipient) and dispatch it (budget-gated).
+
+    ``events`` holds ``(alert_type, title, message)`` or
+    ``(alert_type, title, message, movement_id)`` tuples. Recipients come from
+    ``resolve_case_alert_recipients`` with the case owner as fallback. Alerts are
+    ALWAYS persisted; only the email/webhook DISPATCH is budget-gated.
+    Returns the number of Alert rows created.
+    """
     from app.services.lawyer_roster import resolve_case_alert_recipients
 
     recipients = resolve_case_alert_recipients(db, case)
@@ -1774,30 +1809,16 @@ def emit_deadline_alerts(
 
     _budget = budget if budget is not None else NotifyBudget.from_settings()
 
-    tribunal = case.court.name if case.court else "tribunal no especificado"
-    plazo_txt = _plazo_texto(case.next_deadline_at)
-
-    events: list[tuple[str, str, str]] = []
-    if transition.entered_rojo:
-        events.append((
-            "semaforo_rojo",
-            f"⚠️ Causa {case.rol} pasó a ROJO",
-            f"La causa {case.rol} ante {tribunal} pasó a estado ROJO. {plazo_txt}",
-        ))
-    if transition.fatal_appeared:
-        events.append((
-            "deadline_fatal",
-            f"⏰ Plazo fatal en causa {case.rol}",
-            f"La causa {case.rol} ante {tribunal} tiene un plazo fatal próximo. {plazo_txt}",
-        ))
-
     notification_svc = NotificationService(db)
     alert_count = 0
-    for alert_type, title, message in events:
+    for event in events:
+        alert_type, title, message = event[:3]
+        movement_id = event[3] if len(event) > 3 else None
         for recipient in recipients:
             alert = Alert(
                 lawyer_id=recipient.id,
                 case_id=case.id,
+                movement_id=movement_id,
                 type=alert_type,
                 title=title,
                 message=message,
@@ -1820,6 +1841,105 @@ def emit_deadline_alerts(
                 _budget.decrement()
 
     return alert_count
+
+
+def emit_ratification_alert(
+    db: Session,
+    case: Case,
+    *,
+    budget: Optional[NotifyBudget] = None,
+    today: Optional[date] = None,
+) -> int:
+    """Alert the firm of a FATAL "ratificar firma" plazo that is provably its own.
+
+    HEURISTIC (see ``poder_deadline``): the obligation is ours when the
+    ``Previo a proveer`` comes after an excepciones filing AND the firm is
+    on the ejecutado's side (``_firm_side``; it defaults to "demandado" when the
+    side is unknown, so an unknown side errs toward alerting — a missed fatal
+    plazo costs the defense, a spurious alert only noise). The precise path, the
+    folio parsed from the PDF text, is not implemented yet.
+
+    Runs OUTSIDE the semáforo: the plazo type stays informational, so this never
+    touches ``semaforo`` / ``next_deadline_at``. It requires an ACTIVE, not yet
+    expired plazo row, so already-fulfilled or long-lapsed obligations (the
+    backlog at first deploy) do not fire. De-duplicated per obligation by the
+    trigger movement id stored in ``Alert.movement_id``. Never raises.
+    """
+    try:
+        from app.core.deadlines_config import DeadlineType
+        from app.models.case_deadline import CaseDeadline
+        from app.services.deadline_engine import _firm_side
+        from app.services.poder_deadline import (
+            find_poder_obligation,
+            responds_to_excepciones_filing,
+        )
+
+        row = (
+            db.query(CaseDeadline)
+            .filter(
+                CaseDeadline.case_id == case.id,
+                CaseDeadline.deadline_type == DeadlineType.ACREDITAR_PODER_3D.value,
+                CaseDeadline.status == "active",
+                CaseDeadline.is_manual == False,  # noqa: E712
+            )
+            .order_by(CaseDeadline.id.desc())
+            .first()
+        )
+        if row is None or row.source_movement_id is None:
+            return 0
+        if row.due_date < (today or _today_chile()):
+            return 0
+
+        movements = (
+            db.query(Movement)
+            .filter(Movement.case_id == case.id)
+            .order_by(Movement.movement_date.asc(), Movement.id.asc())
+            .all()
+        )
+        obligation = find_poder_obligation(movements)
+        if obligation is None or obligation.fulfilled:
+            return 0
+        trigger = obligation.trigger
+        if getattr(trigger, "id", None) != row.source_movement_id:
+            return 0
+        if not responds_to_excepciones_filing(movements, trigger):
+            return 0
+        if _firm_side(db, case) == "demandante":
+            return 0
+
+        already = (
+            db.query(Alert.id)
+            .filter(
+                Alert.case_id == case.id,
+                Alert.type == "ratificar_firma",
+                Alert.movement_id == trigger.id,
+            )
+            .first()
+        )
+        if already is not None:
+            return 0
+
+        tribunal = case.court.name if case.court else "tribunal no especificado"
+        due = row.due_date.strftime("%d/%m/%Y")
+        return _fan_out_case_alerts(
+            db,
+            case,
+            [(
+                "ratificar_firma",
+                f"⏰ Ratificar firma: plazo fatal en causa {case.rol}",
+                f"El tribunal ({tribunal}) ordenó ratificar la firma / acreditar "
+                f"poder en la causa {case.rol} antes del {due} (3 días hábiles). "
+                "Apercibimiento: tener por no presentado el escrito; si es el de "
+                "excepciones, se pierde la defensa.",
+                trigger.id,
+            )],
+            budget=budget,
+        )
+    except Exception:
+        logger.exception(
+            "emit_ratification_alert failed for case_id=%s", getattr(case, "id", "?")
+        )
+        return 0
 
 
 def _maybe_recompute_deadlines(
@@ -1862,6 +1982,8 @@ def _maybe_recompute_deadlines(
             "alert skipped — sync continues",
             getattr(case, "id", "?"),
         )
+
+    emit_ratification_alert(db, case, budget=budget)  # never raises
 
 
 def _maybe_classify_matriz(

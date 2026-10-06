@@ -41,6 +41,8 @@ ACTIONABLE_ALERT_TYPES = frozenset(
         "deadline_audit",
         "credential_change",
         "status_change",
+        # Fatal "ratificar firma" plazo that is provably the firm's own.
+        "ratificar_firma",
     }
 )
 
