@@ -133,6 +133,45 @@ Bajo el presupuesto de ~400 líneas por slice, sin encadenado.
       filesystem case-insensitive y un import resuelve al archivo
       equivocado. El módulo puro quedó como `pageMath.ts`.
 
+- [x] **T4 · backend** — Agregar los RUT de demandado al payload de
+      `/cases/deadlines/verdicts`. Pedido de Marcelo 2026-10-06: filtrar
+      "Revisar" y después buscar por RUT para no leer 16 filas a ojo.
+      Medido: el buscador global NO busca por RUT (solo `rol/plaintiff/
+      defendant`), y el payload actual no lo lleva. Cobertura de RUT de
+      demandado: `fuera_de_plazo` 31/31, `no_cumplido` 7/7, resto ~95%.
+      Es una LISTA, no un campo: 89 causas tienen 2 RUT de demandado y 6
+      tienen 3.
+      Ruta: inline (un archivo, ya comprendido). Back PR pendiente.
+      Checks: 2 tests nuevos, 2 mutaciones, suite 2880 passed.
+      GOTCHA encontrado al escribir el test: al agregarle litigantes a una
+      causa, esta SALE del alcance del abogado dueno (Approach C: con
+      litigantes presentes la visibilidad es enteramente litigante-derived,
+      y un DDO. no es abogado). El test consulta como admin, que ademas es
+      el llamador real de esta pantalla.
+
+- [x] **T5 · front** — Campo de búsqueda sobre la lista ya filtrada.
+      Normalización obligatoria: los RUT están guardados `12345678-9` sin
+      puntos (7.572 filas, cero excepciones) pero la gente escribe
+      `12.345.678-9`. Sin normalizar los dos lados, no encuentra nada y
+      parece roto. Matchea también ROL y carátula, que es lo que la fila
+      muestra en pantalla — un buscador que no encuentra el ROL que estás
+      viendo es un defecto, no disciplina de alcance.
+      Ruta: delegada. Front PR #154 (depende del back #330).
+      Checks: cuatro puertas + mutacion, 164 tests.
+
+      La clave de reset de paginacion paso a `estado|abg|vista|query`. Sin
+      eso: estas en la pagina 4, buscas un RUT que matchea 1 fila, y ves
+      una tabla vacia. El test usa 200 filas que se angostan a 120, porque
+      con solo acotar caeria en la pagina 3 y no probaria nada.
+
+      Match por PREFIJO y no substring en el RUT: un substring enganchria
+      digitos del medio de RUT ajenos. Mas plegado de tildes, asi que
+      `munoz` encuentra `MUNOZ` con enie.
+
+      El placeholder cambia segun la lista: las de auditoria y las de
+      tiempo NO tienen RUT en sus datos, asi que dicen "Buscar por ROL o
+      caratula...". Prometer RUT donde no se puede seria mentir.
+
 ## Progreso
 
 - T1 cerrada. Backend PR #328. Suite 2876 passed, 1 xfailed.
