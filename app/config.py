@@ -69,6 +69,12 @@ class Settings(BaseSettings):
     GCP_PROJECT_ID: str = ""
     GCP_PUBSUB_TOPIC: str = "scrape-jobs"
 
+    # Excepciones verdict: calendar days after due_date still treated as "can't
+    # tell if late" (PJUD publishes escritos ~4 days late and they carry no
+    # Diligencia date). 5 covers 92% of the measured lateness. 0 disables it.
+    # Rationale in app/services/deadline_verdict.py.
+    DEADLINE_PUBLICATION_MARGIN_DAYS: int = 5
+
     # Email
     SENDGRID_API_KEY: str = ""
     FROM_EMAIL: str = "notificaciones@segal.cl"

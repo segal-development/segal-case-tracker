@@ -127,7 +127,7 @@ class TestCreation:
 
     def test_verdict_is_computed_when_row_is_created(self, db, owner):
         on_time = _stuck_case(db, owner, "C-3-2026", filed_on=DUE_SATURDAY_COUNTS)
-        late = _stuck_case(db, owner, "C-4-2026", filed_on=date(2026, 3, 12))
+        late = _stuck_case(db, owner, "C-4-2026", filed_on=date(2026, 4, 12))
 
         ejecutar(db, apply=True, today=TODAY)
 
@@ -212,7 +212,7 @@ class TestDryRun:
 
     def test_dry_run_reports_verdicts_and_unanchored(self, db, owner):
         _stuck_case(db, owner, "C-10-2026", filed_on=DUE_SATURDAY_COUNTS)
-        _stuck_case(db, owner, "C-11-2026", filed_on=date(2026, 3, 12))
+        _stuck_case(db, owner, "C-11-2026", filed_on=date(2026, 4, 12))
         orphan = _case(db, owner, "C-12-2026", status="closed")
         _file_excepciones(db, orphan, date(2026, 3, 10))
 
