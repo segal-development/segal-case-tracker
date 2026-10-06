@@ -74,6 +74,11 @@ class CaseDeadline(Base):
     verdict_acted_on = Column(Date, nullable=True)
     verdict_computed_at = Column(DateTime, nullable=True)
 
+    # Provenance marker (migration 064). NULL = created by the engine or by hand.
+    # A one-off job that creates rows outside the engine stamps its name here so
+    # it can later undo exactly what it created (see backfill_plazos_excepciones).
+    origin = Column(String(40), nullable=True)
+
     # Relationships
     case = relationship("Case", back_populates="deadlines")
     source_movement = relationship("Movement", foreign_keys=[source_movement_id])
