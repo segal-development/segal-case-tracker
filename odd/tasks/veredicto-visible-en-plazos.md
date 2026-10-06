@@ -92,7 +92,7 @@ Bajo el presupuesto de ~400 líneas por slice, sin encadenado.
       fija eso, porque es lo que puede romperse en silencio y dejarla
       mirando una pantalla vacía.
 
-- [ ] **T2 · front** — Alimentar las tarjetas desde el veredicto: Cumplido
+- [x] **T2 · front** — Alimentar las tarjetas desde el veredicto: Cumplido
       (`cumplido` + `registro_tardio`), Revisar (`fuera_de_plazo`), Sin
       presentar (`no_cumplido`). Dentro de Revisar, separar por días de
       atraso (>15 / 6-15) con la advertencia de medición.
@@ -105,7 +105,59 @@ Bajo el presupuesto de ~400 líneas por slice, sin encadenado.
       (`no_cumplido`) = 1.642. Revisar=16 y Dudosas=15 coinciden clavado con
       las hojas del Excel que ya se le pasó a Carla.
 
+- [x] **T3 · front** — Paginar las listas de `/plazos`. Pedido de Marcelo
+      2026-10-06 tras ver la pantalla en QA: la lista de "Vencidos" (~213
+      filas) obliga a bajar demasiado. Peor: "Cumplido" tiene 1.606 filas.
+      Decisión: paginación clásica de 50 por página, NO scroll infinito —
+      Dirección Jurídica necesita volver a una página concreta y saber
+      cuánto falta, y en scroll infinito ninguna de las dos cosas se puede.
+      Ruta: delegada (Plazos.tsx 1.100+ líneas + componente + tests).
+      Checks: cuatro puertas + mutación. Front PR #153.
+
+      Los grupos no se rompen: la página recorre los grupos como una
+      secuencia ordenada, con un solo paginador. Cada grupo conserva su
+      lista completa, así que el encabezado imprime el total REAL y agrega
+      "· mostrando 51-100" solo cuando está cortado. Un paginador por grupo
+      habría dado cinco estados de página; a un solo número se puede volver.
+
+      El reset de página va derivado en render
+      (`state.key === resetKey ? ... : 1`), sin efecto, así que no hay frame
+      intermedio con la página vieja. Más acote al total por si la lista se
+      encoge debajo del usuario.
+
+      Cerrado de paso: las tarjetas imprimían `1606` y el paginador `1.606`.
+      Dos formatos del mismo número en la misma fila se leen como números
+      distintos. Ahora todo pasa por `formatCount`.
+
+      GOTCHA macOS: `pagination.ts` junto a `Pagination.tsx` colisiona en el
+      filesystem case-insensitive y un import resuelve al archivo
+      equivocado. El módulo puro quedó como `pageMath.ts`.
+
 ## Progreso
 
-- T1 cerrada. Suite backend 2876 passed, 1 xfailed.
-- Siguiente: T2 (front).
+- T1 cerrada. Backend PR #328. Suite 2876 passed, 1 xfailed.
+- T2 cerrada. Front PR #152 (repo `segal-case-tracker-front`, base `master`).
+  Cuatro puertas verificadas por el orquestador, no solo reportadas por el
+  worker: `tsc` limpio, `eslint --max-warnings 0` limpio, 88 tests, build OK.
+  Mutaciones independientes del orquestador (umbral 15 → 5, y
+  `registro_tardio` → `sinPresentar`): 3 tests en rojo cada una.
+- Decisión del worker, revisada y aceptada: un `fuera_de_plazo` sin
+  `verdict_acted_on` va a Dudosas, nunca a Revisar, y nunca se descarta. Sin
+  fecha de publicación no se puede probar que el atraso supere el error de
+  medición. Hoy son 0 en QA (16 + 15 = 31, el total de `fuera_de_plazo`).
+- Tarjetas de auditoría humana renombradas a "Auditor: cumplido" /
+  "Auditor: incumplido" para que no choquen con el "Cumplido" calculado.
+- T3 cerrada tras revisión en QA. Front PR #153, pendiente de merge.
+  Cuatro mutaciones re-corridas de forma independiente por el orquestador:
+  `ceil`→`floor` 18 rojos, offset corrido 25 rojos, quitar el reset 5 rojos.
+
+## Orden de merge
+
+#328 (backend) primero. La pantalla consume `GET /cases/deadlines/verdicts`;
+si entra el front solo, la tarjeta queda vacía.
+
+## Deuda conocida
+
+El umbral de 15 días y el "~4 días" del texto viven en el front
+(`REVIEW_THRESHOLD_DAYS`); `DEADLINE_PUBLICATION_MARGIN_DAYS` vive en el
+backend. Si cambia uno hay que tocar el otro. Anotado en el código.
