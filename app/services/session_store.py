@@ -45,6 +45,20 @@ _ID_KEY = "pjud:session:id:"
 _RUT_KEY = "pjud:session:rut:"
 
 
+class InvalidSessionBindingError(ValueError):
+    """Raised when a session without a real lawyer id is about to be stored."""
+
+
+def _require_bound_lawyer(session: PJUDSession) -> None:
+    """Fail loudly when a session carries no real lawyer id (0 = unbound)."""
+    lawyer_id = session.lawyer_id
+    if isinstance(lawyer_id, bool) or not isinstance(lawyer_id, int) or lawyer_id <= 0:
+        raise InvalidSessionBindingError(
+            f"Refusing to persist PJUD session {session.session_id}: "
+            f"lawyer_id={lawyer_id!r} is not bound to a real lawyer"
+        )
+
+
 def _rut_clean(rut: str) -> str:
     """Normalize a RUT for use as a Redis secondary-index key.
 
@@ -105,7 +119,16 @@ class SessionStore:
         moment, regardless of the session's original ``expires_at``.
 
         Returns True on success, False on error.
+
+        Raises:
+            InvalidSessionBindingError: ``session.lawyer_id`` is not a real
+                (positive) id.  Persisting an unbound session would write the
+                primary key for lawyer 0 and point the RUT/id secondary keys at
+                it, so one lawyer could resolve (or delete) another's session.
+                This is a programming error and must fail loudly, never be
+                swallowed as a "False" save result.
         """
+        _require_bound_lawyer(session)
         redis = await self._redis()
         if redis is None:
             logger.warning("Redis not available — session not persisted")
@@ -146,6 +169,10 @@ class SessionStore:
 
     async def get_session_by_lawyer(self, lawyer_id: int) -> Optional[PJUDSession]:
         """Retrieve the active session for a lawyer (primary key)."""
+        if lawyer_id <= 0:
+            # 0 is the "unbound" marker: it never identifies a lawyer, and a key
+            # under it can only be legacy data written by the old captcha bug.
+            return None
         redis = await self._redis()
         if redis is None:
             return None
@@ -177,7 +204,12 @@ class SessionStore:
             lawyer_id_str = await redis.get(f"{_ID_KEY}{session_id}")
             if not lawyer_id_str:
                 return None
-            return await self.get_session_by_lawyer(int(lawyer_id_str))
+            session = await self.get_session_by_lawyer(int(lawyer_id_str))
+            # The index is only a pointer: never hand back a session that is
+            # not the one this id was issued for.
+            if session is None or session.session_id != session_id:
+                return None
+            return session
         except Exception as exc:
             logger.error("Failed to get session %s: %s", session_id, exc)
             return None
@@ -193,7 +225,11 @@ class SessionStore:
             lawyer_id_str = await redis.get(f"{_RUT_KEY}{rut}")
             if not lawyer_id_str:
                 return None
-            return await self.get_session_by_lawyer(int(lawyer_id_str))
+            session = await self.get_session_by_lawyer(int(lawyer_id_str))
+            # Never return a session that belongs to a different RUT.
+            if session is None or _rut_clean(session.rut) != rut:
+                return None
+            return session
         except Exception as exc:
             logger.error("Failed to get session for rut %s: %s", rut, exc)
             return None
@@ -233,7 +269,8 @@ class SessionStore:
             lawyer_id_str = await redis.get(f"{_RUT_KEY}{rut_clean}")
             if lawyer_id_str:
                 session = await self.get_session_by_lawyer(int(lawyer_id_str))
-                if session:
+                # Only tear down the session if it really belongs to this RUT.
+                if session and _rut_clean(session.rut) == rut_clean:
                     keys = [
                         f"{_LAWYER_KEY}{session.lawyer_id}",
                         f"{_ID_KEY}{session.session_id}",

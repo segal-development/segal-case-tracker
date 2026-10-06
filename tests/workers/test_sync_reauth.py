@@ -193,6 +193,32 @@ class TestReauthCaptcha:
         assert lawyer.credential_alert_sent_at is None
 
     @pytest.mark.asyncio
+    async def test_session_is_bound_to_the_lawyer_before_saving(self, fake_redis):
+        """The scraper returns an UNBOUND session (lawyer_id=0): the re-auth branch
+        must bind the real lawyer id, or every captcha lawyer overwrites
+        ``pjud:session:lawyer:0`` and get_session_by_lawyer(N) never hits."""
+        from app.workers.sync_scheduler import _reauth
+        from app.services.session_store import SessionStore
+
+        lawyer = _make_lawyer(
+            preferred_auth_method="captcha",
+            encrypted_pjud_password=encrypt_pjud_password("pjudpass"),
+            lawyer_id=19,
+        )
+        store = SessionStore(redis_client=fake_redis)
+        unbound = _make_fake_session(lawyer_id=0, auth_method="captcha")
+        mock_scraper_class, _ = _mock_civil_scraper(login_return_value=unbound)
+
+        with patch("app.scrapper.pjud.civil.CivilScraper", mock_scraper_class):
+            session, reason = await _reauth(lawyer, store)
+
+        assert reason is None
+        assert session.lawyer_id == 19
+        saved = await store.get_session_by_lawyer(19)
+        assert saved is not None and saved.session_id == session.session_id
+        assert await store.get_session_by_lawyer(0) is None
+
+    @pytest.mark.asyncio
     async def test_invalid_credentials_sends_alert_once_and_sets_timestamp(self, fake_redis):
         """PJUD rejects the segunda-clave RUT/password → supervisor alerted once."""
         from app.workers.sync_scheduler import _reauth
