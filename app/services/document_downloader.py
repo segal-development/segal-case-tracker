@@ -21,6 +21,7 @@ from datetime import datetime
 from typing import List, TYPE_CHECKING
 
 from app.scrapper.pjud.exceptions import SessionExpiredError, SessionNotAuthenticatedError
+from app.services.cycle_timing import timed_async
 
 if TYPE_CHECKING:
     from app.models.document import Document
@@ -39,6 +40,8 @@ class DocumentDownloader:
     - Isolate per-document failures: mark ``status="failed"`` and continue.
     """
 
+    # Charged to the cycle's "documents" bucket (no-op outside a worker cycle).
+    @timed_async("documents")
     async def download_and_store(
         self,
         pending_docs: List["Document"],
