@@ -113,6 +113,10 @@ _STATE_ORDER: dict[ProceduralState, int] = {
 }
 
 
+# Movements annulled by the court are prefixed "[Nulo]" by PJUD.
+_ANNULLED_PREFIX = "[Nulo]"
+
+
 class MovementClassifier:
     """Config-driven procedural state classifier.
 
@@ -171,6 +175,16 @@ class MovementClassifier:
         for movement in sorted_movements:
             desc = (movement.description or "") if movement.description is not None else ""
             stage = (movement.stage or "") if movement.stage is not None else ""
+
+            # An act annulled by the court carries the "[Nulo]" prefix and has
+            # no procedural effect: it can neither advance the state nor start
+            # a term.  Guarding here rather than per-rule covers every rule at
+            # once -- and, critically, leaves the state untouched so the valid
+            # act that replaces the annulled one is not blocked by the
+            # no-regression check below.  Same convention as poder_deadline.py
+            # and deadline_verdict.py.
+            if desc.lstrip().startswith(_ANNULLED_PREFIX):
+                continue
 
             best_rule = self._best_matching_rule(desc, stage, state)
 
