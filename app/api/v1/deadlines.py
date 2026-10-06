@@ -287,6 +287,31 @@ class AuditedDeadlineResponse(BaseModel):
     abogado_nombre: Optional[str]
 
 
+class DeadlineVerdictResponse(BaseModel):
+    """One engine-computed verdict, enriched with case info.
+
+    Kept apart from ``AuditedDeadlineResponse`` because the two are mutually
+    exclusive by design: a row a human marked never receives a verdict, and a
+    row the engine judged was never audited.
+    """
+
+    id: int
+    case_id: int
+    rol: str
+    caratula: str
+    deadline_type: str
+    label: str
+    legal_basis: Optional[str]
+    due_date: date
+    triggered_at: date
+    verdict: str
+    # The date PJUD PUBLISHED the filing, not the date it was filed.  The
+    # screen needs it together with ``due_date`` to tell a delay that exceeds
+    # the measurement error from one inside PJUD's ~4-day publication lag.
+    verdict_acted_on: Optional[date]
+    abogado_nombre: Optional[str]
+
+
 # ---------------------------------------------------------------------------
 # Auditor endpoints
 # ---------------------------------------------------------------------------
@@ -418,6 +443,65 @@ async def list_audited_deadlines(
             is_manual=dl.is_manual,
             marked_at=dl.marked_at,
             abogado_nombre=_lawyer_name(case.effective_lawyer_id),
+        )
+        for dl, case in rows
+    ]
+
+
+@router.get("/deadlines/verdicts", response_model=list[DeadlineVerdictResponse])
+async def list_deadline_verdicts(
+    current_lawyer: dict = Depends(get_current_lawyer),
+    db: Session = Depends(get_db),
+):
+    """List engine-computed deadline verdicts for the caller's cases.
+
+    Scoped via ``resolve_case_scope`` exactly like the audited list: the
+    auditor and admin roles see the whole firm, every other role sees its own
+    cases.
+
+    Filtering on ``verdict IS NOT NULL`` is what keeps human audits out: the
+    engine refuses to judge a row a human already marked, so an audited row
+    can never appear here.
+    """
+    scope = resolve_case_scope(db, current_lawyer)
+
+    rows_query = db.query(CaseDeadline, Case).join(
+        Case, CaseDeadline.case_id == Case.id
+    ).filter(CaseDeadline.verdict.isnot(None))
+
+    rows = (
+        apply_case_scope(rows_query, scope)
+        .order_by(
+            nullslast(CaseDeadline.verdict_acted_on.desc()),
+            CaseDeadline.due_date.desc(),
+        )
+        .all()
+    )
+
+    # One query for every name rather than one per lawyer: this list is
+    # firm-wide for admin/auditor, so the per-id lookup the audited endpoint
+    # uses would be ~24 round trips through the Cloud SQL proxy.
+    lawyer_ids = {case.effective_lawyer_id for _, case in rows} - {None}
+    names: dict[int, str] = (
+        dict(db.query(Lawyer.id, Lawyer.name).filter(Lawyer.id.in_(lawyer_ids)).all())
+        if lawyer_ids
+        else {}
+    )
+
+    return [
+        DeadlineVerdictResponse(
+            id=dl.id,
+            case_id=case.id,
+            rol=case.rol or "",
+            caratula=f"{case.plaintiff or ''}/{case.defendant or ''}",
+            deadline_type=dl.deadline_type,
+            label=_DEADLINE_LABELS.get(dl.deadline_type, dl.deadline_type),
+            legal_basis=dl.legal_basis,
+            due_date=dl.due_date,
+            triggered_at=dl.triggered_at,
+            verdict=dl.verdict,
+            verdict_acted_on=dl.verdict_acted_on,
+            abogado_nombre=names.get(case.effective_lawyer_id),
         )
         for dl, case in rows
     ]
