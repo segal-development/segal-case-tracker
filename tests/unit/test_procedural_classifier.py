@@ -353,6 +353,54 @@ class TestSafety:
         assert state == ProceduralState.INDETERMINATE
         assert DeadlineType.SENTENCIA_10D not in triggers
 
+    def test_annulled_movement_does_not_start_a_deadline(self) -> None:
+        """An act annulled by the court ("[Nulo]") must never start a term.
+
+        Real QA data: "[Nulo] Notificación resolución que recibe la causa a
+        prue (Receptor) Diligencia:04/11/2025".  Rule 6 does not require an
+        "Exitosa" marker, so without an explicit guard the annulled act
+        classifies as a valid auto-de-prueba notification and invents a
+        término probatorio the defendant never had.
+        """
+        clf = get_classifier()
+        movements = [
+            _mv(
+                "2026-04-01",
+                "Tramitación",
+                "[Nulo] Notificación resolución que recibe la causa a prue "
+                "(Receptor) Diligencia:01/04/2026",
+            )
+        ]
+        state, triggers = clf.classify(movements, TODAY)
+        assert state == ProceduralState.INDETERMINATE
+        assert DeadlineType.TERMINO_PROBATORIO_10D not in triggers
+
+    def test_valid_movement_after_an_annulled_one_still_starts_the_deadline(self) -> None:
+        """Skipping "[Nulo]" must not swallow the valid act that replaces it.
+
+        The dangerous over-correction is removing a real deadline.  When the
+        annulled notification is followed by a valid one, the valid one still
+        anchors the term.
+        """
+        clf = get_classifier()
+        movements = [
+            _mv(
+                "2026-04-01",
+                "Tramitación",
+                "[Nulo] Notificación resolución que recibe la causa a prue "
+                "(Receptor) Diligencia:01/04/2026",
+            ),
+            _mv(
+                "2026-05-02",
+                "Tramitación",
+                "Notificación resolución que recibe la causa a prue "
+                "(Exitosa) Diligencia:02/05/2026",
+            ),
+        ]
+        state, triggers = clf.classify(movements, TODAY)
+        assert state == ProceduralState.AUTO_PRUEBA
+        assert triggers[DeadlineType.TERMINO_PROBATORIO_10D].movement_date.date() == date(2026, 5, 2)
+
     def test_apelacion_5d_triggered_by_sentencia(self) -> None:
         """Fix #2: 'Dicta Sentencia' movement → SENTENCIA state + APELACION_5D deadline."""
         clf = get_classifier()
