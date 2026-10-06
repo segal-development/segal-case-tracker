@@ -108,6 +108,7 @@ from app.models.case_notificacion import CaseNotificacion
 from app.models.case_escrito import CaseEscrito
 from app.models.case_exhorto import CaseExhorto
 from app.models.document import Document
+from app.services.cycle_timing import format_duration, timed
 from app.services.notification_service import NotificationService
 from app.services.document_persistence import DocumentPersistenceService
 from app.scrapper.pjud.exceptions import (
@@ -986,6 +987,17 @@ class SyncService:
             )
         ).order_by(SyncHistory.completed_at.desc()).first()
     
+    def last_sync_age_hours(self, lawyer_id: int, competencia: str) -> Optional[float]:
+        """Hours since the last successful sync, or None if there is none.
+
+        Read-only helper for logging WHY ``needs_sync`` said no; it never feeds
+        the decision itself.
+        """
+        last_sync = self.get_last_sync(lawyer_id, competencia)
+        if not last_sync or not last_sync.completed_at:
+            return None
+        return (datetime.utcnow() - last_sync.completed_at).total_seconds() / 3600.0
+
     def needs_sync(self, lawyer_id: int, competencia: str, max_age_hours: int = 4) -> bool:
         """Check if a sync is needed based on last sync time."""
         last_sync = self.get_last_sync(lawyer_id, competencia)
@@ -2044,6 +2056,43 @@ def _is_transient_navigation_error(exc: BaseException) -> bool:
     return bool(_TRANSIENT_NAV_ERROR_RE.search(str(exc)))
 
 
+def _log_batch_end(
+    *,
+    lawyer_id: int,
+    end_reason: str,
+    processed: int,
+    selected: int,
+    started_at: float,
+    movements_new: int,
+    alerts_created: int,
+    errors: int,
+) -> None:
+    """Emit the single closing line of a detail batch, with the explicit reason.
+
+    ``end_reason`` is one of: ``no_more_cases`` (every selected case was
+    processed and the selection was smaller than the cap), ``batch_size`` (every
+    selected case was processed and the selection hit DETAIL_BATCH_SIZE, so more
+    may be waiting), ``no_cases`` (nothing selected), ``time_cap`` (the 55 min
+    rotation), ``pjud_account_limit`` (PJUD's ~60 min per-account limit),
+    ``consecutive_timeouts``, ``consecutive_transient_failures``,
+    ``shape_challenge``, ``shape_cooldown``, ``session_expired``.
+
+    One line per batch (per lawyer), never per case. Only ids and counters.
+    """
+    logger.info(
+        "detect_and_sync_movements: done — %d new movements, %d alerts, %d errors; "
+        "end_reason=%s cases=%d/%d elapsed=%s lawyer_id=%s",
+        movements_new,
+        alerts_created,
+        errors,
+        end_reason,
+        processed,
+        selected,
+        format_duration(time.monotonic() - started_at),
+        lawyer_id,
+    )
+
+
 async def detect_and_sync_movements(
     db: Session,
     scraper,
@@ -2054,6 +2103,7 @@ async def detect_and_sync_movements(
     selected_cases: Optional[list] = None,
     delay_between_fetches: float = 0.0,
     reauth_callback: Optional[Callable[[], Awaitable[Optional["PJUDSession"]]]] = None,
+    batch_size_cap: Optional[int] = None,
 ) -> Tuple[int, int, List[str]]:
     """Fetch case details for selected cases and sync new movements to the database.
 
@@ -2109,6 +2159,13 @@ async def detect_and_sync_movements(
             the vault.  A ``SessionNotAuthenticatedError`` on the retry is a
             genuine auth failure and keeps the "second session expiry" stop.
 
+    Closing line:
+        Every call ends with ONE log line carrying ``end_reason=`` (see
+        ``_log_batch_end``) so the reason a batch stopped is stated, not
+        deduced. *batch_size_cap* is the ``DETAIL_BATCH_SIZE`` the selection was
+        cut at; it is only used to tell ``batch_size`` from ``no_more_cases`` in
+        that line and never changes what is fetched.
+
     Proactive rotation:
         The detail loop stops on its own once ``DETAIL_BATCH_MAX_SECONDS``
         (55 min) have elapsed since it started, appending
@@ -2143,6 +2200,10 @@ async def detect_and_sync_movements(
     alerts_created: int = 0
     errors: List[str] = []
 
+    batch_started_monotonic = time.monotonic()
+    processed = 0
+    end_reason = "no_more_cases"
+
     shape_cooldown = get_shape_cooldown()
     if shape_cooldown.active():
         logger.warning(
@@ -2150,6 +2211,12 @@ async def detect_and_sync_movements(
             "skipping PJUD detail work (lawyer_id=%s)",
             shape_cooldown.remaining(),
             lawyer_id,
+        )
+        _log_batch_end(
+            lawyer_id=lawyer_id, end_reason="shape_cooldown", processed=0,
+            selected=len(selected_cases) if selected_cases is not None else 0,
+            started_at=batch_started_monotonic, movements_new=0, alerts_created=0,
+            errors=0,
         )
         return movements_new, alerts_created, errors
 
@@ -2222,6 +2289,7 @@ async def detect_and_sync_movements(
             errors.append(
                 DETAIL_ROTATION_REASON_TEMPLATE.format(minutes=elapsed_minutes)
             )
+            end_reason = "time_cap"
             break
 
         if not api_case.case_token:
@@ -2432,7 +2500,8 @@ async def detect_and_sync_movements(
                         delay,
                         exc,
                     )
-                    await asyncio.sleep(delay)
+                    with timed("waits"):
+                        await asyncio.sleep(delay)
             try:
                 return await _do_fetch()
             except TransientNavigationError:
@@ -2444,6 +2513,7 @@ async def detect_and_sync_movements(
                     url=getattr(exc, "url", "") or "?", reason=str(exc)
                 ) from exc
 
+        processed += 1
         try:
             delta_m, delta_a = await _fetch_with_transient_retry()
             movements_new += delta_m
@@ -2476,6 +2546,7 @@ async def detect_and_sync_movements(
                 f"station-wide cooldown tripped for {cooldown_seconds:.0f}s; "
                 "batch stopped"
             )
+            end_reason = "shape_challenge"
             break
 
         except TransientNavigationError as nav_exc:
@@ -2512,6 +2583,7 @@ async def detect_and_sync_movements(
                     f"Red o PJUD no disponible: {consecutive_transient} fallos de "
                     "navegación consecutivos; lote detenido"
                 )
+                end_reason = "consecutive_transient_failures"
                 break
 
         except (SessionExpiredError, SessionNotAuthenticatedError) as session_exc:
@@ -2543,6 +2615,7 @@ async def detect_and_sync_movements(
                 errors.append(
                     f"Session expired processing {api_case.rol}; batch stopped"
                 )
+                end_reason = "session_expired"
                 break
 
             # Reauth succeeded — update the local session reference and retry once.
@@ -2572,6 +2645,7 @@ async def detect_and_sync_movements(
                     f"station-wide cooldown tripped for {cooldown_seconds:.0f}s; "
                     "batch stopped"
                 )
+                end_reason = "shape_challenge"
                 break
             except SessionExpiredError as throttle_exc:
                 # The retry ran on a brand-new, successfully authenticated
@@ -2588,6 +2662,7 @@ async def detect_and_sync_movements(
                     throttle_exc,
                 )
                 errors.append(PJUD_DETAIL_THROTTLE_REASON)
+                end_reason = "pjud_account_limit"
                 break
             except SessionNotAuthenticatedError:
                 # Login page / not authenticated on the retry: a genuine auth
@@ -2601,6 +2676,7 @@ async def detect_and_sync_movements(
                 errors.append(
                     f"Session expired again on retry for {api_case.rol}; batch stopped"
                 )
+                end_reason = "session_expired"
                 break
             except Exception as retry_exc:
                 # Non-session error on retry — case-specific; advance timestamp.
@@ -2693,6 +2769,7 @@ async def detect_and_sync_movements(
                 errors.append(
                     f"{consecutive_timeouts} consecutive per-case timeouts; batch stopped"
                 )
+                end_reason = "consecutive_timeouts"
                 break
 
         except Exception as exc:
@@ -2732,13 +2809,25 @@ async def detect_and_sync_movements(
 
         if delay_between_fetches > 0:
             # ±40% jitter so the cadence isn't machine-regular (anti-fingerprint).
-            await asyncio.sleep(delay_between_fetches * random.uniform(0.6, 1.4))
+            with timed("waits"):
+                await asyncio.sleep(delay_between_fetches * random.uniform(0.6, 1.4))
+    else:
+        # The loop ran to its natural end (no break): say whether the selection
+        # was cut by the batch size or simply ran out of cases.
+        if not cases_for_check:
+            end_reason = "no_cases"
+        elif batch_size_cap is not None and len(cases_for_check) >= batch_size_cap:
+            end_reason = "batch_size"
 
-    logger.info(
-        "detect_and_sync_movements: done — %d new movements, %d alerts, %d errors",
-        movements_new,
-        alerts_created,
-        len(errors),
+    _log_batch_end(
+        lawyer_id=lawyer_id,
+        end_reason=end_reason,
+        processed=processed,
+        selected=len(cases_for_check),
+        started_at=batch_started_monotonic,
+        movements_new=movements_new,
+        alerts_created=alerts_created,
+        errors=len(errors),
     )
     return movements_new, alerts_created, errors
 

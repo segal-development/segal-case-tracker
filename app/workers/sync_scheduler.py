@@ -41,6 +41,15 @@ from app.services.sync_service import (
     detect_and_sync_movements,
     _select_cases_for_detail_rotation,
 )
+from app.services.cycle_timing import _now as cycle_timing_now
+from app.services.cycle_timing import (
+    CycleTimer,
+    format_breakdown,
+    format_duration as format_gap_seconds,
+    format_gap,
+    timed,
+    use_timer,
+)
 from app.services.session_store import get_session_store, SessionStore
 from app.services.pjud_session import PJUDSession
 from app.services.supervisor_alert_service import send_supervisor_credential_alert
@@ -51,6 +60,84 @@ logger = logging.getLogger("sync_scheduler")
 
 # Scheduler instance
 _scheduler: Optional[AsyncIOScheduler] = None
+
+# (started_at, ended_at) of the previous cycle run by THIS process, so the next
+# cycle can log the gap. None until the first cycle ends (it is per process: a
+# worker restart starts over, and the start line says so).
+_previous_cycle: Optional[tuple[datetime, datetime]] = None
+
+_SYNC_JOB_ID = "sync_all_lawyers"
+
+
+def _wall_now() -> datetime:
+    """Timezone-aware local wall clock (tests replace it)."""
+    return datetime.now().astimezone()
+
+
+def _next_fire_text(now: datetime) -> str:
+    """When APScheduler will fire the sync job next, relative to *now*.
+
+    ``overdue`` means the slot already passed while a cycle was still running:
+    with ``max_instances=1`` and ``coalesce`` that fire is dropped or merged, so
+    a cycle longer than the interval silently costs fires. Never raises.
+    """
+    try:
+        job = _scheduler.get_job(_SYNC_JOB_ID) if _scheduler is not None else None
+        next_run = getattr(job, "next_run_time", None) if job is not None else None
+        if next_run is None:
+            return "next fire unknown"
+        delta = (next_run - now).total_seconds()
+        when = next_run.strftime("%Y-%m-%d %H:%M")
+        if delta >= 0:
+            return f"next fire {when} (in {format_gap(delta)})"
+        return f"next fire {when} (overdue by {format_gap(-delta)})"
+    except Exception:  # noqa: BLE001 — observability must never break the cycle
+        return "next fire unknown"
+
+
+def _log_cycle_start(now: datetime) -> None:
+    """One line per cycle: the gap since the previous one and the next fire."""
+    try:
+        if _previous_cycle is None:
+            previous = "first cycle since worker start"
+        else:
+            prev_start, prev_end = _previous_cycle
+            previous = (
+                f"previous cycle started {format_gap((now - prev_start).total_seconds())} ago "
+                f"and ended {format_gap((now - prev_end).total_seconds())} ago "
+                f"(ran {format_gap((prev_end - prev_start).total_seconds())})"
+            )
+        logger.info(
+            "Cycle start: %s; interval=%dh; %s",
+            previous, SYNC_INTERVAL_HOURS, _next_fire_text(now),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Cycle start line failed (non-fatal)")
+
+
+def _log_cycle_summary(timer: CycleTimer, now: datetime) -> None:
+    """One line per cycle: where the time went, lawyer counters, next fire."""
+    try:
+        results = timer.results
+        if results:
+            lawyers = (
+                f"total={results.get('total_lawyers', 0)} "
+                f"synced={results.get('synced', 0)} "
+                f"fresh={results.get('fresh', 0)} "
+                f"skipped={results.get('skipped', 0)} "
+                f"failed={results.get('failed', 0)}"
+            )
+        else:
+            lawyers = "n/a (cycle ended before the lawyer loop)"
+        logger.info(
+            "Cycle summary: total=%s | %s | lawyers %s | %s",
+            format_gap_seconds(timer.elapsed()),
+            format_breakdown(timer),
+            lawyers,
+            _next_fire_text(now),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Cycle summary line failed (non-fatal)")
 
 
 # ============================================================================
@@ -441,7 +528,8 @@ async def sync_lawyer_cases(
             logger.warning(f"No lawyer found for id {lawyer_id}, skipping")
             return {"skipped": True, "reason": "no_session"}
 
-        pjud_session, reason = await _reauth(lawyer, store)
+        with timed("login"):
+            pjud_session, reason = await _reauth(lawyer, store)
         # Persist any credential_alert_sent_at change _reauth made on the
         # lawyer row (set on a new invalid-credentials episode, cleared on a
         # successful re-auth) regardless of the outcome below.
@@ -460,7 +548,8 @@ async def sync_lawyer_cases(
                 lawyer_id,
             )
             return None
-        new_session, _reason = await _reauth(lawyer, store)
+        with timed("login"):
+            new_session, _reason = await _reauth(lawyer, store)
         return new_session
 
     try:
@@ -473,11 +562,12 @@ async def sync_lawyer_cases(
 
         # Scrape cases
         try:
-            cases = await scraper.get_my_cases(
-                session=session,
-                year="",  # All years
-                max_pages=0,  # All pages
-            )
+            with timed("listing"):
+                cases = await scraper.get_my_cases(
+                    session=session,
+                    year="",  # All years
+                    max_pages=0,  # All pages
+                )
         except PartialListingError as partial_exc:
             # A list page failed for good AFTER some were fetched. sync_cases only
             # upserts (never archives/deletes absent causas), so syncing the
@@ -518,11 +608,12 @@ async def sync_lawyer_cases(
             if fresh_session is None:
                 raise
             session = fresh_session
-            cases = await scraper.get_my_cases(
-                session=session,
-                year="",  # All years
-                max_pages=0,  # All pages
-            )
+            with timed("listing"):
+                cases = await scraper.get_my_cases(
+                    session=session,
+                    year="",  # All years
+                    max_pages=0,  # All pages
+                )
 
         # Convert to ScrapedCase objects
         scraped_cases = convert_api_cases_to_scraped([
@@ -540,12 +631,13 @@ async def sync_lawyer_cases(
 
         # Sync case list to database
         sync_service = SyncService(db)
-        result = sync_service.sync_cases(
-            lawyer_id=lawyer_id,
-            scraped_cases=scraped_cases,
-            competencia=competencia,
-            triggered_by="scheduled",
-        )
+        with timed("listing"):
+            result = sync_service.sync_cases(
+                lawyer_id=lawyer_id,
+                scraped_cases=scraped_cases,
+                competencia=competencia,
+                triggered_by="scheduled",
+            )
 
         # Select the rotation batch AFTER the full case-list upsert so the DB
         # reflects the most recent state (new cases will have last_detail_checked_at=NULL
@@ -561,16 +653,21 @@ async def sync_lawyer_cases(
         # S4-T3/S4-T5: movement detection — reuse the shared implementation.
         # selected_cases drives the rotation (replaces the old front-of-list [:5] cap).
         # DETAIL_FETCH_DELAY throttles requests so the worker does not hammer PJUD.
-        movements_new, alerts_created, mov_errors = await detect_and_sync_movements(
-            db=db,
-            scraper=scraper,
-            pjud_session=session,
-            lawyer_id=lawyer_id,
-            api_cases=cases,
-            selected_cases=rotation_batch,
-            delay_between_fetches=settings.DETAIL_FETCH_DELAY,
-            reauth_callback=_reauth_for_lawyer,
-        )
+        # "detail" is exclusive of the nested login/documents/email/waits buckets.
+        with timed("detail"):
+            movements_new, alerts_created, mov_errors = await detect_and_sync_movements(
+                db=db,
+                scraper=scraper,
+                pjud_session=session,
+                lawyer_id=lawyer_id,
+                api_cases=cases,
+                selected_cases=rotation_batch,
+                delay_between_fetches=settings.DETAIL_FETCH_DELAY,
+                reauth_callback=_reauth_for_lawyer,
+                # Only used by the closing log line to tell "cut by batch size"
+                # from "ran out of cases"; it does not change what is fetched.
+                batch_size_cap=settings.DETAIL_BATCH_SIZE,
+            )
 
         if mov_errors:
             for err in mov_errors:
@@ -646,12 +743,53 @@ async def sync_lawyer_cases(
             await scraper.close()
 
 
+def _fresh_skip_detail(
+    sync_service: SyncService, lawyer_id: int, competencia: str
+) -> str:
+    """Reason text for a freshness skip, with the numbers that explain it.
+
+    The lookup only feeds the log line; if it fails the skip still happens and
+    the line just carries no numbers.
+    """
+    try:
+        age = sync_service.last_sync_age_hours(lawyer_id, competencia)
+        if age is None:
+            return "fresh"
+        remaining = max(MAX_DATA_AGE_HOURS - age, 0.0)
+        return (
+            f"fresh (last sync {age:.1f}h ago, max age {MAX_DATA_AGE_HOURS}h, "
+            f"stale in {remaining:.1f}h)"
+        )
+    except Exception:  # noqa: BLE001 — observability must never alter the skip
+        return "fresh (age unavailable)"
+
+
 async def sync_all_lawyers():
     """
     Sync all active lawyers for all competencias.
-    
-    This is the main scheduled job that runs every N hours.
+
+    This is the main scheduled job that runs every N hours. It is a thin
+    observability shell around ``_run_sync_cycle``: it logs the gap since the
+    previous cycle on entry and where the time went on exit (also on a crash),
+    and changes nothing about what the cycle does.
     """
+    global _previous_cycle
+
+    started = _wall_now()
+    _log_cycle_start(started)
+    timer = CycleTimer()
+    try:
+        with use_timer(timer):
+            await _run_sync_cycle(timer)
+    finally:
+        ended = _wall_now()
+        _previous_cycle = (started, ended)
+        _log_cycle_summary(timer, ended)
+
+
+async def _run_sync_cycle(timer: CycleTimer):
+    """The body of one scheduled cycle (see ``sync_all_lawyers``)."""
+    cycle_started_at = timer.started_at
     logger.info("=" * 60)
     logger.info("Starting scheduled sync for all lawyers")
     logger.info("=" * 60)
@@ -720,6 +858,14 @@ async def sync_all_lawyers():
     finally:
         # Release the setup connection BEFORE the long loop — never held idle.
         setup_db.close()
+        # Everything before the lawyer loop (credential scan, Sysgal, health
+        # check, cartera snapshot) is "maintenance" in the cycle summary.
+        # Minus anything already charged to another bucket in that window, so
+        # the buckets stay exclusive.
+        timer.add(
+            "maintenance",
+            (cycle_timing_now() - cycle_started_at) - sum(timer.totals.values()),
+        )
 
     # PJUD_SCRAPING_ENABLED lets a deployment switch the PJUD scraping loop off
     # when it is not wanted or does not work there (e.g. a worker that should
@@ -747,8 +893,10 @@ async def sync_all_lawyers():
         "total_lawyers": len(lawyer_ids),
         "synced": 0,
         "skipped": 0,
+        "fresh": 0,
         "failed": 0,
     }
+    timer.results = results
 
     for lawyer_id in lawyer_ids:
         for competencia in COMPETENCIAS:
@@ -762,7 +910,15 @@ async def sync_all_lawyers():
                 # Check if sync is needed
                 sync_service = SyncService(work_db)
                 if not sync_service.needs_sync(lawyer_id, competencia, MAX_DATA_AGE_HOURS):
-                    logger.debug(f"Lawyer {lawyer_id} {competencia} is fresh, skipping")
+                    # INFO on purpose: this guard decides whether a fire does any
+                    # work at all, so it must be visible at the level we log at.
+                    # Same "Skipping lawyer ..." style as the credential skips.
+                    results["fresh"] += 1
+                    logger.info(
+                        "Skipping lawyer %s %s: %s",
+                        lawyer_id, competencia,
+                        _fresh_skip_detail(sync_service, lawyer_id, competencia),
+                    )
                     continue
 
                 result = await sync_lawyer_cases(lawyer_id, competencia, work_db)
@@ -788,7 +944,8 @@ async def sync_all_lawyers():
                 work_db.close()
 
             # Small delay between requests to avoid overwhelming PJUD
-            await asyncio.sleep(2)
+            with timed("waits"):
+                await asyncio.sleep(2)
 
     logger.info("=" * 60)
     logger.info(f"Sync complete: {results}")

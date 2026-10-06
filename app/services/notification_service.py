@@ -22,6 +22,7 @@ from app.models.case_notificacion import CaseNotificacion
 from app.models.lawyer import Lawyer
 from app.models.movement import Movement
 from app.models.webhook import Webhook
+from app.services.cycle_timing import timed
 
 logger = logging.getLogger(__name__)
 
@@ -68,12 +69,14 @@ class NotificationService:
             msg.set_content(alert.message)
 
             context = ssl.create_default_context()
-            with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT, timeout=10) as server:
-                if settings.SMTP_USE_TLS:
-                    server.starttls(context=context)
-                if settings.SMTP_USER:
-                    server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
-                server.send_message(msg)
+            # Charged to the cycle's "email" bucket (no-op outside a worker cycle).
+            with timed("email"):
+                with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT, timeout=10) as server:
+                    if settings.SMTP_USE_TLS:
+                        server.starttls(context=context)
+                    if settings.SMTP_USER:
+                        server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
+                    server.send_message(msg)
 
             alert.email_sent = True
             alert.email_sent_at = datetime.utcnow()
