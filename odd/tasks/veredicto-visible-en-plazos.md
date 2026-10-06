@@ -92,7 +92,7 @@ Bajo el presupuesto de ~400 líneas por slice, sin encadenado.
       fija eso, porque es lo que puede romperse en silencio y dejarla
       mirando una pantalla vacía.
 
-- [ ] **T2 · front** — Alimentar las tarjetas desde el veredicto: Cumplido
+- [x] **T2 · front** — Alimentar las tarjetas desde el veredicto: Cumplido
       (`cumplido` + `registro_tardio`), Revisar (`fuera_de_plazo`), Sin
       presentar (`no_cumplido`). Dentro de Revisar, separar por días de
       atraso (>15 / 6-15) con la advertencia de medición.
@@ -107,5 +107,26 @@ Bajo el presupuesto de ~400 líneas por slice, sin encadenado.
 
 ## Progreso
 
-- T1 cerrada. Suite backend 2876 passed, 1 xfailed.
-- Siguiente: T2 (front).
+- T1 cerrada. Backend PR #328. Suite 2876 passed, 1 xfailed.
+- T2 cerrada. Front PR #152 (repo `segal-case-tracker-front`, base `master`).
+  Cuatro puertas verificadas por el orquestador, no solo reportadas por el
+  worker: `tsc` limpio, `eslint --max-warnings 0` limpio, 88 tests, build OK.
+  Mutaciones independientes del orquestador (umbral 15 → 5, y
+  `registro_tardio` → `sinPresentar`): 3 tests en rojo cada una.
+- Decisión del worker, revisada y aceptada: un `fuera_de_plazo` sin
+  `verdict_acted_on` va a Dudosas, nunca a Revisar, y nunca se descarta. Sin
+  fecha de publicación no se puede probar que el atraso supere el error de
+  medición. Hoy son 0 en QA (16 + 15 = 31, el total de `fuera_de_plazo`).
+- Tarjetas de auditoría humana renombradas a "Auditor: cumplido" /
+  "Auditor: incumplido" para que no choquen con el "Cumplido" calculado.
+
+## Orden de merge
+
+#328 (backend) primero. La pantalla consume `GET /cases/deadlines/verdicts`;
+si entra el front solo, la tarjeta queda vacía.
+
+## Deuda conocida
+
+El umbral de 15 días y el "~4 días" del texto viven en el front
+(`REVIEW_THRESHOLD_DAYS`); `DEADLINE_PUBLICATION_MARGIN_DAYS` vive en el
+backend. Si cambia uno hay que tocar el otro. Anotado en el código.
