@@ -351,6 +351,10 @@ async def _reauth(
         try:
             await scraper.start()
             session = await scraper.login_with_segunda_clave(lawyer.rut, password)
+            # The scraper returns an UNBOUND session (lawyer_id=0): bind the
+            # real id before persisting, same as clave_unica and the endpoints.
+            # Without it every captcha lawyer overwrites the lawyer:0 key.
+            session.lawyer_id = int(lawyer.id)
             await store.asave_session(session)
             # Login succeeded — clear any prior credential-alert de-dup
             # marker so a FUTURE credential change alerts again.
