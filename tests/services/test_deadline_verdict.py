@@ -115,7 +115,7 @@ class TestVerdictOnClose:
 
     def test_presentation_after_due_date_is_fuera_de_plazo(self, db, case) -> None:
         due = _notify_and_sync(db, case, 30)
-        proof = _present(db, case, due + timedelta(days=3))
+        proof = _present(db, case, due + timedelta(days=30))
         DeadlineEngine.recompute_case(db, case)
 
         (row,) = _exc_rows(db, case)
@@ -264,7 +264,7 @@ class TestDueDateChanges:
         under the diligencia anchor. The row is closed in the same run that
         advances the state, so the verdict must use the fresh anchor."""
         published = TODAY - timedelta(days=30)
-        diligencia = published - timedelta(days=4)
+        diligencia = published - timedelta(days=12)
         desc = f"{NOTIF_DESC} Diligencia:{diligencia:%d/%m/%Y} 10:00"
         mv = _add(db, case, published, desc)
         old_due = add_business_days(published, 8)
@@ -340,3 +340,58 @@ class TestEvaluator:
         result = evaluate_deadline(EXC, date(2026, 5, 10), [late, early], TODAY)
         assert result.verdict is Verdict.CUMPLIDO
         assert result.movement_id == 1
+
+
+class TestPublicationMargin:
+    """PJUD publishes the escrito days after it was filed and excepciones carry
+    no ``Diligencia:`` date, so a filing just past the due date is
+    indistinguishable from an on-time one. The verdict must not claim lateness
+    it cannot prove: inside the margin it says ``registro_tardio``."""
+
+    DUE = date(2026, 3, 10)
+
+    @staticmethod
+    def _filing(day: date):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            id=7, movement_date=datetime.combine(day, datetime.min.time()),
+            description="Opone excepciones", procedure="Escrito",
+        )
+
+    def _verdict(self, filed_on: date, **kw):
+        return evaluate_deadline(EXC, self.DUE, [self._filing(filed_on)], TODAY, **kw)
+
+    def test_one_day_after_due_date_is_not_fuera_de_plazo(self) -> None:
+        result = self._verdict(self.DUE + timedelta(days=1))
+        assert result.verdict != Verdict.FUERA_DE_PLAZO
+        assert result.verdict == Verdict.REGISTRO_TARDIO
+        assert result.movement_id == 7
+        assert result.acted_on == self.DUE + timedelta(days=1)
+
+    def test_far_after_due_date_is_fuera_de_plazo(self) -> None:
+        result = self._verdict(self.DUE + timedelta(days=60))
+        assert result.verdict == Verdict.FUERA_DE_PLAZO
+
+    def test_margin_boundary_both_sides(self, monkeypatch) -> None:
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "DEADLINE_PUBLICATION_MARGIN_DAYS", 5)
+        assert self._verdict(self.DUE + timedelta(days=5)).verdict == Verdict.REGISTRO_TARDIO
+        assert self._verdict(self.DUE + timedelta(days=6)).verdict == Verdict.FUERA_DE_PLAZO
+
+    def test_margin_is_configurable_and_zero_disables_it(self, monkeypatch) -> None:
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "DEADLINE_PUBLICATION_MARGIN_DAYS", 0)
+        assert self._verdict(self.DUE + timedelta(days=1)).verdict == Verdict.FUERA_DE_PLAZO
+
+    def test_on_or_before_due_date_stays_cumplido(self) -> None:
+        assert self._verdict(self.DUE).verdict == Verdict.CUMPLIDO
+        assert self._verdict(self.DUE - timedelta(days=3)).verdict == Verdict.CUMPLIDO
+
+    def test_other_verdicts_are_unchanged(self) -> None:
+        assert evaluate_deadline(EXC, self.DUE, [], TODAY).verdict == Verdict.NO_CUMPLIDO
+        assert evaluate_deadline(EXC, TODAY + timedelta(days=3), [], TODAY).verdict is None
+        sin_ancla = evaluate_deadline(EXC, None, [self._filing(self.DUE)], TODAY)
+        assert sin_ancla.verdict == Verdict.PRESENTADO_SIN_ANCLA

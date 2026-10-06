@@ -53,6 +53,11 @@ SIN_DETERMINAR = "sin_determinar"
 _MOTIVOS: Dict[str, str] = {
     Verdict.CUMPLIDO.value: "Las excepciones se presentaron dentro del plazo.",
     Verdict.FUERA_DE_PLAZO.value: "Las excepciones se presentaron después del vencimiento del plazo.",
+    Verdict.REGISTRO_TARDIO.value: (
+        "El escrito de excepciones se registró después del vencimiento, pero dentro del margen "
+        "de atraso con que PJUD publica. No se puede afirmar que fue tardío: verifica la fecha "
+        "de presentación en el expediente."
+    ),
     Verdict.NO_CUMPLIDO.value: "El plazo venció y no hay escrito de excepciones en PJUD.",
     Verdict.PRESENTADO_SIN_ANCLA.value: (
         "Las excepciones se presentaron, pero no hay plazo calculado para esta causa, "
@@ -165,6 +170,7 @@ def _build_item(
         filed = result.verdict in (
             Verdict.CUMPLIDO,
             Verdict.FUERA_DE_PLAZO,
+            Verdict.REGISTRO_TARDIO,
             Verdict.PRESENTADO_SIN_ANCLA,
         )
         exc = ExcepcionesOut(

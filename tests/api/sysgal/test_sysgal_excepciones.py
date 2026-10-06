@@ -151,7 +151,7 @@ def test_filing_within_plazo_is_cumplido_with_date_and_movement_id(client, env):
 
 def test_filing_after_plazo_is_fuera_de_plazo(client, env):
     case = make_case(env)
-    add_deadline(env, case, due_in=-5, triggered_ago=15)
+    add_deadline(env, case, due_in=-15, triggered_ago=25)
     add_movement(env, case, "Opone excepciones", days_ago=1)
     row = _only(_get(client))
     assert row["excepciones"]["presentadas"] is True
@@ -283,3 +283,16 @@ def test_superseded_row_that_carries_a_verdict_is_kept(client, env):
     row = _only(_get(client))
     assert row["plazo_excepciones"] is not None
     assert row["veredicto"]["valor"] == "cumplido"
+
+
+def test_filing_just_after_plazo_is_registro_tardio_with_neutral_spanish_reason(client, env):
+    case = make_case(env)
+    add_deadline(env, case, due_in=-3, triggered_ago=13)
+    add_movement(env, case, "Opone excepciones", days_ago=1)  # 2 days past due
+    row = _only(_get(client))
+    assert row["excepciones"]["presentadas"] is True
+    assert row["excepciones"]["fecha"] == (_today_chile() - timedelta(days=1)).isoformat()
+    assert row["veredicto"]["valor"] == "registro_tardio"
+    motivo = row["veredicto"]["motivo"]
+    assert "verifica" in motivo.lower()
+    assert "verificá" not in motivo.lower()
