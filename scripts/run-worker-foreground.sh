@@ -63,5 +63,11 @@ export DETAIL_ROTATION_SCOPE="${ROTATION_SCOPE:-all}"
 export DOC_MAX_PER_CASE="${DOC_MAX:-0}"
 # A PDF is never capped when its movement is newer than this many days.
 export DOC_RECENT_DAYS="${DOC_RECENT:-30}"
+# false = fetch ONLY fresh PDFs and skip the historical ones entirely. Measured
+# 2026-10-07: PDFs took 45-52% of the cycle while PJUD caps detail at ~60 min
+# per account, and 83% of the pending queue is older than six months while only
+# THIRTEEN documents are newer than a week. The history belongs to the dedicated
+# station. Deferred PDFs stay `pending`, so nothing is lost.
+export DOC_HISTORICAL_ENABLED="${DOC_HISTORICAL:-true}"
 
 exec "$VENV" -m app.workers.sync_scheduler

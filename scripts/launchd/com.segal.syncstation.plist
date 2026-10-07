@@ -65,6 +65,15 @@
          line "document cap active" reports how many were deferred. 0 = no cap. -->
     <key>DOC_MAX</key>
     <string>3</string>
+
+    <!-- false = esta estacion trae SOLO los PDFs frescos y saltea los historicos.
+         Medido 2026-10-07: los PDFs se llevaban 45-52% del ciclo mientras PJUD
+         corta el detalle a los ~60 min por cuenta, y 83% de la cola pendiente
+         era de movimientos de mas de seis meses contra TRECE mas nuevos que una
+         semana. El historico es trabajo de la estacion dedicada. Los diferidos
+         quedan `pending`: no se pierde nada, se pospone. -->
+    <key>DOC_HISTORICAL</key>
+    <string>false</string>
   </dict>
 
   <key>RunAtLoad</key>
@@ -75,8 +84,8 @@
   <integer>15</integer>
 
   <key>StandardOutPath</key>
-  <string>/tmp/segal-worker.log</string>
+  <string>/Users/marcelo/Library/Logs/segal/worker.log</string>
   <key>StandardErrorPath</key>
-  <string>/tmp/segal-worker.log</string>
+  <string>/Users/marcelo/Library/Logs/segal/worker.log</string>
 </dict>
 </plist>
