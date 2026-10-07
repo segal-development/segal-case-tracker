@@ -134,3 +134,39 @@ class TestInstrumentationPoints:
             )
 
         assert timer.totals["documents"] == pytest.approx(33)
+
+
+class TestProgressSurvivesAKilledProcess:
+    """The summary line lives in a ``finally``, so it survives an exception --
+    but NOT a kill. On the scraping station the Mac sleeps and the process is
+    killed mid-cycle, so in practice the summary has never been emitted once:
+    zero timing data from the instrumentation we shipped.
+
+    A running breakdown emitted as the cycle advances is what leaves a trail
+    when the process dies without unwinding.
+    """
+
+    def test_current_timer_is_reachable_from_inside_the_cycle(self, clock):
+        timer = CycleTimer()
+        assert cycle_timing.current_timer() is None
+        with use_timer(timer):
+            assert cycle_timing.current_timer() is timer
+        assert cycle_timing.current_timer() is None
+
+    def test_breakdown_is_readable_mid_cycle_not_only_at_the_end(self, clock):
+        timer = CycleTimer()
+        with use_timer(timer):
+            with timed("listing"):
+                clock.advance(30)
+            # Read it here, as a per-lawyer progress line would: the cycle has
+            # not ended and may never end.
+            mid = cycle_timing.format_breakdown(timer)
+            assert "listing=" in mid
+            with timed("detail"):
+                clock.advance(90)
+            later = cycle_timing.format_breakdown(timer)
+
+        # Every bucket is always printed, zero included, so presence proves
+        # nothing: the VALUE is what has to move as the cycle advances.
+        assert "detail=0s" in mid
+        assert "detail=1m30s" in later

@@ -499,3 +499,89 @@ class TestSyncLawyerCasesRecordsBatchStopReason:
         assert result.get("success") is True
         assert last_history.error_message == stop_reason
         assert last_history.status == "partial"
+
+
+class TestPerLawyerProgressLine:
+    """The cycle summary sits in a ``finally``: it survives an exception but not
+    a kill. On the scraping station the Mac sleeps and the process is killed
+    mid-cycle, so that summary has never been emitted once -- the instrumentation
+    produced zero data. A per-lawyer progress line is what leaves a trail."""
+
+    def test_logs_the_running_breakdown_while_the_cycle_is_still_going(self, caplog):
+        import logging
+
+        from app.services.cycle_timing import CycleTimer, timed, use_timer
+        from app.workers.sync_scheduler import _log_lawyer_progress
+
+        timer = CycleTimer()
+        with use_timer(timer):
+            with timed("detail"):
+                pass
+            with caplog.at_level(logging.INFO, logger="sync_scheduler"):
+                _log_lawyer_progress(lawyer_id=16, competencia="civil")
+
+        line = caplog.text
+        assert "Cycle progress" in line
+        assert "lawyer 16" in line
+        assert "civil" in line
+        assert "detail=" in line
+
+    def test_outside_a_cycle_it_is_a_silent_no_op(self, caplog):
+        """Observability must never break the cycle, and must never pretend a
+        timer exists. Called with no active timer it logs nothing."""
+        import logging
+
+        from app.workers.sync_scheduler import _log_lawyer_progress
+
+        with caplog.at_level(logging.INFO, logger="sync_scheduler"):
+            _log_lawyer_progress(lawyer_id=1, competencia="civil")
+
+        assert "Cycle progress" not in caplog.text
+
+
+class TestProgressLineIsActuallyWiredIntoTheCycle:
+    """Mutation gap found and closed: deleting the call at the seam left every
+    other test green, so nothing proved the progress line is reached on a real
+    sync. This drives sync_lawyer_cases down its happy path and asserts it."""
+
+    @pytest.mark.asyncio
+    async def test_a_completed_lawyer_sync_emits_the_progress_line(self, caplog):
+        import logging
+
+        from app.services.cycle_timing import CycleTimer, use_timer
+        from app.workers.sync_scheduler import sync_lawyer_cases
+
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = MagicMock()
+
+        session = MagicMock()
+        session.session_id = "sid"
+        store = MagicMock()
+        store.get_session_by_lawyer = AsyncMock(return_value=session)
+
+        scraper = MagicMock()
+        scraper.get_my_cases = AsyncMock(return_value=[])
+        scraper.close = AsyncMock()
+
+        sync_result = MagicMock(cases_total=3, cases_new=1)
+
+        timer = CycleTimer()
+        with patch("app.workers.sync_scheduler.get_session_store", return_value=store), \
+             patch("app.api.v1.pjud.get_scraper", return_value=scraper), \
+             patch("app.workers.sync_scheduler.convert_api_cases_to_scraped", return_value=[]), \
+             patch("app.workers.sync_scheduler.SyncService") as mock_sync_service, \
+             patch("app.workers.sync_scheduler._select_cases_for_detail_rotation", return_value=[]), \
+             patch(
+                 "app.workers.sync_scheduler.detect_and_sync_movements",
+                 new_callable=AsyncMock,
+                 return_value=(7, 0, []),
+             ):
+            mock_sync_service.return_value.sync_cases.return_value = sync_result
+            with use_timer(timer), caplog.at_level(logging.INFO, logger="sync_scheduler"):
+                await sync_lawyer_cases(lawyer_id=16, competencia="civil", db=mock_db)
+
+        assert "Cycle progress" in caplog.text, (
+            "sync_lawyer_cases completed without emitting the progress line; "
+            "the call at the seam is missing"
+        )
+        assert "lawyer 16" in caplog.text
