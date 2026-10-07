@@ -44,6 +44,7 @@ from app.services.sync_service import (
 from app.services.cycle_timing import _now as cycle_timing_now
 from app.services.cycle_timing import (
     CycleTimer,
+    current_timer,
     format_breakdown,
     format_duration as format_gap_seconds,
     format_gap,
@@ -113,6 +114,33 @@ def _log_cycle_start(now: datetime) -> None:
         )
     except Exception:  # noqa: BLE001
         logger.exception("Cycle start line failed (non-fatal)")
+
+
+def _log_lawyer_progress(lawyer_id: int, competencia: str) -> None:
+    """Running breakdown after each lawyer, not only at the end of the cycle.
+
+    ``_log_cycle_summary`` runs in a ``finally``, so it survives an exception
+    -- but a kill unwinds nothing. On the scraping station the machine sleeps
+    mid-cycle and the process is killed, which is why that summary has never
+    been emitted once and the instrumentation has produced no data at all.
+    This line is what remains when nothing unwinds.
+
+    A no-op outside a cycle: observability must never break the cycle, and
+    must never invent a timer that is not there.
+    """
+    timer = current_timer()
+    if timer is None:
+        return
+    try:
+        logger.info(
+            "Cycle progress: after %s lawyer %d | elapsed=%s | %s",
+            competencia,
+            lawyer_id,
+            format_gap_seconds(timer.elapsed()),
+            format_breakdown(timer),
+        )
+    except Exception:  # noqa: BLE001 — observability must never break the cycle
+        logger.exception("Cycle progress line failed (non-fatal)")
 
 
 def _log_cycle_summary(timer: CycleTimer, now: datetime) -> None:
@@ -712,6 +740,7 @@ async def sync_lawyer_cases(
             result.cases_new,
             movements_new,
         )
+        _log_lawyer_progress(lawyer_id, competencia)
 
         return {
             "success": True,

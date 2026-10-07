@@ -126,6 +126,18 @@ def timed_async(bucket: str):
     return decorator
 
 
+def current_timer() -> Optional[CycleTimer]:
+    """The timer of the cycle in flight, or None outside one.
+
+    Exposed so the cycle can report its running breakdown AS IT GOES. The
+    summary line lives in a ``finally`` and therefore survives an exception,
+    but not a kill -- and on the scraping station the machine sleeps and the
+    process is killed mid-cycle, so that summary has never actually been
+    emitted. A progress line leaves a trail when nothing unwinds.
+    """
+    return _active.get()
+
+
 def format_duration(seconds: float) -> str:
     """``42s``, ``3m05s`` or ``2h05m10s`` — compact and unambiguous in a log."""
     total = int(round(seconds))
