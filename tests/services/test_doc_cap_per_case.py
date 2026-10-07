@@ -61,7 +61,7 @@ def _setup(db, recent=0, old=0, case_level=0):
     return lawyer, docs
 
 
-async def _run(db, lawyer, docs, cap):
+async def _run(db, lawyer, docs, cap, historical=True):
     from app.services import sync_service
     from app.services.sync_service import detect_and_sync_movements
 
@@ -74,6 +74,7 @@ async def _run(db, lawyer, docs, cap):
     with patch.object(sync_service.settings, "DOC_DOWNLOAD_ENABLED", True), \
          patch.object(sync_service.settings, "DOC_MAX_PER_CASE", cap), \
          patch.object(sync_service.settings, "DOC_RECENT_DAYS", 30), \
+         patch.object(sync_service.settings, "DOC_HISTORICAL_ENABLED", historical), \
          patch.object(sync_service.DocumentPersistenceService,
                       "persist_from_detail", return_value=docs), \
          patch("app.services.document_downloader.DocumentDownloader.download_and_store",
@@ -170,3 +171,52 @@ async def test_dated_movement_doc_without_date_is_treated_as_recent(db):
     sent = await _run(db, lawyer, docs + [huerfano], cap=3)
     assert huerfano.id in {d.id for d in sent}, "un doc de movimiento sin fecha no debe diferirse"
     assert len(sent) == 4, "el sin-fecha va aparte del tope de 3 historicos"
+
+
+# ---------------------------------------------------------------------------
+# DOC_HISTORICAL_ENABLED: the daily station fetches only what is fresh.
+#
+# Measured 2026-10-07: documents eat 45-52% of the cycle while PJUD caps detail
+# at ~60 min per account, so every minute on a PDF is a minute not spent on
+# movements. The pending queue is 83% older than six months and only THIRTEEN
+# documents are newer than a week. The historical sweep belongs to the
+# dedicated station, not to the daily one.
+#
+# `cap <= 0` already means "no cap", so it cannot also mean "none" -- and 0 is
+# the default. Hence a separate flag.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_historical_disabled_downloads_only_the_recent_ones(db):
+    lawyer, docs = _setup(db, recent=2, old=10, case_level=4)
+    sent = await _run(db, lawyer, docs, cap=3, historical=False)
+    assert len(sent) == 2
+    assert all(d.pjud_token.startswith("r") for d in sent)
+
+
+@pytest.mark.asyncio
+async def test_historical_disabled_with_nothing_recent_downloads_nothing(db):
+    """No fresh documents means no download at all -- not a fallback to the
+    cap. The whole point is to stop spending the PJUD window on history."""
+    lawyer, docs = _setup(db, old=10, case_level=4)
+    assert await _run(db, lawyer, docs, cap=3, historical=False) == []
+
+
+@pytest.mark.asyncio
+async def test_historical_enabled_is_the_default_and_unchanged(db):
+    """The flag must not change behaviour for anyone who has not set it."""
+    lawyer, docs = _setup(db, recent=2, old=10)
+    assert len(await _run(db, lawyer, docs, cap=3, historical=True)) == 5
+
+
+@pytest.mark.asyncio
+async def test_the_capped_historical_ones_are_the_newest(db):
+    """`historical[:cap]` used to take whatever order persist_from_detail
+    returned. It happened to be newest-first, which is right by accident --
+    make it explicit so a reordering upstream cannot silently start fetching
+    the three oldest instead."""
+    lawyer, docs = _setup(db, old=10)
+    docs = list(reversed(docs))  # oldest first, the hostile order
+    sent = await _run(db, lawyer, docs, cap=3, historical=True)
+    assert [d.pjud_token for d in sent] == ["o0", "o1", "o2"]

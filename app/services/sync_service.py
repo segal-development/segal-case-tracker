@@ -298,6 +298,7 @@ def _cap_historical_documents(
     recent_days: int,
     cap: int,
     rol: str,
+    historical_enabled: bool = True,
 ) -> list:
     """Pick which pending documents to download on this visit.
 
@@ -323,7 +324,7 @@ def _cap_historical_documents(
     case-level document (no movement) has no date BY DESIGN — texto_demanda,
     cert_envio and the multi-MB ebook — so it stays historical and capped.
     """
-    if cap <= 0:
+    if cap <= 0 and historical_enabled:
         return pending_docs
     cutoff = datetime.utcnow() - timedelta(days=recent_days)
 
@@ -334,6 +335,27 @@ def _cap_historical_documents(
 
     recent = [d for d in pending_docs if _is_recent(d)]
     historical = [d for d in pending_docs if d not in recent]
+
+    if not historical_enabled:
+        # The daily station fetches only what is fresh; the history is the
+        # dedicated station's job. Deferred documents stay `pending`, so
+        # nothing is lost -- it is only postponed to a machine that has the
+        # time for it.
+        if historical:
+            logger.info(
+                "detect_and_sync_movements: %s historical documents disabled: "
+                "downloading %d recent, deferred %d still pending",
+                rol, len(recent), len(historical),
+            )
+        return recent
+
+    # Newest first, explicitly. This used to rely on the order
+    # persist_from_detail happened to return; it was right by accident, and a
+    # reordering upstream would silently start fetching the three OLDEST.
+    historical.sort(
+        key=lambda d: (d.document_date is not None, d.document_date),
+        reverse=True,
+    )
     kept = historical[:cap]
     deferred = len(historical) - len(kept)
     if deferred:
@@ -2453,6 +2475,7 @@ async def detect_and_sync_movements(
                     recent_days=settings.DOC_RECENT_DAYS,
                     cap=settings.DOC_MAX_PER_CASE,
                     rol=api_case.rol,
+                    historical_enabled=settings.DOC_HISTORICAL_ENABLED,
                 )
                 if pending_docs:
                     storage_svc = StorageService(get_storage_backend(settings))

@@ -201,6 +201,15 @@ class Settings(BaseSettings):
     DOC_MAX_PER_CASE: int = 0
     # A document is never capped when its movement is newer than this many days.
     DOC_RECENT_DAYS: int = 30
+    # False = fetch ONLY recent documents and skip the historical ones entirely.
+    # Measured 2026-10-07: documents take 45-52% of the cycle while PJUD caps
+    # detail at ~60 min per account, so every minute on a PDF is a minute not
+    # spent on movements. The pending queue is 83% older than six months while
+    # only THIRTEEN documents are newer than a week -- on the daily station that
+    # history is pure cost. It belongs to the dedicated station.
+    # A separate flag because DOC_MAX_PER_CASE <= 0 already means "no cap" (and
+    # 0 is its default), so it cannot also express "none".
+    DOC_HISTORICAL_ENABLED: bool = True
 
     # PJUD session lifetime
     PJUD_SESSION_EXPIRY_MINUTES: int = 90  # Measured session lasts ≥2h; 90 min is conservative
