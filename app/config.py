@@ -85,6 +85,15 @@ class Settings(BaseSettings):
     # its movement_date. 0 disables it. Rationale in app/services/deadline_verdict.py.
     DEADLINE_PODER_NOTIFICATION_ALLOWANCE_DAYS: int = 2
 
+    # Semaforo de plazos: who is told in ADDITION to the case's lawyer(s).
+    # Comma-separated lawyer ids (lawyers.id). Amarillo adds the first list;
+    # ROJO sends to the second, which is the full escalation (it repeats the
+    # amarillo people on purpose: each list reads as "who gets this level").
+    # Defaults, verified 2026-10-14: 15 = Melissa Acevedo, 1 = Carla Lavin.
+    # To change a person: edit these in the worker's .env and restart it.
+    SEMAFORO_AMARILLO_EXTRA_LAWYER_IDS: str = "15"
+    SEMAFORO_ROJO_EXTRA_LAWYER_IDS: str = "15,1"
+
     # Email
     SENDGRID_API_KEY: str = ""
     FROM_EMAIL: str = "notificaciones@segal.cl"

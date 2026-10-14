@@ -41,6 +41,9 @@ class NotificationService:
         # keyed by lawyer id, and go out as ONE digest per lawyer (see
         # ``flush_digests``). Value: (lawyer, DigestBucket).
         self._digests: Dict[Any, Tuple[Lawyer, list]] = {}
+        # Same shape for the semaforo's new VERDE plazos: one grouped email per
+        # lawyer (``PlazoBucket``), sent by the same ``flush_digests``.
+        self._plazo_digests: Dict[Any, Tuple[Lawyer, Any]] = {}
 
     # ------------------------------------------------------------------
     # SMTP connection lifecycle
@@ -330,6 +333,17 @@ class NotificationService:
                     getattr(lawyer, "id", None),
                     exc,
                 )
+        # The two digests are independent: one failing never costs the other.
+        pending_plazos, self._plazo_digests = self._plazo_digests, {}
+        for lawyer, bucket in pending_plazos.values():
+            try:
+                self._send_plazo_verde_digest(lawyer, bucket)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Failed to send verde plazo digest to lawyer %s: %s",
+                    getattr(lawyer, "id", None),
+                    exc,
+                )
 
     def _send_digest(self, lawyer: Lawyer, bucket: Any) -> bool:
         from app.services.movement_digest import render_movement_digest
@@ -360,18 +374,32 @@ class NotificationService:
         self._deliver(msg)
 
         # Only now -- the digest really left -- mark the alerts it covered.
-        sent_at = datetime.utcnow()
         # Only the alerts actually rendered: the ones that merely fed the "y N
         # más" counter stay false ("deliberately not sent", never a lie).
-        for entry in bucket.entries:
-            entry.alert.email_sent = True
-            entry.alert.email_sent_at = sent_at
-        # COMMIT, not flush. The digest is flushed at the END of the batch, past
-        # the last commit of the sync path (``sync_via_consulta`` has none after
-        # it at all), so a mark that is only flushed dies with the session: the
-        # email would have left while the database still said it never did. And
-        # ``email_sent=false`` does not mean "pending" here, it means
-        # "deliberately not sent" -- a lie in that column is read as a decision.
+        self._mark_sent_and_commit([entry.alert for entry in bucket.entries])
+        logger.info(
+            "Movement digest sent to lawyer %s: %d movements (%d rendered)",
+            getattr(lawyer, "id", None),
+            bucket.total_movements,
+            len(bucket.entries),
+        )
+        return True
+
+    def _mark_sent_and_commit(self, alerts: list) -> None:
+        """Mark ``alerts`` as emailed -- they really left -- and COMMIT.
+
+        COMMIT, not flush. A digest is flushed at the END of the batch, past the
+        last commit of the sync path (``sync_via_consulta`` has none after it at
+        all), so a mark that is only flushed dies with the session: the email
+        would have left while the database still said it never did. And
+        ``email_sent=false`` does not mean "pending" for a movement digest, it
+        means "deliberately not sent" -- a lie in that column is read as a
+        decision.
+        """
+        sent_at = datetime.utcnow()
+        for alert in alerts:
+            alert.email_sent = True
+            alert.email_sent_at = sent_at
         try:
             self.db.commit()
         except Exception:
@@ -379,11 +407,120 @@ class NotificationService:
             # logs and moves on, leaving these alerts honestly unmarked.
             self.db.rollback()
             raise
+
+    # ------------------------------------------------------------------
+    # Plazo semaforo: amarillo/rojo immediate, verde grouped
+    # ------------------------------------------------------------------
+
+    def notify_plazo_alert(
+        self, alert: Alert, lawyer: Lawyer, webhooks: List[Webhook]
+    ) -> None:
+        """Dispatch ONE amarillo/rojo alert right now: its own email (never part
+        of a digest) and the lawyer's webhooks. Never raises."""
+        try:
+            self._send_plazo_email(alert, lawyer)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to email plazo alert %s: %s", alert.id, exc)
+        case = alert.case
+        payload = {
+            "event": f"deadline.{alert.type}",
+            "version": "1",
+            "data": {
+                "lawyer_id": lawyer.id,
+                "case": {
+                    "rol": case.rol or "" if case else "",
+                    "tribunal": case.court.name if case and case.court else "",
+                    "caratulado": (
+                        f"{case.plaintiff or ''}/{case.defendant or ''}" if case else ""
+                    ),
+                },
+                "deadline": {"title": alert.title, "message": alert.message or ""},
+            },
+        }
+        self._dispatch(alert, lawyer, webhooks, payload, send_email=False)
+
+    def _send_plazo_email(self, alert: Alert, lawyer: Lawyer) -> bool:
+        from app.services.plazo_email import render_plazo_alert
+
+        if not settings.SMTP_HOST:
+            logger.warning(
+                "SMTP_HOST is not configured; skipping plazo alert %s", alert.id
+            )
+            return False
+        if not lawyer.email:
+            logger.warning(
+                "Lawyer %s has no email; skipping plazo alert %s",
+                getattr(lawyer, "id", None),
+                alert.id,
+            )
+            return False
+        subject, html_body, text_body = render_plazo_alert(lawyer, alert, alert.case)
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = settings.SMTP_FROM or settings.FROM_EMAIL
+        msg["To"] = lawyer.email
+        msg.set_content(text_body)
+        msg.add_alternative(html_body, subtype="html")
+        self._deliver(msg)
+        self._mark_sent_and_commit([alert])
+        return True
+
+    def accumulate_plazo_verde(self, alert: Alert, lawyer: Lawyer) -> None:
+        """Queue one new VERDE plazo for the lawyer's grouped email. Never raises."""
+        try:
+            from app.services.plazo_email import PlazoBucket, PlazoEntry
+
+            case = alert.case
+            entry = PlazoEntry(
+                alert=alert,
+                case_id=alert.case_id,
+                rol=(case.rol if case else "") or "",
+                caratulado=(
+                    f"{case.plaintiff or ''}/{case.defendant or ''}" if case else ""
+                ),
+                court_name=case.court.name if case and case.court else "",
+                title=alert.title,
+                message=alert.message or "",
+            )
+            self._plazo_digests.setdefault(lawyer.id, (lawyer, PlazoBucket()))[1].add(entry)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Could not queue verde plazo (alert %s): %s",
+                getattr(alert, "id", None),
+                exc,
+            )
+
+    def _send_plazo_verde_digest(self, lawyer: Lawyer, bucket: Any) -> bool:
+        from app.services.plazo_email import render_plazo_verde_digest
+
+        if not bucket.total:
+            return False
+        if not settings.SMTP_HOST:
+            logger.warning(
+                "SMTP_HOST is not configured; skipping verde plazo digest for lawyer %s",
+                getattr(lawyer, "id", None),
+            )
+            return False
+        if not lawyer.email:
+            logger.warning(
+                "Lawyer %s has no email; skipping verde plazo digest",
+                getattr(lawyer, "id", None),
+            )
+            return False
+        subject, html_body, text_body = render_plazo_verde_digest(lawyer, bucket)
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = settings.SMTP_FROM or settings.FROM_EMAIL
+        msg["To"] = lawyer.email
+        msg.set_content(text_body)
+        msg.add_alternative(html_body, subtype="html")
+        self._deliver(msg)
+        # Every queued entry is rendered (no cap), so every one is marked.
+        self._mark_sent_and_commit([entry.alert for entry in bucket.entries])
         logger.info(
-            "Movement digest sent to lawyer %s: %d movements (%d rendered)",
+            "Verde plazo digest sent to lawyer %s: %d plazos",
             getattr(lawyer, "id", None),
-            bucket.total_movements,
-            len(bucket.entries),
+            bucket.total,
         )
         return True
 
