@@ -33,7 +33,7 @@ class Movement(Base):
     
     # Timestamps
     movement_date = Column(DateTime, nullable=False)  # Fecha del movimiento
-    created_at = Column(DateTime, default=datetime.utcnow)  # When we detected it
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)  # When detected
     
     # Relationships
     case = relationship("Case", back_populates="movements")
