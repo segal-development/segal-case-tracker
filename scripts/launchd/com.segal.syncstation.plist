@@ -74,6 +74,29 @@
          quedan `pending`: no se pierde nada, se pospone. -->
     <key>DOC_HISTORICAL</key>
     <string>false</string>
+
+    <!-- DELTA-SYNC. El estado diario del PJUD decide que causas reciben el
+         detalle, en lugar de elegirlas por antiguedad.
+
+         Medido: la demora entre que un movimiento ocurre en el PJUD y que lo
+         vemos era de 17 dias de mediana (p99 99), porque una vuelta completa a
+         la cartera tarda ~80 dias. El feed trae ~343 causas notificadas por dia
+         (~25 por abogado) y dice exactamente cuales se movieron.
+
+         El tope de 20 del lote de 30 NO es opcional: el 2026-10-15 el abogado
+         17 recibio 190 notificaciones en un dia y el abogado 1 recibio 64. Sin
+         tope, esas 190 se comerian seis lotes y congelarian su cola de causas
+         olvidadas por dias. El piso de 10 (30 - 20) es lo unico que protege a
+         las 2.150 causas nunca revisadas.
+
+         DETAIL_FEED_MAX_PER_BATCH no se fija aca: su default ya es 20. Se
+         agrega solo si hay que moverlo mirando datos reales.
+
+         Requiere ESTADO_DIARIO_PROBE_ENABLED, que ya esta activo en el .env de
+         esta estacion. Con el flag en false el comportamiento es byte a byte el
+         de antes, asi que apagarlo es el camino de vuelta. -->
+    <key>DETAIL_FEED_PRIORITY_ENABLED</key>
+    <string>true</string>
   </dict>
 
   <key>RunAtLoad</key>
