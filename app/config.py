@@ -262,6 +262,9 @@ class Settings(BaseSettings):
     # weeks catches up over several cycles instead of in one burst. Env var,
     # tunable without a deploy.
     ESTADO_DIARIO_MAX_DAYS_PER_CYCLE: int = Field(default=3, ge=1)
+    # Days since the last detail check after which the on-screen case diagnostic
+    # (GET /cases/diagnostico) reports "latencia" instead of "al_dia".
+    DIAGNOSTICO_LATENCIA_DIAS: int = Field(default=7, ge=1)
     DETAIL_MIN_YEAR: int = 2021    # Only detail-scrape cases with ROL year >= this (0 = all)
     DETAIL_PENDING_DOCS_FIRST: bool = False  # when true, detail rotation prioritizes cases with the most pending documents (PDF backfill)
     # Which side of the freshness/backlog cut this station works on. "all" = no cut
