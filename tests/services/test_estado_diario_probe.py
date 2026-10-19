@@ -1166,9 +1166,10 @@ class TestCaratuladoIsCaptured:
         assert r.rows[0].rol == "C-9-2026"
         assert r.rows[0].caratulado is None
 
-    def test_the_sample_line_shows_the_caratulado(self, caplog):
-        import logging
-
+    def test_the_sample_line_shows_the_caratulado(self, log):
+        # Uses the module's mocked logger, not caplog: another test in the suite
+        # disables the real loggers (alembic's fileConfig), so a caplog
+        # assertion here passes alone and fails in a full run.
         stats = probe.Staleness(
             in_db=0, not_in_db=1, never_checked=0, median_days=None, max_days=None,
             samples={"not_in_db": [
@@ -1176,10 +1177,7 @@ class TestCaratuladoIsCaptured:
                               caratulado="BANCO X / PEREZ"),
             ]},
         )
-        with caplog.at_level(logging.INFO):
-            probe._log_samples(17, "13/10/2026", stats)
-        linea = "\n".join(caplog.messages) % () if False else "\n".join(
-            rec.getMessage() for rec in caplog.records
-        )
+        probe._log_samples(17, "13/10/2026", stats)
+        linea = "\n".join(_logged(log))
         assert "BANCO X / PEREZ" in linea
         assert "C-7-2026" in linea
