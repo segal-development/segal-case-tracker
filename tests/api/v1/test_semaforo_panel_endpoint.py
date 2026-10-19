@@ -136,10 +136,16 @@ def test_row_whose_assess_level_is_none_is_excluded(client, db, people) -> None:
     assert get(client)["por_vencer"] == []
 
 
-def test_type_without_semaforo_is_not_painted(client, db, people) -> None:
+def test_apelacion_is_painted_with_its_single_confirmed_term(client, db, people) -> None:
     make_live(db, make_case(db, people), "apelacion_5d")
 
-    assert get(client)["por_vencer"] == []
+    rows = get(client)["por_vencer"]
+
+    assert len(rows) == 1
+    assert rows[0]["deadline_type"] == "apelacion_5d"
+    assert rows[0]["level"] == "amarillo"  # day 3 of 5
+    assert rows[0]["term_confirmed"] is True
+    assert [r["term_days"] for r in rows[0]["readings"]] == [5]
 
 
 def test_counterparty_plazo_is_not_returned(client, db, people) -> None:
