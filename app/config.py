@@ -93,6 +93,14 @@ class Settings(BaseSettings):
     # To change a person: edit these in the worker's .env and restart it.
     SEMAFORO_AMARILLO_EXTRA_LAWYER_IDS: str = "15"
     SEMAFORO_ROJO_EXTRA_LAWYER_IDS: str = "15,1"
+    # Semaforo cutoff: a plazo whose ``triggered_at`` is more than this many
+    # calendar days before today raises NO alert (no email, no webhook); it stays
+    # visible on the Plazos screen. Exists because the semaforo was switched on
+    # over a base with years of never-closed plazos. 0 or negative = no cutoff
+    # (alert on everything). It must stay above the longest live term: an
+    # 8-business-day plazo reaches ROJO ~9-12 calendar days after it triggers,
+    # so a value below that silences the very escalation the semaforo exists for.
+    SEMAFORO_MAX_TRIGGER_AGE_DAYS: int = 14
 
     # Email
     SENDGRID_API_KEY: str = ""

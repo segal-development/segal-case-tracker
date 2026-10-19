@@ -66,6 +66,32 @@ alarma verde que miente.
 4. **Un fallo del semáforo nunca rompe el ciclo de sync.**
 5. **Nunca una alarma que afirme un plazo que no conocemos.** Si el plazo de
    excepciones no está confirmado, el aviso lo declara.
+6. **Línea de corte.** No se genera alerta (ni correo ni webhook) para un plazo
+   cuyo `triggered_at` sea anterior a `hoy - SEMAFORO_MAX_TRIGGER_AGE_DAYS`
+   días. Lo viejo sigue visible en la pantalla de Plazos. Aplica a los tres
+   colores. `triggered_at` NULL no alerta (se falla hacia el silencio). Valor
+   0 o negativo = sin corte. Se registra en el log (`semaforo: N plazo(s)
+   suppressed by the cutoff`) y en el resumen (`suppressed_by_cutoff`).
+   Default 14, no 7: el rojo de un plazo de 8 días hábiles cae 9 a 12 días
+   corridos después del disparo, así que un corte de 7 silenciaría justo el
+   escalamiento.
+
+## Por qué existe el corte (medido antes de encender)
+
+```
+plazos ACTIVOS que alertarian        1.595
+   de esos, YA VENCIDOS              1.580   (99 %)
+   accionables (hoy o manana)            7
+   verdes de verdad                      8
+
+antiguedad de los vencidos:
+   hace 2-19 dias      124
+   hace 20-59 dias     210
+   hace 60-119 dias    320
+   hace MAS de 120     926      (el mas viejo: 1.969 dias)
+```
+
+Sin corte, el primer ciclo mandaría 1.580 alarmas rojas sobre plazos muertos.
 
 ## Fuera de alcance
 

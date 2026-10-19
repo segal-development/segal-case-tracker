@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import smtplib
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from unittest.mock import patch
 
 import pytest
@@ -443,3 +443,129 @@ class TestAlertTypes:
             "semaforo_rojo", "deadline_fatal", "deadline_added", "deadline_audit",
             "credential_change", "status_change", "ratificar_firma",
         } <= ACTIONABLE_ALERT_TYPES
+
+
+class TestTriggerCutoff:
+    """Plazos triggered before the cutoff raise no alert (they stay on the
+    Plazos screen). Measured on ``triggered_at``; failing towards silence."""
+
+    @staticmethod
+    def _aged_deadline(db, case, age_days, today):
+        row = CaseDeadline(
+            case_id=case.id, deadline_type="excepciones_8d",
+            due_date=add_business_days(today, 8),  # still "active and in the future"
+            triggered_at=today - timedelta(days=age_days), status="active", is_manual=False,
+        )
+        db.add(row)
+        db.commit()
+        return row
+
+    def test_a_plazo_triggered_3_days_ago_alerts(self, db, people, monkeypatch) -> None:
+        monkeypatch.setattr(settings, "SEMAFORO_MAX_TRIGGER_AGE_DAYS", 7)
+        make_deadline(db, make_case(db, people))
+        with smtp_ok():
+            summary = run_semaforo_alerts(db, today=D[3])  # trigger was 3 days earlier
+        assert who(db, "plazo_amarillo") == ["Ana Pérez", "Melissa Acevedo"]
+        assert summary["suppressed_by_cutoff"] == 0
+
+    @pytest.mark.parametrize("day,color", [(1, "verde"), (3, "amarillo"), (4, "rojo")])
+    def test_a_plazo_triggered_60_days_ago_alerts_in_no_color(
+        self, db, people, monkeypatch, day, color
+    ) -> None:
+        from app.services import semaforo_alerts as mod
+
+        monkeypatch.setattr(settings, "SEMAFORO_MAX_TRIGGER_AGE_DAYS", 7)
+        real = mod.assess
+        # The pure assessment would call a 60-day-old plazo "over"; force the
+        # color so the cutoff itself is what is under test.
+        monkeypatch.setattr(
+            mod, "assess", lambda dt, trig, today, term=None: real(dt, TRIGGER, D[day], term)
+        )
+        today = D[day]
+        self._aged_deadline(db, make_case(db, people), 60, today)
+        with smtp_ok() as smtp:
+            summary = run_semaforo_alerts(db, today=today)
+            assert smtp.send_message.call_count == 0
+        assert alerts(db) == []
+        assert summary["created"][color] == 0
+        assert summary["suppressed_by_cutoff"] == 1
+
+    def test_null_triggered_at_does_not_alert_and_is_not_an_error(
+        self, db, people, monkeypatch
+    ) -> None:
+        from types import SimpleNamespace
+
+        from app.services import semaforo_alerts as mod
+
+        monkeypatch.setattr(settings, "SEMAFORO_MAX_TRIGGER_AGE_DAYS", 7)
+        ghost = SimpleNamespace(id=1, case_id=1, deadline_type="excepciones_8d", triggered_at=None)
+        monkeypatch.setattr(mod, "_candidates", lambda db_, today: [ghost])
+        with smtp_ok() as smtp:
+            summary = run_semaforo_alerts(db, today=D[4])
+            assert smtp.send_message.call_count == 0
+        assert alerts(db) == []
+        assert summary["errors"] == 0
+        assert summary["suppressed_by_cutoff"] == 1
+
+    def test_zero_means_no_cutoff(self, db, people, monkeypatch) -> None:
+        monkeypatch.setattr(settings, "SEMAFORO_MAX_TRIGGER_AGE_DAYS", 0)
+        make_deadline(db, make_case(db, people))
+        with smtp_ok():
+            summary = run_semaforo_alerts(db, today=D[4])
+        assert len(alerts(db, "plazo_rojo")) == 3
+        assert summary["suppressed_by_cutoff"] == 0
+
+    def test_negative_also_means_no_cutoff(self, db, people, monkeypatch) -> None:
+        monkeypatch.setattr(settings, "SEMAFORO_MAX_TRIGGER_AGE_DAYS", -5)
+        make_deadline(db, make_case(db, people))
+        with smtp_ok():
+            run_semaforo_alerts(db, today=D[4])
+        assert len(alerts(db, "plazo_rojo")) == 3
+
+    def test_the_age_boundary_is_inclusive(self, db, people, monkeypatch) -> None:
+        monkeypatch.setattr(settings, "SEMAFORO_MAX_TRIGGER_AGE_DAYS", 2)
+        make_deadline(db, make_case(db, people))  # triggered 2026-11-02
+        with smtp_ok():
+            on_edge = run_semaforo_alerts(db, today=D[2])    # age 2 -> kept
+            past_edge = run_semaforo_alerts(db, today=D[3])  # age 3 -> suppressed
+        assert on_edge["suppressed_by_cutoff"] == 0
+        assert past_edge["suppressed_by_cutoff"] == 1
+
+    def test_the_suppressed_count_is_logged(self, db, people, monkeypatch, caplog) -> None:
+        from app.services import semaforo_alerts as mod
+
+        # alembic's env.py runs fileConfig(), which disables every logger that
+        # exists at that time; a migration test earlier in the full suite then
+        # makes caplog blind to this module. Re-enable it for this test only.
+        monkeypatch.setattr(mod.logger, "disabled", False)
+        monkeypatch.setattr(settings, "SEMAFORO_MAX_TRIGGER_AGE_DAYS", 7)
+        case = make_case(db, people)
+        self._aged_deadline(db, case, 60, D[4])
+        self._aged_deadline(db, case, 90, D[4]).deadline_type = "acreditar_poder_3d"
+        db.commit()
+        with caplog.at_level(logging.INFO, logger="app.services.semaforo_alerts"), smtp_ok():
+            run_semaforo_alerts(db, today=D[4])
+        line = next((r.getMessage() for r in caplog.records if "cutoff" in r.getMessage()), "")
+        assert line.startswith("semaforo:") and "2" in line and "7" in line
+
+    def test_a_cutoff_below_the_longest_term_silences_the_8d_rojo(
+        self, db, people, monkeypatch
+    ) -> None:
+        """Documents why the default is not 7: day 8 of an 8-business-day plazo
+        falls 9 calendar days after the trigger."""
+        monkeypatch.setattr(settings, "SEMAFORO_MAX_TRIGGER_AGE_DAYS", 7)
+        make_deadline(db, make_case(db, people))
+        with smtp_ok():
+            run_semaforo_alerts(db, today=D[8])
+        assert alerts(db, "plazo_rojo") == []
+        monkeypatch.setattr(settings, "SEMAFORO_MAX_TRIGGER_AGE_DAYS", 14)
+        with smtp_ok():
+            run_semaforo_alerts(db, today=D[8])
+        assert len(alerts(db, "plazo_rojo")) == 3
+
+    def test_the_default_keeps_a_live_8d_plazo_escalating_to_rojo(self, db, people) -> None:
+        assert settings.SEMAFORO_MAX_TRIGGER_AGE_DAYS >= 14
+        make_deadline(db, make_case(db, people))
+        with smtp_ok():
+            run_semaforo_alerts(db, today=D[8])
+        assert len(alerts(db, "plazo_rojo")) == 3

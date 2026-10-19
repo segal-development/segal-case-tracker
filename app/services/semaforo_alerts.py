@@ -21,7 +21,7 @@ NEVER breaks the sync cycle: ``run_semaforo_alerts`` catches everything.
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
@@ -116,6 +116,23 @@ def _is_ours(db: Session, case: Case, row: CaseDeadline, today: date) -> bool:
 
         return poder_obligation_is_ours(db, case, row, today) is not None
     return _firm_side(db, case) != "demandante"
+
+
+def _within_cutoff(row: Any, today: date) -> bool:
+    """Is this plazo recent enough to alert on? Measured on ``triggered_at``.
+
+    ``SEMAFORO_MAX_TRIGGER_AGE_DAYS`` <= 0 disables the cutoff. A plazo with no
+    ``triggered_at`` is NOT recent: we cannot say when it was born, and a wrong
+    alarm costs more than a missing one (fail towards silence). The check
+    precedes the pure assessment, which cannot take a NULL date.
+    """
+    max_age = settings.SEMAFORO_MAX_TRIGGER_AGE_DAYS
+    if max_age <= 0:
+        return True
+    triggered_at = getattr(row, "triggered_at", None)
+    if triggered_at is None:
+        return False
+    return triggered_at >= today - timedelta(days=max_age)
 
 
 def _existing_keys(db: Session, row_ids: List[int]) -> set:
@@ -241,13 +258,15 @@ def run_semaforo_alerts(
     """Raise and send every semaforo alert due ``today``. NEVER raises.
 
     Returns a summary: plazos ``evaluated``, alerts ``created`` per level,
-    alerts ``dispatched`` (new + retried) and ``errors``.
+    alerts ``dispatched`` (new + retried), ``errors`` and plazos
+    ``suppressed_by_cutoff`` (see ``_within_cutoff``).
     """
     summary: Dict[str, Any] = {
         "evaluated": 0,
         "created": {"verde": 0, "amarillo": 0, "rojo": 0},
         "dispatched": 0,
         "errors": 0,
+        "suppressed_by_cutoff": 0,
     }
     owns_svc = notification_svc is None
     svc: Optional[NotificationService] = notification_svc
@@ -256,6 +275,9 @@ def run_semaforo_alerts(
         rows = _candidates(db, today)
         existing = _existing_keys(db, [r.id for r in rows])
         for row in rows:
+            if not _within_cutoff(row, today):
+                summary["suppressed_by_cutoff"] += 1
+                continue
             summary["evaluated"] += 1
             try:
                 _create_alerts(db, row, today, existing, summary["created"])
@@ -266,6 +288,14 @@ def run_semaforo_alerts(
                     getattr(row, "id", "?"),
                 )
                 db.rollback()
+
+        if summary["suppressed_by_cutoff"]:
+            logger.info(
+                "semaforo: %d plazo(s) suppressed by the cutoff "
+                "(SEMAFORO_MAX_TRIGGER_AGE_DAYS=%d; triggered earlier or unknown)",
+                summary["suppressed_by_cutoff"],
+                settings.SEMAFORO_MAX_TRIGGER_AGE_DAYS,
+            )
 
         if svc is None:
             svc = NotificationService(db)
