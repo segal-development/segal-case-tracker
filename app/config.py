@@ -107,6 +107,12 @@ class Settings(BaseSettings):
     # Older ones are history, not something a lawyer can still react to.
     # 0 or negative = no window (announce every such plazo, however old).
     SEMAFORO_EXPIRED_WINDOW_DAYS: int = 30
+    # Excepciones term (business days): legally 4 or 8 depending on where the
+    # requerimiento was served, and no source we have says where. 0 = unknown,
+    # keep both readings (default). 4 or 8 = the firm tells us its cases always
+    # run that way, so the plazo is assessed with that single confirmed term.
+    # Anything else is rejected at load. Reversible by env, no deploy of code.
+    SEMAFORO_EXCEPCIONES_TERM_DAYS: int = 0
 
     # Email
     SENDGRID_API_KEY: str = ""
@@ -340,6 +346,16 @@ class Settings(BaseSettings):
     @classmethod
     def _normalize_rotation_scope(cls, v):
         return v.strip().lower() if isinstance(v, str) else v
+
+    @field_validator("SEMAFORO_EXCEPCIONES_TERM_DAYS")
+    @classmethod
+    def _excepciones_term_is_0_4_or_8(cls, v: int) -> int:
+        if v not in (0, 4, 8):
+            raise ValueError(
+                "SEMAFORO_EXCEPCIONES_TERM_DAYS must be 0 (unknown, keep both "
+                f"readings), 4 or 8; got {v}"
+            )
+        return v
 
     @model_validator(mode="after")
     def validate_production_secrets(self) -> "Settings":

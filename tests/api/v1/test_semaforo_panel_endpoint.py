@@ -7,6 +7,7 @@ reading), day 8 = Wed 11-11.
 from datetime import date, timedelta
 
 import pytest
+from uuid import uuid4
 
 from app.config import settings
 from app.core.security import create_access_token
@@ -232,3 +233,102 @@ def test_endpoint_is_read_only(client, db, people) -> None:
     get(client)
 
     assert db.query(Alert).count() == 0
+
+
+# -- terminated cases -------------------------------------------------------
+
+
+def _set_state(db, case, state):
+    case.procedural_state = state
+    db.commit()
+
+
+def test_terminada_case_is_excluded_from_both_groups(client, db, people) -> None:
+    dead = make_case(db, people, rol="C-2143-2022")
+    _set_state(db, dead, "terminada")
+    make_live(db, dead)
+    make_expired(db, dead)
+
+    body = get(client)
+
+    assert body["por_vencer"] == [] and body["vencidos"] == []
+
+
+def test_only_terminada_is_filtered_other_states_and_null_stay(client, db, people) -> None:
+    for i, state in enumerate([None, "en_tramite", "apelacion"], start=1):
+        case = make_case(db, people, rol=f"C-{i}-2026")
+        _set_state(db, case, state)
+        make_live(db, case)
+        make_expired(db, case)
+
+    body = get(client)
+
+    assert len(body["por_vencer"]) == 3
+    assert len(body["vencidos"]) == 3
+    assert all(r["case_id"] for r in body["por_vencer"])
+
+
+# -- the same case stored under two lawyers ---------------------------------
+
+
+def _twin(db, people, owner, court_name, rol="C-8085-2025"):
+    court = Court(code=f"T-{uuid4().hex[:10]}", name=court_name, region="RM", type="civil")
+    db.add(court)
+    db.commit()
+    case = Case(
+        lawyer_id=people[owner].id, court_id=court.id, rol=rol,
+        competencia="civil", plaintiff="Banco X", defendant="Deudor", status="active",
+    )
+    db.add(case)
+    db.commit()
+    return case
+
+
+def test_same_case_under_two_lawyers_collapses_to_one_row_for_admin(client, db, people) -> None:
+    first = make_live(db, _twin(db, people, "ana", "5º Juzgado Civil de Santiago"), "apelacion_5d")
+    make_live(db, _twin(db, people, "otro", "5° JUZGADO CIVIL DE  SANTIAGO", rol="c-8085-2025"), "apelacion_5d")
+
+    (row,) = get(client, ADMIN_RUT)["por_vencer"]
+
+    assert row["deadline_id"] == first.id  # oldest record survives
+    assert row["abogado_nombre"] == "Ana Pérez"
+    assert row["abogados"] == ["Ana Pérez", "Otro Abogado"]
+
+
+def test_expired_duplicates_collapse_too(client, db, people) -> None:
+    make_expired(db, _twin(db, people, "ana", "5º Juzgado Civil de Santiago"))
+    make_expired(db, _twin(db, people, "otro", "5º Juzgado Civil de Santiago"))
+
+    assert len(get(client, ADMIN_RUT)["vencidos"]) == 1
+
+
+def test_lawyer_own_view_is_unchanged_by_the_collapse(client, db, people) -> None:
+    make_live(db, _twin(db, people, "ana", "5º Juzgado Civil de Santiago"), "apelacion_5d")
+    make_live(db, _twin(db, people, "otro", "5º Juzgado Civil de Santiago"), "apelacion_5d")
+
+    (row,) = get(client, RUT)["por_vencer"]
+
+    assert row["abogado_nombre"] == "Ana Pérez"
+    assert row["abogados"] == ["Ana Pérez"]
+
+
+def test_different_court_type_or_due_date_are_not_collapsed(client, db, people) -> None:
+    extra = [
+        Lawyer(rut=f"4444444{n}-4", name=f"Extra {n}", email=f"e{n}@segal.cl", role="lawyer", is_active=True)
+        for n in (1, 2)
+    ]
+    db.add_all(extra)
+    db.commit()
+    people = {**people, "e1": extra[0], "e2": extra[1]}
+    court5 = "5º Juzgado Civil de Santiago"
+    make_live(db, _twin(db, people, "ana", court5, "C-1-2026"), "apelacion_5d")
+    make_live(db, _twin(db, people, "otro", "6º Juzgado Civil de Santiago", "C-1-2026"), "apelacion_5d")
+    make_live(
+        db, _twin(db, people, "e1", court5, "C-1-2026"), "apelacion_5d",
+        triggered=date(2026, 11, 3),
+    )
+    make_live(db, _twin(db, people, "e2", court5, "C-1-2026"), "acreditar_poder_3d")
+    from unittest.mock import patch
+
+    with patch("app.services.sync_service.poder_obligation_is_ours", return_value=object()):
+        assert len(get(client, ADMIN_RUT)["por_vencer"]) == 4

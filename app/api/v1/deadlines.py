@@ -483,6 +483,9 @@ class SemaforoPanelRowResponse(BaseModel):
     #: false: several possible terms, none confirmed (see `readings`).
     term_confirmed: Optional[bool] = None
     readings: List[SemaforoReadingResponse] = []
+    #: Every lawyer on the plazo (several when the same case is stored under
+    #: more than one firm lawyer and was collapsed into this row).
+    abogados: List[str] = []
 
 
 class SemaforoPanelResponse(BaseModel):
