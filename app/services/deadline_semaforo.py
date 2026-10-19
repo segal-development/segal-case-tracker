@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any, Optional
 
+from app.config import settings
 from app.core.semaforo_config import (
     EXCEPCIONES_SCALE_BY_TERM,
     SCALE_APELACION_5D,
@@ -84,12 +85,14 @@ class Assessment:
 def confirmed_excepciones_term(deadline: Any) -> Optional[int]:
     """The confirmed excepciones term (4 or 8), or None when unknown.
 
-    Always None today: ``lugar_requerimiento`` exists in no source. When one
-    appears (a column, a parsed receptor stamp), return its term here and
-    nothing else changes -- the alert copy switches from "sin confirmar" to
-    the single known term on its own.
+    No per-plazo source exists (``lugar_requerimiento`` is in no column), so
+    the only confirmation is the firm's own statement, carried by the
+    ``SEMAFORO_EXCEPCIONES_TERM_DAYS`` setting: 4 or 8 pins the term for every
+    excepciones plazo, 0 (default) leaves it unknown. A per-plazo source can
+    still plug in here, ahead of the setting, with no change to any caller.
     """
-    return None
+    pinned = settings.SEMAFORO_EXCEPCIONES_TERM_DAYS
+    return pinned if pinned in EXCEPCIONES_SCALE_BY_TERM else None
 
 
 def _reading(scale: Scale, triggered_at: date, today: date, day: int) -> Reading:

@@ -220,3 +220,56 @@ class TestEdges:
 
     def test_unknown_deadline_type_has_no_semaforo(self) -> None:
         assert assess("no_such_deadline", TRIGGER, DAY_DATE[2]) is None
+
+
+class TestPinnedExcepcionesTerm:
+    """SEMAFORO_EXCEPCIONES_TERM_DAYS: 0 = unknown (both readings), 4 or 8 pins."""
+
+    @staticmethod
+    def _pin(monkeypatch, value) -> None:
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "SEMAFORO_EXCEPCIONES_TERM_DAYS", value)
+
+    def test_default_is_zero_so_both_readings_stay(self, monkeypatch) -> None:
+        from app.config import Settings
+
+        assert Settings().SEMAFORO_EXCEPCIONES_TERM_DAYS == 0
+        self._pin(monkeypatch, 0)
+        term = confirmed_excepciones_term(object())
+        assert term is None
+        a = assess("excepciones_8d", TRIGGER, DAY_DATE[2], term)
+        assert a.confirmed is False and [r.term_days for r in a.readings] == [4, 8]
+
+    def test_8_gives_one_confirmed_8_day_reading(self, monkeypatch) -> None:
+        self._pin(monkeypatch, 8)
+        term = confirmed_excepciones_term(object())
+        assert term == 8
+        a = assess("excepciones_8d", TRIGGER, DAY_DATE[2], term)
+        assert a.confirmed is True
+        assert [r.term_days for r in a.readings] == [8]
+        assert a.slot == "8d"
+
+    def test_4_gives_one_confirmed_4_day_reading(self, monkeypatch) -> None:
+        self._pin(monkeypatch, 4)
+        term = confirmed_excepciones_term(object())
+        assert term == 4
+        a = assess("excepciones_8d", TRIGGER, DAY_DATE[2], term)
+        assert a.confirmed is True
+        assert [r.term_days for r in a.readings] == [4]
+        assert a.slot == "4d"
+
+    @pytest.mark.parametrize("bad", [1, 5, 7, 9, -4])
+    def test_any_other_value_is_rejected_at_config_load(self, bad) -> None:
+        from pydantic import ValidationError
+
+        from app.config import Settings
+
+        with pytest.raises(ValidationError, match="SEMAFORO_EXCEPCIONES_TERM_DAYS"):
+            Settings(SEMAFORO_EXCEPCIONES_TERM_DAYS=bad)
+
+    @pytest.mark.parametrize("ok", [0, 4, 8])
+    def test_valid_values_load(self, ok) -> None:
+        from app.config import Settings
+
+        assert Settings(SEMAFORO_EXCEPCIONES_TERM_DAYS=ok).SEMAFORO_EXCEPCIONES_TERM_DAYS == ok

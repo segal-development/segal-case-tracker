@@ -30,6 +30,7 @@ from app.models.case_deadline import CaseDeadline
 from app.models.lawyer import Lawyer
 from app.services.business_days import count_business_days_remaining
 from app.services.deadline_semaforo import Assessment, assess
+from app.services.estado_diario_probe import normalize_court_name
 from app.services.semaforo_alerts import (
     _confirmed_term,
     _is_ours,
@@ -63,6 +64,9 @@ class PanelRow:
     #: False when the term is one of several possible ones (excepciones).
     term_confirmed: Optional[bool]
     readings: List[ReadingRow] = field(default_factory=list)
+    #: Every distinct lawyer name on this plazo. More than one when the same
+    #: case is stored under several firm lawyers and the rows were collapsed.
+    abogados: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -106,7 +110,48 @@ def _row(
         level=level,
         term_confirmed=a.confirmed if a else None,
         readings=_readings(a),
+        abogados=[lawyer.name] if lawyer and lawyer.name else [],
     )
+
+
+def _same_plazo_key(row: PanelRow) -> tuple:
+    return (
+        "".join((row.rol or "").split()).upper(),
+        normalize_court_name(row.tribunal),
+        row.deadline_type,
+        row.due_date,
+    )
+
+
+def _collapse_same_case(rows: List[PanelRow]) -> List[PanelRow]:
+    """One row per (ROL, court, plazo type, due date).
+
+    The same case can be stored once per firm lawyer; the firm-wide view would
+    show it twice. The survivor is the row with the lowest ``deadline_id`` (the
+    oldest record: stable between refreshes) and it keeps its position in the
+    already-sorted list. Its ``abogados`` lists every lawyer of the group so
+    nobody disappears silently. A scoped view holds one row per key, so it is
+    untouched.
+    """
+    groups: dict[tuple, List[PanelRow]] = {}
+    for r in rows:
+        groups.setdefault(_same_plazo_key(r), []).append(r)
+    survivors = {}
+    for key, members in groups.items():
+        keep = min(members, key=lambda r: r.deadline_id)
+        names = {n for m in members for n in m.abogados}
+        keep.abogados = sorted(names)
+        survivors[key] = keep
+    return [r for r in rows if survivors[_same_plazo_key(r)] is r]
+
+
+#: A procedurally finished case has no live plazo worth a board slot. The
+#: end-state signal is ``procedural_state``; ``Case.status`` stays "active".
+TERMINATED_STATE = "terminada"
+
+
+def _is_terminated(case: Case) -> bool:
+    return case.procedural_state == TERMINATED_STATE
 
 
 def _por_vencer(db: Session, today: date, case_ids: Optional[Collection[int]]) -> List[PanelRow]:
@@ -128,12 +173,12 @@ def _por_vencer(db: Session, today: date, case_ids: Optional[Collection[int]]) -
         a = assess(dl.deadline_type, dl.triggered_at, today, _confirmed_term(dl))
         if a is None or a.level is None:
             continue
-        if not _is_ours(db, case, dl, today):
+        if _is_terminated(case) or not _is_ours(db, case, dl, today):
             continue
         due = a.earliest_live_due or dl.due_date
         rows.append(_row(db, dl, case, today, a, a.level.value, due))
     rows.sort(key=lambda r: (-URGENCY.index(Level(r.level)), r.due_date, r.deadline_id))
-    return rows
+    return _collapse_same_case(rows)
 
 
 def _vencidos(db: Session, today: date, case_ids: Optional[Collection[int]]) -> List[PanelRow]:
@@ -142,12 +187,12 @@ def _vencidos(db: Session, today: date, case_ids: Optional[Collection[int]]) -> 
         if case_ids is not None and dl.case_id not in case_ids:
             continue
         case = db.get(Case, dl.case_id)
-        if case is None or not _is_ours(db, case, dl, today):
+        if case is None or _is_terminated(case) or not _is_ours(db, case, dl, today):
             continue
         a = assess(dl.deadline_type, dl.triggered_at, today, _confirmed_term(dl))
         rows.append(_row(db, dl, case, today, a, None, dl.due_date))
     rows.sort(key=lambda r: (r.due_date, r.deadline_id), reverse=True)
-    return rows
+    return _collapse_same_case(rows)
 
 
 def build_panel(
