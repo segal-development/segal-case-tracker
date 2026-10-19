@@ -77,10 +77,17 @@ _TAG_RE = re.compile(r"<[^>]+>")
 
 @dataclass(frozen=True)
 class FeedRow:
-    """One row of the feed. ``tribunal`` is None when the feed did not carry it."""
+    """One row of the feed.
+
+    ``tribunal`` and ``caratulado`` are None when the feed row did not carry
+    them. ``caratulado`` is what tells us WHOSE a case is: a ROL missing from
+    our database says nothing on its own, but its caratulado says whether it is
+    one of the firm's clients or an unrelated third party.
+    """
 
     rol: str
     tribunal: Optional[str] = None
+    caratulado: Optional[str] = None
 
 
 @dataclass
@@ -165,6 +172,9 @@ def classify_response(response) -> ProbeResult:
 
     rol_idx = header_cells.index("rol")
     tribunal_idx = header_cells.index("tribunal") if "tribunal" in header_cells else None
+    # The header check above guarantees the column exists; a short data row
+    # still must not raise -- the probe never breaks the cycle.
+    caratulado_idx = header_cells.index("caratulado")
     feed_rows: List[FeedRow] = []
     for r in data_rows:
         if len(r) <= rol_idx or not r[rol_idx]:
@@ -172,7 +182,12 @@ def classify_response(response) -> ProbeResult:
         tribunal = None
         if tribunal_idx is not None and len(r) > tribunal_idx:
             tribunal = r[tribunal_idx] or None
-        feed_rows.append(FeedRow(rol=r[rol_idx].upper(), tribunal=tribunal))
+        caratulado = r[caratulado_idx] or None if len(r) > caratulado_idx else None
+        feed_rows.append(
+            FeedRow(
+                rol=r[rol_idx].upper(), tribunal=tribunal, caratulado=caratulado
+            )
+        )
     if not feed_rows:
         return ProbeResult(NO_ACTIVITY, status_n)
     return ProbeResult(OK, status_n, rows=feed_rows)
@@ -384,7 +399,9 @@ def _log_samples(lawyer_id, fecha: str, stats: Staleness) -> None:
             continue
         shown = rows[:SAMPLE_LIMIT]
         entries = "; ".join(
-            f"{r.rol}@{(r.tribunal or '-').replace(chr(34), chr(39))}" for r in shown
+            f"{r.rol}@{(r.tribunal or '-').replace(chr(34), chr(39))}"
+            f" | {(r.caratulado or '-').replace(chr(34), chr(39))}"
+            for r in shown
         )
         logger.info(
             'ESTADO_DIARIO_PROBE_SAMPLE lawyer=%s date=%s category=%s total=%d '
