@@ -107,3 +107,46 @@ Más `mypy app/core`, que es un paso del CI que ya costó un deploy fallido.
 
 Documento creado 2026-10-19. Alcance acordado con Marcelo tras medir la
 población. Decisión clave: excluir los 906 con verdict vacío.
+
+## T4 — Verificación contra la base real (2026-10-19)
+
+Ejecutada por el orquestador (el worker no tenía acceso a la base). Se llamó a
+`expired_unfiled_deadlines` contra la base de QA, en modo solo lectura, con
+`SEMAFORO_EXPIRED_WINDOW_DAYS = 30`.
+
+```
+ventana configurada: SEMAFORO_EXPIRED_WINDOW_DAYS = 30
+avisos que saldrian HOY: 22   (medido a mano antes: 22)
+abogados que recibirian correo: 9
+```
+
+**Coincide exactamente con la medición manual en SQL hecha antes de escribir
+código.** El reparto: abogado 18 → 7 avisos, abogado 14 → 3, abogado 17 → 3,
+abogados 15/19/1 → 2 cada uno, abogados 12/9/16 → 1 cada uno. Todos
+`excepciones_8d`, con vencimientos entre el 2026-09-21 y el 2026-10-08.
+
+Volumen del primer día: sano. Ningún abogado recibe una avalancha.
+
+## Desviación aceptada del contrato
+
+El contrato nombraba `excepciones_8d` y `apelacion_5d`. `FATAL_DEADLINE_VALUES`
+incluye además `acreditar_poder_3d`, que ya tiene su propio canal
+(`ratificar_firma`). El conjunto se derivó como
+`FATAL_DEADLINE_VALUES - PARALLEL_DEADLINE_VALUES` en vez de una lista fija, lo
+que da exactamente los dos tipos del contrato sin hardcodearlos.
+
+## Cambios fuera del módulo, declarados
+
+- `notification_service.py`: elige el renderizador según el tipo de alerta.
+  Necesario para la feature.
+- `alerts.py`: `plazo_vencido` entra en `ACTIONABLE_ALERT_TYPES`, para que
+  aparezca en "Requiere atención". Coherente con la feature.
+
+## Verificación final
+
+| Control | Resultado |
+|---|---|
+| Suite completa | 26 failed, 3405 passed — las mismas 26 preexistentes, ninguna nueva |
+| `mypy app/core` | limpio |
+| Selección contra base real | 22 avisos, igual a la medición manual |
+| Copy | español neutro con tuteo, sin voseo (hay tests que lo fijan) |
