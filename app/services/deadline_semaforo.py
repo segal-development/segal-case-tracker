@@ -34,6 +34,7 @@ from typing import Any, Optional
 
 from app.core.semaforo_config import (
     EXCEPCIONES_SCALE_BY_TERM,
+    SCALE_APELACION_5D,
     SCALE_PODER_3D,
     URGENCY,
     Level,
@@ -43,6 +44,7 @@ from app.services.business_days import add_business_days, business_days_elapsed
 
 EXCEPCIONES = "excepciones_8d"  # DeadlineType.EXCEPCIONES_8D.value (name is historic)
 PODER = "acreditar_poder_3d"  # DeadlineType.ACREDITAR_PODER_3D.value
+APELACION = "apelacion_5d"  # DeadlineType.APELACION_5D.value
 
 
 @dataclass(frozen=True)
@@ -66,7 +68,7 @@ class Assessment:
     readings: tuple[Reading, ...]
     #: Most urgent level among the live readings; None when none is live.
     level: Optional[Level]
-    #: Dedupe slot, e.g. "8d", "3d", "u4+8", "u8" (u = unconfirmed).
+    #: Dedupe slot, e.g. "8d", "3d", "5d", "u4+8", "u8" (u = unconfirmed).
     slot: str
 
     @property
@@ -117,6 +119,12 @@ def assess(
         readings = (_reading(SCALE_PODER_3D, triggered_at, today, day),)
         return Assessment(
             deadline_type, triggered_at, day, True, readings, readings[0].level, "3d"
+        )
+
+    if deadline_type == APELACION:
+        readings = (_reading(SCALE_APELACION_5D, triggered_at, today, day),)
+        return Assessment(
+            deadline_type, triggered_at, day, True, readings, readings[0].level, "5d"
         )
 
     if deadline_type != EXCEPCIONES:

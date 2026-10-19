@@ -14,6 +14,7 @@ import pytest
 
 from app.core.semaforo_config import (
     SCALE_EXCEPCIONES_4D,
+    SCALE_APELACION_5D,
     SCALE_EXCEPCIONES_8D,
     SCALE_PODER_3D,
     Level,
@@ -74,6 +75,12 @@ class TestScaleBoundaries:
     @pytest.mark.parametrize("day,expected", [(1, V), (2, A), (3, R), (4, None)])
     def test_ratificacion_3_days(self, day, expected) -> None:
         assert SCALE_PODER_3D.level_for_day(day) == expected
+
+    @pytest.mark.parametrize(
+        "day,expected", [(1, V), (2, V), (3, A), (4, A), (5, R), (6, None)]
+    )
+    def test_apelacion_5_days(self, day, expected) -> None:
+        assert SCALE_APELACION_5D.level_for_day(day) == expected
 
     def test_day_zero_has_no_level_on_the_scale_itself(self) -> None:
         assert SCALE_EXCEPCIONES_8D.level_for_day(0) is None
@@ -169,6 +176,38 @@ class TestRatificacion:
         assert a.slot == "3d"
 
 
+class TestApelacion:
+    """Art. 475 CPC: ONE known term of 5 business days, so never unconfirmed."""
+
+    @pytest.mark.parametrize(
+        "day,expected", [(1, V), (2, V), (3, A), (4, A), (5, R)]
+    )
+    def test_five_day_scale(self, day, expected) -> None:
+        a = assess("apelacion_5d", TRIGGER, DAY_DATE[day])
+        assert a is not None
+        assert a.level == expected
+        assert a.day == day
+        assert a.slot == "5d"
+        assert a.readings[0].due_date == DAY_DATE[5]
+
+    def test_over_from_day_6(self) -> None:
+        a = assess("apelacion_5d", TRIGGER, DAY_DATE[6])
+        assert a is not None
+        assert a.level is None
+        assert a.readings[0].level is None
+        assert a.live_readings == ()
+
+    def test_term_is_always_confirmed_with_exactly_one_reading(self) -> None:
+        a = assess("apelacion_5d", TRIGGER, DAY_DATE[2])
+        assert a is not None
+        assert a.confirmed is True
+        assert [r.term_days for r in a.readings] == [5]
+
+    def test_a_confirmed_term_argument_is_ignored(self) -> None:
+        a = assess("apelacion_5d", TRIGGER, DAY_DATE[2], confirmed_term_days=8)
+        assert a is not None and a.slot == "5d" and a.confirmed is True
+
+
 class TestEdges:
     def test_the_day_the_term_opens_counts_as_day_one(self) -> None:
         a = assess("excepciones_8d", TRIGGER, TRIGGER, confirmed_term_days=8)
@@ -180,4 +219,4 @@ class TestEdges:
         assert a.level is None
 
     def test_unknown_deadline_type_has_no_semaforo(self) -> None:
-        assert assess("apelacion_5d", TRIGGER, DAY_DATE[2]) is None
+        assert assess("no_such_deadline", TRIGGER, DAY_DATE[2]) is None

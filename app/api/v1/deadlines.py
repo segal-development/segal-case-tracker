@@ -22,6 +22,7 @@ from sqlalchemy import or_
 from sqlalchemy.sql import nullslast
 
 from app.api.deps import (
+    ALL_CASES,
     get_current_lawyer,
     get_db,
     require_auditor,
@@ -34,6 +35,7 @@ from app.core.deadlines_config import (
     PARALLEL_DEADLINE_VALUES,
     DeadlineType,
 )
+from app.config import settings
 from app.core.decision_rules import RECOMMENDATION_DISCLAIMER, resolve_rule
 from app.models.alert import Alert
 from app.models.case import Case
@@ -41,6 +43,7 @@ from app.models.case_deadline import CaseDeadline
 from app.models.case_litigante import CaseLitigante
 from app.models.lawyer import Lawyer
 from app.services.business_days import count_business_days_remaining, add_business_days
+from app.services.deadline_engine import _today_chile
 
 from zoneinfo import ZoneInfo
 
@@ -453,6 +456,68 @@ async def list_audited_deadlines(
         )
         for dl, case in rows
     ]
+
+
+class SemaforoReadingResponse(BaseModel):
+    term_days: int
+    due_date: date
+    #: null once that reading's last day has gone by.
+    level: Optional[str] = None
+
+
+class SemaforoPanelRowResponse(BaseModel):
+    deadline_id: int
+    case_id: int
+    rol: str
+    caratula: str
+    tribunal: Optional[str] = None
+    abogado_id: Optional[int] = None
+    abogado_nombre: Optional[str] = None
+    deadline_type: str
+    label: str
+    due_date: date
+    #: Negative once expired.
+    dias_habiles_remaining: int
+    #: "verde" | "amarillo" | "rojo" from deadline_semaforo.assess; null in `vencidos`.
+    level: Optional[str] = None
+    #: false: several possible terms, none confirmed (see `readings`).
+    term_confirmed: Optional[bool] = None
+    readings: List[SemaforoReadingResponse] = []
+
+
+class SemaforoPanelResponse(BaseModel):
+    today: date
+    expired_window_days: int
+    por_vencer: List[SemaforoPanelRowResponse]
+    vencidos: List[SemaforoPanelRowResponse]
+
+
+@router.get("/deadlines/semaforo", response_model=SemaforoPanelResponse)
+async def get_semaforo_panel(
+    current_lawyer: dict = Depends(get_current_lawyer),
+    db: Session = Depends(get_db),
+):
+    """Fatal plazos for the home-screen panel. Read-only.
+
+    ``por_vencer``: live plazos with the level from ``deadline_semaforo.assess``
+    (most urgent first). ``vencidos``: expired and unfiled inside
+    ``SEMAFORO_EXPIRED_WINDOW_DAYS``. Plazos that are the counterparty's are
+    never returned. Scoped via ``resolve_case_scope``: admin/auditor see the
+    firm, every other role its own cases.
+    """
+    from dataclasses import asdict
+
+    from app.services.semaforo_panel import build_panel
+
+    scope = resolve_case_scope(db, current_lawyer)
+    today = _today_chile()
+    panel = build_panel(db, today, None if scope is ALL_CASES else scope)
+    return SemaforoPanelResponse(
+        today=today,
+        expired_window_days=settings.SEMAFORO_EXPIRED_WINDOW_DAYS,
+        por_vencer=[SemaforoPanelRowResponse(**asdict(r)) for r in panel.por_vencer],
+        vencidos=[SemaforoPanelRowResponse(**asdict(r)) for r in panel.vencidos],
+    )
 
 
 @router.get("/deadlines/verdicts", response_model=list[DeadlineVerdictResponse])
