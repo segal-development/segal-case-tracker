@@ -233,7 +233,9 @@ class TestClassification:
         )
         r = probe.classify_response(_resp(html))
         assert r.outcome == probe.OK
-        assert r.rows == [probe.FeedRow(rol="C-9-2026", tribunal=None)]
+        assert r.rows == [
+            probe.FeedRow(rol="C-9-2026", tribunal=None, caratulado="A/B")
+        ]
 
     def test_blank_tribunal_cell_is_none(self):
         r = probe.classify_response(_resp(_table([("C-1-2026", "13/10/2026", "A/B", "  ")])))
@@ -734,8 +736,8 @@ class TestReturnsItsRows:
         ])
         rows = await _run(_scraper(_page(_resp(body))), db)
         assert rows == [
-            probe.FeedRow(rol="C-1-2026", tribunal="1 Civil"),
-            probe.FeedRow(rol="C-2-2026", tribunal="2 Civil"),
+            probe.FeedRow(rol="C-1-2026", tribunal="1 Civil", caratulado="A/B"),
+            probe.FeedRow(rol="C-2-2026", tribunal="2 Civil", caratulado="A/B"),
         ]
 
     @pytest.mark.asyncio
@@ -773,7 +775,9 @@ class TestReturnsItsRows:
             scraper=_scraper(_page(_resp(body))), lawyer_id=8, competencia="civil",
             today=TODAY, now=NOW, session_factory=broken_factory,
         )
-        assert rows == [probe.FeedRow(rol="C-1-2026", tribunal="1 Civil")]
+        assert rows == [
+            probe.FeedRow(rol="C-1-2026", tribunal="1 Civil", caratulado="A/B")
+        ]
 
 
 class TestShapeCooldown:
@@ -1131,3 +1135,49 @@ class TestBusinessDayRange:
         rows = await _run(_scraper(page), db)  # lawyer_id=8 has no row
         assert page.posted == ["13/10/2026"]
         assert rows == []
+
+
+class TestCaratuladoIsCaptured:
+    """The feed row carries the caratulado; keeping it is how we find out WHOSE
+    cases the ones missing from our database are (the firm's clients, or
+    unrelated third parties). Without it, a missing ROL says nothing."""
+
+    def test_the_parser_keeps_the_caratulado_of_each_row(self):
+        r = probe.classify_response(_resp(_table([
+            ("C-1-2026", "13/10/2026", "BANCO X / PEREZ", "1 Civil"),
+            ("C-2-2026", "13/10/2026", "RETAIL Y / SOTO", "2 Civil"),
+        ])))
+        assert r.outcome == probe.OK
+        assert [row.caratulado for row in r.rows] == [
+            "BANCO X / PEREZ",
+            "RETAIL Y / SOTO",
+        ]
+
+    def test_a_row_without_caratulado_keeps_none_and_does_not_break(self):
+        # The header check guarantees the column exists, but a short data row
+        # must not raise: the probe never breaks the cycle.
+        body = (
+            "<table><thead><tr><th>Rol</th><th>Fecha</th><th>Caratulado</th>"
+            "<th>Tribunal</th></tr></thead>"
+            "<tbody><tr><td>C-9-2026</td><td>13/10/2026</td></tr></tbody></table>"
+        )
+        r = probe.classify_response(_resp(body))
+        assert r.outcome == probe.OK
+        assert r.rows[0].rol == "C-9-2026"
+        assert r.rows[0].caratulado is None
+
+    def test_the_sample_line_shows_the_caratulado(self, log):
+        # Uses the module's mocked logger, not caplog: another test in the suite
+        # disables the real loggers (alembic's fileConfig), so a caplog
+        # assertion here passes alone and fails in a full run.
+        stats = probe.Staleness(
+            in_db=0, not_in_db=1, never_checked=0, median_days=None, max_days=None,
+            samples={"not_in_db": [
+                probe.FeedRow(rol="C-7-2026", tribunal="9 Civil",
+                              caratulado="BANCO X / PEREZ"),
+            ]},
+        )
+        probe._log_samples(17, "13/10/2026", stats)
+        linea = "\n".join(_logged(log))
+        assert "BANCO X / PEREZ" in linea
+        assert "C-7-2026" in linea
