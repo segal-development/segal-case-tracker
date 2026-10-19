@@ -175,6 +175,60 @@ def render_plazo_alert(lawyer: Any, alert: Any, case: Any) -> Tuple[str, str, st
 
 
 # ---------------------------------------------------------------------------
+# Immediate email: one fatal plazo that expired with no filing from the firm
+# ---------------------------------------------------------------------------
+
+
+def render_plazo_vencido(lawyer: Any, alert: Any, case: Any) -> Tuple[str, str, str]:
+    """``(subject, html_body, text_body)`` for one expired-and-unfiled alert.
+
+    Not a semaforo level: it has its own badge and wording (the term is over,
+    so there is nothing to count down). Pure.
+    """
+    raw_name = getattr(lawyer, "name", None) or "Abogado(a)"
+    rol = (case.rol if case is not None else "") or ""
+    caratulado = (
+        f"{case.plaintiff or ''}/{case.defendant or ''}" if case is not None else ""
+    )
+    court = case.court.name if case is not None and case.court else ""
+    subject = alert.title
+    color = _LEVEL_COLOR[Level.ROJO]
+
+    body_rows = f"""\
+          <tr>
+            <td style="padding:32px 32px 8px 32px;">
+              <p style="margin:0 0 4px 0; font-size:13px; font-weight:bold; text-transform:uppercase; letter-spacing:0.5px;">
+                <span style="display:inline-block; background-color:{color}; color:#ffffff; padding:2px 8px; border-radius:4px;">Plazo vencido</span>
+              </p>
+              <h1 style="margin:8px 0 0 0; color:#111827; font-size:20px; line-height:1.4;">Hola {html.escape(raw_name)}, {html.escape(alert.title)}</h1>
+            </td>
+          </tr>
+{_section_html(html.escape(_case_line(rol, caratulado, court)), '''              <tr>
+                <td style="padding:12px 16px;">
+''' + _paragraphs_html(alert.message) + '''
+                </td>
+              </tr>''')}"""
+    html_body = _shell(
+        subject,
+        body_rows,
+        "Este aviso se envía una sola vez por plazo vencido sin presentación.",
+    )
+    text_lines = [
+        f"PLAZO VENCIDO — {_BRAND}",
+        "",
+        f"Hola {raw_name},",
+        "",
+        _case_line(rol, caratulado, court),
+        "",
+        alert.title,
+        "",
+        alert.message or "",
+        "",
+    ]
+    return subject, html_body, "\n".join(text_lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
 # Grouped email: the day's new verde plazos of one lawyer
 # ---------------------------------------------------------------------------
 

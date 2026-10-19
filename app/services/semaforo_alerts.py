@@ -356,6 +356,51 @@ def _dispatch_pending(db: Session, today: date, svc: NotificationService) -> int
     return dispatched
 
 
+def _dispatch_expired(db: Session, today: date, svc: NotificationService) -> int:
+    """Send every expired-and-unfiled alert not yet emailed.
+
+    Its own rule, because by definition the term is over: ``_dispatch_pending``
+    only sends while ``due_date >= today``. This one sends (and retries a failed
+    send) while the plazo is still inside ``SEMAFORO_EXPIRED_WINDOW_DAYS``
+    (<= 0 = no window), the case is still active and the verdict still says the
+    firm did not act: a verdict that flipped to "cumplido" since the alert was
+    raised cancels the pending email. Each alert is sent at most once
+    (``email_sent``).
+    """
+    query = (
+        db.query(Alert)
+        .join(CaseDeadline, CaseDeadline.id == Alert.entity_id)
+        .join(Case, Case.id == CaseDeadline.case_id)
+        .filter(
+            Alert.entity_type.like(f"{_ENTITY_PREFIX}%"),
+            Alert.type == EXPIRED_ALERT_TYPE,
+            Alert.email_sent.is_(False),
+            CaseDeadline.verdict.in_(_NOT_ACTED_VERDICTS),
+            CaseDeadline.due_date < today,
+            Case.status == "active",
+        )
+    )
+    window = settings.SEMAFORO_EXPIRED_WINDOW_DAYS
+    if window > 0:
+        query = query.filter(CaseDeadline.due_date >= today - timedelta(days=window))
+
+    webhooks: Dict[int, List[Webhook]] = {}
+    dispatched = 0
+    for alert in query.order_by(Alert.id).all():
+        lawyer = db.get(Lawyer, alert.lawyer_id)
+        if lawyer is None:
+            continue
+        if lawyer.id not in webhooks:
+            webhooks[lawyer.id] = (
+                db.query(Webhook)
+                .filter(Webhook.lawyer_id == lawyer.id, Webhook.is_active == True)  # noqa: E712
+                .all()
+            )
+        svc.notify_plazo_alert(alert, lawyer, webhooks[lawyer.id])
+        dispatched += 1
+    return dispatched
+
+
 def run_semaforo_alerts(
     db: Session,
     today: Optional[date] = None,
@@ -365,8 +410,8 @@ def run_semaforo_alerts(
 
     Returns a summary: plazos ``evaluated``, alerts ``created`` per level,
     alerts ``dispatched`` (new + retried), ``errors`` and plazos
-    ``suppressed_by_cutoff`` (see ``_within_cutoff``) and ``expired_created``
-    (one-time "fatal plazo expired unfiled" alerts, a channel parallel to the
+    ``suppressed_by_cutoff`` (see ``_within_cutoff``), ``expired_created`` and
+    ``expired_dispatched`` (one-time "fatal plazo expired unfiled" alerts, a channel parallel to the
     semaforo; see ``expired_unfiled_deadlines``).
     """
     summary: Dict[str, Any] = {
@@ -376,6 +421,7 @@ def run_semaforo_alerts(
         "errors": 0,
         "suppressed_by_cutoff": 0,
         "expired_created": 0,
+        "expired_dispatched": 0,
     }
     owns_svc = notification_svc is None
     svc: Optional[NotificationService] = notification_svc
@@ -411,6 +457,12 @@ def run_semaforo_alerts(
         if svc is None:
             svc = NotificationService(db)
         summary["dispatched"] = _dispatch_pending(db, today, svc)
+        try:
+            summary["expired_dispatched"] = _dispatch_expired(db, today, svc)
+        except Exception:
+            summary["errors"] += 1
+            logger.exception("semaforo: expired notice dispatch failed; skipped")
+            db.rollback()
     except Exception:
         summary["errors"] += 1
         logger.exception("semaforo: run failed; the sync cycle is not affected")

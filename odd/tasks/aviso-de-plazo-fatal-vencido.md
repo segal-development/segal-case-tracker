@@ -91,8 +91,15 @@ Más `mypy app/core`, que es un paso del CI que ya costó un deploy fallido.
       `ACTIONABLE_ALERT_TYPES`); entity_type `plazo:<tipo>:vencido`; destinatarios
       = `_recipients(..., Level.ROJO)`; contador `expired_created`. Excepciones
       respeta `_is_ours` (el estudio demandante no avisa).
-- [ ] **T3** — Despacho por correo con su propia regla, independiente del
+- [x] **T3** — Despacho por correo con su propia regla, independiente del
       término vivo. Copy en español neutro.
+      Evidencia: RED = `assert [] == ['ana@segal.cl', ...]` y
+      `KeyError: 'expired_dispatched'`; GREEN = suite de semáforo completa en
+      verde, `mypy app/core` limpio. Commit: T3_SHA.
+      `_dispatch_expired`: manda mientras el plazo esté en la ventana, la causa
+      activa y el verdict siga siendo no_cumplido/fuera_de_plazo; reintenta
+      envíos fallidos; `_dispatch_pending` intacto. Contador
+      `expired_dispatched`. Render propio `render_plazo_vencido`.
 - [ ] **T4** — Verificación contra la base real: contar los avisos que saldrían
       antes de encender, y comparar con las 22 medidas.
 

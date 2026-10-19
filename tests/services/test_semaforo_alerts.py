@@ -809,3 +809,106 @@ class TestExpiredAlert:
         with smtp_ok():
             summary = run_semaforo_alerts(db, today=TODAY)
         assert summary["errors"] == 1 and len(vencidos(db)) == 3
+
+
+class TestExpiredDispatch:
+    def test_each_recipient_gets_its_own_email_and_it_is_marked_sent(self, db, people) -> None:
+        make_expired(db, make_case(db, people, rol="C-9-2026"))
+        with smtp_ok() as smtp:
+            summary = run_semaforo_alerts(db, today=TODAY)
+            tos = sorted(c.args[0]["To"] for c in smtp.send_message.call_args_list)
+            subs = subjects(smtp)
+        assert tos == ["ana@segal.cl", "carla@segal.cl", "melissa@segal.cl"]
+        assert all(s.startswith("VENCIDO") and "C-9-2026" in s for s in subs)
+        assert all(a.email_sent for a in vencidos(db))
+        assert summary["expired_dispatched"] == 3
+        assert summary["dispatched"] == 0  # the live-term counter is untouched
+
+    def test_the_email_body_is_neutral_spanish_and_states_the_date(self, db, people) -> None:
+        make_expired(db, make_case(db, people), due=date(2026, 11, 17))
+        with smtp_ok() as smtp:
+            run_semaforo_alerts(db, today=TODAY)
+            msg = smtp.send_message.call_args_list[0].args[0]
+        for kind in ("html", "plain"):
+            body = msg.get_body((kind,)).get_content()
+            assert "17-11-2026" in body
+            assert "Ana Pérez" in body or "Melissa" in body or "Carla" in body
+            if kind == "plain":
+                assert "!" not in body
+            assert not re.search(r"\b(sos|tenés|revisá)\b", body.lower())
+
+    def test_it_is_sent_once_not_every_cycle(self, db, people) -> None:
+        make_expired(db, make_case(db, people))
+        with smtp_ok() as smtp:
+            run_semaforo_alerts(db, today=TODAY)
+            smtp.send_message.reset_mock()
+            summary = run_semaforo_alerts(db, today=TODAY + timedelta(days=1))
+            assert smtp.send_message.call_count == 0
+        assert summary["expired_dispatched"] == 0
+
+    def test_a_failed_send_is_retried_by_the_next_run_without_a_new_alert(
+        self, db, people
+    ) -> None:
+        make_expired(db, make_case(db, people))
+        with smtp_ok() as smtp:
+            smtp.send_message.side_effect = smtplib.SMTPRecipientsRefused({})
+            run_semaforo_alerts(db, today=TODAY)
+            assert not any(a.email_sent for a in vencidos(db))
+            smtp.send_message.side_effect = None
+            smtp.send_message.reset_mock()
+            run_semaforo_alerts(db, today=TODAY + timedelta(days=1))
+            assert smtp.send_message.call_count == 3
+        assert all(a.email_sent for a in vencidos(db)) and len(vencidos(db)) == 3
+
+    def test_the_term_being_over_does_not_stop_the_email(self, db, people) -> None:
+        """The live-term rule (due_date >= today) would drop this one: it is the
+        whole point of the separate dispatch."""
+        make_expired(db, make_case(db, people), due=TODAY - timedelta(days=10))
+        with smtp_ok() as smtp:
+            run_semaforo_alerts(db, today=TODAY)
+            assert smtp.send_message.call_count == 3
+
+    def test_an_unsent_alert_is_dropped_once_it_leaves_the_window(
+        self, db, people, monkeypatch
+    ) -> None:
+        make_expired(db, make_case(db, people), due=TODAY - timedelta(days=5))
+        with smtp_ok() as smtp:
+            smtp.send_message.side_effect = smtplib.SMTPRecipientsRefused({})
+            run_semaforo_alerts(db, today=TODAY)
+            smtp.send_message.side_effect = None
+            smtp.send_message.reset_mock()
+            run_semaforo_alerts(db, today=TODAY + timedelta(days=40))
+            assert smtp.send_message.call_count == 0
+
+    def test_if_the_verdict_turns_out_we_acted_the_pending_email_is_not_sent(
+        self, db, people
+    ) -> None:
+        row = make_expired(db, make_case(db, people))
+        with smtp_ok() as smtp:
+            smtp.send_message.side_effect = smtplib.SMTPRecipientsRefused({})
+            run_semaforo_alerts(db, today=TODAY)
+            row.verdict = "cumplido"
+            db.commit()
+            smtp.send_message.side_effect = None
+            smtp.send_message.reset_mock()
+            run_semaforo_alerts(db, today=TODAY + timedelta(days=1))
+            assert smtp.send_message.call_count == 0
+
+    def test_a_crash_while_dispatching_does_not_escape(self, db, people, monkeypatch) -> None:
+        make_expired(db, make_case(db, people))
+        make_deadline(db, make_case(db, people, rol="C-2-2026"))
+
+        def boom(*a, **k):
+            raise RuntimeError("dispatch exploded")
+
+        monkeypatch.setattr("app.services.semaforo_alerts._dispatch_expired", boom)
+        with smtp_ok():
+            summary = run_semaforo_alerts(db, today=TODAY)
+        assert summary["errors"] >= 1
+
+    def test_the_live_term_rule_is_unchanged_for_other_alerts(self, db, people) -> None:
+        make_deadline(db, make_case(db, people))
+        with smtp_ok() as smtp:
+            summary = run_semaforo_alerts(db, today=D[4])
+            assert smtp.send_message.call_count == 3
+        assert summary["dispatched"] == 3 and summary["expired_dispatched"] == 0
