@@ -2038,6 +2038,50 @@ def _fan_out_case_alerts(
     return alert_count
 
 
+def poder_obligation_is_ours(
+    db: Session, case: Case, row, today: Optional[date] = None
+):
+    """The "Previo a proveer" movement when the ratification obligation behind
+    ``row`` is provably the firm's own, else ``None``.
+
+    HEURISTIC (see ``poder_deadline``): the obligation is ours when the
+    ``Previo a proveer`` comes after an excepciones filing AND the firm is on
+    the ejecutado's side (``_firm_side``; it defaults to "demandado" when the
+    side is unknown, so an unknown side errs toward alerting). ``row`` must be
+    the case's ACTIVE, automatic ``acreditar_poder_3d`` row, not yet expired.
+    Shared by ``emit_ratification_alert`` and the plazo semaforo so both agree
+    on whose obligation it is.
+    """
+    from app.services.deadline_engine import _firm_side
+    from app.services.poder_deadline import (
+        find_poder_obligation,
+        responds_to_excepciones_filing,
+    )
+
+    if row is None or row.source_movement_id is None:
+        return None
+    if row.due_date < (today or _today_chile()):
+        return None
+
+    movements = (
+        db.query(Movement)
+        .filter(Movement.case_id == case.id)
+        .order_by(Movement.movement_date.asc(), Movement.id.asc())
+        .all()
+    )
+    obligation = find_poder_obligation(movements)
+    if obligation is None or obligation.fulfilled:
+        return None
+    trigger = obligation.trigger
+    if getattr(trigger, "id", None) != row.source_movement_id:
+        return None
+    if not responds_to_excepciones_filing(movements, trigger):
+        return None
+    if _firm_side(db, case) == "demandante":
+        return None
+    return trigger
+
+
 def emit_ratification_alert(
     db: Session,
     case: Case,
@@ -2047,27 +2091,16 @@ def emit_ratification_alert(
 ) -> int:
     """Alert the firm of a FATAL "ratificar firma" plazo that is provably its own.
 
-    HEURISTIC (see ``poder_deadline``): the obligation is ours when the
-    ``Previo a proveer`` comes after an excepciones filing AND the firm is
-    on the ejecutado's side (``_firm_side``; it defaults to "demandado" when the
-    side is unknown, so an unknown side errs toward alerting — a missed fatal
-    plazo costs the defense, a spurious alert only noise). The precise path, the
-    folio parsed from the PDF text, is not implemented yet.
-
-    Runs OUTSIDE the semáforo: the plazo type stays informational, so this never
-    touches ``semaforo`` / ``next_deadline_at``. It requires an ACTIVE, not yet
-    expired plazo row, so already-fulfilled or long-lapsed obligations (the
-    backlog at first deploy) do not fire. De-duplicated per obligation by the
-    trigger movement id stored in ``Alert.movement_id``. Never raises.
+    Whose obligation it is: see ``poder_obligation_is_ours``. Runs OUTSIDE the
+    semáforo: the plazo type stays informational, so this never touches
+    ``semaforo`` / ``next_deadline_at``. It requires an ACTIVE, not yet expired
+    plazo row, so already-fulfilled or long-lapsed obligations (the backlog at
+    first deploy) do not fire. De-duplicated per obligation by the trigger
+    movement id stored in ``Alert.movement_id``. Never raises.
     """
     try:
         from app.core.deadlines_config import DeadlineType
         from app.models.case_deadline import CaseDeadline
-        from app.services.deadline_engine import _firm_side
-        from app.services.poder_deadline import (
-            find_poder_obligation,
-            responds_to_excepciones_filing,
-        )
 
         row = (
             db.query(CaseDeadline)
@@ -2080,26 +2113,8 @@ def emit_ratification_alert(
             .order_by(CaseDeadline.id.desc())
             .first()
         )
-        if row is None or row.source_movement_id is None:
-            return 0
-        if row.due_date < (today or _today_chile()):
-            return 0
-
-        movements = (
-            db.query(Movement)
-            .filter(Movement.case_id == case.id)
-            .order_by(Movement.movement_date.asc(), Movement.id.asc())
-            .all()
-        )
-        obligation = find_poder_obligation(movements)
-        if obligation is None or obligation.fulfilled:
-            return 0
-        trigger = obligation.trigger
-        if getattr(trigger, "id", None) != row.source_movement_id:
-            return 0
-        if not responds_to_excepciones_filing(movements, trigger):
-            return 0
-        if _firm_side(db, case) == "demandante":
+        trigger = poder_obligation_is_ours(db, case, row, today)
+        if trigger is None:
             return 0
 
         already = (

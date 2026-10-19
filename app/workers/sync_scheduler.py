@@ -260,6 +260,21 @@ def _audit_validation(
         )
 
 
+def _run_semaforo_alerts_safely(db: Session) -> None:
+    """Raise and send the plazo semaforo alerts due now (see
+    ``app.services.semaforo_alerts``). SAFE-FAIL: the semaforo is calendar-
+    driven, so a failure here must never abort or delay the sync cycle; the
+    next call (the next cycle, or the cron job) picks up whatever this one
+    missed."""
+    try:
+        from app.services.semaforo_alerts import run_semaforo_alerts
+
+        summary = run_semaforo_alerts(db)
+        logger.info("Semaforo de plazos: %s", summary)
+    except Exception:
+        logger.exception("Semaforo de plazos failed (non-fatal)")
+
+
 def _maybe_take_cartera_snapshot(db: Session) -> None:
     """Take the current period's cartera snapshot once, the first cycle that
     notices none exists yet — cheap single-row check, SAFE-FAIL like the
@@ -909,6 +924,14 @@ async def _run_sync_cycle(timer: CycleTimer):
             _maybe_take_cartera_snapshot(setup_db)
         except Exception:
             logger.exception("Cartera snapshot check failed (non-fatal)")
+
+        # Semaforo de plazos: a day-N level change is the calendar's doing, not
+        # a sync event, so the scan runs at the START of every cycle, before the
+        # multi-hour lawyer loop. Idempotent; safe-fail by construction. It
+        # reuses this session on purpose (no extra SessionLocal() call). Plazos
+        # discovered DURING the loop wait for the next cycle, or for the cron
+        # job ``python -m app.jobs.send_semaforo_alerts`` if it is scheduled.
+        _run_semaforo_alerts_safely(setup_db)
 
         # Only lawyer IDs are needed downstream — sync_lawyer_cases re-resolves the
         # Lawyer row from whatever session it is handed. Ordered by staleness so
