@@ -48,6 +48,8 @@ ACTIONABLE_ALERT_TYPES = frozenset(
         # activity, announced once a day in one email.
         "plazo_amarillo",
         "plazo_rojo",
+        # Fatal plazo that expired with no filing from the firm (one per plazo).
+        "plazo_vencido",
     }
 )
 

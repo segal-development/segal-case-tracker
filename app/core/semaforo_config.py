@@ -45,6 +45,12 @@ IMMEDIATE_ALERT_TYPES = frozenset(
 GROUPED_ALERT_TYPE = ALERT_TYPE_BY_LEVEL[Level.VERDE]
 SEMAFORO_ALERT_TYPES = frozenset(ALERT_TYPE_BY_LEVEL.values())
 
+#: A FATAL plazo that expired with the firm not having acted. A channel parallel
+#: to the semaforo, NOT a level: it is deliberately absent from
+#: ``ALERT_TYPE_BY_LEVEL`` / ``SEMAFORO_ALERT_TYPES`` so the live-term scan and
+#: dispatch never see it. Immediate and actionable, like amarillo / rojo.
+EXPIRED_ALERT_TYPE = "plazo_vencido"
+
 
 @dataclass(frozen=True)
 class Scale:

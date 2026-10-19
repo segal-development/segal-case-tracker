@@ -29,6 +29,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.core.deadlines_config import FATAL_DEADLINE_VALUES, PARALLEL_DEADLINE_VALUES
 from app.core.semaforo_config import (
+    EXPIRED_ALERT_TYPE,
     ALERT_TYPE_BY_LEVEL,
     LEVEL_BY_ALERT_TYPE,
     SEMAFORO_ALERT_TYPES,
@@ -51,7 +52,7 @@ from app.services.deadline_semaforo import (
     confirmed_excepciones_term,
 )
 from app.services.notification_service import NotificationService
-from app.services.plazo_copy import build_alert_text
+from app.services.plazo_copy import build_alert_text, build_vencido_text
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +201,76 @@ def expired_unfiled_deadlines(db: Session, today: date) -> List[CaseDeadline]:
     return query.order_by(CaseDeadline.id).all()
 
 
+def _create_expired_alerts(
+    db: Session, row: CaseDeadline, today: date, existing: set
+) -> int:
+    """Create (and commit) the one-time expired-and-unfiled alerts of ``row``.
+
+    Returns how many were created. Dedupe reuses ``existing`` (see
+    ``_existing_keys``): the key is (entity_type, plazo id, type, lawyer), so a
+    plazo is announced once, ever, per recipient.
+    """
+    case = db.get(Case, row.case_id)
+    if case is None:
+        return 0
+    entity_type = f"{_ENTITY_PREFIX}{row.deadline_type}:vencido"
+    # Escalation recipients are the same people who are told of a rojo.
+    recipients = _recipients(db, case, Level.ROJO)
+    if all((entity_type, row.id, EXPIRED_ALERT_TYPE, r.id) in existing for r in recipients):
+        return 0
+    # Excepciones is only the firm's obligation when it defends the debtor.
+    if row.deadline_type == EXCEPCIONES and not _is_ours(db, case, row, today):
+        return 0
+
+    tribunal = case.court.name if case.court else "tribunal no especificado"
+    title, message = build_vencido_text(
+        row.deadline_type, row.due_date, row.verdict, case.rol or "", tribunal
+    )
+    created = 0
+    for recipient in recipients:
+        key = (entity_type, row.id, EXPIRED_ALERT_TYPE, recipient.id)
+        if key in existing:
+            continue
+        db.add(Alert(
+            lawyer_id=recipient.id,
+            case_id=case.id,
+            type=EXPIRED_ALERT_TYPE,
+            entity_type=entity_type,
+            entity_id=row.id,
+            title=title,
+            message=message,
+        ))
+        existing.add(key)
+        created += 1
+    db.commit()
+    return created
+
+
+def _run_expired_notice(db: Session, today: date, summary: Dict[str, Any]) -> None:
+    """Raise the expired-and-unfiled alerts. NEVER raises: a failure here is
+    logged and counted, and must not stop the live-term alerts or the dispatch."""
+    try:
+        rows = expired_unfiled_deadlines(db, today)
+        existing = _existing_keys(db, [r.id for r in rows])
+        for row in rows:
+            try:
+                summary["expired_created"] += _create_expired_alerts(db, row, today, existing)
+            except Exception:
+                summary["errors"] += 1
+                logger.exception(
+                    "semaforo: could not raise the expired notice for case_deadline %s; skipped",
+                    getattr(row, "id", "?"),
+                )
+                db.rollback()
+    except Exception:
+        summary["errors"] += 1
+        logger.exception("semaforo: expired notice failed; live alerts are not affected")
+        try:
+            db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _create_alerts(
     db: Session, row: CaseDeadline, today: date, existing: set, created: Dict[str, int]
 ) -> None:
@@ -294,7 +365,9 @@ def run_semaforo_alerts(
 
     Returns a summary: plazos ``evaluated``, alerts ``created`` per level,
     alerts ``dispatched`` (new + retried), ``errors`` and plazos
-    ``suppressed_by_cutoff`` (see ``_within_cutoff``).
+    ``suppressed_by_cutoff`` (see ``_within_cutoff``) and ``expired_created``
+    (one-time "fatal plazo expired unfiled" alerts, a channel parallel to the
+    semaforo; see ``expired_unfiled_deadlines``).
     """
     summary: Dict[str, Any] = {
         "evaluated": 0,
@@ -302,6 +375,7 @@ def run_semaforo_alerts(
         "dispatched": 0,
         "errors": 0,
         "suppressed_by_cutoff": 0,
+        "expired_created": 0,
     }
     owns_svc = notification_svc is None
     svc: Optional[NotificationService] = notification_svc
@@ -331,6 +405,8 @@ def run_semaforo_alerts(
                 summary["suppressed_by_cutoff"],
                 settings.SEMAFORO_MAX_TRIGGER_AGE_DAYS,
             )
+
+        _run_expired_notice(db, today, summary)
 
         if svc is None:
             svc = NotificationService(db)

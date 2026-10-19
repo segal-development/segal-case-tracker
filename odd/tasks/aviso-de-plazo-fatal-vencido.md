@@ -84,7 +84,13 @@ Más `mypy app/core`, que es un paso del CI que ya costó un deploy fallido.
       pide solo excepciones/apelación, así que se deriva como fatales menos
       `PARALLEL_DEADLINE_VALUES` (poder tiene su propia vía, `ratificar_firma`).
       Variable: `SEMAFORO_EXPIRED_WINDOW_DAYS` (30; <=0 sin ventana).
-- [ ] **T2** — Alerta y deduplicación: un tipo nuevo, una sola vez por plazo.
+- [x] **T2** — Alerta y deduplicación: un tipo nuevo, una sola vez por plazo.
+      Evidencia: RED = 8 failed (`assert 0 == 3`, `vencidos(db)` vacío);
+      GREEN = 77 passed, `mypy app/core` limpio. Commit: T2_SHA.
+      Tipo `plazo_vencido` (fuera de `SEMAFORO_ALERT_TYPES`, dentro de
+      `ACTIONABLE_ALERT_TYPES`); entity_type `plazo:<tipo>:vencido`; destinatarios
+      = `_recipients(..., Level.ROJO)`; contador `expired_created`. Excepciones
+      respeta `_is_ours` (el estudio demandante no avisa).
 - [ ] **T3** — Despacho por correo con su propia regla, independiente del
       término vivo. Copy en español neutro.
 - [ ] **T4** — Verificación contra la base real: contar los avisos que saldrían

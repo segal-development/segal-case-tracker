@@ -7,6 +7,7 @@ Day 3 = Thu 11-05, day 4 = Fri 11-06, day 6 = Mon 11-09, day 8 = Wed 11-11.
 from __future__ import annotations
 
 import logging
+import re
 import smtplib
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
@@ -688,3 +689,123 @@ class TestExpiredSelection:
         make_expired(db, make_case(db, people))
         self._select(db)
         assert alerts(db) == []
+
+
+def vencidos(db):
+    return db.query(Alert).filter(Alert.type == "plazo_vencido").order_by(Alert.id).all()
+
+
+class TestExpiredAlert:
+    def test_one_alert_per_recipient_with_the_dedupe_key_shape(self, db, people) -> None:
+        row = make_expired(db, make_case(db, people))
+        with smtp_ok():
+            summary = run_semaforo_alerts(db, today=TODAY)
+        found = vencidos(db)
+        assert sorted(db.get(Lawyer, a.lawyer_id).name for a in found) == [
+            "Ana Pérez", "Carla Lavín", "Melissa Acevedo",
+        ]
+        assert {a.entity_type for a in found} == {"plazo:excepciones_8d:vencido"}
+        assert {a.entity_id for a in found} == {row.id}
+        assert summary["expired_created"] == 3
+
+    def test_it_is_announced_once_ever(self, db, people) -> None:
+        make_expired(db, make_case(db, people))
+        with smtp_ok():
+            run_semaforo_alerts(db, today=TODAY)
+            second = run_semaforo_alerts(db, today=TODAY + timedelta(days=1))
+            third = run_semaforo_alerts(db, today=TODAY + timedelta(days=2))
+        assert len(vencidos(db)) == 3
+        assert second["expired_created"] == 0 and third["expired_created"] == 0
+
+    def test_each_expired_plazo_gets_its_own_alerts(self, db, people) -> None:
+        make_expired(db, make_case(db, people, rol="C-1-2026"))
+        make_expired(db, make_case(db, people, rol="C-2-2026"))
+        with smtp_ok():
+            run_semaforo_alerts(db, today=TODAY)
+        assert len(vencidos(db)) == 6
+
+    def test_the_text_states_the_absolute_date_and_the_case(self, db, people) -> None:
+        make_expired(db, make_case(db, people, rol="C-77-2026"), due=date(2026, 11, 17))
+        with smtp_ok():
+            run_semaforo_alerts(db, today=TODAY)
+        a = vencidos(db)[0]
+        assert "C-77-2026" in a.title and "17-11-2026" in a.title
+        assert "1º Juzgado Civil" in a.message
+        assert "hoy" not in a.message.lower()
+
+    def test_no_voseo_no_exclamations(self, db, people) -> None:
+        make_expired(db, make_case(db, people))
+        make_expired(db, make_case(db, people, rol="C-2-2026"), verdict="fuera_de_plazo")
+        with smtp_ok():
+            run_semaforo_alerts(db, today=TODAY)
+        for a in vencidos(db):
+            text = f"{a.title} {a.message}"
+            assert "!" not in text
+            for voseo in ("revisá", "verificá", "contactá", "tenés"):
+                assert voseo not in text.lower()
+            assert not re.search(r"\bsos\b", text.lower())
+
+    def test_fuera_de_plazo_is_not_worded_as_a_missed_filing(self, db, people) -> None:
+        make_expired(db, make_case(db, people), verdict="fuera_de_plazo")
+        with smtp_ok():
+            run_semaforo_alerts(db, today=TODAY)
+        assert "posterioridad" in vencidos(db)[0].message
+
+    def test_when_the_firm_is_the_demandante_excepciones_is_not_ours(self, db, people) -> None:
+        case = make_case(db, people)
+        db.add(CaseLitigante(
+            case_id=case.id, participante="AB.DTE", rut=FIRM_RUT,
+            persona_type="NATURAL", nombre="Ana", natural_key="k1",
+        ))
+        db.commit()
+        make_expired(db, case)
+        with smtp_ok():
+            run_semaforo_alerts(db, today=TODAY)
+        assert vencidos(db) == []
+
+    def test_outside_the_window_or_unknown_verdict_creates_nothing(self, db, people) -> None:
+        case = make_case(db, people)
+        make_expired(db, case, due=TODAY - timedelta(days=45))
+        make_expired(db, case, verdict=None, triggered_at=date(2026, 9, 1))
+        with smtp_ok():
+            summary = run_semaforo_alerts(db, today=TODAY)
+        assert vencidos(db) == [] and summary["expired_created"] == 0
+
+    def test_it_does_not_change_the_live_term_alerts(self, db, people) -> None:
+        make_deadline(db, make_case(db, people))
+        with smtp_ok():
+            summary = run_semaforo_alerts(db, today=D[4])
+        assert summary["created"] == {"verde": 0, "amarillo": 0, "rojo": 3}
+        assert vencidos(db) == []
+
+    def test_a_failure_in_the_notice_never_escapes_and_live_alerts_still_go(
+        self, db, people, monkeypatch
+    ) -> None:
+        def boom(*a, **k):
+            raise RuntimeError("selection exploded")
+
+        monkeypatch.setattr("app.services.semaforo_alerts.expired_unfiled_deadlines", boom)
+        make_deadline(db, make_case(db, people))
+        with smtp_ok():
+            summary = run_semaforo_alerts(db, today=D[4])
+        assert summary["errors"] >= 1
+        assert summary["created"]["rojo"] == 3
+
+    def test_one_bad_expired_row_does_not_block_the_others(self, db, people, monkeypatch) -> None:
+        import app.services.semaforo_alerts as mod
+
+        real = mod._recipients
+        calls = {"n": 0}
+
+        def flaky(db_, case, level):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("bad row")
+            return real(db_, case, level)
+
+        monkeypatch.setattr(mod, "_recipients", flaky)
+        make_expired(db, make_case(db, people, rol="C-1-2026"))
+        make_expired(db, make_case(db, people, rol="C-2-2026"))
+        with smtp_ok():
+            summary = run_semaforo_alerts(db, today=TODAY)
+        assert summary["errors"] == 1 and len(vencidos(db)) == 3
