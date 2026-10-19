@@ -175,6 +175,16 @@ def classify_response(response) -> ProbeResult:
     # The header check above guarantees the column exists; a short data row
     # still must not raise -- the probe never breaks the cycle.
     caratulado_idx = header_cells.index("caratulado")
+    # The caratulado came back empty on the first real run. Log the shape the
+    # feed actually sends -- headers and the first row's cell count -- because
+    # guessing why is what wastes a cycle. One short line per probe.
+    logger.info(
+        "ESTADO_DIARIO_PROBE_SHAPE headers=%r rol_idx=%d caratulado_idx=%d "
+        "tribunal_idx=%s first_row_cells=%d first_row=%r",
+        header_cells, rol_idx, caratulado_idx, tribunal_idx,
+        len(data_rows[0]) if data_rows else 0,
+        data_rows[0][:6] if data_rows else [],
+    )
     feed_rows: List[FeedRow] = []
     for r in data_rows:
         if len(r) <= rol_idx or not r[rol_idx]:
