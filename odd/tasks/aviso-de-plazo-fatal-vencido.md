@@ -79,14 +79,14 @@ Más `mypy app/core`, que es un paso del CI que ya costó un deploy fallido.
       ventana configurable. Sin efectos: solo la consulta y sus tests.
       Evidencia: RED = `ImportError: cannot import name
       'expired_unfiled_deadlines'`; GREEN = 66 passed en test_semaforo_alerts,
-      `mypy app/core` limpio. Commit: T1_SHA.
+      `mypy app/core` limpio. Commit: b6a1250.
       Hallazgo: `FATAL_DEADLINE_VALUES` incluye `acreditar_poder_3d`; el alcance
       pide solo excepciones/apelación, así que se deriva como fatales menos
       `PARALLEL_DEADLINE_VALUES` (poder tiene su propia vía, `ratificar_firma`).
       Variable: `SEMAFORO_EXPIRED_WINDOW_DAYS` (30; <=0 sin ventana).
 - [x] **T2** — Alerta y deduplicación: un tipo nuevo, una sola vez por plazo.
       Evidencia: RED = 8 failed (`assert 0 == 3`, `vencidos(db)` vacío);
-      GREEN = 77 passed, `mypy app/core` limpio. Commit: T2_SHA.
+      GREEN = 77 passed, `mypy app/core` limpio. Commit: 65fed80.
       Tipo `plazo_vencido` (fuera de `SEMAFORO_ALERT_TYPES`, dentro de
       `ACTIONABLE_ALERT_TYPES`); entity_type `plazo:<tipo>:vencido`; destinatarios
       = `_recipients(..., Level.ROJO)`; contador `expired_created`. Excepciones
@@ -95,7 +95,7 @@ Más `mypy app/core`, que es un paso del CI que ya costó un deploy fallido.
       término vivo. Copy en español neutro.
       Evidencia: RED = `assert [] == ['ana@segal.cl', ...]` y
       `KeyError: 'expired_dispatched'`; GREEN = suite de semáforo completa en
-      verde, `mypy app/core` limpio. Commit: T3_SHA.
+      verde, `mypy app/core` limpio. Commit: c956d68.
       `_dispatch_expired`: manda mientras el plazo esté en la ventana, la causa
       activa y el verdict siga siendo no_cumplido/fuera_de_plazo; reintenta
       envíos fallidos; `_dispatch_pending` intacto. Contador
