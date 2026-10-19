@@ -440,7 +440,8 @@ class NotificationService:
         self._dispatch(alert, lawyer, webhooks, payload, send_email=False)
 
     def _send_plazo_email(self, alert: Alert, lawyer: Lawyer) -> bool:
-        from app.services.plazo_email import render_plazo_alert
+        from app.core.semaforo_config import EXPIRED_ALERT_TYPE
+        from app.services.plazo_email import render_plazo_alert, render_plazo_vencido
 
         if not settings.SMTP_HOST:
             logger.warning(
@@ -454,7 +455,10 @@ class NotificationService:
                 alert.id,
             )
             return False
-        subject, html_body, text_body = render_plazo_alert(lawyer, alert, alert.case)
+        render = (
+            render_plazo_vencido if alert.type == EXPIRED_ALERT_TYPE else render_plazo_alert
+        )
+        subject, html_body, text_body = render(lawyer, alert, alert.case)
         msg = EmailMessage()
         msg["Subject"] = subject
         msg["From"] = settings.SMTP_FROM or settings.FROM_EMAIL

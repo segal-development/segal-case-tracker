@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from datetime import date
 
-from app.core.deadlines_config import DEADLINE_DISCLAIMER
+from app.core.deadlines_config import DEADLINE_DISCLAIMER, DEADLINE_LABELS
 from app.core.semaforo_config import EXCEPCIONES_TERM_PLACE
 from app.services.deadline_semaforo import EXCEPCIONES, PODER, Assessment, Reading
 
@@ -99,4 +99,34 @@ def build_alert_text(a: Assessment, rol: str, tribunal: str) -> tuple[str, str]:
     else:  # pragma: no cover - assess() returns None for any other type
         raise ValueError(f"no copy for {a.deadline_type!r}")
     lines.append(DEADLINE_DISCLAIMER)
+    return title, "\n".join(lines)
+
+
+def build_vencido_text(
+    deadline_type: str, due_date: date, verdict: str, rol: str, tribunal: str
+) -> tuple[str, str]:
+    """``(title, message)`` for a fatal plazo that expired with no filing from us.
+
+    Absolute dates only (the text is stored and may be read days later). The
+    wording follows what the verdict proves: ``no_cumplido`` says we found no
+    filing; ``fuera_de_plazo`` says the filing is dated after the deadline,
+    and in both cases asks the lawyer to check the expediente, because the
+    verdict is derived from published movements, not from the filing itself.
+    """
+    label = DEADLINE_LABELS.get(deadline_type, deadline_type)
+    title = f"VENCIDO · {label}, causa {rol}: venció el {_d(due_date)}"
+    if verdict == "fuera_de_plazo":
+        finding = (
+            "El escrito aparece registrado con posterioridad al vencimiento del plazo."
+        )
+    else:
+        finding = "No encontramos un escrito presentado dentro del plazo."
+    lines = [
+        f"{label}: el plazo venció el {_d(due_date)}.",
+        f"Tribunal: {tribunal}.",
+        finding,
+        "Revisa el expediente para confirmar el estado de la causa y definir "
+        "los pasos a seguir. Este aviso se envía una sola vez.",
+        DEADLINE_DISCLAIMER,
+    ]
     return title, "\n".join(lines)
