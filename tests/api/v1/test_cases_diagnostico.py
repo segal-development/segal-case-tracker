@@ -306,3 +306,50 @@ def test_rut_only_matches_defendant_side(client, db, admin, court):
                          persona_type="JURIDICA", nombre="BANCO", natural_key=f"{c.id}-dte"))
     db.commit()
     assert _get(client, _headers(admin.rut), rut="8430773-4").json()["encontrado"] is False
+
+
+
+def _case_con_demandado(db, ab, court, rol, rut):
+    c = _case(db, ab, court, rol=rol, checked_days_ago=1)
+    db.add(
+        CaseLitigante(
+            case_id=c.id, participante="DDO.", rut=rut,
+            persona_type="JURIDICA", nombre="BANCO X",
+            natural_key=f"{c.id}-{rut}",
+        )
+    )
+    return c
+
+
+class TestResultsAreCapped:
+    """A company RUT (a bank being sued) matches hundreds of cases. Measured on
+    the real database: one such RUT returns 512. The endpoint builds a full
+    diagnosis per row, with a movements query each, so without a cap the screen
+    hangs for minutes -- and it is used with a client on the phone."""
+
+    def test_over_the_cap_returns_the_cap_and_reports_the_total(
+        self, client, db, admin, court
+    ):
+        from app.api.v1.cases import DIAGNOSTICO_MAX_FILAS
+
+        ab = _lawyer(db, "20000000-1", "Ana")
+        rut = "90743000-6"
+        for i in range(DIAGNOSTICO_MAX_FILAS + 3):
+            _case_con_demandado(db, ab, court, f"C-{9000 + i}-2026", rut)
+        db.commit()
+
+        body = _get(client, _headers(admin.rut), rut=rut).json()
+        assert body["encontrado"] is True
+        assert len(body["filas"]) == DIAGNOSTICO_MAX_FILAS
+        assert body["total"] == DIAGNOSTICO_MAX_FILAS + 3
+
+    def test_under_the_cap_the_total_equals_the_rows(self, client, db, admin, court):
+        ab = _lawyer(db, "20000000-2", "Luis")
+        rut = "11111111-1"
+        _case_con_demandado(db, ab, court, "C-8001-2026", rut)
+        _case_con_demandado(db, ab, court, "C-8002-2026", rut)
+        db.commit()
+
+        body = _get(client, _headers(admin.rut), rut=rut).json()
+        assert body["total"] == 2
+        assert len(body["filas"]) == 2

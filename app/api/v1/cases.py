@@ -148,9 +148,17 @@ class DiagnosticoFila(BaseModel):
     veredicto_detalle: str
 
 
+#: Cap on diagnosed rows. A company RUT (a bank being sued) matches hundreds of
+#: cases -- 512 for one real RUT -- and each row costs a movements query, so an
+#: uncapped answer hangs a screen used with a client on the phone. ``total``
+#: still reports how many matched, so the screen can say it is showing a slice.
+DIAGNOSTICO_MAX_FILAS = 50
+
+
 class DiagnosticoResponse(BaseModel):
     buscado: str
     encontrado: bool
+    total: int
     filas: List[DiagnosticoFila]
 
 
@@ -858,7 +866,8 @@ async def diagnostico_causa(
             .exists()
         )
         buscado = f"RUT {rut_term}"
-    cases = query.order_by(Case.id).all()
+    total = query.count()
+    cases = query.order_by(Case.id).limit(DIAGNOSTICO_MAX_FILAS).all()
 
     case_ids = [c.id for c in cases]
     lawyers = {
@@ -924,7 +933,9 @@ async def diagnostico_causa(
                 veredicto_detalle=detalle,
             )
         )
-    return DiagnosticoResponse(buscado=buscado, encontrado=bool(filas), filas=filas)
+    return DiagnosticoResponse(
+        buscado=buscado, encontrado=bool(filas), total=total, filas=filas
+    )
 
 
 @router.get("/summary", response_model=CaseSummaryResponse)

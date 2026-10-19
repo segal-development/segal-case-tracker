@@ -93,3 +93,26 @@ Frontend (`segal-deudores-web`, rama por defecto `master`): vitest y
 
 - [x] **T1** — Backend: el endpoint con los cuatro veredictos. Commit `d4dd4a9`.
 - [ ] **T2** — Frontend: la pantalla donde se escribe el ROL o el RUT.
+
+## Tope de resultados (agregado tras verificar contra la base real)
+
+El RUT de un banco demandado devuelve **512 causas**. Sin tope, el endpoint
+armaba el diagnóstico completo de cada una —con una consulta de movimientos por
+fila— y tardaba más de dos minutos: inaceptable en una pantalla que se usa con
+el cliente al teléfono.
+
+`DIAGNOSTICO_MAX_FILAS = 50`, y la respuesta gana el campo `total` para que la
+pantalla pueda decir que está mostrando una parte.
+
+Medido después del cambio:
+
+| Consulta | total | filas | tiempo |
+|---|---|---|---|
+| RUT de banco | 512 | 50 | 8,1 s |
+| ROL con 3 filas | 3 | 3 | 1,3 s |
+| ROL que no existe | 0 | 0 | 0,4 s |
+
+Los 8 s son del caso patológico. El uso real —un ROL, o el RUT de una persona—
+va por debajo de 1,5 s. No se optimiza más por ahora: el N+1 de movimientos
+sobre 50 filas es el costo, y bajarlo exige una consulta agrupada que no se
+justifica hasta ver que moleste.
