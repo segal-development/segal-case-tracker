@@ -298,12 +298,25 @@ def staleness_stats(
             unknown += 1
 
     feed_tribunal: dict = {}
+    feed_caratulado: dict = {}
     for r in rows:
         if r.tribunal and (r.rol not in feed_tribunal or r.tribunal < feed_tribunal[r.rol]):
             feed_tribunal[r.rol] = r.tribunal
+        if r.caratulado and r.rol not in feed_caratulado:
+            feed_caratulado[r.rol] = r.caratulado
 
     def _sample(rols) -> List[FeedRow]:
-        return [FeedRow(rol=r, tribunal=feed_tribunal.get(r)) for r in sorted(rols)]
+        # Carry the caratulado through: a missing ROL says nothing on its own,
+        # its caratulado says whose case it is. Rebuilding the row without it
+        # is why the first real run logged "-" for every sample.
+        return [
+            FeedRow(
+                rol=r,
+                tribunal=feed_tribunal.get(r),
+                caratulado=feed_caratulado.get(r),
+            )
+            for r in sorted(rols)
+        ]
 
     nowhere = [r for r in missing if r not in elsewhere]
     samples = {

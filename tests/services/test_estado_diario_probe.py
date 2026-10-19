@@ -1181,3 +1181,25 @@ class TestCaratuladoIsCaptured:
         linea = "\n".join(_logged(log))
         assert "BANCO X / PEREZ" in linea
         assert "C-7-2026" in linea
+
+
+class TestSamplesKeepTheCaratulado:
+    """`_sample` rebuilt FeedRow from scratch with only rol and tribunal, so the
+    caratulado captured by the parser never reached the log: the first real run
+    printed '-' for every row. The caratulado is the whole point of the sample
+    -- a missing ROL says nothing, its caratulado says whose case it is."""
+
+    def test_a_not_in_db_sample_carries_the_caratulado_of_its_feed_row(self, db):
+        rows = [
+            probe.FeedRow(
+                rol="C-13610-2026",
+                tribunal="14º Juzgado Civil de Santiago",
+                caratulado="FRANGOPULOS/PROMOTORA CMR FALABELLA S.A",
+            )
+        ]
+        stats = probe.staleness_stats(
+            lambda: db, rows, datetime(2026, 10, 19, 12, 0), lawyer_id=17
+        )
+        muestra = stats.samples["not_in_db"]
+        assert [r.rol for r in muestra] == ["C-13610-2026"]
+        assert muestra[0].caratulado == "FRANGOPULOS/PROMOTORA CMR FALABELLA S.A"
