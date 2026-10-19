@@ -12,6 +12,8 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from unittest.mock import patch
 
+from dataclasses import replace
+
 import pytest
 
 from app.config import settings
@@ -489,6 +491,37 @@ class TestTriggerCutoff:
         assert alerts(db) == []
         assert summary["created"][color] == 0
         assert summary["suppressed_by_cutoff"] == 1
+
+    @pytest.mark.parametrize("sin_nivel", ["assessment_is_none", "level_is_none"])
+    def test_a_plazo_with_no_level_does_not_alert(
+        self, db, people, monkeypatch, sin_nivel
+    ) -> None:
+        """No level means no reading applies: stay silent, do not guess one.
+
+        ``_candidates`` already drops plazos whose due_date has gone by, so
+        this guard covers what slips past it: an unknown deadline type, or a
+        term that cannot be computed. Without it the code would raise on
+        ``a.level`` (None assessment) or KeyError on ``ALERT_TYPE_BY_LEVEL``,
+        and a crash inside the cycle is exactly what must never happen.
+        """
+        from app.services import semaforo_alerts as mod
+
+        today = D[1]
+        self._aged_deadline(db, make_case(db, people), 1, today)
+        real = mod.assess
+
+        def _no_level(dt, trig, when, term=None):
+            if sin_nivel == "assessment_is_none":
+                return None
+            a = real(dt, trig, when, term)
+            return None if a is None else replace(a, readings=(), level=None)
+
+        monkeypatch.setattr(mod, "assess", _no_level)
+        with smtp_ok() as smtp:
+            summary = run_semaforo_alerts(db, today=today)
+            assert smtp.send_message.call_count == 0
+        assert alerts(db) == []
+        assert summary["errors"] == 0
 
     def test_null_triggered_at_does_not_alert_and_is_not_an_error(
         self, db, people, monkeypatch
