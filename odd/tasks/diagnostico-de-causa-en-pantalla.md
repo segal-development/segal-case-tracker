@@ -91,5 +91,5 @@ Frontend (`segal-deudores-web`, rama por defecto `master`): vitest y
 
 ## Tareas
 
-- [ ] **T1** — Backend: el endpoint con los cuatro veredictos.
+- [x] **T1** — Backend: el endpoint con los cuatro veredictos. Commit `d4dd4a9`.
 - [ ] **T2** — Frontend: la pantalla donde se escribe el ROL o el RUT.
