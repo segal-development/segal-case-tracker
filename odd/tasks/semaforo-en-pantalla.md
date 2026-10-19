@@ -78,7 +78,7 @@ Frontend (`/Users/marcelo/Projects/segal-deudores-web`, rama por defecto
 
 ## Tareas
 
-- [ ] **T1** — Backend: endpoint de solo lectura que devuelve, por plazo fatal,
+- [x] **T1** (3daed52) — Backend: endpoint de solo lectura que devuelve, por plazo fatal,
       el nivel de `assess` y los datos de la causa. Vivos y vencidos recientes.
 - [ ] **T2** — Verificación contra la base real: contar lo que devuelve el
       endpoint y compararlo con 10 vivos / 34 vencidos.
@@ -90,3 +90,9 @@ Frontend (`/Users/marcelo/Projects/segal-deudores-web`, rama por defecto
 
 Documento creado 2026-10-19 tras medir la población. Decisión acordada con
 Marcelo: los tres plazos fatales, no solo excepciones; vivos y vencidos juntos.
+
+- T1 (3daed52): `GET /api/v1/cases/deadlines/semaforo`, servicio `app/services/semaforo_panel.py`.
+- T2 pendiente de ticket: script `scripts/check_semaforo_panel.py` listo (commit "chore(plazos): script para contar el panel...");
+  falta correrlo contra la base real. Diferencias esperadas con 10/34: `apelacion_5d`
+  no tiene semáforo en `assess` (queda fuera de por_vencer) y `acreditar_poder_3d`
+  vencido no es provablemente nuestro (queda fuera de vencidos).
