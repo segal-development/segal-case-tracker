@@ -101,6 +101,12 @@ class Settings(BaseSettings):
     # 8-business-day plazo reaches ROJO ~9-12 calendar days after it triggers,
     # so a value below that silences the very escalation the semaforo exists for.
     SEMAFORO_MAX_TRIGGER_AGE_DAYS: int = 14
+    # Expired-and-unfiled notice: a FATAL plazo whose ``due_date`` passed with
+    # the firm NOT having acted (verdict no_cumplido / fuera_de_plazo) is
+    # announced once, but only while it expired within this many calendar days.
+    # Older ones are history, not something a lawyer can still react to.
+    # 0 or negative = no window (announce every such plazo, however old).
+    SEMAFORO_EXPIRED_WINDOW_DAYS: int = 30
 
     # Email
     SENDGRID_API_KEY: str = ""

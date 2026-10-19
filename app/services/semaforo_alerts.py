@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.core.deadlines_config import FATAL_DEADLINE_VALUES, PARALLEL_DEADLINE_VALUES
 from app.core.semaforo_config import (
     ALERT_TYPE_BY_LEVEL,
     LEVEL_BY_ALERT_TYPE,
@@ -41,6 +42,7 @@ from app.models.case_deadline import CaseDeadline
 from app.models.lawyer import Lawyer
 from app.models.webhook import Webhook
 from app.services.deadline_engine import _firm_side, _today_chile
+from app.services.deadline_verdict import Verdict
 from app.services.deadline_semaforo import (
     EXCEPCIONES,
     PODER,
@@ -55,6 +57,15 @@ logger = logging.getLogger(__name__)
 
 _TYPES = (EXCEPCIONES, PODER)
 _ENTITY_PREFIX = "plazo:"
+
+#: Verdicts that say the firm did NOT act. A NULL verdict is "unknown", not
+#: "did not act", and is deliberately absent: warning about a doubt is noise.
+#: Fatal plazos this notice covers: the config's fatal set minus the parallel
+#: ones. ``acreditar_poder_3d`` is fatal but has its own detection and its own
+#: alert ("ratificar_firma"), and its ownership is not provable from the row.
+_EXPIRED_NOTICE_TYPES = FATAL_DEADLINE_VALUES - PARALLEL_DEADLINE_VALUES
+
+_NOT_ACTED_VERDICTS = (Verdict.NO_CUMPLIDO.value, Verdict.FUERA_DE_PLAZO.value)
 
 
 def entity_type_for(assessment: Assessment) -> str:
@@ -163,6 +174,30 @@ def _candidates(db: Session, today: date) -> List[CaseDeadline]:
         .order_by(CaseDeadline.id)
         .all()
     )
+
+
+def expired_unfiled_deadlines(db: Session, today: date) -> List[CaseDeadline]:
+    """FATAL plazos that expired with the firm NOT having acted. Read-only.
+
+    Selected on the verdict and the date, never on the row ``status`` (the two
+    are independent: a ``superseded`` row can carry ``no_cumplido``). Only
+    ``due_date`` within ``SEMAFORO_EXPIRED_WINDOW_DAYS`` of ``today`` (<= 0 =
+    no window) on a case that is still ``active``.
+    """
+    query = (
+        db.query(CaseDeadline)
+        .join(Case, Case.id == CaseDeadline.case_id)
+        .filter(
+            CaseDeadline.deadline_type.in_(_EXPIRED_NOTICE_TYPES),
+            CaseDeadline.due_date < today,
+            CaseDeadline.verdict.in_(_NOT_ACTED_VERDICTS),
+            Case.status == "active",
+        )
+    )
+    window = settings.SEMAFORO_EXPIRED_WINDOW_DAYS
+    if window > 0:
+        query = query.filter(CaseDeadline.due_date >= today - timedelta(days=window))
+    return query.order_by(CaseDeadline.id).all()
 
 
 def _create_alerts(

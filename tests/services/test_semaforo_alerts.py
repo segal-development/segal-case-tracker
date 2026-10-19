@@ -602,3 +602,89 @@ class TestTriggerCutoff:
         with smtp_ok():
             run_semaforo_alerts(db, today=D[8])
         assert len(alerts(db, "plazo_rojo")) == 3
+
+
+# ---------------------------------------------------------------------------
+# Expired-and-unfiled notice (parallel channel, not a semaforo level)
+# ---------------------------------------------------------------------------
+
+TODAY = date(2026, 11, 20)
+
+
+def make_expired(db, case, *, due=None, verdict="no_cumplido", type_="excepciones_8d",
+                 status="expired", triggered_at=None):
+    due = due or TODAY - timedelta(days=3)
+    row = CaseDeadline(
+        case_id=case.id, deadline_type=type_, due_date=due,
+        triggered_at=triggered_at or due - timedelta(days=12), status=status, is_manual=False,
+        verdict=verdict,
+    )
+    db.add(row)
+    db.commit()
+    return row
+
+
+class TestExpiredSelection:
+    def _select(self, db, today=TODAY):
+        from app.services.semaforo_alerts import expired_unfiled_deadlines
+
+        return [r.id for r in expired_unfiled_deadlines(db, today)]
+
+    @pytest.mark.parametrize("verdict", ["no_cumplido", "fuera_de_plazo"])
+    def test_selects_a_fatal_plazo_the_firm_did_not_act_on(self, db, people, verdict) -> None:
+        row = make_expired(db, make_case(db, people), verdict=verdict)
+        assert self._select(db) == [row.id]
+
+    @pytest.mark.parametrize("type_", ["excepciones_8d", "apelacion_5d"])
+    def test_both_fatal_types_are_selected(self, db, people, type_) -> None:
+        row = make_expired(db, make_case(db, people), type_=type_)
+        assert self._select(db) == [row.id]
+
+    @pytest.mark.parametrize("type_", ["acreditar_poder_3d", "sentencia_10d", "traslado_ejecutante_4d"])
+    def test_non_fatal_types_are_not_selected(self, db, people, type_) -> None:
+        make_expired(db, make_case(db, people), type_=type_)
+        assert self._select(db) == []
+
+    @pytest.mark.parametrize("verdict", [None, "", "cumplido", "registro_tardio"])
+    def test_unknown_or_acted_verdicts_are_excluded(self, db, people, verdict) -> None:
+        make_expired(db, make_case(db, people), verdict=verdict)
+        assert self._select(db) == []
+
+    def test_the_selection_goes_by_verdict_not_by_row_status(self, db, people) -> None:
+        case = make_case(db, people)
+        ids = [
+            make_expired(db, case, status=s, triggered_at=TODAY - timedelta(days=20 + i)).id
+            for i, s in enumerate(("expired", "superseded", "no_cumplido"))
+        ]
+        assert self._select(db) == ids
+
+    def test_a_plazo_still_running_or_due_today_is_not_expired(self, db, people) -> None:
+        case = make_case(db, people)
+        make_expired(db, case, due=TODAY)
+        make_expired(db, case, due=TODAY + timedelta(days=1))
+        assert self._select(db) == []
+
+    def test_only_active_cases(self, db, people) -> None:
+        make_expired(db, make_case(db, people, status="archived"))
+        assert self._select(db) == []
+
+    def test_the_window_boundary_is_inclusive(self, db, people, monkeypatch) -> None:
+        monkeypatch.setattr(settings, "SEMAFORO_EXPIRED_WINDOW_DAYS", 30)
+        case = make_case(db, people)
+        inside = make_expired(db, case, due=TODAY - timedelta(days=30))
+        make_expired(db, case, due=TODAY - timedelta(days=31))
+        assert self._select(db) == [inside.id]
+
+    @pytest.mark.parametrize("value", [0, -5])
+    def test_zero_or_negative_means_no_window(self, db, people, monkeypatch, value) -> None:
+        monkeypatch.setattr(settings, "SEMAFORO_EXPIRED_WINDOW_DAYS", value)
+        row = make_expired(db, make_case(db, people), due=TODAY - timedelta(days=900))
+        assert self._select(db) == [row.id]
+
+    def test_the_default_window_is_30_days(self) -> None:
+        assert settings.SEMAFORO_EXPIRED_WINDOW_DAYS == 30
+
+    def test_selection_has_no_side_effects(self, db, people) -> None:
+        make_expired(db, make_case(db, people))
+        self._select(db)
+        assert alerts(db) == []
