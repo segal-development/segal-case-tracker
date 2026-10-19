@@ -80,7 +80,7 @@ Frontend (`/Users/marcelo/Projects/segal-deudores-web`, rama por defecto
 
 - [x] **T1** (3daed52) — Backend: endpoint de solo lectura que devuelve, por plazo fatal,
       el nivel de `assess` y los datos de la causa. Vivos y vencidos recientes.
-- [x] **T1b** (596071d) — Escala de `apelacion_5d` en `assess` (verde 1-2, amarillo 3-4, rojo 5; término único, confirmado).
+- [x] **T1b** (9f6793b) — Escala de `apelacion_5d` en `assess` (verde 1-2, amarillo 3-4, rojo 5; término único, confirmado).
 - [ ] **T2** — Verificación contra la base real: contar lo que devuelve el
       endpoint y compararlo con 10 vivos / 34 vencidos.
 - [ ] **T3** — Frontend: el panel en el inicio, con colores.
