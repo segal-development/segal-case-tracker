@@ -104,6 +104,8 @@ from app.models.alert import Alert
 from app.models.lawyer import Lawyer
 from app.models.sync_history import SyncHistory
 from app.models.webhook import Webhook
+from app.models.case_deadline import CaseDeadline
+from app.core.deadlines_config import FATAL_DEADLINE_VALUES
 from app.models.case_litigante import CaseLitigante
 from app.models.case_notificacion import CaseNotificacion
 from app.models.case_escrito import CaseEscrito
@@ -1795,6 +1797,29 @@ def _select_cases_for_detail_rotation(
     # the dominant backfill signal, so it goes FIRST — ahead of reserved/
     # last_detail/filed. A correlated scalar subquery keeps it portable across
     # Postgres and SQLite (no LEFT JOIN + GROUP BY needed).
+    # HIGHEST priority: a FATAL plazo about to expire. Re-reading the case
+    # before the window closes is the only way to notice the firm already
+    # acted -- otherwise we keep telling a lawyer to do what he did (real
+    # incident 2026-10-20, C-4124-2026) and we also miss a genuine lapse.
+    # Already-expired plazos are excluded on purpose: re-reading changes
+    # nothing for them and they would starve the live ones.
+    if settings.DETAIL_FATAL_PLAZO_DAYS > 0:
+        hoy = _today_chile()
+        plazo_fatal_inminente = (
+            select(func.count(CaseDeadline.id))
+            .where(
+                CaseDeadline.case_id == Case.id,
+                CaseDeadline.status == "active",
+                CaseDeadline.deadline_type.in_(tuple(FATAL_DEADLINE_VALUES)),
+                CaseDeadline.due_date >= hoy,
+                CaseDeadline.due_date
+                <= hoy + timedelta(days=settings.DETAIL_FATAL_PLAZO_DAYS),
+            )
+            .correlate(Case)
+            .scalar_subquery()
+        )
+        order_clauses.insert(0, plazo_fatal_inminente.desc())
+
     if settings.DETAIL_PENDING_DOCS_FIRST:
         pending_docs = (
             select(func.count(Document.id))
