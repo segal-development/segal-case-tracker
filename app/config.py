@@ -108,11 +108,16 @@ class Settings(BaseSettings):
     # 0 or negative = no window (announce every such plazo, however old).
     SEMAFORO_EXPIRED_WINDOW_DAYS: int = 30
     # Excepciones term (business days): legally 4 or 8 depending on where the
-    # requerimiento was served, and no source we have says where. 0 = unknown,
-    # keep both readings (default). 4 or 8 = the firm tells us its cases always
-    # run that way, so the plazo is assessed with that single confirmed term.
-    # Anything else is rejected at load. Reversible by env, no deploy of code.
-    SEMAFORO_EXCEPCIONES_TERM_DAYS: int = 0
+    # requerimiento was served, and no source we have says where. 4 or 8 pins
+    # that single term for every excepciones plazo; 0 = unknown, keep BOTH
+    # readings. Anything else is rejected at load. Reversible by env, no deploy.
+    #
+    # Default 8, by the firm's own instruction: drop the 4-day reading and keep
+    # only the 8-day one. It is a DEFAULT and not an env var on purpose -- this
+    # value has to hold wherever the code runs, and setting it only on the
+    # scraping station (its LaunchAgent plist) left the API still on 0, so the
+    # panel kept printing "Plazo no confirmado: 4 días / 8 días" to the lawyers.
+    SEMAFORO_EXCEPCIONES_TERM_DAYS: int = 8
 
     # Email
     SENDGRID_API_KEY: str = ""
