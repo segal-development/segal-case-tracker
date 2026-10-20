@@ -195,6 +195,20 @@ class DocumentPersistenceService:
                 if doc is not None:
                     results.append(doc)
 
+            # Escrito-linked rows a movement may adopt (in memory; see
+            # _adopt_escrito_document). Built once, before the movement loop.
+            adoptable: dict = {}
+            for d in existing_docs.values():
+                if (
+                    d.doc_type == "escrito_doc"
+                    and d.escrito_id is not None
+                    and d.movement_id is None
+                    and d.case_id == case_id
+                    and d.document_date is not None
+                    and d not in adoptable.setdefault(d.document_date.date(), [])
+                ):
+                    adoptable[d.document_date.date()].append(d)
+
             # ------------------------------------------------------------
             # 2. Movement-level documents
             # ------------------------------------------------------------
@@ -243,6 +257,15 @@ class DocumentPersistenceService:
                         case_rol,
                         scope_key=pjud_movement.folio,
                     )
+                    if pjud_doc.doc_type == "escrito_doc" and movement_id is not None:
+                        self._adopt_escrito_document(
+                            case_id=case_id,
+                            movement_id=movement_id,
+                            token_hash=token_hash,
+                            document_date=document_date,
+                            existing_by_hash=existing_docs,
+                            adoptable=adoptable,
+                        )
                     doc = self._upsert_document(
                         db=db,
                         case_id=case_id,
@@ -326,6 +349,53 @@ class DocumentPersistenceService:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _adopt_escrito_document(
+        case_id: int,
+        movement_id: int,
+        token_hash: str,
+        document_date: Optional[datetime],
+        existing_by_hash: dict,
+        adoptable: dict,
+    ) -> None:
+        """Let a movement ``escrito_doc`` reuse the row already queued for its escrito.
+
+        Order "escrito first, movement later": the escrito pane queued the PDF, then
+        the court resolved the escrito and the movement carries the same PDF. The two
+        hashes can never match (see the same-date guard in ``persist_from_detail``),
+        so without this the movement would insert a second row. Instead the movement
+        takes over the escrito's row: one row, both ``escrito_id`` and ``movement_id``.
+
+        Only called for ``escrito_doc`` documents of a persisted movement, so no other
+        document type can be affected. Works purely on the prefetched map, no query:
+        it registers the chosen row under the movement's hash in ``existing_by_hash``
+        so ``_upsert_document`` applies its usual rules (stored rows are untouched,
+        pending/failed refresh the JWT). A row is adopted at most once: it leaves
+        ``adoptable`` and, once it has a ``movement_id``, is never a candidate again.
+        """
+        if token_hash in existing_by_hash:
+            return  # this movement already has its own row: normal path
+
+        # Later cycles: the movement's document already lives on an adopted row
+        # (hash of the escrito, movement_id of this movement).
+        for d in existing_by_hash.values():
+            if (
+                d.doc_type == "escrito_doc"
+                and d.escrito_id is not None
+                and d.movement_id == movement_id
+            ):
+                existing_by_hash[token_hash] = d
+                return
+
+        if document_date is None:
+            return
+        candidates = adoptable.get(document_date.date())
+        if not candidates:
+            return
+        row = candidates.pop(0)
+        row.movement_id = movement_id
+        existing_by_hash[token_hash] = row
 
     @staticmethod
     def _escrito_doc_counts_by_date(existing_by_hash: dict) -> Counter:

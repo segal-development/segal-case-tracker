@@ -374,3 +374,94 @@ def test_an_already_queued_escrito_document_keeps_refreshing(db, seeded):
 
     _, from_escritos = _docs_by_link(db)
     assert [d.pjud_token for d in from_escritos] == ["esc-2"]
+
+
+# ---------------------------------------------------------------------------
+# Escrito queued first, movement arrives later: the movement ADOPTS the row
+# ---------------------------------------------------------------------------
+
+
+def _two_escritos_same_day():
+    return [
+        PJUDEscrito("10/03/2024", "Escrito A", "DEUDOR UNO", True, False, "esc-a"),
+        PJUDEscrito("10/03/2024", "Escrito B", "DEUDOR UNO", True, False, "esc-b"),
+    ]
+
+
+def test_movement_adopts_the_queued_escrito_document(db, seeded):
+    _, case = seeded
+    escritos = [_escrito(10, "esc-1")]
+    _persist(db, case, _detail(escritos))
+    db.commit()
+    _add_movements(db, case, ("1", "10/03/2024"))
+    movement = _movement_with_escrito_doc("1", "10/03/2024")
+
+    _persist(db, case, _detail(escritos, movements=[movement]))
+    db.commit()
+    # A further cycle must stay at one row (adoption is stable, not re-inserted).
+    _persist(db, case, _detail(escritos, movements=[movement]))
+    db.commit()
+
+    rows = db.query(Document).all()
+    assert len(rows) == 1
+    assert rows[0].escrito_id is not None
+    assert rows[0].movement_id is not None
+
+
+def test_adopting_a_stored_escrito_document_keeps_status_and_gcs_path(db, seeded):
+    _, case = seeded
+    escritos = [_escrito(10, "esc-1")]
+    _persist(db, case, _detail(escritos))
+    row = db.query(Document).one()
+    row.status = "stored"
+    row.gcs_path = "bucket/path.pdf"
+    db.commit()
+    _add_movements(db, case, ("1", "10/03/2024"))
+
+    _persist(
+        db,
+        case,
+        _detail(escritos, movements=[_movement_with_escrito_doc("1", "10/03/2024")]),
+    )
+    db.commit()
+
+    row = db.query(Document).one()
+    assert row.movement_id is not None and row.escrito_id is not None
+    assert row.status == "stored"
+    assert row.gcs_path == "bucket/path.pdf"
+    assert row.pjud_token == "esc-1"  # stored rows are never touched
+
+
+def test_movement_escrito_doc_without_a_matching_escrito_inserts_as_before(db, seeded):
+    _, case = seeded
+    _add_movements(db, case, ("1", "10/03/2024"))
+
+    _persist(
+        db,
+        case,
+        _detail([], movements=[_movement_with_escrito_doc("1", "10/03/2024")]),
+    )
+
+    row = db.query(Document).one()
+    assert row.movement_id is not None
+    assert row.escrito_id is None
+    assert row.doc_type == "escrito_doc"
+
+
+def test_two_same_day_escritos_with_one_movement_doc_adopt_exactly_one(db, seeded):
+    _, case = seeded
+    escritos = _two_escritos_same_day()
+    _persist(db, case, _detail(escritos))
+    db.commit()
+    assert db.query(Document).count() == 2
+    _add_movements(db, case, ("1", "10/03/2024"))
+    movement = _movement_with_escrito_doc("1", "10/03/2024")
+
+    _persist(db, case, _detail(escritos, movements=[movement]))
+    db.commit()
+    _persist(db, case, _detail(escritos, movements=[movement]))
+    db.commit()
+
+    rows = db.query(Document).all()
+    assert len(rows) == 2
+    assert sorted(d.movement_id is not None for d in rows) == [False, True]
