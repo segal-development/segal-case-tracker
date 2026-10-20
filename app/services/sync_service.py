@@ -192,10 +192,31 @@ class SyncResult:
     cases_total: int = 0
     cases_new: int = 0
     cases_updated: int = 0
+    #: Nuevas descartadas por el piso de anio (DETAIL_MIN_YEAR). Se cuentan
+    #: para que el listado cuadre: sin esto, cases_new + cases_updated <
+    #: cases_total no se puede interpretar y una perdida real pasa inadvertida.
+    cases_year_skipped: int = 0
     movements_new: int = 0
     alerts_created: int = 0
     errors: List[str] = None
     
+    @property
+    def cases_unaccounted(self) -> int:
+        """Cases the listing produced that landed in no bucket.
+
+        Zero is the healthy value. Anything above it is a case the scraper saw
+        and the database never got, without an error and without the year
+        floor explaining it -- the silent leak.
+        """
+        return max(
+            0,
+            self.cases_total
+            - self.cases_new
+            - self.cases_updated
+            - self.cases_year_skipped
+            - len(self.errors or []),
+        )
+
     def __post_init__(self):
         if self.errors is None:
             self.errors = []
@@ -931,6 +952,7 @@ class SyncService:
                 def _process_chunk(chunk=chunk):
                     chunk_new = 0
                     chunk_updated = 0
+                    chunk_year_skipped = 0
                     chunk_errors: List[str] = []
                     for scraped in chunk:
                         # Year floor: never CREATE a case older than DETAIL_MIN_YEAR
@@ -941,6 +963,7 @@ class SyncService:
                             scraped.rol.strip().upper() not in existing_by_rol
                             and not rol_year_ok(scraped.rol)
                         ):
+                            chunk_year_skipped += 1
                             continue
                         try:
                             case, is_new = self._upsert_case(
@@ -953,14 +976,33 @@ class SyncService:
                                 chunk_updated += 1
                         except Exception as e:
                             chunk_errors.append(f"Error syncing {scraped.rol}: {str(e)}")
-                    return chunk_new, chunk_updated, chunk_errors
+                    return chunk_new, chunk_updated, chunk_year_skipped, chunk_errors
 
-                chunk_new, chunk_updated, chunk_errors = self._commit_with_retry(
+                (
+                    chunk_new,
+                    chunk_updated,
+                    chunk_year_skipped,
+                    chunk_errors,
+                ) = self._commit_with_retry(
                     _process_chunk, caches=(existing_by_rol, self._court_cache)
                 )
                 result.cases_new += chunk_new
                 result.cases_updated += chunk_updated
+                result.cases_year_skipped += chunk_year_skipped
                 result.errors.extend(chunk_errors)
+
+            # Reconcile: every case the listing produced must land in exactly one
+            # bucket. `unaccounted` is the one that matters -- a case neither
+            # created, updated, year-skipped nor errored vanished silently, and
+            # that is the leak behind the cases whose caratulado is a client of
+            # the firm. Zero means the listing is fully persisted.
+            logger.info(
+                "LISTING_RECONCILE lawyer=%s competencia=%s scraped=%d new=%d "
+                "updated=%d year_skipped=%d errors=%d unaccounted=%d",
+                lawyer_id, competencia, result.cases_total, result.cases_new,
+                result.cases_updated, result.cases_year_skipped,
+                len(result.errors), result.cases_unaccounted,
+            )
 
             def _finalize_sync_record():
                 # Guards the (rare) case where this is the very first commit
