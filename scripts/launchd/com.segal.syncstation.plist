@@ -97,6 +97,13 @@
          de antes, asi que apagarlo es el camino de vuelta. -->
     <key>DETAIL_FEED_PRIORITY_ENABLED</key>
     <string>true</string>
+    <!-- El estudio informo (2026-10-19) que ya no usa el termino de 4 dias
+         para oponer excepciones: para ellos siempre son 8 habiles. 0 = no se
+         sabe y se muestran las dos lecturas (el default del codigo). Si
+         aparece una causa requerida dentro de la comuna del tribunal, volver
+         a 0 aca y reiniciar: sin deploy. -->
+    <key>SEMAFORO_EXCEPCIONES_TERM_DAYS</key>
+    <string>8</string>
   </dict>
 
   <key>RunAtLoad</key>
