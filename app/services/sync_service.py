@@ -1820,6 +1820,61 @@ def _select_cases_for_detail_rotation(
     order_clauses = []
     if reserved_first:
         order_clauses.append(Case.consulta_reserved.desc())
+    # Secondary-cuaderno demotion. PJUD splits one judicial case into cuadernos:
+    # the main one ("Principal") plus secondary ones (medidas prejudiciales,
+    # incidentes, apremios). We keep ONE Case row per cuaderno, so without this
+    # the rotation spends most of its budget re-reading cuadernos instead of
+    # real cases -- measured 2026-10-20 on QA, 60% of the 1.082 daily detail
+    # reads, with one lawyer burning 131 of its 156 daily reads on 199 medidas
+    # prejudiciales re-read every 1,5 days.
+    #
+    # WHICH FIELD: Case.procedure, written as ``procedure = scraped.cuaderno``
+    # by sync/ingest. It is the per-row cuaderno and is never NULL in
+    # production (measured: 0 of 15.201 rows). Case.listing_cuaderno_raw is NOT
+    # usable here: it stores the whole listing cell, which CONCATENATES every
+    # cuaderno of that listing row ("Incidente Nulidad de lo Obrado |
+    # Principal"), and it is NULL for the 4.064 rows never detail-scraped.
+    #
+    # The rule SINKS a row, it never removes it. An inert secondary cuaderno
+    # read less than N days ago sorts below everything else; past N days it
+    # rejoins the rotation at its true age, and when there is nothing else to
+    # scrape it still fills the batch. Never sunk:
+    #   - the Principal cuaderno;
+    #   - a row whose cuaderno we cannot identify (NULL/blank): unknown means
+    #     "treat as a real case", because being wrong that way is safe and
+    #     being wrong the other way blinds the firm;
+    #   - any row carrying a LIVE deadline (active, not yet due). 13 of the 54
+    #     live deadlines measured that day lived on a secondary cuaderno, so
+    #     dropping those rows would blind a quarter of the live fatal plazos.
+    # Sits BELOW the fatal-plazo / pending-docs / reserved slots (inserted at
+    # the head below) and ABOVE the age rotation, so no priority slot loses.
+    if (
+        settings.DETAIL_SECONDARY_CUADERNO_DEMOTE
+        and settings.DETAIL_SECONDARY_CUADERNO_MIN_DAYS > 0
+    ):
+        cuaderno = func.lower(func.trim(func.coalesce(Case.procedure, "")))
+        plazos_vivos = (
+            select(func.count(CaseDeadline.id))
+            .where(
+                CaseDeadline.case_id == Case.id,
+                CaseDeadline.status == "active",
+                CaseDeadline.due_date >= _today_chile(),
+            )
+            .correlate(Case)
+            .scalar_subquery()
+        )
+        leido_hace_poco = datetime.utcnow() - timedelta(
+            days=settings.DETAIL_SECONDARY_CUADERNO_MIN_DAYS
+        )
+        cuaderno_secundario_inerte = and_(
+            cuaderno != "",
+            cuaderno.notlike("principal%"),
+            plazos_vivos == 0,
+            Case.last_detail_checked_at.isnot(None),
+            Case.last_detail_checked_at > leido_hace_poco,
+        )
+        # False sorts before True, so the sunk rows go last.
+        order_clauses.append(cuaderno_secundario_inerte.asc())
     # NULLS FIRST only matters for scope "all" (never-detailed go first). Under
     # "fresh" there are no NULLs in the set, so this reads as "least recently
     # checked first"; under "backlog" every row is NULL, so filed_at DESC decides.
