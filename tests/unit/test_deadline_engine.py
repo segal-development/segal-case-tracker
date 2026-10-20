@@ -401,7 +401,9 @@ class TestDemandadoEscritoClosesExcepciones:
         """The most important guard: a really missed plazo keeps warning."""
         case = self._seed(db)
         _recompute(db, case)
-        assert self._row(db, case).status == "active"
+        # Overdue and unanswered: closed as "expired" (a lapsed MANDATORY plazo
+        # reads as ROJO) instead of lingering "active" with a date in the past.
+        assert self._row(db, case).status == "expired"
         assert case.semaforo == "rojo"
 
     @pytest.mark.parametrize(
@@ -417,7 +419,7 @@ class TestDemandadoEscritoClosesExcepciones:
         case = self._seed(db)
         _add_escrito(db, case.id, self.due, tipo=tipo)
         _recompute(db, case)
-        assert self._row(db, case).status == "active"
+        assert self._row(db, case).status == "expired"  # not closed as cumplido
         assert case.semaforo == "rojo"
 
     @pytest.mark.parametrize("solicitante", ["Demandante", "Ejecutante", "Tribunal"])
@@ -425,14 +427,14 @@ class TestDemandadoEscritoClosesExcepciones:
         case = self._seed(db)
         _add_escrito(db, case.id, self.due, solicitante=solicitante)
         _recompute(db, case)
-        assert self._row(db, case).status == "active"
+        assert self._row(db, case).status == "expired"  # not closed as cumplido
         assert case.semaforo == "rojo"
 
     def test_escrito_without_date_does_not_close(self, db) -> None:
         case = self._seed(db)
         _add_escrito(db, case.id, None)
         _recompute(db, case)
-        assert self._row(db, case).status == "active"
+        assert self._row(db, case).status == "expired"  # not closed as cumplido
 
     def test_manual_row_is_never_overwritten(self, db) -> None:
         from app.services.business_days import add_business_days
@@ -791,7 +793,8 @@ class TestAutoPruebaSubDeadlines:
                 .filter(
                     CaseDeadline.case_id == case.id,
                     CaseDeadline.deadline_type == dtype.value,
-                    CaseDeadline.status == "active",
+                    # The seeded dates are long past: a lapsed plazo is "expired".
+                    CaseDeadline.status.in_(("active", "expired")),
                 )
                 .first()
             )
@@ -873,7 +876,7 @@ class TestCitacionSentenciaRealTexts:
             .filter(
                 CaseDeadline.case_id == case.id,
                 CaseDeadline.deadline_type == DeadlineType.TERMINO_PROBATORIO_10D.value,
-                CaseDeadline.status == "active",
+                CaseDeadline.status.in_(("active", "expired")),
             )
             .first()
         )
@@ -887,7 +890,7 @@ class TestCitacionSentenciaRealTexts:
             .filter(
                 CaseDeadline.case_id == case.id,
                 CaseDeadline.deadline_type == DeadlineType.SENTENCIA_10D.value,
-                CaseDeadline.status == "active",
+                CaseDeadline.status.in_(("active", "expired")),  # seeded dates are past
             )
             .first()
         )

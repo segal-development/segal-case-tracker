@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -52,6 +52,8 @@ from app.models.case_escrito import CaseEscrito
 from app.models.movement import Movement
 from app.services.business_days import add_business_days, count_business_days_remaining
 from app.services.deadline_verdict import (
+    DETECTORS,
+    default_margin_days,
     evaluate_deadline,
     is_excepciones_escrito,
     verdict_rank,
@@ -477,6 +479,14 @@ class DeadlineEngine:
                 CaseDeadline.deadline_type.notin_(PARALLEL_DEADLINE_VALUES),
                 or_(
                     CaseDeadline.status == "active",
+                    # A plazo step 6b closed ("expired") is still ours to
+                    # supersede when the case advances: left alone it would
+                    # keep the semáforo ROJO for a state that no longer exists.
+                    and_(
+                        CaseDeadline.status == "expired",
+                        CaseDeadline.marked_by.is_(None),
+                        CaseDeadline.marked_at.is_(None),
+                    ),
                     and_(
                         CaseDeadline.deadline_type == DeadlineType.EXCEPCIONES_8D.value,
                         CaseDeadline.status.in_(("superseded", "expired")),
@@ -491,8 +501,21 @@ class DeadlineEngine:
             )
             .all()
         )
-        closed_candidates = [r for r in all_active if r.status != "active"]
-        all_active = [r for r in all_active if r.status == "active"]
+        # "expired" rows are re-derived like live ones, except the excepciones
+        # rebeldía closure (demandante), which is final by design and only
+        # re-judged against escritos.
+        def _is_rebeldia_closure(r: CaseDeadline) -> bool:
+            return (
+                r.status == "expired"
+                and r.deadline_type == DeadlineType.EXCEPCIONES_8D.value
+                and side == "demandante"
+            )
+
+        closed_candidates = [
+            r for r in all_active
+            if r.status == "superseded" or _is_rebeldia_closure(r)
+        ]
+        all_active = [r for r in all_active if r not in closed_candidates]
         for row in all_active:
             current_trigger = new_trigger_keys.get(row.deadline_type)
             # DEMANDADO: a filed defense is judged FIRST. It must win over every
@@ -590,12 +613,19 @@ class DeadlineEngine:
             ):
                 proc_state = ProceduralState.REBELDE
                 cls._record_verdict(exc_row, movements, today, escritos)
-                exc_row.status = "expired"
+                exc_row.status = "expired"  # rebeldía; also used by step 6b
                 db.flush()
 
         # Step 6b: an overdue plazo that is still active (nothing moved on yet)
         # is already a closed question: record it now instead of waiting for it
         # to be superseded. A plazo still in force stays sin determinar.
+        #
+        # Once its term (publication margin included) is over, the row is also
+        # CLOSED as "expired". Leaving it "active" made a plazo from months ago
+        # drive ``next_deadline_at`` and the semáforo forever. "expired" keeps
+        # the meaning the semáforo already gives it ("a MANDATORY plazo lapsed
+        # => ROJO"), so a missed obligation is not silently turned green. Rows
+        # an auditor touched are left alone.
         overdue_active = (
             db.query(CaseDeadline)
             .filter(
@@ -608,6 +638,13 @@ class DeadlineEngine:
         )
         for row in overdue_active:
             cls._record_verdict(row, movements, today, escritos)
+            if (
+                row.status == "active"
+                and row.marked_by is None
+                and row.marked_at is None
+                and cls._term_elapsed(row, today)
+            ):
+                row.status = "expired"
         db.flush()
 
         # Step 6c: a plazo closed BEFORE its escrito was known keeps a stale miss
@@ -861,6 +898,20 @@ class DeadlineEngine:
             )
             cls._clear_verdict(row)
 
+    @classmethod
+    def _term_elapsed(cls, row: CaseDeadline, today: date) -> bool:
+        """Whether ``row`` is genuinely finished, so it may leave the active set.
+
+        Judged on the EFFECTIVE due date (``_current_due_date``), never the raw
+        column, which can be stale on a re-anchored row. Types with a verdict
+        detector also wait out the publication margin: an act filed on time can
+        be published late, and closing the row earlier would freeze a false
+        miss (the bug fixed in PR #379). Types without a detector have no
+        verdict to protect, so their term ends on the due date.
+        """
+        margin = default_margin_days(row.deadline_type) if row.deadline_type in DETECTORS else 0
+        return cls._current_due_date(row) + timedelta(days=margin) < today
+
     @staticmethod
     def _current_due_date(row: CaseDeadline) -> date:
         """due_date the plazo SHOULD have today.
@@ -931,8 +982,10 @@ class DeadlineEngine:
                         computed_at=datetime.now(timezone.utc),
                     )
                     db.add(current_row)
-                elif not existing.is_manual and existing.status == "active":
-                    # Only "active" rows are refreshed. Audited (cumplido /
+                elif not existing.is_manual and existing.status in ("active", "expired"):
+                    # Only "active" rows (and "expired", which step 6b writes
+                    # for a lapsed plazo and re-derives every run, so a late
+                    # act can still turn it cumplido) are refreshed. Audited (cumplido /
                     # no_cumplido) and manual rows are the auditor's call, and a
                     # "superseded" row is deliberately NOT resurrected: that keeps
                     # the step-5 exclusion the single guard against silent loss
@@ -960,7 +1013,7 @@ class DeadlineEngine:
                 .filter(
                     CaseDeadline.case_id == case_id,
                     CaseDeadline.deadline_type == dtype.value,
-                    CaseDeadline.status == "active",
+                    CaseDeadline.status.in_(("active", "expired")),
                     CaseDeadline.is_manual == False,  # noqa: E712
                 )
                 .all()
