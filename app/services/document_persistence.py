@@ -73,12 +73,19 @@ class DocumentPersistenceService:
         detail: "PJUDCaseDetail",  # type: ignore[name-defined]  # noqa: F821
         case_id: int,
         db: Session,
+        escrito_rows: Optional[list] = None,
     ) -> List["Document"]:  # type: ignore[name-defined]  # noqa: F821
         """Upsert all Document rows from parsed case detail.
 
         Iterates:
         - detail.case_documents  (texto_demanda, cert_envio, ebook)
         - movement.documentos for each movement in detail.movements
+        - detail.escritos that carry a document (linked via ``Document.escrito_id``)
+
+        ``escrito_rows`` is the ``(CaseEscrito, is_new)`` list that
+        ``_sync_entities(..., SPEC_ESCRITO)`` already returned for this case. Passing
+        it saves a SELECT; when omitted the case's escritos are queried (only if the
+        detail actually has an escrito with a document).
 
         Also sets Movement.document_token = pjud_movement.documento_token
         (the bug fix: tokens were parsed but never written to the DB).
@@ -129,6 +136,16 @@ class DocumentPersistenceService:
                             pjud_doc.doc_type, case_rol, scope_key=pjud_movement.folio
                         )
                     )
+        # Escritos live in their own PJUD pane and have no folio, so their identity
+        # is scoped by the escrito's own natural key. The same PDF arriving later
+        # as a movement (once the court resolves the escrito) hashes under the
+        # movement's folio instead, so it is a separate row: there is no key the
+        # two panes share.
+        escrito_docs = self._escritos_with_documents(detail, case_id, db, escrito_rows)
+        for escrito_row, pjud_doc, _scope in escrito_docs:
+            wanted_hashes.add(
+                document_identity_hash(pjud_doc.doc_type, case_rol, scope_key=_scope)
+            )
         existing_docs: dict = (
             {
                 d.pjud_token_hash: d
@@ -237,6 +254,25 @@ class DocumentPersistenceService:
                     if doc is not None:
                         results.append(doc)
 
+            # ------------------------------------------------------------
+            # 3. Escrito-level documents (Escritos pane, no movement yet)
+            # ------------------------------------------------------------
+            for escrito_row, pjud_doc, scope in escrito_docs:
+                doc = self._upsert_document(
+                    db=db,
+                    case_id=case_id,
+                    movement_id=None,
+                    pjud_doc=pjud_doc,
+                    token_hash=document_identity_hash(
+                        pjud_doc.doc_type, case_rol, scope_key=scope
+                    ),
+                    existing_by_hash=existing_docs,
+                    document_date=escrito_row.fecha_ingreso,
+                    escrito_id=escrito_row.id,
+                )
+                if doc is not None:
+                    results.append(doc)
+
             # Single flush for all document inserts/updates + movement token writes
             # (was a flush per document/movement — one round-trip each over the proxy).
             db.flush()
@@ -260,6 +296,57 @@ class DocumentPersistenceService:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _escritos_with_documents(
+        detail: "PJUDCaseDetail",  # type: ignore[name-defined]  # noqa: F821
+        case_id: int,
+        db: Session,
+        escrito_rows: Optional[list],
+    ) -> list:
+        """Return ``(CaseEscrito, PJUDDocument, scope_key)`` for each escrito with a PDF.
+
+        Only escritos flagged ``tiene_documento`` with a ``doc_token`` qualify. The
+        escrito pane does not expose which PHP handler serves the file; escritos are
+        unsigned documents, so they are served by ``docuN.php`` (the same handler and
+        ``escrito_doc`` type the movement parser assigns to unsigned documents).
+        """
+        candidates = [e for e in detail.escritos if e.tiene_documento and e.doc_token]
+        if not candidates:
+            return []
+
+        # Lazy import: sync_service imports this module at load time.
+        from app.models.case_escrito import CaseEscrito
+        from app.scrapper.pjud.base import PJUDDocument
+        from app.services.sync_service import escrito_natural_key
+
+        if escrito_rows is not None:
+            rows_by_key = {row.natural_key: row for row, _is_new in escrito_rows}
+        else:
+            rows_by_key = {
+                row.natural_key: row
+                for row in db.query(CaseEscrito)
+                .filter(CaseEscrito.case_id == case_id)
+                .all()
+            }
+
+        out: list = []
+        for escrito in candidates:
+            key = escrito_natural_key(escrito)
+            row = rows_by_key.get(key)
+            if row is None or row.id is None:
+                continue
+            pjud_doc = PJUDDocument(
+                token=escrito.doc_token,
+                tipo="principal",
+                url_type="docuN",
+                doc_type="escrito_doc",
+                endpoint="documentos/docuN.php",
+                param_name="dtaDoc",
+                available=True,
+            )
+            out.append((row, pjud_doc, f"escrito:{key}"))
+        return out
+
+    @staticmethod
     def _upsert_document(
         db: Session,
         case_id: int,
@@ -268,6 +355,7 @@ class DocumentPersistenceService:
         token_hash: str,
         existing_by_hash: dict,
         document_date: Optional[datetime] = None,
+        escrito_id: Optional[int] = None,
     ) -> Optional["Document"]:  # type: ignore[name-defined]  # noqa: F821
         """INSERT-or-UPDATE a single Document row using a prefetched existence map.
 
@@ -280,6 +368,9 @@ class DocumentPersistenceService:
         - status=stored → skip entirely (already downloaded; do not overwrite)
         - status=pending or failed → refresh pjud_token (JWT rotated)
         - not found → insert
+
+        ``escrito_id`` links a document that originated in the Escritos pane (it
+        has no movement yet); ``movement_id`` and ``escrito_id`` are independent.
 
         Returns the Document ORM object (inserted or existing).
         """
@@ -300,6 +391,7 @@ class DocumentPersistenceService:
         doc = Document(
             case_id=case_id,
             movement_id=movement_id,
+            escrito_id=escrito_id,
             doc_type=pjud_doc.doc_type,
             pjud_endpoint=pjud_doc.endpoint,
             pjud_token=pjud_doc.token,

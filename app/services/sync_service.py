@@ -2749,13 +2749,14 @@ async def detect_and_sync_movements(
 
             # 2. Sync entity types in priority order (S1-T12 + S2-T03).
             # Litigantes are stored but SILENT (ADR-004); the rest alert + notify.
+            escrito_rows = None
             for entity_list, spec in [
                 (detail.litigantes, SPEC_LITIGANTE),
                 (detail.notificaciones, SPEC_NOTIFICACION),
                 (detail.escritos, SPEC_ESCRITO),
                 (detail.exhortos, SPEC_EXHORTO),
             ]:
-                _sync_entities(
+                synced = _sync_entities(
                     db,
                     int(db_case.id),
                     entity_list,
@@ -2766,12 +2767,14 @@ async def detect_and_sync_movements(
                     notification_svc=notification_svc,
                     budget=shared_budget,
                 )
+                if spec is SPEC_ESCRITO:
+                    escrito_rows = synced
 
             # 3. Persist document tokens (Slice 1 — S1-T13).
             # Must run after sync_movements so that Movement rows exist for
             # the folio-based lookup inside persist_from_detail.
             persisted_docs = DocumentPersistenceService().persist_from_detail(
-                detail, int(db_case.id), db
+                detail, int(db_case.id), db, escrito_rows=escrito_rows
             )
 
             # Mark this case as detail-checked so the rotation scheduler
@@ -3363,20 +3366,23 @@ async def sync_via_consulta(
                         case.rol, new_count, alert_count,
                     )
 
+                escrito_rows = None
                 for entity_list, spec in [
                     (detail.litigantes, SPEC_LITIGANTE),
                     (detail.notificaciones, SPEC_NOTIFICACION),
                     (detail.escritos, SPEC_ESCRITO),
                     (detail.exhortos, SPEC_EXHORTO),
                 ]:
-                    _sync_entities(
+                    synced = _sync_entities(
                         db, int(case.id), entity_list, spec,
                         case=case, lawyer=lawyer, webhooks=webhooks,
                         notification_svc=notification_svc, budget=shared_budget,
                     )
+                    if spec is SPEC_ESCRITO:
+                        escrito_rows = synced
 
                 persisted_docs = DocumentPersistenceService().persist_from_detail(
-                    detail, int(case.id), db
+                    detail, int(case.id), db, escrito_rows=escrito_rows
                 )
 
                 case.consulta_reserved = False
