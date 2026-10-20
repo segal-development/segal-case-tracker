@@ -1991,7 +1991,24 @@ def _select_cases_for_detail_rotation(
     feed_slots = 0
     if settings.DETAIL_FEED_PRIORITY_ENABLED and priority_rols:
         feed_keys = {r.strip().upper() for r in priority_rols if r and r.strip()}
-        feed_slots = min(max(settings.DETAIL_FEED_MAX_PER_BATCH, 0), batch_size)
+        # The cap is a SHARE of the batch, not an absolute number.
+        #
+        # It was written against DETAIL_BATCH_SIZE, the batch the scheduler
+        # passes. Other callers pass their own, and three of them are SMALLER
+        # than the cap: scripts/freshness_sync.py has CONSULTA_BATCH = 15 and
+        # CU_ROTATOR_BATCH = 15 against a cap of 20. With an absolute cap those
+        # runs hand the feed EVERY slot they have and leave the age rotation a
+        # floor of ZERO -- exactly the starvation the cap exists to prevent
+        # (see the measurement in the comment above: 190 notified causas,
+        # lawyer 17, 2026-10-15).
+        #
+        # Scaling it keeps the scheduler's own batch on the same number it has
+        # always had, since there batch_size == DETAIL_BATCH_SIZE.
+        base_lote = max(settings.DETAIL_BATCH_SIZE, 1)
+        tope = max(settings.DETAIL_FEED_MAX_PER_BATCH, 0)
+        if batch_size != base_lote:
+            tope = int(round(tope * batch_size / base_lote))
+        feed_slots = min(tope, batch_size)
 
     def _is_pending_feed_hit(db_case) -> bool:
         if db_case.rol.strip().upper() not in feed_keys:
