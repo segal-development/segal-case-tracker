@@ -344,8 +344,26 @@ async def test_roundtrips_five_new_movements(db, seeded, capsys):
 # the column wrong -- measured on QA, 2.115 cases were behind by 373 days on
 # average. no_new stays at 56: there the value is already correct, the helper
 # writes nothing, and the case is never dirtied.
-NO_NEW_BUDGET = 56
-FIVE_NEW_BUDGET = 73
+#
+# Both budgets went up by 4 when escritos with a PDF started getting their own
+# ``documents`` row (linked via escrito_id). The fixture carries 4 such escritos.
+# The added trips are 4x ``UPDATE documents``: each pending escrito document gets
+# its live JWT refreshed on every pass, exactly like the movement documents do
+# (a download needs the live token). No SELECT was added: persist_from_detail
+# reuses the case_escritos rows _sync_entities already loaded
+# (``SELECT case_escritos`` stays at 1; see test_escrito_documents_add_no_select).
+NO_NEW_BUDGET = 60
+FIVE_NEW_BUDGET = 77
+
+
+@pytest.mark.asyncio
+async def test_escrito_documents_add_no_select(db, seeded):
+    """Linking escrito PDFs reuses the rows _sync_entities loaded: no 2nd SELECT."""
+    lawyer, case = seeded
+    await _run_case(db, lawyer, _detail(3, "g1"))
+    with RoundTrips(db.get_bind()) as rt:
+        await _run_case(db, lawyer, _detail(3, "g2"))
+    assert rt.by_kind["SELECT case_escritos"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -425,9 +443,9 @@ async def test_expire_on_commit_is_off_during_case_and_restored(db, seeded, monk
     seen = []
     real = DocumentPersistenceService.persist_from_detail
 
-    def spy(self, detail, case_id, session):
+    def spy(self, detail, case_id, session, **kwargs):
         seen.append(session.expire_on_commit)
-        return real(self, detail, case_id, session)
+        return real(self, detail, case_id, session, **kwargs)
 
     monkeypatch.setattr(DocumentPersistenceService, "persist_from_detail", spy)
     assert db.expire_on_commit is True
@@ -443,7 +461,7 @@ async def test_expire_on_commit_restored_when_the_case_fails(db, seeded, monkeyp
 
     lawyer, case = seeded
 
-    def boom(self, detail, case_id, session):
+    def boom(self, detail, case_id, session, **kwargs):
         raise RuntimeError("document phase exploded")
 
     monkeypatch.setattr(DocumentPersistenceService, "persist_from_detail", boom)
