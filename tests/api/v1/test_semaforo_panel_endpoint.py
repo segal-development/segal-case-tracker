@@ -89,7 +89,18 @@ def test_requires_authentication(client) -> None:
     assert client.get(URL).status_code in (401, 403)
 
 
-def test_live_excepciones_row_carries_level_both_readings_and_case_data(client, db, people) -> None:
+def test_live_excepciones_row_carries_level_both_readings_and_case_data(
+    client, db, people, monkeypatch
+) -> None:
+    """The UNCONFIRMED shape of a row: two readings and term_confirmed False.
+
+    Pinned to 0 on purpose. The shipping default is 8 (one confirmed reading),
+    so this row shape is no longer what the panel returns by default -- see
+    test_by_default_the_panel_shows_one_confirmed_8_day_reading below.
+    """
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "SEMAFORO_EXCEPCIONES_TERM_DAYS", 0)
     case = make_case(db, people)
     make_live(db, case)
 
@@ -111,6 +122,24 @@ def test_live_excepciones_row_carries_level_both_readings_and_case_data(client, 
         (4, "2026-11-06"), (8, "2026-11-11"),
     ]
     assert row["dias_habiles_remaining"] >= 0
+
+
+def test_by_default_the_panel_shows_one_confirmed_8_day_reading(client, db, people) -> None:
+    """What the lawyers actually see: ONE due date, no "Plazo no confirmado".
+
+    The firm asked for the 4-day reading to be dropped and only the 8-day one
+    kept, so SEMAFORO_EXCEPCIONES_TERM_DAYS defaults to 8. Nothing pinned here:
+    this test exists to catch the default silently going back to 0, which is
+    what put a "Plazo no confirmado: 4 días / 8 días" box on every excepciones
+    plazo in the panel.
+    """
+    case = make_case(db, people)
+    make_live(db, case)
+
+    (row,) = get(client)["por_vencer"]
+
+    assert row["term_confirmed"] is True
+    assert [(r["term_days"], r["due_date"]) for r in row["readings"]] == [(8, "2026-11-11")]
 
 
 def test_poder_is_confirmed_single_reading(client, db, people) -> None:

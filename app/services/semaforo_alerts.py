@@ -27,7 +27,11 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.core.deadlines_config import FATAL_DEADLINE_VALUES, PARALLEL_DEADLINE_VALUES
+from app.core.deadlines_config import (
+    FATAL_DEADLINE_VALUES,
+    OPTIONAL_ACTIONABLE_VALUES,
+    PARALLEL_DEADLINE_VALUES,
+)
 from app.core.semaforo_config import (
     EXPIRED_ALERT_TYPE,
     ALERT_TYPE_BY_LEVEL,
@@ -61,10 +65,27 @@ _ENTITY_PREFIX = "plazo:"
 
 #: Verdicts that say the firm did NOT act. A NULL verdict is "unknown", not
 #: "did not act", and is deliberately absent: warning about a doubt is noise.
-#: Fatal plazos this notice covers: the config's fatal set minus the parallel
-#: ones. ``acreditar_poder_3d`` is fatal but has its own detection and its own
-#: alert ("ratificar_firma"), and its ownership is not provable from the row.
-_EXPIRED_NOTICE_TYPES = FATAL_DEADLINE_VALUES - PARALLEL_DEADLINE_VALUES
+#: Fatal plazos this notice covers: the config's fatal set, minus the parallel
+#: ones, minus the OPTIONAL ones.
+#:
+#: ``acreditar_poder_3d`` (parallel) is fatal but has its own detection and its
+#: own alert ("ratificar_firma"), and its ownership is not provable from the row.
+#:
+#: ``apelacion_5d`` (optional) is excluded because appealing is a RIGHT the firm
+#: exercises case by case, not an obligation: "no todo conviene apelarlo (...) si
+#: eventualmente vemos ganable se apela" (Carla Lavín, 2026-10-20). A window that
+#: closes unused is a decision, not a miss, so "VENCIDO, no presentaste" would
+#: report the firm's own strategy as a failure.
+#:
+#: Do NOT narrow this back to ``- PARALLEL_DEADLINE_VALUES``. Apelación currently
+#: emits nothing only by accident -- ``deadline_verdict.DETECTORS`` has no
+#: apelación detector, so its verdict stays NULL and the query below filters it
+#: out. Adding that detector is a natural future change (the NULL rows look like
+#: a bug); this subtraction is what keeps it from mailing hundreds of false
+#: VENCIDO notices the day it lands.
+_EXPIRED_NOTICE_TYPES = (
+    FATAL_DEADLINE_VALUES - PARALLEL_DEADLINE_VALUES - OPTIONAL_ACTIONABLE_VALUES
+)
 
 _NOT_ACTED_VERDICTS = (Verdict.NO_CUMPLIDO.value, Verdict.FUERA_DE_PLAZO.value)
 
