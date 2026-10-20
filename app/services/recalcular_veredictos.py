@@ -51,6 +51,7 @@ from typing import Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session, load_only, selectinload
 
 from app.models.case_deadline import CaseDeadline
+from app.models.case_escrito import CaseEscrito
 from app.models.movement import Movement
 from app.services.deadline_engine import DeadlineEngine, _today_chile
 from app.services.deadline_verdict import evaluate_deadline
@@ -118,6 +119,22 @@ def _load_movements(db: Session, case_ids: List[int]) -> Dict[int, List[Movement
     return by_case
 
 
+def _load_escritos(db: Session, case_ids: List[int]) -> Dict[int, List[CaseEscrito]]:
+    """Escritos of the chunk's cases in ONE query (filing dates are verdict evidence)."""
+    by_case: Dict[int, List[CaseEscrito]] = {}
+    query = (
+        db.query(CaseEscrito)
+        .options(load_only(
+            CaseEscrito.id, CaseEscrito.case_id, CaseEscrito.fecha_ingreso,
+            CaseEscrito.tipo_escrito, CaseEscrito.solicitante,
+        ))
+        .filter(CaseEscrito.case_id.in_(case_ids))
+    )
+    for escrito in query:
+        by_case.setdefault(escrito.case_id, []).append(escrito)
+    return by_case
+
+
 def planificar(
     db: Session,
     *,
@@ -148,7 +165,9 @@ def planificar(
     protegidas_cambian: Counter = Counter()
     for start in range(0, len(candidates), _LOAD_CHUNK):
         chunk = candidates[start:start + _LOAD_CHUNK]
-        movements = _load_movements(db, sorted({r.case_id for r in chunk}))
+        chunk_case_ids = sorted({r.case_id for r in chunk})
+        movements = _load_movements(db, chunk_case_ids)
+        escritos = _load_escritos(db, chunk_case_ids)
         for row in chunk:
             protegida = _is_protected(row)
             if protegida:
@@ -162,6 +181,7 @@ def planificar(
                 today,
                 publication_margin_days=publication_margin_days,
                 triggered_at=row.triggered_at,
+                escritos=escritos.get(row.case_id, []),
             )
             if result.verdict is None:
                 if not protegida:
