@@ -332,3 +332,29 @@ def test_different_court_type_or_due_date_are_not_collapsed(client, db, people) 
 
     with patch("app.services.sync_service.poder_obligation_is_ours", return_value=object()):
         assert len(get(client, ADMIN_RUT)["por_vencer"]) == 4
+
+
+
+class TestVencidosCarryTheirVerdict:
+    """A plazo filed LATE is not a plazo never filed, and the panel must tell
+    them apart.
+
+    Measured on the real database: of the 9 rows the panel showed under
+    "vencidos sin presentar", 6 carried verdict ``fuera_de_plazo`` -- the
+    escrito IS in our own ``case_escritos`` ("Opone excepciones", Demandado,
+    09-oct). Telling a lawyer he never filed something he filed is the fastest
+    way to make him stop trusting the panel.
+    """
+
+    def test_a_late_filing_is_distinguishable_from_one_never_filed(
+        self, client, db, people
+    ) -> None:
+        tarde = make_case(db, people, rol="C-900-2026")
+        make_expired(db, tarde, verdict="fuera_de_plazo")
+        nunca = make_case(db, people, rol="C-901-2026")
+        make_expired(db, nunca, verdict="no_cumplido")
+        db.commit()
+
+        filas = {f["rol"]: f for f in get(client)["vencidos"]}
+        assert filas["C-900-2026"]["verdict"] == "fuera_de_plazo"
+        assert filas["C-901-2026"]["verdict"] == "no_cumplido"

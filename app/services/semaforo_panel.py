@@ -67,6 +67,11 @@ class PanelRow:
     #: Every distinct lawyer name on this plazo. More than one when the same
     #: case is stored under several firm lawyers and the rows were collapsed.
     abogados: List[str] = field(default_factory=list)
+    #: The plazo's verdict, for ``vencidos`` rows; None for ``por_vencer``.
+    #: ``no_cumplido`` = nothing was filed. ``fuera_de_plazo`` = an escrito WAS
+    #: filed, late. Showing both as "sin presentar" tells a lawyer he never
+    #: filed something he filed, which is how the panel loses its credibility.
+    verdict: Optional[str] = None
 
 
 @dataclass
@@ -92,6 +97,7 @@ def _row(
     a: Optional[Assessment],
     level: Optional[str],
     due: date,
+    verdict: Optional[str] = None,
 ) -> PanelRow:
     lawyer_id = case.effective_lawyer_id
     lawyer = db.get(Lawyer, lawyer_id) if lawyer_id is not None else None
@@ -111,6 +117,7 @@ def _row(
         term_confirmed=a.confirmed if a else None,
         readings=_readings(a),
         abogados=[lawyer.name] if lawyer and lawyer.name else [],
+        verdict=verdict,
     )
 
 
@@ -190,7 +197,7 @@ def _vencidos(db: Session, today: date, case_ids: Optional[Collection[int]]) -> 
         if case is None or _is_terminated(case) or not _is_ours(db, case, dl, today):
             continue
         a = assess(dl.deadline_type, dl.triggered_at, today, _confirmed_term(dl))
-        rows.append(_row(db, dl, case, today, a, None, dl.due_date))
+        rows.append(_row(db, dl, case, today, a, None, dl.due_date, verdict=dl.verdict))
     rows.sort(key=lambda r: (r.due_date, r.deadline_id), reverse=True)
     return _collapse_same_case(rows)
 
