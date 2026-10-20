@@ -335,8 +335,17 @@ async def test_roundtrips_five_new_movements(db, seeded, capsys):
 # What is left is deliberate: 17/7 pending-document JWT refreshes (a download
 # needs the live token), 4 escrito doc_token refreshes (the API still serves
 # that column), and the commit/savepoint boundaries that protect the movements.
+#
+# five_new went 72 -> 73 when last_movement_at started being derived from the
+# case's rows instead of from scraped_movements[0]. The added round-trip is NOT
+# a read: deriving it costs no query (the N+1 prefetch already holds every
+# movement). It is the UPDATE on ``cases`` that now happens because the column
+# actually changes. The old code was cheaper here only because it was leaving
+# the column wrong -- measured on QA, 2.115 cases were behind by 373 days on
+# average. no_new stays at 56: there the value is already correct, the helper
+# writes nothing, and the case is never dirtied.
 NO_NEW_BUDGET = 56
-FIVE_NEW_BUDGET = 72
+FIVE_NEW_BUDGET = 73
 
 
 # ---------------------------------------------------------------------------

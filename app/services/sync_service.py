@@ -1259,17 +1259,53 @@ class SyncService:
                 _budget.remaining + notify_dispatched,  # original limit
             )
 
-        # Update last_movement_at on case
-        if scraped_movements:
-            latest_date = self._parse_date(scraped_movements[0].fecha)
-            if latest_date and (
-                not case.last_movement_at or latest_date > case.last_movement_at
-            ):
-                case.last_movement_at = latest_date
+        # Derive last_movement_at from the case's ROWS, not from this list.
+        #
+        # This used to read ``scraped_movements[0]`` and only move forward,
+        # which made the column depend on the order PJUD returned rows in AND
+        # on this one scrape having seen everything. Neither holds:
+        # ``_load_other_cuadernos`` appends another cuaderno's movements AFTER
+        # the principal ones, so the newest is routinely not at index 0, and
+        # several other paths (ingest, consulta) insert Movement rows without
+        # ever coming through here. Measured on QA, 2.113 active cases carried
+        # a last_movement_at OLDER than their own newest movement row.
+        #
+        # It is a decision input, not a label: deadline_engine compares it
+        # against a semaforo override, poda decides what is prunable with it,
+        # and lawyer_roster decides what is stale with it.
+        #
+        # Recomputing makes the invariant hold for every writer instead of
+        # patching them one by one, and it costs NO extra query: the N+1 fix
+        # above already prefetched every movement this case has, and
+        # _upsert_movement keeps that map complete as it inserts. It runs even
+        # for an empty scrape, so a case whose rows arrived through another
+        # path is still corrected the next time this one runs.
+        self._recompute_last_movement_at(case, existing_movements.values())
 
         self.db.commit()
         return new_count, alert_count
-    
+
+    @staticmethod
+    def _recompute_last_movement_at(case: Case, movements: Iterable[Movement]) -> None:
+        """Set ``case.last_movement_at`` to the newest date among ``movements``.
+
+        ``movements`` is the case's COMPLETE set — the prefetched map from
+        ``sync_movements``, which holds every row the case had plus every row
+        just inserted — so no query is needed and the result equals
+        ``max(movement_date)`` in the DB.
+
+        Only writes when the value actually changes, so an unchanged case does
+        not dirty the session. An empty set leaves the column alone: a sync
+        never deletes movements, so "nothing here" means this scrape told us
+        nothing, not that the case has no history.
+        """
+        dates = [m.movement_date for m in movements if m.movement_date is not None]
+        if not dates:
+            return
+        newest = max(dates)
+        if newest != case.last_movement_at:
+            case.last_movement_at = newest
+
     def _upsert_case(
         self,
         lawyer_id: int,
