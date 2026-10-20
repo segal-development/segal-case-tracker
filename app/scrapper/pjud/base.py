@@ -32,6 +32,7 @@ _CHROME_UA = (
 
 from app.config import settings
 from app.services.pjud_session import PJUDSession
+from app.scrapper.pjud.dns_probe import maybe_probe_name_resolution
 from app.scrapper.pjud.exceptions import (
     CredentialExpiredError,
     InvalidCredentialsError,
@@ -925,7 +926,12 @@ class PJUDBaseScraper(ABC):
         from app.scrapper.pjud_civil import RECAPTCHA_SITEKEY, RECAPTCHA_ACTION_LOGIN
 
         page = await self._get_page()
-        await page.goto(PJUD_HOME_URL, wait_until="domcontentloaded")
+        try:
+            await page.goto(PJUD_HOME_URL, wait_until="domcontentloaded")
+        except Exception as nav_exc:
+            # TEMPORARY diagnostic (see dns_probe.py): observe-only, then re-raise untouched.
+            maybe_probe_name_resolution(str(nav_exc), PJUD_HOME_URL)
+            raise
 
         token = await self._generate_recaptcha_token(
             page, RECAPTCHA_SITEKEY, RECAPTCHA_ACTION_LOGIN
@@ -1140,6 +1146,10 @@ class PJUDBaseScraper(ABC):
         except LoginError:
             raise
         except Exception as e:
+            # TEMPORARY diagnostic (see dns_probe.py): observe-only. The only
+            # navigation that can raise a raw ERR_NAME_NOT_RESOLVED here is the
+            # home goto; the call is a no-op for any other error.
+            maybe_probe_name_resolution(str(e), PJUD_HOME_URL)
             logger.error(f"Login error: {e}")
             raise LoginError(f"Error during login: {str(e)}", cause=e)
     
@@ -1283,6 +1293,8 @@ class PJUDBaseScraper(ABC):
                 await page.goto(PJUD_INDEX_URL, wait_until="domcontentloaded")
                 await asyncio.sleep(2)
             except Exception as nav_exc:
+                # TEMPORARY diagnostic (see dns_probe.py): observe-only, never raises.
+                maybe_probe_name_resolution(str(nav_exc), PJUD_INDEX_URL)
                 return False, str(nav_exc)
 
         # Let any client-side redirect after the initial load settle before we
