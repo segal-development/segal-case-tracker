@@ -536,6 +536,73 @@ async def _reauth(
         return None, "no_credentials"
 
 
+#: Intentos de login ante un fallo de RED. 1 = sin reintento.
+REAUTH_NETWORK_ATTEMPTS = 3
+#: Espera entre intentos, en segundos. Los fallos de DNS medidos duraban
+#: minutos con ventanas buenas en el medio, asi que la espera crece.
+REAUTH_NETWORK_BACKOFF_SECONDS = (20, 45)
+
+#: Marcas de un fallo de RED en la razon que devuelve ``_reauth``. Solo estas
+#: reintentan: credenciales invalidas, ausentes, un descifrado fallido o una
+#: pagina de login trabada NO se reintentan nunca -- gastan una sesion contra
+#: el PJUD y, en el caso de las credenciales, pueden bloquear la cuenta.
+_NETWORK_FAILURE_MARKERS = (
+    "ERR_NAME_NOT_RESOLVED",
+    "ERR_CONNECTION_RESET",
+    "ERR_CONNECTION_REFUSED",
+    "ERR_CONNECTION_TIMED_OUT",
+    "ERR_INTERNET_DISCONNECTED",
+    "ERR_NETWORK_CHANGED",
+    "ERR_ADDRESS_UNREACHABLE",
+    "ERR_SOCKET_NOT_CONNECTED",
+)
+
+
+def _is_network_failure(reason: Optional[str]) -> bool:
+    """True when the reason looks like the network, not the credentials.
+
+    Conservative on purpose: anything unrecognised is NOT retried.
+    """
+    if not reason:
+        return False
+    return any(m in reason for m in _NETWORK_FAILURE_MARKERS)
+
+
+async def _reauth_with_network_retry(lawyer, store, reauth=None):
+    """``_reauth`` plus a bounded retry when the failure is the network.
+
+    The station's Mac resolves the PJUD domain intermittently: measured
+    2026-10-20, 115 ERR_NAME_NOT_RESOLVED in bursts of minutes with working
+    windows between them, costing 11 of 13 lawyers their whole sync and
+    closing the cycle in 17m38s instead of three hours. One 40-second hiccup
+    must not discard three hours of work.
+
+    Mirrors the listing-pagination recovery of #165, at the login.
+    """
+    attempt_reauth = reauth or _reauth
+    session = None
+    reason: Optional[str] = None
+    for attempt in range(1, REAUTH_NETWORK_ATTEMPTS + 1):
+        session, reason = await attempt_reauth(lawyer, store)
+        if session is not None or not _is_network_failure(reason):
+            return session, reason
+        if attempt < REAUTH_NETWORK_ATTEMPTS:
+            espera = REAUTH_NETWORK_BACKOFF_SECONDS[
+                min(attempt - 1, len(REAUTH_NETWORK_BACKOFF_SECONDS) - 1)
+            ]
+            logger.warning(
+                "Re-auth lawyer %s: network failure (%s). Retry %d/%d in %ss.",
+                getattr(lawyer, "id", "?"), reason, attempt + 1,
+                REAUTH_NETWORK_ATTEMPTS, espera,
+            )
+            await asyncio.sleep(espera)
+    logger.error(
+        "Re-auth lawyer %s: gave up after %d network failures (%s).",
+        getattr(lawyer, "id", "?"), REAUTH_NETWORK_ATTEMPTS, reason,
+    )
+    return session, reason
+
+
 async def sync_lawyer_cases(
     lawyer_id: int,
     competencia: str,
@@ -573,7 +640,7 @@ async def sync_lawyer_cases(
             return {"skipped": True, "reason": "no_session"}
 
         with timed("login"):
-            pjud_session, reason = await _reauth(lawyer, store)
+            pjud_session, reason = await _reauth_with_network_retry(lawyer, store)
         # Persist any credential_alert_sent_at change _reauth made on the
         # lawyer row (set on a new invalid-credentials episode, cleared on a
         # successful re-auth) regardless of the outcome below.
