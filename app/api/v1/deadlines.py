@@ -482,6 +482,9 @@ class SemaforoPanelRowResponse(BaseModel):
     level: Optional[str] = None
     #: false: several possible terms, none confirmed (see `readings`).
     term_confirmed: Optional[bool] = None
+    #: Solo en ``vencidos``: no_cumplido = no se presento nada;
+    #: fuera_de_plazo = SI se presento, tarde. Son cosas distintas.
+    verdict: Optional[str] = None
     readings: List[SemaforoReadingResponse] = []
     #: Every lawyer on the plazo (several when the same case is stored under
     #: more than one firm lawyer and was collapsed into this row).
