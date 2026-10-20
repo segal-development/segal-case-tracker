@@ -306,3 +306,47 @@ class TestProactiveRotationAtCap:
         assert cases[2].last_detail_checked_at is None
         db.refresh(cases[0])
         assert cases[0].last_detail_checked_at is not None
+
+
+class TestAProportionalBatchCannotDefeatTheCap:
+    """A per-lawyer batch (DETAIL_BATCH_PROPORTIONAL) may be far larger than
+    the old flat one. The 55-min proactive stop is checked BEFORE every single
+    case, so the batch size can never buy more PJUD time than the cap allows:
+    the extra causas simply lead the next cycle.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_large_batch_still_stops_at_the_cap(self, db, monkeypatch, no_sleep):
+        from app.services.sync_service import (
+            DETAIL_ROTATION_REASON_TEMPLATE,
+            detect_and_sync_movements,
+        )
+
+        _patch_shape_cooldown(monkeypatch)
+        roles = [f"C-BIG-{i}" for i in range(40)]
+        lawyer, cases = _seed(db, "32000009-9", "TH-COURT9", roles)
+        api_cases = [_make_api_case(rol, f"b{i}") for i, rol in enumerate(roles)]
+
+        # start=0, then one reading per case: the cap is crossed on the 4th.
+        clock = _FakeClock([0.0, 0.0, 10 * 60.0, 30 * 60.0, 56 * 60.0])
+        monkeypatch.setattr(sync_service_module, "DETAIL_BATCH_CLOCK", clock)
+
+        scraper = MagicMock()
+        scraper.get_case_detail = AsyncMock(return_value=_make_detail_empty())
+
+        _, _, errors = await detect_and_sync_movements(
+            db=db, scraper=scraper, pjud_session=MagicMock(), lawyer_id=lawyer.id,
+            api_cases=api_cases, selected_cases=api_cases,
+            reauth_callback=AsyncMock(),
+            batch_size_cap=len(api_cases),
+        )
+
+        assert scraper.get_case_detail.await_count == 3, (
+            "the cap, not the batch size, must decide where a long batch ends"
+        )
+        assert errors == [DETAIL_ROTATION_REASON_TEMPLATE.format(minutes=56)]
+        # Everything past the cut keeps its NULL timestamp, so it leads the
+        # next rotation instead of being silently skipped.
+        for case in cases[3:]:
+            db.refresh(case)
+            assert case.last_detail_checked_at is None

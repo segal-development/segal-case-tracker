@@ -92,6 +92,14 @@
          DETAIL_FEED_MAX_PER_BATCH no se fija aca: su default ya es 20. Se
          agrega solo si hay que moverlo mirando datos reales.
 
+         OJO: desde DETAIL_BATCH_PROPORTIONAL (default true en app/config.py)
+         el lote ya NO es 80 para todos, sino la porcion de cartera de cada
+         abogado, y el tope del feed ESCALA con el lote para conservar la
+         misma proporcion. Con base 80 y tope 20, un lote de 160 recibe 40
+         cupos de feed y 120 de rotacion por antiguedad; un lote de 15 recibe
+         4 y 11. El piso de la rotacion nunca queda en cero, que era lo que
+         pasaria con un tope absoluto sobre un lote chico.
+
          Requiere ESTADO_DIARIO_PROBE_ENABLED, que ya esta activo en el .env de
          esta estacion. Con el flag en false el comportamiento es byte a byte el
          de antes, asi que apagarlo es el camino de vuelta. -->

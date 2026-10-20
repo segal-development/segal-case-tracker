@@ -1991,7 +1991,19 @@ def _select_cases_for_detail_rotation(
     feed_slots = 0
     if settings.DETAIL_FEED_PRIORITY_ENABLED and priority_rols:
         feed_keys = {r.strip().upper() for r in priority_rols if r and r.strip()}
-        feed_slots = min(max(settings.DETAIL_FEED_MAX_PER_BATCH, 0), batch_size)
+        # The cap is a SHARE of the batch, not an absolute number. It is
+        # written against DETAIL_BATCH_SIZE (the batch everybody used to get),
+        # so once the batch is sized per lawyer it has to scale with it: a
+        # cartera small enough to receive a batch under the cap would hand the
+        # feed every slot it has and leave the age rotation a floor of ZERO --
+        # exactly the starvation the cap was written to prevent. When the
+        # batch equals the base (DETAIL_BATCH_PROPORTIONAL off) this is the
+        # same number it has always been.
+        base_lote = max(settings.DETAIL_BATCH_SIZE, 1)
+        tope = max(settings.DETAIL_FEED_MAX_PER_BATCH, 0)
+        if batch_size != base_lote:
+            tope = int(round(tope * batch_size / base_lote))
+        feed_slots = min(tope, batch_size)
 
     def _is_pending_feed_hit(db_case) -> bool:
         if db_case.rol.strip().upper() not in feed_keys:
@@ -2044,6 +2056,166 @@ def _select_cases_for_detail_rotation(
 
     _log_scope(len(result))
     return result
+
+
+def _allocate_detail_batches(
+    carteras: dict[int, int], *, base: int, floor: int, ceiling: int
+) -> dict[int, int]:
+    """Split ``base x lawyers`` detail slots in proportion to each cartera.
+
+    Water filling. A lawyer whose proportional share lands outside
+    [floor, ceiling] is fixed at the bound it crossed and leaves the pool; the
+    slots that bound frees (or claims) are then re-divided among the lawyers
+    still free, until nobody is out of bounds. The last pass apportions the
+    remaining slots by largest remainder, so the total is EXACTLY the budget
+    and never one slot over it -- the cycle must not grow against PJUD.
+
+    Both bounds are also capped by the cartera itself: a lawyer with 9 causas
+    is allotted 9, never the 15-slot floor.
+
+    Deterministic: the pool is walked biggest cartera first, ties by lawyer id.
+
+    Args:
+        carteras: lawyer id -> number of causas eligible for detail scraping.
+        base: ``DETAIL_BATCH_SIZE`` -- the flat batch each lawyer used to get,
+            and therefore the per-lawyer contribution to the firm-wide budget.
+        floor: smallest batch a lawyer with a cartera may receive.
+        ceiling: largest batch any single lawyer may receive.
+
+    Returns:
+        lawyer id -> batch size, for the lawyers that hold at least one causa.
+    """
+    activos = {lid: n for lid, n in carteras.items() if n > 0}
+    if not activos:
+        return {}
+
+    presupuesto = base * len(activos)
+    fijos: dict[int, int] = {}
+    libres = set(activos)
+
+    while libres:
+        resto = presupuesto - sum(fijos.values())
+        total_libre = sum(activos[lid] for lid in libres)
+        if resto <= 0 or total_libre <= 0:
+            # The bounds already spent the budget; whoever is left still gets
+            # its floor. Going a few slots over here is the floor doing its
+            # job -- nobody starves -- and it only happens with far more
+            # lawyers than causas.
+            for lid in libres:
+                fijos[lid] = min(floor, activos[lid])
+            break
+
+        fijado = False
+        for lid in sorted(libres, key=lambda x: (-activos[x], x)):
+            cuota = resto * activos[lid] / total_libre
+            techo = min(ceiling, activos[lid])
+            piso = min(floor, activos[lid])
+            if cuota > techo:
+                fijos[lid] = techo
+                libres.discard(lid)
+                fijado = True
+                break
+            if cuota < piso:
+                fijos[lid] = piso
+                libres.discard(lid)
+                fijado = True
+                break
+        if fijado:
+            continue
+
+        # Everyone left is within bounds: largest-remainder apportionment.
+        enteros: dict[int, int] = {}
+        restos: list[tuple[float, int, int]] = []
+        for lid in libres:
+            exacto = resto * activos[lid] / total_libre
+            enteros[lid] = int(exacto)
+            restos.append((exacto - int(exacto), activos[lid], lid))
+        sobran = resto - sum(enteros.values())
+        # Biggest fractional remainder first; ties by bigger cartera, then id.
+        restos.sort(key=lambda r: (-r[0], -r[1], r[2]))
+        for _, _, lid in restos[:sobran]:
+            enteros[lid] += 1
+        fijos.update({lid: max(1, n) for lid, n in enteros.items()})
+        libres = set()
+
+    return fijos
+
+
+def detail_batch_size_for_lawyer(db: Session, lawyer_id: int, competencia: str) -> int:
+    """How many causas this lawyer's detail batch may hold in THIS cycle.
+
+    Flat ``DETAIL_BATCH_SIZE`` when ``DETAIL_BATCH_PROPORTIONAL`` is off (byte
+    for byte the behaviour that existed before); otherwise the lawyer's share
+    of ``DETAIL_BATCH_SIZE x lawyers with a cartera``, in proportion to the
+    cartera that lawyer actually holds. See ``_allocate_detail_batches``.
+
+    Cost: ONE grouped COUNT over ``cases`` per lawyer per cycle (~13 rows on
+    the firm today). Nothing per case -- the per-case round-trip budget in
+    ``tests/services/test_roundtrips_per_case.py`` is untouched.
+
+    KNOWN APPROXIMATION: the count does not apply the ``DETAIL_MIN_YEAR``
+    filter, because parsing the ROL year in SQL is not portable across
+    Postgres and SQLite (the selection applies it in Python, case by case).
+    The count is a WEIGHT, not a budget: a handful of out-of-year rows shifts
+    a share slightly and changes nothing else. Measured 2026-10-20 on QA, the
+    year filter excluded 0 of the 15.201 rows, so today it is exactly equal.
+
+    Fails open: any problem counting returns the flat batch. A lawyer must
+    never be starved by a bookkeeping failure.
+    """
+    if not settings.DETAIL_BATCH_PROPORTIONAL:
+        return settings.DETAIL_BATCH_SIZE
+
+    base = settings.DETAIL_BATCH_SIZE
+    try:
+        filas = (
+            db.query(Case.lawyer_id, func.count(Case.id))
+            .join(Lawyer, Lawyer.id == Case.lawyer_id)
+            .filter(
+                Case.competencia == competencia,
+                Case.poda_at.is_(None),  # podadas consume no scraping budget
+                Lawyer.is_active.is_(True),
+            )
+            .group_by(Case.lawyer_id)
+            .all()
+        )
+        carteras = {int(lid): int(n) for lid, n in filas}
+    except Exception:  # noqa: BLE001 — see "fails open" above
+        logger.exception(
+            "detail_batch_size_for_lawyer: could not size the cartera for "
+            "lawyer_id=%s; falling back to the flat batch of %d",
+            lawyer_id,
+            base,
+        )
+        return base
+
+    reparto = _allocate_detail_batches(
+        carteras,
+        base=base,
+        floor=settings.DETAIL_BATCH_MIN_SIZE,
+        ceiling=int(base * settings.DETAIL_BATCH_MAX_MULTIPLIER),
+    )
+    lote = reparto.get(lawyer_id)
+    if lote is None:
+        # No cartera for this competencia, or the lawyer is inactive and this
+        # is a manual single-lawyer run. The flat batch is the safe answer; the
+        # selection returns an empty list anyway when there is nothing to pick.
+        return base
+
+    logger.info(
+        "Detail batch (proportional): lawyer_id=%s competencia=%s cartera=%d "
+        "of %d firm-wide -> lote=%d (base=%d, piso=%d, techo=%d, abogados=%d)",
+        lawyer_id,
+        competencia,
+        carteras.get(lawyer_id, 0),
+        sum(carteras.values()),
+        lote,
+        base,
+        settings.DETAIL_BATCH_MIN_SIZE,
+        int(base * settings.DETAIL_BATCH_MAX_MULTIPLIER),
+        len(reparto),
+    )
+    return lote
 
 
 def _oldest_unchecked_label(db: Session, lawyer_id: int) -> str:

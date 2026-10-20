@@ -38,6 +38,7 @@ from app.services.sync_service import (
     DETAIL_ROTATION_REASON_MARKER,
     SyncService,
     convert_api_cases_to_scraped,
+    detail_batch_size_for_lawyer,
     detect_and_sync_movements,
     _select_cases_for_detail_rotation,
 )
@@ -778,12 +779,20 @@ async def sync_lawyer_cases(
         # Select the rotation batch AFTER the full case-list upsert so the DB
         # reflects the most recent state (new cases will have last_detail_checked_at=NULL
         # and therefore be at the front of the queue — highest priority).
+        # How many causas THIS lawyer's batch may hold. Flat
+        # DETAIL_BATCH_SIZE for everyone used to mean the lap over a cartera
+        # was a function of its size alone: measured 2026-10-20, lawyer 1 held
+        # 38% of the portfolio and got 9% of the daily reads (49,5 day lap)
+        # while a 253-causa cartera lapped in 1,6 days. One grouped COUNT per
+        # lawyer per cycle; see detail_batch_size_for_lawyer.
+        batch_size = detail_batch_size_for_lawyer(db, lawyer_id, competencia)
+
         rotation_batch = _select_cases_for_detail_rotation(
             db=db,
             lawyer_id=lawyer_id,
             competencia=competencia,
             api_cases=cases,
-            batch_size=settings.DETAIL_BATCH_SIZE,
+            batch_size=batch_size,
             # Ignored by the selection unless DETAIL_FEED_PRIORITY_ENABLED is on.
             # A causa visited since the start of today (UTC, like every
             # ``last_detail_checked_at``) has already consumed its feed entry.
@@ -807,7 +816,7 @@ async def sync_lawyer_cases(
                 reauth_callback=_reauth_for_lawyer,
                 # Only used by the closing log line to tell "cut by batch size"
                 # from "ran out of cases"; it does not change what is fetched.
-                batch_size_cap=settings.DETAIL_BATCH_SIZE,
+                batch_size_cap=batch_size,
             )
 
         if mov_errors:

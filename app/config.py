@@ -261,6 +261,41 @@ class Settings(BaseSettings):
     # Detail rotation (sync-rotacion Slice 1)
     DETAIL_BATCH_SIZE: int = 30    # Cases per scheduled rotation batch
     DETAIL_FETCH_DELAY: float = 2.0  # Seconds between consecutive detail fetches
+    # Per-lawyer batch proportional to the cartera that lawyer actually holds,
+    # instead of the same flat DETAIL_BATCH_SIZE for everyone.
+    #
+    # Measured 2026-10-20 (live QA DB + station worker log, 24 h): lawyer 1
+    # holds 5.698 of the 14.981 active causas (38%) and received 115 of the
+    # 1.261 daily detail reads (9%) -- a 49,5 day lap -- while a lawyer with
+    # 253 causas received 156 reads/day, a 1,6 day lap. Nothing was stopped by
+    # PJUD: in three days there were zero "Limite de detalle de PJUD" and zero
+    # "Rotacion preventiva" messages, and 14 of 16 batches ended on batch_size.
+    # The ceiling was ours.
+    #
+    # The allocation CONSERVES the firm-wide budget
+    # (DETAIL_BATCH_SIZE x lawyers with a cartera), so the cycle costs the same
+    # wall clock and the same PJUD exposure it costs today; it only moves the
+    # slots to where the work is. Share = cartera / firm cartera, clamped
+    # between DETAIL_BATCH_MIN_SIZE and DETAIL_BATCH_SIZE x
+    # DETAIL_BATCH_MAX_MULTIPLIER, and whatever a clamp frees is handed back to
+    # the lawyers that are not clamped.
+    #
+    # Default ON in code on purpose: a value set only in the scraping station's
+    # LaunchAgent plist never reaches the API, and that mistake has cost us
+    # once already. False restores the flat batch byte for byte.
+    DETAIL_BATCH_PROPORTIONAL: bool = True
+    # Floor: the smallest cartera must keep being read. Never larger than the
+    # cartera it protects (a lawyer with 9 causas gets 9, not 15).
+    DETAIL_BATCH_MIN_SIZE: int = Field(default=15, ge=1)
+    # Ceiling, as a multiple of DETAIL_BATCH_SIZE, so one huge cartera cannot
+    # eat a whole cycle and delay every lawyer behind it (the cycle visits
+    # lawyers sequentially). At the station's base of 80 this is 160 causas; at
+    # the firm's measured mean of ~20 s per causa that is ~53 min, just under
+    # the DETAIL_BATCH_MAX_SECONDS (55 min) proactive rotation stop that guards
+    # the ~60 min PJUD per-account limit. For a lawyer slower than ~20,6 s per
+    # causa the time cap, not this ceiling, ends the batch -- which is exactly
+    # its job: the unvisited causas lead the next cycle, nothing is lost.
+    DETAIL_BATCH_MAX_MULTIPLIER: float = Field(default=2.0, ge=1.0)
     # Observe-only probe of the OJV "estado diario" feed (see
     # app/services/estado_diario_probe.py). One in-page POST per lawyer per
     # cycle, one log line, no effect on what the sync scrapes or alerts.

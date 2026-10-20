@@ -202,3 +202,45 @@ class TestFeedPriority:
     def test_batch_smaller_than_the_cap_never_exceeds_the_batch(self, db, feed_on):
         lawyer, others, feed, api = _world(db, feed_n=190, other_n=60)
         assert len(_select(db, lawyer, api, set(feed), batch=8)) == 8
+
+
+class TestCapScalesWithTheBatch:
+    """The feed cap is a SHARE of the batch, not an absolute number.
+
+    The cap exists to keep a floor (``batch_size - cap``) for the age
+    rotation: on 2026-10-15 lawyer 17 received 190 feed notifications in a day
+    and without the floor they would freeze its never-reviewed queue for days.
+
+    Once the batch is sized per lawyer (DETAIL_BATCH_PROPORTIONAL), a small
+    cartera gets a batch SMALLER than the cap, and an absolute cap would eat
+    all of it -- the age-rotation floor would be ZERO exactly for the lawyers
+    the floor was written to protect. Scaling the cap with the batch keeps the
+    ratio the firm measured, whatever the batch size is.
+    """
+
+    def test_a_batch_smaller_than_the_cap_still_keeps_its_rotation_floor(
+        self, db, feed_on, monkeypatch
+    ):
+        # Base 30 / cap 20 -> a batch of 15 gets 10 feed slots and 5 age slots.
+        monkeypatch.setattr(settings, "DETAIL_BATCH_SIZE", 30)
+        lawyer, others, feed, api = _world(db, feed_n=190, other_n=60)
+        got = _select(db, lawyer, api, set(feed), batch=15)
+        assert len(got) == 15
+        assert len([r for r in got if r in set(feed)]) == 10
+        assert [r for r in got if r not in set(feed)] == others[:5]
+
+    def test_a_batch_bigger_than_the_base_scales_the_cap_up(
+        self, db, feed_on, monkeypatch
+    ):
+        monkeypatch.setattr(settings, "DETAIL_BATCH_SIZE", 30)
+        lawyer, others, feed, api = _world(db, feed_n=190, other_n=60)
+        got = _select(db, lawyer, api, set(feed), batch=60)
+        assert len([r for r in got if r in set(feed)]) == 40
+        assert [r for r in got if r not in set(feed)] == others[:20]
+
+    def test_a_batch_equal_to_the_base_is_unchanged(self, db, feed_on, monkeypatch):
+        monkeypatch.setattr(settings, "DETAIL_BATCH_SIZE", 30)
+        lawyer, others, feed, api = _world(db, feed_n=190, other_n=60)
+        got = _select(db, lawyer, api, set(feed), batch=30)
+        assert len([r for r in got if r in set(feed)]) == 20
+        assert [r for r in got if r not in set(feed)] == others[:10]
