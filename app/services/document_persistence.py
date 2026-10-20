@@ -9,6 +9,7 @@ Out of scope (Slice 2): StorageService, downloads, GCS.
 
 import hashlib
 import logging
+from collections import Counter
 from datetime import datetime
 from typing import List, Optional
 
@@ -257,15 +258,46 @@ class DocumentPersistenceService:
             # ------------------------------------------------------------
             # 3. Escrito-level documents (Escritos pane, no movement yet)
             # ------------------------------------------------------------
+            same_date_docs = self._escrito_doc_counts_by_date(existing_docs)
+            escritos_per_date = Counter(
+                row.fecha_ingreso.date()
+                for row, _doc, _scope in escrito_docs
+                if row.fecha_ingreso is not None
+            )
             for escrito_row, pjud_doc, scope in escrito_docs:
+                token_hash = document_identity_hash(
+                    pjud_doc.doc_type, case_rol, scope_key=scope
+                )
+                # Same-date guard (a deliberate HEURISTIC, not a real dedup).
+                # When the court resolves an escrito, the same PDF reappears as a
+                # movement `escrito_doc`. The two panes share no key:
+                # pjud_token_hash is sha256(doc_type|rol|scope_key) and an escrito
+                # has no folio, so the movement row can never match ours. Queueing
+                # ours too would download the PDF twice and show two identical rows
+                # in the case Documentos tab. So: do not CREATE an escrito document
+                # when the case already holds at least as many movement-borne
+                # escrito_doc documents dated that day as it has escritos dated that
+                # day (two escritos + one same-day doc still creates: one is
+                # uncovered). Measured on QA: 510 duplicates avoided vs 28 of 1.135
+                # tokened escritos sharing a date with another escrito. Rows that
+                # already exist are never skipped, so they keep refreshing their JWT.
+                day = (
+                    escrito_row.fecha_ingreso.date()
+                    if escrito_row.fecha_ingreso is not None
+                    else None
+                )
+                if (
+                    token_hash not in existing_docs
+                    and day is not None
+                    and same_date_docs.get(day, 0) >= escritos_per_date[day]
+                ):
+                    continue
                 doc = self._upsert_document(
                     db=db,
                     case_id=case_id,
                     movement_id=None,
                     pjud_doc=pjud_doc,
-                    token_hash=document_identity_hash(
-                        pjud_doc.doc_type, case_rol, scope_key=scope
-                    ),
+                    token_hash=token_hash,
                     existing_by_hash=existing_docs,
                     document_date=escrito_row.fecha_ingreso,
                     escrito_id=escrito_row.id,
@@ -296,6 +328,23 @@ class DocumentPersistenceService:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _escrito_doc_counts_by_date(existing_by_hash: dict) -> Counter:
+        """Count movement-borne ``escrito_doc`` documents per date, from memory.
+
+        ``existing_by_hash`` already holds every movement document of this detail
+        (prefetched by hash, plus rows added earlier in this pass), so no query is
+        needed. Rows linked to an escrito are excluded: they are ours, not the
+        movement-side copy.
+        """
+        return Counter(
+            d.document_date.date()
+            for d in existing_by_hash.values()
+            if d.doc_type == "escrito_doc"
+            and d.escrito_id is None
+            and d.document_date is not None
+        )
+
+    @staticmethod
     def _escritos_with_documents(
         detail: "PJUDCaseDetail",  # type: ignore[name-defined]  # noqa: F821
         case_id: int,
@@ -306,8 +355,9 @@ class DocumentPersistenceService:
 
         Only escritos flagged ``tiene_documento`` with a ``doc_token`` qualify. The
         escrito pane does not expose which PHP handler serves the file; escritos are
-        unsigned documents, so they are served by ``docuN.php`` (the same handler and
-        ``escrito_doc`` type the movement parser assigns to unsigned documents).
+        unsigned documents, so they are served by ``docuN.php``. Verified against the
+        existing corpus: all 91.051 stored ``escrito_doc`` rows use exactly this
+        endpoint.
         """
         candidates = [e for e in detail.escritos if e.tiene_documento and e.doc_token]
         if not candidates:

@@ -260,3 +260,117 @@ async def test_pre_2024_case_escrito_is_not_downloaded(db, seeded, monkeypatch):
     await _run_pipeline(db, lawyer, "C-77-2023", monkeypatch)
 
     assert [d for batch in _CapturingDownloader.batches for d in batch] == []
+
+
+# ---------------------------------------------------------------------------
+# Same PDF through both panes: count-aware same-date guard
+# ---------------------------------------------------------------------------
+
+
+def _movement_with_escrito_doc(folio: str, fecha: str) -> PJUDMovement:
+    return PJUDMovement(
+        folio=folio,
+        fecha=fecha,
+        tipo_tramite="Escrito",
+        descripcion="m",
+        documentos=[
+            PJUDDocument(
+                token=f"mov-tok-{folio}",
+                tipo="principal",
+                url_type="docuN",
+                doc_type="escrito_doc",
+                endpoint="documentos/docuN.php",
+                param_name="dtaDoc",
+            )
+        ],
+    )
+
+
+def _add_movements(db, case, *folios_dates):
+    from app.models.movement import Movement
+
+    for folio, fecha in folios_dates:
+        db.add(
+            Movement(
+                case_id=case.id,
+                folio=folio,
+                description="m",
+                movement_date=datetime.strptime(fecha, "%d/%m/%Y"),
+            )
+        )
+    db.commit()
+
+
+def _docs_by_link(db):
+    rows = db.query(Document).all()
+    return (
+        [d for d in rows if d.movement_id is not None],
+        [d for d in rows if d.escrito_id is not None],
+    )
+
+
+def test_one_escrito_with_a_same_date_escrito_doc_is_not_duplicated(db, seeded):
+    _, case = seeded
+    _add_movements(db, case, ("1", "10/03/2024"))
+    detail = _detail(
+        [_escrito(10, "esc-a")],
+        movements=[_movement_with_escrito_doc("1", "10/03/2024")],
+    )
+
+    _persist(db, case, detail)
+
+    from_movements, from_escritos = _docs_by_link(db)
+    assert len(from_movements) == 1
+    assert from_escritos == []
+
+
+def test_two_escritos_with_one_same_date_escrito_doc_still_create_rows(db, seeded):
+    _, case = seeded
+    _add_movements(db, case, ("1", "10/03/2024"))
+    two_same_day = [
+        PJUDEscrito("10/03/2024", "Escrito A", "DEUDOR UNO", True, False, "esc-a"),
+        PJUDEscrito("10/03/2024", "Escrito B", "DEUDOR UNO", True, False, "esc-b"),
+    ]
+    detail = _detail(
+        two_same_day, movements=[_movement_with_escrito_doc("1", "10/03/2024")]
+    )
+
+    _persist(db, case, detail)
+
+    _, from_escritos = _docs_by_link(db)
+    assert len(from_escritos) >= 1  # one of the two is genuinely uncovered
+    assert {d.escrito_id for d in from_escritos} <= {e.id for e in db.query(CaseEscrito)}
+
+
+def test_escrito_with_no_same_date_escrito_doc_is_created(db, seeded):
+    _, case = seeded
+    _add_movements(db, case, ("1", "09/03/2024"))
+    detail = _detail(
+        [_escrito(10, "esc-a")],
+        movements=[_movement_with_escrito_doc("1", "09/03/2024")],  # other day
+    )
+
+    _persist(db, case, detail)
+
+    _, from_escritos = _docs_by_link(db)
+    assert len(from_escritos) == 1
+
+
+def test_an_already_queued_escrito_document_keeps_refreshing(db, seeded):
+    """The guard only decides whether to CREATE; an existing row is never dropped."""
+    _, case = seeded
+    _persist(db, case, _detail([_escrito(10, "esc-1")]))
+    db.commit()
+    _add_movements(db, case, ("1", "10/03/2024"))
+
+    _persist(
+        db,
+        case,
+        _detail(
+            [_escrito(10, "esc-2")],
+            movements=[_movement_with_escrito_doc("1", "10/03/2024")],
+        ),
+    )
+
+    _, from_escritos = _docs_by_link(db)
+    assert [d.pjud_token for d in from_escritos] == ["esc-2"]
