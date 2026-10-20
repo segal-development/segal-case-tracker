@@ -298,6 +298,27 @@ class Settings(BaseSettings):
     # The cap is a number to tune from real data, so it is an env var, not a constant.
     DETAIL_FEED_PRIORITY_ENABLED: bool = False
     DETAIL_FEED_MAX_PER_BATCH: int = Field(default=20, ge=0)
+    # PJUD splits one judicial case into cuadernos: the main one ("Principal")
+    # plus secondary ones (medidas prejudiciales, incidentes, apremios). We keep
+    # ONE ``cases`` row per cuaderno, so the detail rotation treats each cuaderno
+    # as an independent case to visit. Measured 2026-10-20 on QA: 60% of the
+    # 1.082 daily detail reads landed on a cuaderno that is not Principal, and
+    # one lawyer spent 131 of its 156 daily reads re-reading 199 medidas
+    # prejudiciales every 1,5 days.
+    # When ON, a secondary cuaderno that carries NO live deadline is not re-read
+    # more often than every DETAIL_SECONDARY_CUADERNO_MIN_DAYS days: it sinks
+    # below everything else until then, and afterwards rejoins the rotation at
+    # its true age. It is a DEPRIORITIZATION, never a skip -- 13 of 54 live
+    # deadlines measured that day lived on a secondary cuaderno, and a cuaderno
+    # we cannot identify counts as a real case.
+    # Default ON in code on purpose: a value set only in the scraping station's
+    # LaunchAgent plist never reaches the API. Flip it in the environment to
+    # kill it without a deploy.
+    DETAIL_SECONDARY_CUADERNO_DEMOTE: bool = True
+    # Minimum days between two reads of an inert secondary cuaderno. 0 disables
+    # the demotion as well (every row is always "due"). Tunable from real data,
+    # so it is an env var, not a constant.
+    DETAIL_SECONDARY_CUADERNO_MIN_DAYS: int = Field(default=14, ge=0)
 
     # Notifications
     NOTIFY_MAX_PER_SYNC: int = 25           # Max notifications dispatched per sync_movements call
