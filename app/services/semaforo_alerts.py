@@ -245,7 +245,10 @@ def _create_expired_alerts(
 
     tribunal = case.court.name if case.court else "tribunal no especificado"
     title, message = build_vencido_text(
-        row.deadline_type, row.due_date, row.verdict, case.rol or "", tribunal
+        row.deadline_type, row.due_date, row.verdict, case.rol or "", tribunal,
+        # No movement behind the verdict = the evidence is an escrito, whose
+        # filing date is known (see ``DeadlineEngine._apply_verdict``).
+        filed_on=row.verdict_acted_on if row.verdict_movement_id is None else None,
     )
     created = 0
     for recipient in recipients:

@@ -103,7 +103,13 @@ def build_alert_text(a: Assessment, rol: str, tribunal: str) -> tuple[str, str]:
 
 
 def build_vencido_text(
-    deadline_type: str, due_date: date, verdict: str, rol: str, tribunal: str
+    deadline_type: str,
+    due_date: date,
+    verdict: str,
+    rol: str,
+    tribunal: str,
+    *,
+    filed_on: date | None = None,
 ) -> tuple[str, str]:
     """``(title, message)`` for a fatal plazo that expired with no filing from us.
 
@@ -112,10 +118,19 @@ def build_vencido_text(
     filing; ``fuera_de_plazo`` says the filing is dated after the deadline,
     and in both cases asks the lawyer to check the expediente, because the
     verdict is derived from published movements, not from the filing itself.
+
+    ``filed_on`` is the FILING date of the escrito that produced the verdict
+    (``case_escritos.fecha_ingreso``), when that is where the evidence came from.
+    Then the filing is known, so the text states its date and never claims that
+    nothing was found.
     """
     label = DEADLINE_LABELS.get(deadline_type, deadline_type)
     title = f"VENCIDO · {label}, causa {rol}: venció el {_d(due_date)}"
-    if verdict == "fuera_de_plazo":
+    if verdict == "fuera_de_plazo" and filed_on is not None:
+        finding = (
+            f"El escrito se presentó el {_d(filed_on)}, después del vencimiento del plazo."
+        )
+    elif verdict == "fuera_de_plazo":
         finding = (
             "El escrito aparece registrado con posterioridad al vencimiento del plazo."
         )

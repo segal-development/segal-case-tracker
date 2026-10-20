@@ -73,6 +73,7 @@ missed it") that nobody checked.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from enum import Enum
@@ -160,6 +161,47 @@ def _detect_poder(
     return min(acts, key=_day) if acts else None
 
 
+# --- Escrito evidence (case_escritos) ---------------------------------------
+#
+# ``CaseEscrito.fecha_ingreso`` is the date the party FILED, which is the real
+# date of the act. A movement carries the date the court (or PJUD) published or
+# resolved it: median 0 days later, p90 15, worst 78. So an escrito is stronger
+# evidence of WHEN than a movement, and it is only ever used to improve a verdict.
+_OPONE_EXCEPCIONES_ESCRITO_RE = re.compile(r"opone\s+excepciones")
+# Whole words, so "Demandante" never matches. The ejecutado files the excepciones
+# whichever side the firm is on; which plazos are OURS is decided elsewhere
+# (``actionable_sets`` / ``_is_ours``), not by who filed.
+_DEBTOR_SOLICITANTE_RE = re.compile(r"\b(demandad[oa]s?|ejecutad[oa]s?)\b")
+
+
+def _normalize(value: Optional[str]) -> str:
+    decomposed = unicodedata.normalize("NFKD", value or "")
+    stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return " ".join(stripped.lower().split())
+
+
+def is_excepciones_escrito(escrito: object) -> bool:
+    """True for a dated escrito in which the EJECUTADO opposes the execution."""
+    return (
+        getattr(escrito, "fecha_ingreso", None) is not None
+        and bool(_OPONE_EXCEPCIONES_ESCRITO_RE.search(_normalize(getattr(escrito, "tipo_escrito", None))))
+        and bool(_DEBTOR_SOLICITANTE_RE.search(_normalize(getattr(escrito, "solicitante", None))))
+    )
+
+
+# Which escritos fulfil which plazo. Only excepciones has a defined escrito
+# signal; every other type ignores escritos (no invented evidence).
+EscritoMatcher = Callable[[object], bool]
+ESCRITO_MATCHERS: dict[str, EscritoMatcher] = {
+    DeadlineType.EXCEPCIONES_8D.value: is_excepciones_escrito,
+}
+
+
+def verdict_uses_escritos(deadline_type: str) -> bool:
+    """Whether ``evaluate_deadline`` can read escritos for this plazo type."""
+    return deadline_type in ESCRITO_MATCHERS
+
+
 DETECTORS: dict[str, Detector] = {
     DeadlineType.EXCEPCIONES_8D.value: _detect_excepciones,
     DeadlineType.ACREDITAR_PODER_3D.value: _detect_poder,
@@ -182,6 +224,60 @@ def default_margin_days(deadline_type: str) -> int:
     return margin
 
 
+# Quality order of a verdict: escrito evidence may only move a result UP.
+_RANK = {
+    None: -1,
+    Verdict.NO_CUMPLIDO: 0,
+    Verdict.PRESENTADO_SIN_ANCLA: 1,
+    Verdict.FUERA_DE_PLAZO: 2,
+    Verdict.REGISTRO_TARDIO: 3,
+    Verdict.CUMPLIDO: 4,
+}
+
+
+def verdict_rank(value: Optional[object]) -> int:
+    """Rank of a stored/computed verdict (``Verdict`` or its string); NULL is lowest."""
+    if value is None:
+        return _RANK[None]
+    try:
+        return _RANK[Verdict(value)]
+    except ValueError:
+        return _RANK[None]
+
+
+def _evaluate_escritos(
+    deadline_type: str,
+    due_date: Optional[date],
+    escritos: Optional[Sequence[object]],
+    triggered_at: Optional[date],
+) -> Optional[VerdictResult]:
+    """Verdict from the filing date of a matching escrito, or None (no evidence).
+
+    ``fecha_ingreso`` is the real date of the act, so the publication margin
+    does not apply: on or before ``due_date`` is on time, after it is late. An
+    escrito dated before ``triggered_at`` predates the plazo and is not evidence.
+    """
+    matcher = ESCRITO_MATCHERS.get(deadline_type)
+    if matcher is None or not escritos:
+        return None
+    days = [
+        _day_of_escrito(e) for e in escritos
+        if matcher(e) and (triggered_at is None or _day_of_escrito(e) >= triggered_at)
+    ]
+    if not days:
+        return None
+    filed_on = min(days)
+    if due_date is None:
+        return VerdictResult(Verdict.PRESENTADO_SIN_ANCLA, None, filed_on)
+    verdict = Verdict.CUMPLIDO if filed_on <= due_date else Verdict.FUERA_DE_PLAZO
+    return VerdictResult(verdict, None, filed_on)
+
+
+def _day_of_escrito(escrito: object) -> date:
+    stamp = escrito.fecha_ingreso  # type: ignore[attr-defined]
+    return stamp.date() if isinstance(stamp, datetime) else stamp
+
+
 def evaluate_deadline(
     deadline_type: str,
     due_date: Optional[date],
@@ -190,11 +286,36 @@ def evaluate_deadline(
     *,
     publication_margin_days: Optional[int] = None,
     triggered_at: Optional[date] = None,
+    escritos: Optional[Sequence[object]] = None,
 ) -> VerdictResult:
     """Pure evaluation. Never reads the row's lifecycle ``status``.
 
     ``publication_margin_days`` defaults to the per-type setting; 0 disables it.
+
+    ``escritos`` (``CaseEscrito``-like rows) are ADDITIVE evidence: the better of
+    the movement-based and the escrito-based verdict wins, so passing them can
+    only improve a result, never worsen it. With ``None``/empty the result is
+    exactly the movement-only one.
     """
+    from_movements = _evaluate_movements(
+        deadline_type, due_date, movements, today,
+        publication_margin_days=publication_margin_days, triggered_at=triggered_at,
+    )
+    from_escritos = _evaluate_escritos(deadline_type, due_date, escritos, triggered_at)
+    if from_escritos is not None and _RANK[from_escritos.verdict] > _RANK[from_movements.verdict]:
+        return from_escritos
+    return from_movements
+
+
+def _evaluate_movements(
+    deadline_type: str,
+    due_date: Optional[date],
+    movements: Sequence[object],
+    today: date,
+    *,
+    publication_margin_days: Optional[int] = None,
+    triggered_at: Optional[date] = None,
+) -> VerdictResult:
     detector = DETECTORS.get(deadline_type)
     if detector is None:
         return UNDETERMINED

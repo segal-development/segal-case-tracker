@@ -29,6 +29,7 @@ from zoneinfo import ZoneInfo
 
 from dateutil.relativedelta import relativedelta
 
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 import re as _re
@@ -50,7 +51,12 @@ from app.models.case_deadline import CaseDeadline
 from app.models.case_escrito import CaseEscrito
 from app.models.movement import Movement
 from app.services.business_days import add_business_days, count_business_days_remaining
-from app.services.deadline_verdict import evaluate_deadline
+from app.services.deadline_verdict import (
+    evaluate_deadline,
+    is_excepciones_escrito,
+    verdict_rank,
+    verdict_uses_escritos,
+)
 from app.services.poder_deadline import find_poder_obligation
 from app.services.procedural_classifier import MovementClassifier, anchor_date
 
@@ -180,12 +186,38 @@ def _normalize_text(value: Optional[str]) -> str:
 
 
 def _is_demandado_opposition_escrito(escrito: CaseEscrito) -> bool:
-    """True for a dated escrito in which the ejecutado opposes the execution."""
-    return (
-        escrito.fecha_ingreso is not None
-        and bool(_OPONE_EXCEPCIONES_RE.search(_normalize_text(escrito.tipo_escrito)))
-        and bool(_DEMANDADO_SOLICITANTE_RE.search(_normalize_text(escrito.solicitante)))
-    )
+    """True for a dated escrito in which the ejecutado opposes the execution.
+
+    One definition, shared with the verdict (``deadline_verdict``).
+    """
+    return is_excepciones_escrito(escrito)
+
+
+class _EscritosOfCase:
+    """The ``case_escritos`` of one case, loaded lazily and AT MOST ONCE.
+
+    A recompute touches several plazo rows of the same case; each used to be a
+    candidate for its own query. Cases that never need escritos (no excepciones
+    verdict to compute) never pay the query.
+    """
+
+    def __init__(self, db: Session, case_id: int) -> None:
+        self._db = db
+        self._case_id = case_id
+        self._rows: Optional[list[CaseEscrito]] = None
+
+    def get(self) -> list[CaseEscrito]:
+        if self._rows is None:
+            self._rows = (
+                self._db.query(CaseEscrito)
+                .filter(CaseEscrito.case_id == self._case_id)
+                .all()
+            )
+        return self._rows
+
+
+# Verdicts an escrito can still improve (a better one is never replaced).
+_REJUDGEABLE_VERDICTS = ("no_cumplido", "fuera_de_plazo", "registro_tardio")
 
 
 def _day_of(value: object) -> date:
@@ -364,6 +396,8 @@ class DeadlineEngine:
         if loaded is not None:
             loaded.movements = movements
 
+        escritos = _EscritosOfCase(db, case.id)
+
         # Step 3: classify.
         proc_state, triggers = _CLASSIFIER.classify(movements, today)
 
@@ -429,19 +463,36 @@ class DeadlineEngine:
         # including when new_trigger_keys is empty (TERMINADA, INDETERMINATE, SENTENCIA
         # after appeal window) — so that no stale "active" rows remain after the
         # case advances, preventing false ROJO from prior-state past-due deadlines.
+        # The same query also returns the closed excepciones rows an escrito could
+        # still correct (see ``_rejudge_closed_excepciones``), so re-judging them
+        # costs no extra round-trip.
         all_active = (
             db.query(CaseDeadline)
             .filter(
                 CaseDeadline.case_id == case.id,
-                CaseDeadline.status == "active",
                 CaseDeadline.is_manual == False,  # noqa: E712
                 # PARALLEL plazos are not in the classifier's triggers by design;
                 # without this exclusion they would be superseded on the next
                 # recompute (silently: no error, no log). Owned by step 5c.
                 CaseDeadline.deadline_type.notin_(PARALLEL_DEADLINE_VALUES),
+                or_(
+                    CaseDeadline.status == "active",
+                    and_(
+                        CaseDeadline.deadline_type == DeadlineType.EXCEPCIONES_8D.value,
+                        CaseDeadline.status.in_(("superseded", "expired")),
+                        CaseDeadline.marked_by.is_(None),
+                        CaseDeadline.marked_at.is_(None),
+                        # NULL verdict is excluded on purpose: a closed row without
+                        # one was cleared (re-anchored, stale due_date) and judging
+                        # it would invent a miss.
+                        CaseDeadline.verdict.in_(_REJUDGEABLE_VERDICTS),
+                    ),
+                ),
             )
             .all()
         )
+        closed_candidates = [r for r in all_active if r.status != "active"]
+        all_active = [r for r in all_active if r.status == "active"]
         for row in all_active:
             current_trigger = new_trigger_keys.get(row.deadline_type)
             # DEMANDADO: a filed defense is judged FIRST. It must win over every
@@ -456,13 +507,13 @@ class DeadlineEngine:
                 side == "demandado"
                 and row.deadline_type == DeadlineType.EXCEPCIONES_8D.value
                 and not re_anchored
-                and cls._close_excepciones_on_defense(db, row, movements, today)
+                and cls._close_excepciones_on_defense(db, row, movements, today, escritos)
             ):
                 continue
             if current_trigger is None:
                 # The plazo closed because the case moved on: judge it BEFORE
                 # superseding, or the evidence is lost with the row's status.
-                cls._record_verdict(row, movements, today)
+                cls._record_verdict(row, movements, today, escritos)
                 row.status = "superseded"
             elif row.triggered_at != current_trigger:
                 # Re-anchored (e.g. the diligencia-date change): a NEW row for
@@ -501,7 +552,7 @@ class DeadlineEngine:
             )
             for row in still_active:
                 if row.due_date < today and latest_mv_date > row.due_date:
-                    cls._record_verdict(row, movements, today)
+                    cls._record_verdict(row, movements, today, escritos)
                     row.status = "superseded"
             db.flush()
 
@@ -538,7 +589,7 @@ class DeadlineEngine:
                 and not has_excepciones_movement
             ):
                 proc_state = ProceduralState.REBELDE
-                cls._record_verdict(exc_row, movements, today)
+                cls._record_verdict(exc_row, movements, today, escritos)
                 exc_row.status = "expired"
                 db.flush()
 
@@ -556,8 +607,12 @@ class DeadlineEngine:
             .all()
         )
         for row in overdue_active:
-            cls._record_verdict(row, movements, today)
+            cls._record_verdict(row, movements, today, escritos)
         db.flush()
+
+        # Step 6c: a plazo closed BEFORE its escrito was known keeps a stale miss
+        # forever unless it is judged again.
+        cls._rejudge_closed_excepciones(db, movements, today, escritos, closed_candidates)
 
         # Step 7a: compute semáforo from nearest active deadline.
         semaforo = cls._compute_semaforo(
@@ -633,7 +688,12 @@ class DeadlineEngine:
 
     @classmethod
     def _close_excepciones_on_defense(
-        cls, db: Session, row: CaseDeadline, movements: list[Movement], today: date
+        cls,
+        db: Session,
+        row: CaseDeadline,
+        movements: list[Movement],
+        today: date,
+        escritos_of_case: Optional[_EscritosOfCase] = None,
     ) -> bool:
         """DEMANDADO: a filed "Opone excepciones" fulfils the art. 464 plazo.
 
@@ -654,9 +714,11 @@ class DeadlineEngine:
         """
         if row.is_manual or row.status != "active":
             return False
+        if escritos_of_case is None:
+            escritos_of_case = _EscritosOfCase(db, row.case_id)
         escritos = [
             _day_of(e.fecha_ingreso)
-            for e in db.query(CaseEscrito).filter(CaseEscrito.case_id == row.case_id).all()
+            for e in escritos_of_case.get()
             if _is_demandado_opposition_escrito(e)
         ]
         opposition_movements = [mv for mv in movements if _is_opposition_movement(mv)]
@@ -678,9 +740,60 @@ class DeadlineEngine:
             # Same closure the engine always gave a movement-shown opposition
             # (superseded + margin-aware verdict).
             row.status = "superseded"
-            cls._apply_verdict(row, movements, today)
+            cls._apply_verdict(row, movements, today, escritos_of_case)
         row.computed_at = datetime.now(timezone.utc)
         return True
+
+    @classmethod
+    def _rejudge_closed_excepciones(
+        cls,
+        db: Session,
+        movements: list[Movement],
+        today: date,
+        escritos: _EscritosOfCase,
+        rows: list[CaseDeadline],
+    ) -> None:
+        """Re-judge CLOSED excepciones rows against the escritos now on file.
+
+        The filing date (``case_escritos.fecha_ingreso``) can arrive after the
+        row was closed (superseded / expired) with a movement-only verdict, and
+        a closed row is never visited by the live-plazo steps again. ``rows``
+        are pre-selected by the step-5 query (excepciones, closed, automatic,
+        not marked by an auditor, verdict a miss). Rules:
+
+        * Only ``verdict*`` is written, never ``status``.
+        * Monotone: the verdict is replaced ONLY by a strictly better one, so
+          this can never turn a ``cumplido`` into a miss.
+        * Auditor decisions always win: manual rows, rows with ``marked_by`` /
+          ``marked_at`` never reach this method, and rows whose status an
+          auditor set (cumplido / no_cumplido) are not closed rows.
+        * Escritos are loaded only when there is a row to judge.
+        """
+        if not rows:
+            return
+        try:
+            if not any(is_excepciones_escrito(e) for e in escritos.get()):
+                return
+            for row in rows:
+                result = evaluate_deadline(
+                    row.deadline_type,
+                    cls._current_due_date(row),
+                    movements,
+                    today,
+                    triggered_at=row.triggered_at,
+                    escritos=escritos.get(),
+                )
+                if result.verdict is None or verdict_rank(result.verdict) <= verdict_rank(
+                    row.verdict
+                ):
+                    continue
+                row.verdict = result.verdict.value
+                row.verdict_movement_id = result.movement_id
+                row.verdict_acted_on = result.acted_on
+                row.verdict_computed_at = datetime.now(timezone.utc)
+            db.flush()
+        except Exception as exc:
+            logger.exception("re-judging closed excepciones failed: %s — skipping", exc)
 
     @staticmethod
     def _clear_verdict(row: CaseDeadline) -> None:
@@ -691,7 +804,11 @@ class DeadlineEngine:
 
     @classmethod
     def _record_verdict(
-        cls, row: CaseDeadline, movements: list[Movement], today: date
+        cls,
+        row: CaseDeadline,
+        movements: list[Movement],
+        today: date,
+        escritos: Optional[_EscritosOfCase] = None,
     ) -> None:
         """Persist the verdict of a plazo that is closing (or already overdue).
 
@@ -701,11 +818,15 @@ class DeadlineEngine:
         """
         if row.is_manual or row.status in ("cumplido", "no_cumplido"):
             return
-        cls._apply_verdict(row, movements, today)
+        cls._apply_verdict(row, movements, today, escritos)
 
     @classmethod
     def _apply_verdict(
-        cls, row: CaseDeadline, movements: list[Movement], today: date
+        cls,
+        row: CaseDeadline,
+        movements: list[Movement],
+        today: date,
+        escritos: Optional[_EscritosOfCase] = None,
     ) -> None:
         """Evaluate and write the verdict columns of ``row``. NEVER raises.
 
@@ -720,6 +841,11 @@ class DeadlineEngine:
                 movements,
                 today,
                 triggered_at=row.triggered_at,
+                escritos=(
+                    escritos.get()
+                    if escritos is not None and verdict_uses_escritos(row.deadline_type)
+                    else None
+                ),
             )
             if result.verdict is None:
                 cls._clear_verdict(row)
