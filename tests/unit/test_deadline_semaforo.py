@@ -152,10 +152,19 @@ class TestUnconfirmedTerm:
         a = assess("excepciones_8d", TRIGGER, date(2026, 11, 12))
         assert a.level is None
 
-    def test_no_source_confirms_the_term_today(self) -> None:
-        """lugar_requerimiento exists in no source: until one does, this is
-        None for every plazo. This test is the tripwire: if it starts failing
-        somebody wired a source, and the alert copy needs a second look."""
+    def test_no_per_plazo_source_confirms_the_term_today(self, monkeypatch) -> None:
+        """lugar_requerimiento exists in no source: until one does, nothing
+        confirms the term PER PLAZO. This test is the tripwire: if it starts
+        failing somebody wired a source, and the alert copy needs a second look.
+
+        The firm-wide setting is pinned to 0 here on purpose. It is a statement
+        about how the firm's cases run, not a per-plazo source, so leaving it at
+        its shipping default (8) would make this assertion pass for the wrong
+        reason and the tripwire would never fire again.
+        """
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "SEMAFORO_EXCEPCIONES_TERM_DAYS", 0)
         assert confirmed_excepciones_term(object()) is None
 
 
@@ -231,10 +240,22 @@ class TestPinnedExcepcionesTerm:
 
         monkeypatch.setattr(settings, "SEMAFORO_EXCEPCIONES_TERM_DAYS", value)
 
-    def test_default_is_zero_so_both_readings_stay(self, monkeypatch) -> None:
+    def test_the_default_is_the_8_day_term_the_firm_works_with(self) -> None:
+        """Shipping default = 8, so the panel shows ONE confirmed due date.
+
+        The old default (0, "keep both readings") printed a "Plazo no
+        confirmado: 4 días / 8 días" box on every excepciones plazo. The firm
+        asked for the 4-day reading to be dropped and only the 8-day one kept,
+        and that has to hold wherever the code runs -- setting it as an env var
+        on the scraping station fixed the worker and left the API, which is
+        what actually serves the panel, still on 0.
+        """
         from app.config import Settings
 
-        assert Settings().SEMAFORO_EXCEPCIONES_TERM_DAYS == 0
+        assert Settings().SEMAFORO_EXCEPCIONES_TERM_DAYS == 8
+
+    def test_zero_still_restores_both_readings(self, monkeypatch) -> None:
+        """The escape hatch stays: 0 is still a valid, env-settable value."""
         self._pin(monkeypatch, 0)
         term = confirmed_excepciones_term(object())
         assert term is None
