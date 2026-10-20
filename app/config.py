@@ -271,6 +271,12 @@ class Settings(BaseSettings):
     # Days since the last detail check after which the on-screen case diagnostic
     # (GET /cases/diagnostico) reports "latencia" instead of "al_dia".
     DIAGNOSTICO_LATENCIA_DIAS: int = Field(default=7, ge=1)
+    #: Dias de antelacion con que una causa con plazo FATAL por vencer salta
+    #: al frente de la rotacion de detalle. 0 = sin prioridad.
+    #: Incidente 2026-10-20: se alerto "vence hoy" sobre un poder ya acreditado
+    #: el dia anterior, porque la causa no se releia hace 18 horas. Ese dia
+    #: habia 14 plazos fatales venciendo en <=1 dia sin relectura.
+    DETAIL_FATAL_PLAZO_DAYS: int = 2
     DETAIL_MIN_YEAR: int = 2021    # Only detail-scrape cases with ROL year >= this (0 = all)
     DETAIL_PENDING_DOCS_FIRST: bool = False  # when true, detail rotation prioritizes cases with the most pending documents (PDF backfill)
     # Which side of the freshness/backlog cut this station works on. "all" = no cut
