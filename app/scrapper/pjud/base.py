@@ -926,7 +926,12 @@ class PJUDBaseScraper(ABC):
         from app.scrapper.pjud_civil import RECAPTCHA_SITEKEY, RECAPTCHA_ACTION_LOGIN
 
         page = await self._get_page()
-        await page.goto(PJUD_HOME_URL, wait_until="domcontentloaded")
+        try:
+            await page.goto(PJUD_HOME_URL, wait_until="domcontentloaded")
+        except Exception as nav_exc:
+            # TEMPORARY diagnostic (see dns_probe.py): observe-only, then re-raise untouched.
+            maybe_probe_name_resolution(str(nav_exc), PJUD_HOME_URL)
+            raise
 
         token = await self._generate_recaptcha_token(
             page, RECAPTCHA_SITEKEY, RECAPTCHA_ACTION_LOGIN
@@ -1141,6 +1146,10 @@ class PJUDBaseScraper(ABC):
         except LoginError:
             raise
         except Exception as e:
+            # TEMPORARY diagnostic (see dns_probe.py): observe-only. The only
+            # navigation that can raise a raw ERR_NAME_NOT_RESOLVED here is the
+            # home goto; the call is a no-op for any other error.
+            maybe_probe_name_resolution(str(e), PJUD_HOME_URL)
             logger.error(f"Login error: {e}")
             raise LoginError(f"Error during login: {str(e)}", cause=e)
     

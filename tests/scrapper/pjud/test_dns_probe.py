@@ -209,3 +209,61 @@ class TestHookInMisCausasLoad:
         await _drain()
         assert result == (False, "Timeout 30000ms exceeded")
         assert _probe_lines(logs) == []
+
+
+HOME_URL = "https://oficinajudicialvirtual.pjud.cl/home/index.php"
+
+
+class TestHookInLoginPaths:
+    """Re-auth path: the login gotos must feed the same probe, outcome unchanged."""
+
+    async def test_login_with_token_goto_failure_probes_and_still_raises_login_error(self):
+        from app.scrapper.pjud.civil import CivilScraper
+        from app.scrapper.pjud.exceptions import LoginError
+
+        scraper = CivilScraper(headless=True)
+        page = AsyncMock()
+        page.goto = AsyncMock(side_effect=Exception(NAV_ERR))
+        scraper._get_page = AsyncMock(return_value=page)
+        limiter = AsyncMock()
+        with patch(
+            "app.scrapper.pjud.resilience.rate_limiter.pjud_action_limiter",
+            return_value=limiter,
+        ), patch("app.scrapper.pjud.base.maybe_probe_name_resolution") as probe:
+            with pytest.raises(LoginError) as exc_info:
+                await scraper.login_with_token("19586894-5", "secret", "tok")
+        assert "ERR_NAME_NOT_RESOLVED" in str(exc_info.value)  # same message as before
+        probe.assert_called_once()
+        assert probe.call_args.args == (NAV_ERR, HOME_URL)
+
+    async def test_login_goto_failure_probes_and_reraises_the_original_exception(self):
+        from app.scrapper.pjud.civil import CivilScraper
+
+        scraper = CivilScraper(headless=True)
+        original = Exception(NAV_ERR)
+        page = AsyncMock()
+        page.goto = AsyncMock(side_effect=original)
+        scraper._get_page = AsyncMock(return_value=page)
+        with patch("app.scrapper.pjud.base.maybe_probe_name_resolution") as probe:
+            with pytest.raises(Exception) as exc_info:
+                await scraper.login_with_segunda_clave("19586894-5", "secret")
+        assert exc_info.value is original  # untouched, same object
+        probe.assert_called_once()
+        assert probe.call_args.args == (NAV_ERR, HOME_URL)
+
+    async def test_login_with_token_other_error_does_not_probe(self, logs, resolvers):
+        from app.scrapper.pjud.civil import CivilScraper
+        from app.scrapper.pjud.exceptions import LoginError
+
+        scraper = CivilScraper(headless=True)
+        page = AsyncMock()
+        page.goto = AsyncMock(side_effect=Exception("Timeout 30000ms exceeded"))
+        scraper._get_page = AsyncMock(return_value=page)
+        with patch(
+            "app.scrapper.pjud.resilience.rate_limiter.pjud_action_limiter",
+            return_value=AsyncMock(),
+        ):
+            with pytest.raises(LoginError):
+                await scraper.login_with_token("19586894-5", "secret", "tok")
+        await _drain()
+        assert _probe_lines(logs) == []
