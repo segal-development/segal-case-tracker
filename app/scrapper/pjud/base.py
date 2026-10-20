@@ -32,6 +32,7 @@ _CHROME_UA = (
 
 from app.config import settings
 from app.services.pjud_session import PJUDSession
+from app.scrapper.pjud.dns_probe import maybe_probe_name_resolution
 from app.scrapper.pjud.exceptions import (
     CredentialExpiredError,
     InvalidCredentialsError,
@@ -1283,6 +1284,8 @@ class PJUDBaseScraper(ABC):
                 await page.goto(PJUD_INDEX_URL, wait_until="domcontentloaded")
                 await asyncio.sleep(2)
             except Exception as nav_exc:
+                # TEMPORARY diagnostic (see dns_probe.py): observe-only, never raises.
+                maybe_probe_name_resolution(str(nav_exc), PJUD_INDEX_URL)
                 return False, str(nav_exc)
 
         # Let any client-side redirect after the initial load settle before we
