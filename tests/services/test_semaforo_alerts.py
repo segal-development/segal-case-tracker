@@ -2,6 +2,10 @@
 
 Calendar: trigger Monday 2026-11-02 (see tests/unit/test_deadline_semaforo.py).
 Day 3 = Thu 11-05, day 4 = Fri 11-06, day 6 = Mon 11-09, day 8 = Wed 11-11.
+
+The shipping default pins the excepciones term at 8 days (verde days 1-5,
+amarillo days 6-7, rojo day 8, over from day 9). Tests about the unknown term
+pin ``SEMAFORO_EXCEPCIONES_TERM_DAYS`` to 0 explicitly.
 """
 
 from __future__ import annotations
@@ -114,7 +118,7 @@ class TestRecipientsByLevel:
     def test_amarillo_adds_melissa_and_is_immediate(self, db, people) -> None:
         make_deadline(db, make_case(db, people))
         with smtp_ok() as smtp:
-            run_semaforo_alerts(db, today=D[3])  # unconfirmed: 4-day reading is amarillo
+            run_semaforo_alerts(db, today=D[6])  # 8-day term: day 6 is amarillo
             tos = sorted(c.args[0]["To"] for c in smtp.send_message.call_args_list)
         assert who(db, "plazo_amarillo") == ["Ana Pérez", "Melissa Acevedo"]
         assert tos == ["ana@segal.cl", "melissa@segal.cl"]  # carla is NOT told yet
@@ -122,7 +126,7 @@ class TestRecipientsByLevel:
     def test_rojo_adds_melissa_and_carla(self, db, people) -> None:
         make_deadline(db, make_case(db, people))
         with smtp_ok() as smtp:
-            run_semaforo_alerts(db, today=D[4])
+            run_semaforo_alerts(db, today=D[8])
             tos = sorted(c.args[0]["To"] for c in smtp.send_message.call_args_list)
         assert who(db, "plazo_rojo") == ["Ana Pérez", "Carla Lavín", "Melissa Acevedo"]
         assert tos == ["ana@segal.cl", "carla@segal.cl", "melissa@segal.cl"]
@@ -132,21 +136,21 @@ class TestRecipientsByLevel:
     ) -> None:
         make_deadline(db, make_case(db, people, lawyer=people["melissa"]))
         with smtp_ok() as smtp:
-            run_semaforo_alerts(db, today=D[4])
+            run_semaforo_alerts(db, today=D[8])
             assert smtp.send_message.call_count == 2  # melissa once, carla once
         assert who(db, "plazo_rojo") == ["Carla Lavín", "Melissa Acevedo"]
 
     def test_amarillo_and_rojo_are_never_inside_the_verde_digest(self, db, people) -> None:
         make_deadline(db, make_case(db, people))
         with smtp_ok() as smtp:
-            run_semaforo_alerts(db, today=D[4])
+            run_semaforo_alerts(db, today=D[8])
             assert not any(s.startswith("VERDE") for s in subjects(smtp))
 
     def test_each_rojo_is_its_own_email(self, db, people) -> None:
         make_deadline(db, make_case(db, people, rol="C-1-2026"))
         make_deadline(db, make_case(db, people, rol="C-2-2026"))
         with smtp_ok() as smtp:
-            run_semaforo_alerts(db, today=D[4])
+            run_semaforo_alerts(db, today=D[8])
             assert smtp.send_message.call_count == 6  # 2 plazos x 3 people
 
 
@@ -154,9 +158,9 @@ class TestWhenAlertsFire:
     def test_a_second_run_the_same_day_does_nothing(self, db, people) -> None:
         make_deadline(db, make_case(db, people))
         with smtp_ok() as smtp:
-            run_semaforo_alerts(db, today=D[4])
+            run_semaforo_alerts(db, today=D[8])
             first = smtp.send_message.call_count
-            summary = run_semaforo_alerts(db, today=D[4])
+            summary = run_semaforo_alerts(db, today=D[8])
             assert smtp.send_message.call_count == first
         assert len(alerts(db)) == 3
         assert summary["created"] == {"verde": 0, "amarillo": 0, "rojo": 0}
@@ -164,17 +168,19 @@ class TestWhenAlertsFire:
     def test_each_new_level_is_announced_once_as_days_pass(self, db, people) -> None:
         make_deadline(db, make_case(db, people))
         with smtp_ok():
-            for day in (1, 2, 3, 4):
+            for day in (1, 2, 6, 8):
                 run_semaforo_alerts(db, today=D[day])
         assert len(alerts(db, "plazo_verde")) == 1   # day 1; day 2 is the same slot+level
         assert len(alerts(db, "plazo_amarillo")) == 2
         assert len(alerts(db, "plazo_rojo")) == 3
 
     def test_the_same_level_returns_for_the_other_reading_and_is_announced_again(
-        self, db, people
+        self, db, people, monkeypatch
     ) -> None:
         """amarillo on day 3 (4-day reading) and again on day 6 (8-day reading)
         are two real alarms about two different possible deadlines."""
+        # The dual 4/8-day reading is no longer the default; pinned here on purpose.
+        monkeypatch.setattr(settings, "SEMAFORO_EXCEPCIONES_TERM_DAYS", 0)
         make_deadline(db, make_case(db, people))
         with smtp_ok():
             run_semaforo_alerts(db, today=D[3])
@@ -187,7 +193,7 @@ class TestWhenAlertsFire:
     def test_first_seen_late_gets_only_the_current_level_no_backlog(self, db, people) -> None:
         make_deadline(db, make_case(db, people))
         with smtp_ok():
-            run_semaforo_alerts(db, today=D[4])
+            run_semaforo_alerts(db, today=D[8])
         assert alerts(db, "plazo_verde") == [] and alerts(db, "plazo_amarillo") == []
         assert len(alerts(db, "plazo_rojo")) == 3
 
@@ -230,7 +236,9 @@ class TestWhenAlertsFire:
 
 
 class TestTheTermWeDoNotKnow:
-    def test_unconfirmed_is_declared_in_the_stored_alert(self, db, people) -> None:
+    def test_unconfirmed_is_declared_in_the_stored_alert(self, db, people, monkeypatch) -> None:
+        # The dual 4/8-day reading is no longer the default; pinned here on purpose.
+        monkeypatch.setattr(settings, "SEMAFORO_EXCEPCIONES_TERM_DAYS", 0)
         make_deadline(db, make_case(db, people))
         with smtp_ok():
             run_semaforo_alerts(db, today=D[3])
@@ -265,7 +273,9 @@ class TestTheTermWeDoNotKnow:
             run_semaforo_alerts(db, today=date(2026, 11, 7))
         assert len(alerts(db)) == 3
 
-    def test_the_email_an_unconfirmed_plazo_sends_declares_it(self, db, people) -> None:
+    def test_the_email_an_unconfirmed_plazo_sends_declares_it(self, db, people, monkeypatch) -> None:
+        # The dual 4/8-day reading is no longer the default; pinned here on purpose.
+        monkeypatch.setattr(settings, "SEMAFORO_EXCEPCIONES_TERM_DAYS", 0)
         make_deadline(db, make_case(db, people))
         with smtp_ok() as smtp:
             run_semaforo_alerts(db, today=D[4])
@@ -295,11 +305,11 @@ class TestNothingIsLost:
         make_deadline(db, make_case(db, people))
         with smtp_ok() as smtp:
             smtp.send_message.side_effect = smtplib.SMTPRecipientsRefused({})
-            run_semaforo_alerts(db, today=D[4])
+            run_semaforo_alerts(db, today=D[8])
             assert not any(a.email_sent for a in alerts(db, "plazo_rojo"))
             smtp.send_message.side_effect = None
             smtp.send_message.reset_mock()
-            run_semaforo_alerts(db, today=D[4])
+            run_semaforo_alerts(db, today=D[8])
             assert smtp.send_message.call_count == 3
         assert all(a.email_sent for a in alerts(db, "plazo_rojo"))
 
@@ -326,7 +336,7 @@ class TestNothingIsLost:
             row.triggered_at = date(2026, 10, 28)  # an old plazo, now rojo
             row.due_date = add_business_days(row.triggered_at, 8)
             db.commit()
-            run_semaforo_alerts(db, today=date(2026, 11, 3))
+            run_semaforo_alerts(db, today=date(2026, 11, 7))  # day 8 of 10-28
             first = subjects(smtp)[0]
         assert not first.startswith("VERDE")
 
@@ -355,7 +365,7 @@ class TestNeverBreaksTheCycle:
             return real(*a, **k)
 
         with smtp_ok(), patch.object(mod, "assess", side_effect=flaky):
-            summary = run_semaforo_alerts(db, today=D[4])
+            summary = run_semaforo_alerts(db, today=D[8])
         assert summary["errors"] == 1
         assert len(alerts(db, "plazo_rojo")) == 3
 
@@ -372,7 +382,7 @@ class TestNeverBreaksTheCycle:
         )
         make_deadline(db, make_case(db, people))
         with caplog.at_level(logging.WARNING), smtp_ok():
-            run_semaforo_alerts(db, today=D[4])
+            run_semaforo_alerts(db, today=D[8])
         assert who(db, "plazo_rojo") == ["Ana Pérez", "Carla Lavín"]
         assert "abc" in caplog.text and "9999" in caplog.text
 
@@ -381,7 +391,7 @@ class TestNeverBreaksTheCycle:
         db.commit()
         make_deadline(db, make_case(db, people))
         with smtp_ok():
-            run_semaforo_alerts(db, today=D[4])
+            run_semaforo_alerts(db, today=D[8])
         assert who(db, "plazo_rojo") == ["Ana Pérez", "Melissa Acevedo"]
 
 
@@ -463,11 +473,11 @@ class TestTriggerCutoff:
         db.commit()
         return row
 
-    def test_a_plazo_triggered_3_days_ago_alerts(self, db, people, monkeypatch) -> None:
+    def test_a_plazo_triggered_7_days_ago_alerts(self, db, people, monkeypatch) -> None:
         monkeypatch.setattr(settings, "SEMAFORO_MAX_TRIGGER_AGE_DAYS", 7)
         make_deadline(db, make_case(db, people))
         with smtp_ok():
-            summary = run_semaforo_alerts(db, today=D[3])  # trigger was 3 days earlier
+            summary = run_semaforo_alerts(db, today=D[6])  # trigger was 7 days earlier
         assert who(db, "plazo_amarillo") == ["Ana Pérez", "Melissa Acevedo"]
         assert summary["suppressed_by_cutoff"] == 0
 
@@ -545,7 +555,7 @@ class TestTriggerCutoff:
         monkeypatch.setattr(settings, "SEMAFORO_MAX_TRIGGER_AGE_DAYS", 0)
         make_deadline(db, make_case(db, people))
         with smtp_ok():
-            summary = run_semaforo_alerts(db, today=D[4])
+            summary = run_semaforo_alerts(db, today=D[8])
         assert len(alerts(db, "plazo_rojo")) == 3
         assert summary["suppressed_by_cutoff"] == 0
 
@@ -553,7 +563,7 @@ class TestTriggerCutoff:
         monkeypatch.setattr(settings, "SEMAFORO_MAX_TRIGGER_AGE_DAYS", -5)
         make_deadline(db, make_case(db, people))
         with smtp_ok():
-            run_semaforo_alerts(db, today=D[4])
+            run_semaforo_alerts(db, today=D[8])
         assert len(alerts(db, "plazo_rojo")) == 3
 
     def test_the_age_boundary_is_inclusive(self, db, people, monkeypatch) -> None:
@@ -636,13 +646,25 @@ class TestExpiredSelection:
         row = make_expired(db, make_case(db, people), verdict=verdict)
         assert self._select(db) == [row.id]
 
-    @pytest.mark.parametrize("type_", ["excepciones_8d", "apelacion_5d"])
-    def test_both_fatal_types_are_selected(self, db, people, type_) -> None:
-        row = make_expired(db, make_case(db, people), type_=type_)
+    def test_the_mandatory_fatal_type_is_selected(self, db, people) -> None:
+        row = make_expired(db, make_case(db, people), type_="excepciones_8d")
         assert self._select(db) == [row.id]
 
-    @pytest.mark.parametrize("type_", ["acreditar_poder_3d", "sentencia_10d", "traslado_ejecutante_4d"])
+    @pytest.mark.parametrize(
+        "type_", ["acreditar_poder_3d", "sentencia_10d", "traslado_ejecutante_4d"]
+    )
     def test_non_fatal_types_are_not_selected(self, db, people, type_) -> None:
+        make_expired(db, make_case(db, people), type_=type_)
+        assert self._select(db) == []
+
+    @pytest.mark.parametrize("type_", ["apelacion_5d", "reposicion_auto_prueba_3d"])
+    def test_optional_rights_are_not_selected(self, db, people, type_) -> None:
+        """Fatal but OPTIONAL: letting the window close is a choice, not a miss.
+
+        Appealing is a right the firm weighs case by case, so a VENCIDO notice
+        would report its own strategy as a failure. See the note on
+        ``_EXPIRED_NOTICE_TYPES``.
+        """
         make_expired(db, make_case(db, people), type_=type_)
         assert self._select(db) == []
 
@@ -774,7 +796,7 @@ class TestExpiredAlert:
     def test_it_does_not_change_the_live_term_alerts(self, db, people) -> None:
         make_deadline(db, make_case(db, people))
         with smtp_ok():
-            summary = run_semaforo_alerts(db, today=D[4])
+            summary = run_semaforo_alerts(db, today=D[8])
         assert summary["created"] == {"verde": 0, "amarillo": 0, "rojo": 3}
         assert vencidos(db) == []
 
@@ -787,7 +809,7 @@ class TestExpiredAlert:
         monkeypatch.setattr("app.services.semaforo_alerts.expired_unfiled_deadlines", boom)
         make_deadline(db, make_case(db, people))
         with smtp_ok():
-            summary = run_semaforo_alerts(db, today=D[4])
+            summary = run_semaforo_alerts(db, today=D[8])
         assert summary["errors"] >= 1
         assert summary["created"]["rojo"] == 3
 
@@ -909,6 +931,32 @@ class TestExpiredDispatch:
     def test_the_live_term_rule_is_unchanged_for_other_alerts(self, db, people) -> None:
         make_deadline(db, make_case(db, people))
         with smtp_ok() as smtp:
-            summary = run_semaforo_alerts(db, today=D[4])
+            summary = run_semaforo_alerts(db, today=D[8])
             assert smtp.send_message.call_count == 3
         assert summary["dispatched"] == 3 and summary["expired_dispatched"] == 0
+
+
+def test_expired_notice_never_covers_optional_rights():
+    """The "VENCIDO, no presentaste" notice is only for MANDATORY plazos.
+
+    APELACION_5D is fatal but OPTIONAL: appealing is a right the firm exercises
+    case by case ("no todo conviene apelarlo" — Carla Lavín, 2026-10-20), so a
+    window that closes unused is a decision, not a miss. Announcing it as
+    VENCIDO would turn the firm's own strategy into a false alarm.
+
+    This is a LANDMINE GUARD. Today apelacion_5d emits nothing only because
+    deadline_verdict.DETECTORS has no apelación detector, so its verdict stays
+    NULL and the query filters it out. The 754 NULL rows in QA look like a bug;
+    adding that detector is the obvious "fix", and the day someone does, this
+    set decides whether the firm gets mailed about appeals it chose not to file.
+    Exclude by OPTIONAL_ACTIONABLE_VALUES, not by the missing detector.
+    """
+    from app.core.deadlines_config import OPTIONAL_ACTIONABLE_VALUES
+    from app.services.semaforo_alerts import _EXPIRED_NOTICE_TYPES
+
+    assert not (_EXPIRED_NOTICE_TYPES & OPTIONAL_ACTIONABLE_VALUES), (
+        "optional rights must never raise a VENCIDO notice: "
+        f"{sorted(_EXPIRED_NOTICE_TYPES & OPTIONAL_ACTIONABLE_VALUES)}"
+    )
+    # ...and the obligation it exists for is still covered.
+    assert _EXPIRED_NOTICE_TYPES == {"excepciones_8d"}

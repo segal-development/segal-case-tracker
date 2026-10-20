@@ -102,6 +102,11 @@ class CaseResponse(BaseModel):
     assigned_lawyer_id: Optional[int] = None
     assigned_lawyer_nombre: Optional[str] = None
     asignado: bool = False
+    # The lawyer who works this causa (Case.effective_lawyer_id: the override
+    # when set, else the provenance lawyer). Same names as the Plazos panel.
+    # Optional so an unknown lawyer never breaks the payload.
+    abogado_id: Optional[int] = None
+    abogado_nombre: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -764,6 +769,14 @@ async def list_cases(
         else {}
     )
 
+    # Effective-lawyer names for this page (1 query, no N+1).
+    effective_ids = {c.effective_lawyer_id for c in cases} - {None}
+    effective_names = (
+        dict(db.query(Lawyer.id, Lawyer.name).filter(Lawyer.id.in_(effective_ids)).all())
+        if effective_ids
+        else {}
+    )
+
     # Build response with court info
     items = []
     for case in cases:
@@ -803,6 +816,8 @@ async def list_cases(
             assigned_lawyer_id=case.assigned_lawyer_id,
             assigned_lawyer_nombre=assigned_names.get(case.assigned_lawyer_id),
             asignado=case.assigned_lawyer_id is not None,
+            abogado_id=case.effective_lawyer_id,
+            abogado_nombre=effective_names.get(case.effective_lawyer_id),
             **_sysgal_fields(sysgal_info.get(case.id)),
         ))
 
@@ -1024,6 +1039,12 @@ async def cases_facets(
     return CaseFacetsResponse(tribunals=tribunals, materias=materias)
 
 
+def _effective_lawyer_name(case: Case) -> Optional[str]:
+    """Name of ``Case.effective_lawyer_id`` using the already-mapped relationships."""
+    holder = case.assigned_lawyer if case.assigned_lawyer_id is not None else case.lawyer
+    return holder.name if holder else None
+
+
 @router.get("/{case_id}", response_model=CaseDetailResponse)
 async def get_case(
     case_id: int,
@@ -1105,6 +1126,8 @@ async def get_case(
         assigned_lawyer_id=case.assigned_lawyer_id,
         assigned_lawyer_nombre=case.assigned_lawyer.name if case.assigned_lawyer else None,
         asignado=case.assigned_lawyer_id is not None,
+        abogado_id=case.effective_lawyer_id,
+        abogado_nombre=_effective_lawyer_name(case),
         **_sysgal_fields(sysgal_info),
     )
 
