@@ -1454,7 +1454,26 @@ class PJUDBaseScraper(ABC):
                     break
                 
                 current_page += 1
-            
+
+            # Reconcile what PJUD said exists against what pagination actually
+            # collected. A shortfall here is rows the scraper never brought
+            # back, which no amount of persistence logic can recover -- and it
+            # is invisible otherwise, because every row that DOES arrive is
+            # stored. `missing` is the number to watch; 0 is healthy.
+            collected = len(all_cases)
+            missing = (total_count - collected) if total_count else 0
+            logger.info(
+                "LISTING_PAGINATION_RECONCILE reported=%s collected=%d missing=%d "
+                "pages_expected=%s pages_read=%d max_pages=%s",
+                total_count, collected, missing, total_pages, current_page, max_pages,
+            )
+            if missing > 0:
+                logger.warning(
+                    "LISTING_SHORTFALL reported=%s collected=%d missing=%d: PJUD "
+                    "listed more causas than pagination returned.",
+                    total_count, collected, missing,
+                )
+
             return all_cases
             
         except Exception as e:
