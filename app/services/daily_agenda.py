@@ -146,7 +146,15 @@ def lawyer_day_agenda(db, lawyer: Lawyer, day: date) -> DayAgenda:
                 )
             )
 
-        if case.next_review_at == day:
+        # DecisionEngine mirrors the plazo into next_review_at, so a case with a
+        # plazo today would be listed twice in the email. The deadline entry
+        # already carries it (and the fatal flag that triggers the partner CC);
+        # only a review with its own date, i.e. no plazo, is a separate entry.
+        review_mirrors_deadline = (
+            case.next_deadline_at is not None
+            and case.next_review_at == case.next_deadline_at
+        )
+        if case.next_review_at == day and not review_mirrors_deadline:
             rule = resolve_rule(case.recommended_action_code)
             reviews.append(
                 AgendaItem(
