@@ -8,12 +8,17 @@ Design rules — this answers questions about FATAL plazos, so it never invents:
 * "Presentó" and "a tiempo" are separate answers. ``excepciones.presentadas``
   says whether the filing exists in PJUD; ``veredicto`` says whether it was on
   time, and is ``presentado_sin_ancla`` when there is no plazo to compare to.
-* The filing is ``Movement.procedure == 'Escrito'`` + ``Opone excepciones``.
-  A ``Resolución`` with the same text is the court's ruling, not the filing.
+* The filing is ``Movement.procedure == 'Escrito'`` + ``Opone excepciones``, or
+  a ``CaseEscrito`` of the ejecutado opposing the execution. The escrito exists
+  from the day the lawyer FILES, the movement only once the court PROVIDES it,
+  so reading movements alone says "no escrito" while there is one. A
+  ``Resolución`` with the same text is the court's ruling, not the filing.
 * ``sin_determinar`` is an explicit, valid verdict.
 * The verdict is evaluated live with ``deadline_verdict.evaluate_deadline``
-  (pure) over the same movements shown in the response, so ``presentadas`` and
-  ``veredicto`` can never contradict each other. The persisted
+  (pure) over the same movements and escritos shown in the response, so
+  ``presentadas`` and ``veredicto`` can never contradict each other. When the
+  evidence is an escrito there is no movement to point at: ``movimiento_id`` is
+  null and ``fecha`` is the escrito's filing date. The persisted
   ``CaseDeadline.verdict`` is deliberately not read: it is NULL on rows still in
   force and can lag behind new movements.
 * Scope is EVERY causa of the client (``all_case_ids_for_cliente``), not only
@@ -38,12 +43,13 @@ from app.api.sysgal.deps import require_sysgal_key
 from app.core.deadlines_config import DEADLINE_DISCLAIMER, DeadlineType
 from app.models.case import Case
 from app.models.case_deadline import CaseDeadline
+from app.models.case_escrito import CaseEscrito
 from app.models.case_litigante import CaseLitigante
 from app.models.court import Court
 from app.models.movement import Movement
 from app.services.business_days import count_business_days_remaining
 from app.services.deadline_engine import _today_chile
-from app.services.deadline_verdict import Verdict, evaluate_deadline
+from app.services.deadline_verdict import Verdict, evaluate_deadline, is_excepciones_escrito
 from app.utils.rut import normalize_rut
 
 router = APIRouter()
@@ -58,14 +64,16 @@ _MOTIVOS: Dict[str, str] = {
         "de atraso con que PJUD publica. No se puede afirmar que fue tardío: verifica la fecha "
         "de presentación en el expediente."
     ),
-    Verdict.NO_CUMPLIDO.value: "El plazo venció y no hay escrito de excepciones en PJUD.",
+    Verdict.NO_CUMPLIDO.value: "El plazo venció y no se registra un escrito de excepciones en PJUD.",
     Verdict.PRESENTADO_SIN_ANCLA.value: (
         "Las excepciones se presentaron, pero no hay plazo calculado para esta causa, "
         "así que no se puede decir si fue a tiempo."
     ),
     SIN_DETERMINAR: "Hoy no hay datos suficientes para afirmar si se cumplió o no.",
 }
-_MOTIVO_SIN_MOVIMIENTOS = "No hay movimientos de PJUD cargados para esta causa."
+_MOTIVO_SIN_MOVIMIENTOS = (
+    "No hay movimientos ni escritos de excepciones de PJUD cargados para esta causa."
+)
 _MOTIVO_NO_EJECUTADO = (
     "El RUT consultado no figura como demandado en esta causa, "
     "por lo que las excepciones no le corresponden."
@@ -140,6 +148,7 @@ def _build_item(
     court_name: Optional[str],
     roles: List[str],
     movements: List[Movement],
+    escritos: List[CaseEscrito],
     excepciones_row: Optional[CaseDeadline],
     poder_row: Optional[CaseDeadline],
     today: date,
@@ -153,7 +162,10 @@ def _build_item(
             fundamento_legal=excepciones_row.legal_basis,
         )
 
-    if not movements:
+    # An excepciones escrito is evidence even before any movement is loaded; one
+    # that is not the filing (e.g. "Téngase presente") is not, so it must not
+    # open the door to a verdict that would turn absence into a "miss".
+    if not movements and not any(is_excepciones_escrito(e) for e in escritos):
         exc = ExcepcionesOut()
         verdict_value, motivo = SIN_DETERMINAR, _MOTIVO_SIN_MOVIMIENTOS
     elif not _is_ejecutado(roles):
@@ -165,8 +177,10 @@ def _build_item(
             excepciones_row.due_date if excepciones_row is not None else None,
             movements,
             today,
+            escritos=escritos,
         )
-        # A verdict other than None/no_cumplido exists only when an act was found.
+        # A verdict other than None/no_cumplido exists only when an act was found;
+        # that act may be an escrito, which has no movement id.
         filed = result.verdict in (
             Verdict.CUMPLIDO,
             Verdict.FUERA_DE_PLAZO,
@@ -244,6 +258,14 @@ def get_excepciones(
     ):
         movements_by_case.setdefault(mv.case_id, []).append(mv)
 
+    escritos_by_case: Dict[int, List[CaseEscrito]] = {}
+    for esc in (
+        db.query(CaseEscrito)
+        .filter(CaseEscrito.case_id.in_(case_ids))
+        .order_by(CaseEscrito.fecha_ingreso, CaseEscrito.id)
+    ):
+        escritos_by_case.setdefault(esc.case_id, []).append(esc)
+
     deadlines: Dict[tuple, List[CaseDeadline]] = {}
     for row in db.query(CaseDeadline).filter(
         CaseDeadline.case_id.in_(case_ids),
@@ -264,6 +286,7 @@ def get_excepciones(
                 court_names.get(case.court_id),
                 roles_by_case.get(case.id, []),
                 movements_by_case.get(case.id, []),
+                escritos_by_case.get(case.id, []),
                 _pick_deadline(
                     [
                         r
