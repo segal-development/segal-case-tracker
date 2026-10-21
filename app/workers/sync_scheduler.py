@@ -192,6 +192,12 @@ def _active_lawyer_ids_by_staleness(db: Session) -> list[int]:
     daily, so the same 6–7 lawyers at the head of the heap synced every day while
     the tail (Carla included) never got a turn for two weeks. Ordering by
     staleness makes the rotation fair no matter where a cycle gets cut.
+
+    ``SYNC_LAWYER_IDS`` narrows the set (split load across machines / isolate one
+    lawyer) but never the order: staleness still decides, not the setting's order.
+    Unknown or inactive ids simply don't match. If the setting is non-empty but
+    yields no valid id (a typo), nobody is visited — failing closed beats a
+    silent fallback to the whole firm when the intent was to isolate one lawyer.
     """
     last_ok = (
         db.query(
@@ -202,12 +208,14 @@ def _active_lawyer_ids_by_staleness(db: Session) -> list[int]:
         .group_by(SyncHistory.lawyer_id)
         .subquery()
     )
-    rows = (
+    query = (
         db.query(Lawyer.id, last_ok.c.last_ok)
         .outerjoin(last_ok, last_ok.c.lawyer_id == Lawyer.id)
         .filter(Lawyer.is_active.is_(True))
-        .all()
     )
+    if settings.SYNC_LAWYER_IDS.strip():
+        query = query.filter(Lawyer.id.in_(settings.sync_lawyer_ids_list))
+    rows = query.all()
     # Sort in Python: NULLS FIRST is dialect-dependent (SQLite in tests).
     rows.sort(key=lambda r: (r.last_ok is not None, r.last_ok or datetime.min, r.id))
     return [r.id for r in rows]
