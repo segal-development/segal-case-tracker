@@ -319,6 +319,39 @@ class Settings(BaseSettings):
     # the demotion as well (every row is always "due"). Tunable from real data,
     # so it is an env var, not a constant.
     DETAIL_SECONDARY_CUADERNO_MIN_DAYS: int = Field(default=14, ge=0)
+    # Dormancy demotion. A causa that has not moved in years is rotated at the
+    # same frequency as one notified yesterday. Measured 2026-10-21 on the live
+    # QA DB, over the 15.201 rows in rotation (status='active', poda_at NULL):
+    # 2.976 have not moved in over a year, 1.245 in over two, 367 in over
+    # three, and NONE of the 2.976 carries a live deadline today.
+    #
+    # The rotation is the channel for what nobody told us about. A dormant
+    # causa that wakes up is caught by the OJV estado-diario feed
+    # (DETAIL_FEED_PRIORITY_ENABLED), which reads PJUD's daily docket per
+    # lawyer and jumps the matching causas to the front of the queue.
+    #
+    # Default ON in code on purpose: a value set only in the scraping station's
+    # LaunchAgent plist never reaches the API. Flip it in the environment to
+    # kill it without a deploy.
+    DETAIL_DORMANT_DEMOTE: bool = True
+    # Days without a single movement after which a causa counts as dormant.
+    # 0 disables the demotion. 365 measured as the only cut that frees a
+    # material share of the budget: 2.976 rows against 1.245 at 730 days and
+    # 367 at 1.095. A row with NO ``last_movement_at`` is NEVER dormant -- see
+    # the comment in ``_select_cases_for_detail_rotation``.
+    DETAIL_DORMANT_DAYS: int = Field(default=365, ge=0)
+    # Minimum days between two rotation reads of a dormant causa, i.e. the
+    # worst case a dormant causa can go unseen by the rotation. 0 disables the
+    # demotion as well.
+    #
+    # WHY 90 AND NOT LESS: the age rotation already orders by "least recently
+    # read first", so a window SHORTER than the cartera's own lap changes
+    # nothing -- the dormant row loses on age anyway. Measured laps per lawyer
+    # on 2026-10-21 run from 7 to 69 days, so only a window above ~65 days
+    # actually bites across the whole firm. WHY NOT MORE: going from 90 to 365
+    # buys the worst cartera 4,3 more days of lap (67,3 -> 63,0) while
+    # quadrupling the blind window. The curve flattens at 90.
+    DETAIL_DORMANT_MIN_DAYS: int = Field(default=90, ge=0)
 
     # Notifications
     NOTIFY_MAX_PER_SYNC: int = 25           # Max notifications dispatched per sync_movements call

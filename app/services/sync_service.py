@@ -1820,6 +1820,21 @@ def _select_cases_for_detail_rotation(
     order_clauses = []
     if reserved_first:
         order_clauses.append(Case.consulta_reserved.desc())
+
+    # A LIVE deadline (active, not yet due) is the one thing that cancels every
+    # demotion below. Built once and referenced by both clauses so the
+    # selection stays a single statement.
+    plazos_vivos = (
+        select(func.count(CaseDeadline.id))
+        .where(
+            CaseDeadline.case_id == Case.id,
+            CaseDeadline.status == "active",
+            CaseDeadline.due_date >= _today_chile(),
+        )
+        .correlate(Case)
+        .scalar_subquery()
+    )
+
     # Secondary-cuaderno demotion. PJUD splits one judicial case into cuadernos:
     # the main one ("Principal") plus secondary ones (medidas prejudiciales,
     # incidentes, apremios). We keep ONE Case row per cuaderno, so without this
@@ -1853,16 +1868,6 @@ def _select_cases_for_detail_rotation(
         and settings.DETAIL_SECONDARY_CUADERNO_MIN_DAYS > 0
     ):
         cuaderno = func.lower(func.trim(func.coalesce(Case.procedure, "")))
-        plazos_vivos = (
-            select(func.count(CaseDeadline.id))
-            .where(
-                CaseDeadline.case_id == Case.id,
-                CaseDeadline.status == "active",
-                CaseDeadline.due_date >= _today_chile(),
-            )
-            .correlate(Case)
-            .scalar_subquery()
-        )
         leido_hace_poco = datetime.utcnow() - timedelta(
             days=settings.DETAIL_SECONDARY_CUADERNO_MIN_DAYS
         )
@@ -1875,6 +1880,72 @@ def _select_cases_for_detail_rotation(
         )
         # False sorts before True, so the sunk rows go last.
         order_clauses.append(cuaderno_secundario_inerte.asc())
+
+    # Dormancy demotion. A causa that has not produced a single movement in
+    # over DETAIL_DORMANT_DAYS days is re-read by the rotation at exactly the
+    # same frequency as one notified yesterday. Measured 2026-10-21 on the live
+    # QA DB, over the 15.201 rows in rotation: 2.976 had not moved in over a
+    # year (1.245 over two, 367 over three), and NONE of them carried a live
+    # deadline that day.
+    #
+    # WHY THIS IS SAFE: the rotation is not the firm's only eye. The OJV
+    # estado-diario feed reads PJUD's daily docket per lawyer and jumps the
+    # causas it names to the front of the queue (``priority_rols`` below,
+    # gated by DETAIL_FEED_PRIORITY_ENABLED, ON in the station). A dormant
+    # causa that WAKES UP is caught there. The rotation exists for what nobody
+    # told us about, and that is what gets the freed capacity.
+    #
+    # The rule SINKS a row, it never removes it. Past
+    # DETAIL_DORMANT_MIN_DAYS the row rejoins the rotation at its true age --
+    # and since the age order is "least recently read first", a dormant row
+    # that has waited that long is OLDER than the hot frontier and therefore
+    # wins its slot. So DETAIL_DORMANT_MIN_DAYS is the worst case a dormant
+    # causa can go unseen by the rotation, not a floor it drifts past. A
+    # cartera made only of dormant rows still fills its batch.
+    #
+    # Never sunk:
+    #   - a causa that moved inside the window;
+    #   - a causa with NO ``last_movement_at`` (3.699 rows, 1.758 of them never
+    #     detail-scraped at all). The absence of a movement on record is not
+    #     evidence of dormancy, it is the absence of evidence: being wrong
+    #     towards "real case" costs capacity, being wrong the other way blinds
+    #     the firm. Same rule the cuaderno clause applies to an unknown
+    #     cuaderno;
+    #   - any row carrying a LIVE deadline (active, not yet due), deliberately
+    #     broader than just the fatal types.
+    #
+    # COMPOSITION WITH THE CUADERNO CLAUSE: both are ORDER BY terms of this
+    # same statement, cuaderno first, so the sort key is
+    # ``(cuaderno inerte, durmiente, edad)`` and the buckets are
+    # real+viva < real+durmiente < cuaderno+viva < cuaderno+durmiente. A row
+    # that is BOTH lands last -- correctly, it is the least deserving row in
+    # the cartera. The windows do NOT add up: both predicates test the same
+    # ``last_detail_checked_at`` against their own window, so a both-row's
+    # effective minimum interval is max(14, 90) = 90 days, never 104.
+    #
+    # Sits BELOW the fatal-plazo / pending-docs / reserved slots (inserted at
+    # the head below) and ABOVE the age rotation, so no priority slot loses.
+    if (
+        settings.DETAIL_DORMANT_DEMOTE
+        and settings.DETAIL_DORMANT_DAYS > 0
+        and settings.DETAIL_DORMANT_MIN_DAYS > 0
+    ):
+        quieta_desde = datetime.utcnow() - timedelta(
+            days=settings.DETAIL_DORMANT_DAYS
+        )
+        releida_hace_poco = datetime.utcnow() - timedelta(
+            days=settings.DETAIL_DORMANT_MIN_DAYS
+        )
+        causa_durmiente = and_(
+            Case.last_movement_at.isnot(None),
+            Case.last_movement_at < quieta_desde,
+            plazos_vivos == 0,
+            Case.last_detail_checked_at.isnot(None),
+            Case.last_detail_checked_at > releida_hace_poco,
+        )
+        # False sorts before True, so the sunk rows go last.
+        order_clauses.append(causa_durmiente.asc())
+
     # NULLS FIRST only matters for scope "all" (never-detailed go first). Under
     # "fresh" there are no NULLs in the set, so this reads as "least recently
     # checked first"; under "backlog" every row is NULL, so filed_at DESC decides.
