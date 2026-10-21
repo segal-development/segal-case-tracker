@@ -20,8 +20,8 @@ todas de abogados distintos. Relacionado: `bug-de-identidad-rol-tribunal.md`.
 
 ## Tasks
 
-- [ ] T1 · S1 · inline · migración 072 + modelo
-- [ ] T2 · S2-S4 · inline · merge generalizado (clave + 14 tablas)
+- [x] T1 · S1 · inline · migración 072 + modelo · 8596ab6
+- [x] T2 · S2-S4 · worker · merge generalizado (clave + tablas hijas) · 7fabee8
 - [ ] T3 · S5 · PR aparte · `sync_cases` escribe `firm_lawyer_id` y mapa por la clave nueva; `ingest_service` lookups
 - [ ] T4 · S5 · PR aparte · hash de documentos incluye tribunal (prerrequisito, ver bug-de-identidad)
 - [ ] T5 · S5 · requiere visto bueno · limpieza real (dry-run primero, backup antes)
