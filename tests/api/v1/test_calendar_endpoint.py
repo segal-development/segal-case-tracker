@@ -203,7 +203,7 @@ class TestQueryCost:
             resp = authed_client.get("/api/v1/calendar?days=30")
 
         assert resp.status_code == 200
-        assert len(resp.json()["items"]) == 1
+        assert len(resp.json()["opportunities"]) == 1
         assert statements, "the endpoint issued no SELECT against cases"
         main = max(statements, key=len)
         assert "next_deadline_at IS NOT NULL" in main and "next_review_at IS NOT NULL" in main, (
@@ -227,7 +227,7 @@ class TestQueryCost:
             resp = authed_client.get("/api/v1/calendar?days=30")
 
         assert resp.status_code == 200
-        assert len(resp.json()["items"]) == 10
+        assert len(resp.json()["opportunities"]) == 10
         assert counter["count"] <= 1, (
             f"court loaded separately {counter['count']} times — expected a join"
         )
@@ -335,8 +335,10 @@ class TestIncludeOverdue:
 # ---------------------------------------------------------------------------
 
 
-class TestTwoItemsPerCase:
-    def test_case_with_both_dates_yields_two_items(self, authed_client, db, lawyer, court):
+class TestDeadlineAndOpportunityPerCase:
+    def test_case_with_plazo_and_distinct_review_date_splits_across_lists(
+        self, authed_client, db, lawyer, court
+    ):
         c = _make_case(
             db, lawyer, court, "C-1201-2026",
             next_deadline_at=TODAY + timedelta(days=2),
@@ -345,13 +347,11 @@ class TestTwoItemsPerCase:
             recommended_action_code="oponer_excepciones",
             semaforo="rojo",
         )
-        response = authed_client.get("/api/v1/calendar")
-        assert response.status_code == 200
-        items = [i for i in response.json()["items"] if i["case_id"] == c.id]
-        kinds = {i["kind"] for i in items}
-        assert kinds == {"deadline", "review"}
+        body = authed_client.get("/api/v1/calendar").json()
+        assert [i["kind"] for i in body["items"] if i["case_id"] == c.id] == ["deadline"]
+        assert [o["case_id"] for o in body["opportunities"]] == [c.id]
 
-    def test_review_item_resolves_recommended_action_text_and_urgency(
+    def test_opportunity_resolves_recommended_action_text_and_urgency(
         self, authed_client, db, lawyer, court
     ):
         c = _make_case(
@@ -360,26 +360,23 @@ class TestTwoItemsPerCase:
             recommended_action_code="oponer_excepciones",
             semaforo="rojo",
         )
-        response = authed_client.get("/api/v1/calendar")
-        assert response.status_code == 200
-        items = [i for i in response.json()["items"] if i["case_id"] == c.id]
-        assert len(items) == 1
-        review = items[0]
-        assert review["kind"] == "review"
-        assert review["recommended_action"] == "Oponer excepciones (escrito de oposición)"
-        assert review["urgency"] == "critica"
+        body = authed_client.get("/api/v1/calendar").json()
+        assert body["items"] == []
+        (opp,) = [o for o in body["opportunities"] if o["case_id"] == c.id]
+        assert opp["recommended_action"] == "Oponer excepciones (escrito de oposición)"
+        assert opp["urgency"] == "critica"
 
-    def test_review_item_with_unknown_code_resolves_to_none(self, authed_client, db, lawyer, court):
+    def test_opportunity_with_unknown_code_resolves_to_none(self, authed_client, db, lawyer, court):
         c = _make_case(
             db, lawyer, court, "C-1203-2026",
             next_review_at=TODAY + timedelta(days=1),
             recommended_action_code="not_a_real_code",
             semaforo="amarillo",
         )
-        response = authed_client.get("/api/v1/calendar")
-        review = next(i for i in response.json()["items"] if i["case_id"] == c.id)
-        assert review["recommended_action"] is None
-        assert review["urgency"] is None
+        body = authed_client.get("/api/v1/calendar").json()
+        opp = next(o for o in body["opportunities"] if o["case_id"] == c.id)
+        assert opp["recommended_action"] is None
+        assert opp["urgency"] is None
 
 
 class TestMirroredReviewNotDuplicated:
@@ -417,7 +414,7 @@ class TestMirroredReviewNotDuplicated:
         assert summary["total"] == 1
         assert summary["overdue_count"] == 1
 
-    def test_case_without_deadline_keeps_its_review_item(
+    def test_case_without_deadline_surfaces_as_opportunity(
         self, authed_client, db, lawyer, court
     ):
         c = _make_case(
@@ -426,11 +423,9 @@ class TestMirroredReviewNotDuplicated:
             recommended_action_code="oponer_excepciones",
             semaforo="amarillo",
         )
-        items = [
-            i for i in authed_client.get("/api/v1/calendar").json()["items"]
-            if i["case_id"] == c.id
-        ]
-        assert [i["kind"] for i in items] == ["review"]
+        body = authed_client.get("/api/v1/calendar").json()
+        assert [i for i in body["items"] if i["case_id"] == c.id] == []
+        assert [o["case_id"] for o in body["opportunities"]] == [c.id]
 
     def test_mixed_cases_are_each_counted_once(self, authed_client, db, lawyer, court):
         due = TODAY + timedelta(days=1)
@@ -451,8 +446,9 @@ class TestMirroredReviewNotDuplicated:
             semaforo="amarillo",
         )
         body = authed_client.get("/api/v1/calendar").json()
-        assert sorted(i["kind"] for i in body["items"]) == ["deadline", "deadline", "review"]
-        assert body["summary"]["total"] == 3
+        assert [i["kind"] for i in body["items"]] == ["deadline", "deadline"]
+        assert len(body["opportunities"]) == 1
+        assert body["summary"]["total"] == 2
         assert body["summary"]["overdue_count"] == 1
 
     def test_fatal_count_unchanged_by_dedup(self, authed_client, db, lawyer, court):
@@ -727,3 +723,174 @@ class TestAbogadoRutScoping:
         rols = {i["rol"] for i in resp.json()["items"]}
         assert "C-1-2026" in rols
         assert "C-2-2026" not in rols
+
+
+# ---------------------------------------------------------------------------
+# Opportunities: undated, returned apart from the dated items
+# ---------------------------------------------------------------------------
+
+
+class TestOpportunities:
+    """A standing opportunity (abandono / prescripción / apremio) has no legal
+    date. The ``next_review_at`` the engine stores for it is derived from the
+    case id purely to spread review load, so the Agenda must not present it as
+    a date next to real plazos."""
+
+    def test_opportunity_without_plazo_is_not_a_dated_item(
+        self, authed_client, db, lawyer, court
+    ):
+        c = _make_case(
+            db, lawyer, court, "C-2001-2026",
+            next_review_at=TODAY + timedelta(days=9),
+            recommended_action_code="oponer_excepciones",
+            semaforo="amarillo",
+        )
+        body = authed_client.get("/api/v1/calendar").json()
+        assert body["items"] == []
+        (opp,) = body["opportunities"]
+        assert opp["case_id"] == c.id
+        assert opp["rol"] == "C-2001-2026"
+        assert opp["caratulado"] == "Banco X/Deudor Y"
+        assert opp["court_name"] == "Juzgado Calendario"
+        assert opp["semaforo"] == "amarillo"
+
+    def test_opportunity_exposes_no_date_field(self, authed_client, db, lawyer, court):
+        _make_case(
+            db, lawyer, court, "C-2002-2026",
+            next_review_at=TODAY + timedelta(days=9),
+            recommended_action_code="oponer_excepciones",
+            semaforo="amarillo",
+        )
+        (opp,) = authed_client.get("/api/v1/calendar").json()["opportunities"]
+        assert set(opp) == {
+            "case_id", "rol", "caratulado", "court_name",
+            "semaforo", "recommended_action", "urgency",
+        }
+        assert "date" not in opp and "overdue" not in opp
+
+    def test_summary_total_counts_only_dated_items(self, authed_client, db, lawyer, court):
+        _make_case(
+            db, lawyer, court, "C-2003-2026",
+            next_deadline_at=TODAY + timedelta(days=2), semaforo="rojo",
+        )
+        for i in range(3):
+            _make_case(
+                db, lawyer, court, f"C-2004-{i}-2026",
+                next_review_at=TODAY + timedelta(days=8 + i),
+                recommended_action_code="oponer_excepciones",
+                semaforo="amarillo",
+            )
+        summary = authed_client.get("/api/v1/calendar").json()["summary"]
+        assert summary["total"] == 1
+        assert summary["opportunities_count"] == 3
+
+    def test_opportunities_count_matches_list(self, authed_client, db, lawyer, court):
+        for i in range(2):
+            _make_case(
+                db, lawyer, court, f"C-2005-{i}-2026",
+                next_review_at=TODAY + timedelta(days=8),
+                semaforo="amarillo",
+            )
+        body = authed_client.get("/api/v1/calendar").json()
+        assert body["summary"]["opportunities_count"] == len(body["opportunities"]) == 2
+
+    def test_opportunities_ordered_by_urgency_then_rol_never_by_date(
+        self, authed_client, db, lawyer, court
+    ):
+        # Dates run opposite to the expected order on purpose: if the synthetic
+        # date leaked into the sort, this would fail.
+        from app.core.decision_rules import DECISION_RULES
+
+        by_urgency = {}
+        for rule in DECISION_RULES:
+            by_urgency.setdefault(rule.urgency.value, rule.code)
+        assert {"critica", "alta"} <= set(by_urgency), "need two urgency tiers in the catalog"
+
+        specs = [
+            ("C-9-2026", "alta", 1),
+            ("C-3-2026", "critica", 20),
+            ("C-1-2026", "alta", 30),
+            ("C-2-2026", "critica", 10),
+        ]
+        for rol, urgency, offset in specs:
+            _make_case(
+                db, lawyer, court, rol,
+                next_review_at=TODAY + timedelta(days=offset),
+                recommended_action_code=by_urgency[urgency],
+                semaforo="amarillo",
+            )
+        opps = authed_client.get("/api/v1/calendar").json()["opportunities"]
+        assert [(o["urgency"], o["rol"]) for o in opps] == [
+            ("critica", "C-2-2026"),
+            ("critica", "C-3-2026"),
+            ("alta", "C-1-2026"),
+            ("alta", "C-9-2026"),
+        ]
+
+    def test_unknown_urgency_sorts_last(self, authed_client, db, lawyer, court):
+        _make_case(
+            db, lawyer, court, "C-0-2026",
+            next_review_at=TODAY + timedelta(days=8),
+            recommended_action_code="not_a_real_code", semaforo="amarillo",
+        )
+        _make_case(
+            db, lawyer, court, "C-5-2026",
+            next_review_at=TODAY + timedelta(days=8),
+            recommended_action_code="oponer_excepciones", semaforo="amarillo",
+        )
+        opps = authed_client.get("/api/v1/calendar").json()["opportunities"]
+        assert [o["rol"] for o in opps] == ["C-5-2026", "C-0-2026"]
+
+    def test_opportunities_ignore_window_and_semaforo(self, authed_client, db, lawyer, court):
+        """No date means no window: a far-future or stale-past synthetic date,
+        or ``days=1``/``include_overdue=false``, must not hide an opportunity."""
+        _make_case(
+            db, lawyer, court, "C-2101-2026",
+            next_review_at=TODAY + timedelta(days=37), semaforo="amarillo",
+        )
+        _make_case(
+            db, lawyer, court, "C-2102-2026",
+            next_review_at=TODAY - timedelta(days=40), semaforo="verde",
+        )
+        resp = authed_client.get("/api/v1/calendar?days=1&include_overdue=false")
+        body = resp.json()
+        assert sorted(o["rol"] for o in body["opportunities"]) == ["C-2101-2026", "C-2102-2026"]
+        assert body["summary"]["opportunities_count"] == 2
+
+    def test_case_with_plazo_stays_a_deadline_item(self, authed_client, db, lawyer, court):
+        due = TODAY + timedelta(days=3)
+        c = _make_case(
+            db, lawyer, court, "C-2201-2026",
+            next_deadline_at=due, next_deadline_fatal=True, next_review_at=due,
+            recommended_action_code="oponer_excepciones", semaforo="rojo",
+        )
+        db.add(CaseDeadline(
+            case_id=c.id, deadline_type="excepciones", due_date=due,
+            triggered_at=TODAY, status="active",
+        ))
+        db.commit()
+        body = authed_client.get("/api/v1/calendar").json()
+        (item,) = body["items"]
+        assert item["kind"] == "deadline"
+        assert item["date"] == due.isoformat()
+        assert item["fatal"] is True
+        assert item["overdue"] is False
+        assert body["opportunities"] == []
+        assert body["summary"] == {
+            "total": 1, "overdue_count": 0, "fatal_count": 1, "opportunities_count": 0,
+        }
+
+    def test_opportunities_respect_scope(self, authed_client, db, lawyer, other_lawyer, court):
+        _make_case(
+            db, other_lawyer, court, "C-2301-2026",
+            next_review_at=TODAY + timedelta(days=8), semaforo="amarillo",
+        )
+        body = authed_client.get("/api/v1/calendar").json()
+        assert body["opportunities"] == []
+
+    def test_archived_case_is_not_an_opportunity(self, authed_client, db, lawyer, court):
+        _make_case(
+            db, lawyer, court, "C-2302-2026", status="archived",
+            next_review_at=TODAY + timedelta(days=8), semaforo="amarillo",
+        )
+        assert authed_client.get("/api/v1/calendar").json()["opportunities"] == []

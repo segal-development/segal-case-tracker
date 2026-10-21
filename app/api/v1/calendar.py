@@ -1,9 +1,10 @@
 """Calendar endpoint — slice 2a/2b of req #5/#11 (calendarización).
 
-Agenda of upcoming/overdue DEADLINES and REVIEW dates across the caller's
-scoped cases, sorted by date ascending. Reuses data already denormalized on
-``Case`` at the end of every sync (``DeadlineEngine.recompute_case`` /
-``DecisionEngine``): ``next_deadline_at``/``next_deadline_fatal`` and
+Agenda of upcoming/overdue DEADLINES across the caller's scoped cases, sorted
+by date ascending, plus the standing OPPORTUNITIES returned apart and undated.
+Reuses data already denormalized on ``Case`` at the end of every sync
+(``DeadlineEngine.recompute_case`` / ``DecisionEngine``):
+``next_deadline_at``/``next_deadline_fatal`` and
 ``next_review_at``/``recommended_action_code``. This endpoint performs no
 new computation — it is a read-only fan-out + windowing view over columns
 the engine already writes. Deadline items additionally resolve a real
@@ -41,13 +42,14 @@ router = APIRouter()
 
 
 class CalendarItemResponse(BaseModel):
-    """One agenda entry: either a procedural deadline or a DecisionEngine
-    review date. ``fatal``/``label`` are only meaningful for
-    ``kind="deadline"``; ``recommended_action``/``urgency`` only for
-    ``kind="review"``."""
+    """One dated agenda entry: a procedural deadline.
+
+    ``kind`` is kept (today it only ever takes ``"deadline"``) so existing
+    consumers that branch on it keep working; undated opportunities no longer
+    travel here, see ``OpportunityResponse``."""
 
     date: date
-    kind: Literal["deadline", "review"]
+    kind: Literal["deadline"]
     case_id: int
     rol: str
     caratulado: str
@@ -55,17 +57,38 @@ class CalendarItemResponse(BaseModel):
     semaforo: Optional[str] = None
     fatal: Optional[bool] = None
     label: Optional[str] = None
-    recommended_action: Optional[str] = None
-    urgency: Optional[str] = None
     overdue: bool
 
     model_config = ConfigDict(from_attributes=True)
 
 
+class OpportunityResponse(BaseModel):
+    """A standing opportunity (abandono / prescripción / apremio) on a case.
+
+    Deliberately has NO date and NO ``overdue``: these have no legal date. The
+    ``next_review_at`` the DecisionEngine stores for them is derived from the
+    case id only to spread review load across days, so exposing it would show
+    an invented date beside real plazos (and let it later read as "overdue")."""
+
+    case_id: int
+    rol: str
+    caratulado: str
+    court_name: Optional[str] = None
+    semaforo: Optional[str] = None
+    recommended_action: Optional[str] = None
+    urgency: Optional[str] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class CalendarSummaryResponse(BaseModel):
+    """``total``/``overdue_count``/``fatal_count`` count dated ``items`` only;
+    opportunities have their own counter so they never inflate the KPIs."""
+
     total: int
     overdue_count: int
     fatal_count: int
+    opportunities_count: int
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -73,6 +96,7 @@ class CalendarSummaryResponse(BaseModel):
 class CalendarResponse(BaseModel):
     items: List[CalendarItemResponse]
     summary: CalendarSummaryResponse
+    opportunities: List[OpportunityResponse]
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -110,6 +134,20 @@ def _resolve_window(
         if include_overdue and _is_still_active(case):
             return True, True
     return False, False
+
+
+# Explicit display order for opportunities. ``Urgency`` is a plain str Enum, so
+# sorting on its value would be alphabetical (alta < baja < critica < media),
+# which is wrong; relying on declaration order would silently break if someone
+# reorders the enum. Most urgent first. Unknown/missing urgency sorts last.
+_URGENCY_RANK = {"critica": 0, "alta": 1, "media": 2, "baja": 3}
+_UNKNOWN_URGENCY_RANK = len(_URGENCY_RANK)
+
+
+def _opportunity_sort_key(opp: OpportunityResponse) -> tuple:
+    # Never the synthetic review date: it is a load-spreading artifact and
+    # would make the order depend on the case id.
+    return (_URGENCY_RANK.get(opp.urgency, _UNKNOWN_URGENCY_RANK), opp.rol, opp.case_id)
 
 
 def _caratulado(case: Case) -> str:
@@ -177,16 +215,27 @@ async def get_calendar(
     db: Session = Depends(get_db),
     current_lawyer: dict = Depends(get_current_lawyer),
 ):
-    """Agenda of upcoming/overdue deadlines and review dates.
+    """Agenda of upcoming/overdue deadlines, plus undated opportunities.
 
     Scoped like the stats endpoints: a regular lawyer sees only cases where
     they are an abogado-of-record litigante; auditor/admin see every study
     case (``resolve_case_scope`` / ``apply_case_scope``). Archived cases are
-    excluded. Each case contributes up to two items: a ``deadline`` item
-    when ``next_deadline_at`` falls in the window, and a ``review`` item
-    when ``next_review_at`` does and differs from the plazo — the review item's ``recommended_action``
-    text/urgency is resolved from ``Case.recommended_action_code`` via
-    ``app.core.decision_rules.resolve_rule`` (same resolution the
+    excluded.
+
+    ``items`` holds only real dated plazos: a ``deadline`` item when
+    ``next_deadline_at`` falls in the window.
+
+    ``opportunities`` holds every in-scope case that has a standing
+    opportunity, i.e. a ``next_review_at`` that does not merely mirror the
+    plazo (the engine mirrors it when a plazo exists, and that date is already
+    in ``items``). With no plazo, a ``next_review_at`` is only ever set by the
+    engine for abandono / prescripción / apremio. They carry no date, so the
+    window (``days``/``include_overdue``) and ``_is_still_active`` do not apply:
+    those filters judged whether a dated item was stale, and there is no date
+    to judge. Whether an opportunity exists is the engine's call, not the
+    calendar's. Order: rule urgency (most urgent first), then ``rol``.
+    ``recommended_action``/``urgency`` come from ``Case.recommended_action_code``
+    via ``app.core.decision_rules.resolve_rule`` (same resolution the
     ``/cases/{id}/deadlines`` endpoint uses).
     """
     scope = resolve_case_scope(db, current_lawyer)
@@ -225,6 +274,7 @@ async def get_calendar(
     horizon_end = today + timedelta(days=days)
 
     items: List[CalendarItemResponse] = []
+    opportunities: List[OpportunityResponse] = []
     for case in cases:
         court_name = case.court.name if case.court else None
         caratulado = _caratulado(case)
@@ -250,41 +300,34 @@ async def get_calendar(
                 )
 
         # DecisionEngine mirrors the plazo into next_review_at when a case has one,
-        # so the same date would surface twice (deadline + review) and double the
-        # KPI totals. The deadline item already carries it, plus fatal and label.
-        # Only a review with its own date (no plazo: abandono, prescripción, apremio)
-        # is a distinct agenda entry.
+        # so that date is already an item above. Only a review with no plazo
+        # behind it is a standing opportunity.
         review_mirrors_deadline = (
             case.next_deadline_at is not None
             and case.next_review_at == case.next_deadline_at
         )
         if case.next_review_at is not None and not review_mirrors_deadline:
-            include, overdue = _resolve_window(
-                case.next_review_at, today, horizon_end, include_overdue, case
-            )
-            if include:
-                rule = resolve_rule(case.recommended_action_code)
-                items.append(
-                    CalendarItemResponse(
-                        date=case.next_review_at,
-                        kind="review",
-                        case_id=case.id,
-                        rol=case.rol,
-                        caratulado=caratulado,
-                        court_name=court_name,
-                        semaforo=case.semaforo,
-                        recommended_action=rule.action_text if rule else None,
-                        urgency=rule.urgency.value if rule else None,
-                        overdue=overdue,
-                    )
+            rule = resolve_rule(case.recommended_action_code)
+            opportunities.append(
+                OpportunityResponse(
+                    case_id=case.id,
+                    rol=case.rol,
+                    caratulado=caratulado,
+                    court_name=court_name,
+                    semaforo=case.semaforo,
+                    recommended_action=rule.action_text if rule else None,
+                    urgency=rule.urgency.value if rule else None,
                 )
+            )
 
     items.sort(key=lambda i: (i.date, i.case_id, i.kind))
+    opportunities.sort(key=_opportunity_sort_key)
 
     summary = CalendarSummaryResponse(
         total=len(items),
         overdue_count=sum(1 for i in items if i.overdue),
         fatal_count=sum(1 for i in items if i.fatal),
+        opportunities_count=len(opportunities),
     )
 
-    return CalendarResponse(items=items, summary=summary)
+    return CalendarResponse(items=items, summary=summary, opportunities=opportunities)
