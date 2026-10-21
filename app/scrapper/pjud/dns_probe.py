@@ -24,13 +24,17 @@ When a navigation fails that way we emit ONE line, at that very instant::
 
 import asyncio
 import logging
-import os
 import socket
-import struct
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Optional
 from urllib.parse import urlparse
+
+from app.scrapper.pjud.dns_resolver import (
+    build_a_query as _build_a_query,
+    parse_a_records as _parse_a_records,
+    resolve_via_public_dns as _resolve_via_public,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +44,6 @@ PROBE_MIN_INTERVAL_SECONDS = 30.0
 
 #: Each resolver gets this long; a hung resolver must never stall anything.
 PROBE_TIMEOUT_SECONDS = 3.0
-
-PUBLIC_RESOLVER = "8.8.8.8"
 
 _MARKER = "ERR_NAME_NOT_RESOLVED"
 
@@ -57,60 +59,6 @@ def _resolve_via_os(host: str) -> str:
     """The path Chromium uses: the OS resolver. Returns the first IP."""
     infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
     return infos[0][4][0]
-
-
-def _build_a_query(host: str, txid: int) -> bytes:
-    header = struct.pack(">HHHHHH", txid, 0x0100, 1, 0, 0, 0)
-    qname = b"".join(
-        bytes([len(p)]) + p.encode("ascii") for p in host.rstrip(".").split(".")
-    ) + b"\x00"
-    return header + qname + struct.pack(">HH", 1, 1)
-
-
-def _skip_name(data: bytes, pos: int) -> int:
-    while True:
-        length = data[pos]
-        if length == 0:
-            return pos + 1
-        if length & 0xC0 == 0xC0:
-            return pos + 2
-        pos += 1 + length
-
-
-def _parse_a_records(data: bytes, txid: int) -> list:
-    rid, flags, qd, an, _ns, _ar = struct.unpack(">HHHHHH", data[:12])
-    if rid != txid:
-        raise OSError("dns txid mismatch")
-    rcode = flags & 0x000F
-    if rcode != 0:
-        raise OSError(f"dns rcode={rcode}")
-    pos = 12
-    for _ in range(qd):
-        pos = _skip_name(data, pos) + 4
-    ips = []
-    for _ in range(an):
-        pos = _skip_name(data, pos)
-        rtype, _cls, _ttl, rdlen = struct.unpack(">HHIH", data[pos:pos + 10])
-        pos += 10
-        if rtype == 1 and rdlen == 4:
-            ips.append(".".join(str(b) for b in data[pos:pos + 4]))
-        pos += rdlen
-    if not ips:
-        raise OSError("dns answer has no A records")
-    return ips
-
-
-def _resolve_via_public(host: str) -> list:
-    """Direct UDP A query to 8.8.8.8, bypassing the OS resolver."""
-    txid = int.from_bytes(os.urandom(2), "big")
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        sock.settimeout(PROBE_TIMEOUT_SECONDS)
-        sock.sendto(_build_a_query(host, txid), (PUBLIC_RESOLVER, 53))
-        data, _ = sock.recvfrom(2048)
-    finally:
-        sock.close()
-    return _parse_a_records(data, txid)
 
 
 async def _timed(fn: Callable, host: str):
