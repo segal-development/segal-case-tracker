@@ -9,8 +9,56 @@ personal". Si falla → confirmamos el equipo dedicado, con evidencia.
 
 > Este spike NO compromete nada en producción. Es una prueba aislada de bajo costo.
 
-**Estado:** no ejecutado. Requiere los cambios de código de la sección 2 y el
-aprovisionamiento de la sección 3.
+---
+
+## ⛔ ESTADO: CERRADO SIN EJECUTAR — 2026-10-21
+
+**El spike no se corrió porque falló en el aprovisionamiento: no existe el
+insumo que necesita.**
+
+La sección 1.3 anticipaba que la escasez de IP ISP estáticas chilenas podía ser
+en sí misma el resultado. Eso fue exactamente lo que pasó.
+
+| Proveedor | ISP/static residential con salida en Chile |
+|---|---|
+| **IPRoyal** | **NO.** Respuesta textual de soporte: *"Los ISP Proxies no están actualmente disponibles en Chile."* Confirman que el producto es IP estática dedicada con permanencia por la duración del pedido — pero no en Chile. |
+| **Oxylabs** | No figura. Para Chile solo publica *"Residential and Datacenter Proxies"*; lo único dedicado es datacenter, que es justo lo que Shape bloquea. |
+| **Webshare** | No figura. Su residencial chileno es rotativo (US$7/mes por 1 GB); su "Dedicated Proxy" no declara ser residencial. |
+
+**Costo total de llegar a esta conclusión: US$0.** No se contrató VPS ni proxy.
+
+### Consecuencia
+
+Se confirma la **Opción A** de `propuesta-infraestructura-scraping.md`: equipo
+dedicado encendido en la oficina. Ahora con evidencia, no como preferencia.
+
+Las alternativas restantes se descartan por las mismas razones ya documentadas:
+
+- **IP de otro país** → el login es con Clave Única chilena; un IP extranjero es
+  *más* sospechoso, no menos (sección 1.3).
+- **Datacenter chileno** → es la señal que Shape bloquea (sección 1 de la
+  propuesta, y el worker de GCE que lleva meses con `synced: 0`).
+- **Proxy móvil chileno** → rota por naturaleza, rompe la sesión; y a ~US$10/día
+  supera el costo del equipo en un mes.
+
+### Qué queda vivo de este documento
+
+- La **sección 2** (pre-requisitos de código): el punto 3, `SYNC_LAWYER_IDS`, se
+  implementó igual porque sirve para repartir la carga entre dos máquinas
+  físicas. Los puntos 1 y 2 (proxy y user agent) quedan sin construir.
+- La **sección 4** (controles de riesgo): aplica a cualquier prueba futura que
+  use una cuenta real del PJUD.
+- El resto queda como registro de por qué la nube no es viable, para la próxima
+  vez que alguien pregunte.
+
+> **Para reabrir** haría falta un proveedor con IP ISP/residencial estática y
+> dedicada con salida en Chile. No se consultó Bright Data ISP; si aparece esa
+> opción, el runbook de abajo sigue siendo válido tal cual.
+
+---
+
+**Estado original del documento:** plan de ejecución, redactado antes de
+consultar a los proveedores. Se conserva completo abajo.
 
 ---
 
