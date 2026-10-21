@@ -202,6 +202,50 @@ class TestLawyerDayAgenda:
         agenda = lawyer_day_agenda(db, lawyer, TARGET_DAY)
         assert agenda.has_urgent is False
 
+    def test_deadline_mirrored_in_review_appears_once_as_deadline(self, db, court, lawyer):
+        # DecisionEngine mirrors the plazo into next_review_at, so a case with a
+        # plazo must not be listed again under reviews.
+        c = _make_case(
+            db, court, "C-8-2026", owner=lawyer,
+            next_deadline_at=TARGET_DAY, next_review_at=TARGET_DAY,
+            recommended_action_code="oponer_excepciones",
+        )
+        _seed_abogado(db, c, lawyer)
+
+        agenda = lawyer_day_agenda(db, lawyer, TARGET_DAY)
+        assert [i.rol for i in agenda.deadlines] == ["C-8-2026"]
+        assert agenda.reviews == []
+
+    def test_review_without_deadline_stays_next_to_a_mirrored_case(self, db, court, lawyer):
+        a = _make_case(
+            db, court, "C-9-2026", owner=lawyer,
+            next_deadline_at=TARGET_DAY, next_review_at=TARGET_DAY,
+        )
+        b = _make_case(
+            db, court, "C-10-2026", owner=lawyer,
+            next_review_at=TARGET_DAY, recommended_action_code="oponer_excepciones",
+        )
+        _seed_abogado(db, a, lawyer)
+        _seed_abogado(db, b, lawyer)
+
+        agenda = lawyer_day_agenda(db, lawyer, TARGET_DAY)
+        assert [i.rol for i in agenda.deadlines] == ["C-9-2026"]
+        assert [i.rol for i in agenda.reviews] == ["C-10-2026"]
+
+    def test_fatal_still_flagged_when_review_mirrors_deadline(self, db, court, lawyer):
+        # fatal drives the CC to the partner; dropping the mirrored review must
+        # not lose it.
+        c = _make_case(
+            db, court, "C-11-2026", owner=lawyer,
+            next_deadline_at=TARGET_DAY, next_deadline_fatal=True,
+            next_review_at=TARGET_DAY,
+        )
+        _seed_abogado(db, c, lawyer)
+
+        agenda = lawyer_day_agenda(db, lawyer, TARGET_DAY)
+        assert agenda.deadlines[0].fatal is True
+        assert agenda.has_urgent is True
+
     def test_demandado_rut_populated_and_rendered(self, db, court, lawyer):
         from app.services.daily_agenda import render_daily_agenda_email
 
