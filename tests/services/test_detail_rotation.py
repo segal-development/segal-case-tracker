@@ -29,6 +29,7 @@ def _seed_case(
     filed_at: datetime | None = None,
     last_detail_checked_at: datetime | None = None,
     procedure: str | None = None,
+    last_movement_at: datetime | None = None,
 ) -> Case:
     """Create Lawyer + Court + Case rows and return the Case.
 
@@ -60,6 +61,7 @@ def _seed_case(
         filed_at=filed_at,
         last_detail_checked_at=last_detail_checked_at,
         procedure=procedure,
+        last_movement_at=last_movement_at,
     )
     db.add(case)
     db.flush()
