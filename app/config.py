@@ -228,6 +228,14 @@ class Settings(BaseSettings):
     PJUD_VIEWPORT_HEIGHT: int = 1080        # Browser viewport height
     PJUD_ALERTS_ENABLED: bool = True        # Enable/disable alert webhooks
     PJUD_SCRAPING_ENABLED: bool = True      # False where the IP can't authenticate against PJUD (cloud VM)
+    # Resolve the PJUD host ourselves (direct UDP query) and pass Chromium
+    # --host-resolver-rules=MAP, so the browser never calls the macOS system
+    # resolver for it. See app/scrapper/pjud/dns_resolver.py for the evidence:
+    # getaddrinfo refuses the host in 2-4 ms while a public resolver answers it.
+    # DEFAULT OFF ON PURPOSE: PJUD sits behind F5 Shape and any new Chromium
+    # flag is a fingerprint risk, so this is enabled by hand on the station and
+    # watched over a live cycle before it ever becomes the default.
+    PJUD_BYPASS_SYSTEM_DNS: bool = False
 
     # Document storage (Slice 2)
     DOC_STORAGE_BACKEND: str = "local"          # "local" or "gcs"

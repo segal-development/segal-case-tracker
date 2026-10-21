@@ -33,6 +33,7 @@ _CHROME_UA = (
 from app.config import settings
 from app.services.pjud_session import PJUDSession
 from app.scrapper.pjud.dns_probe import maybe_probe_name_resolution
+from app.scrapper.pjud.dns_resolver import chromium_dns_bypass_args
 from app.scrapper.pjud.exceptions import (
     CredentialExpiredError,
     InvalidCredentialsError,
@@ -608,6 +609,11 @@ class PJUDBaseScraper(ABC):
             logger.info("Using system Chrome: %s", chrome_path)
         else:
             logger.info("Using Playwright bundled Chromium")
+
+        # Opt-in: map the PJUD host to an address we resolved ourselves, so
+        # Chromium never asks the (measurably broken) macOS system resolver.
+        # Returns [] — today's behaviour — when off or when resolution fails.
+        launch_args += await chromium_dns_bypass_args()
 
         self._playwright = await async_playwright().start()
         if user_data_dir:
