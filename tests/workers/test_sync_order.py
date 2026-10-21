@@ -7,6 +7,7 @@ turn for two weeks. Ordering by staleness makes the rotation fair regardless of
 where a cycle is interrupted.
 """
 
+import logging
 from datetime import datetime, timedelta
 
 from app.config import settings
@@ -107,3 +108,28 @@ class TestSyncLawyerIdsSetting:
     def test_property_skips_non_numeric_tokens_and_whitespace(self, monkeypatch):
         monkeypatch.setattr(settings, "SYNC_LAWYER_IDS", " 1, 7 ,x,,16 ")
         assert settings.sync_lawyer_ids_list == [1, 7, 16]
+
+
+class TestSyncLawyerIdsLogging:
+    """A setting edited by hand on two machines must say what it did."""
+
+    def test_warns_when_the_setting_yields_no_usable_id(self, db, monkeypatch, caplog):
+        _lawyer(db, "Solo")
+        monkeypatch.setattr(settings, "SYNC_LAWYER_IDS", "abc")
+        with caplog.at_level(logging.WARNING):
+            assert _active_lawyer_ids_by_staleness(db) == []
+        assert "SYNC_LAWYER_IDS" in caplog.text
+
+    def test_reports_the_restriction_when_it_applies(self, db, monkeypatch, caplog):
+        a = _lawyer(db, "A")
+        monkeypatch.setattr(settings, "SYNC_LAWYER_IDS", str(a.id))
+        with caplog.at_level(logging.INFO):
+            _active_lawyer_ids_by_staleness(db)
+        assert "SYNC_LAWYER_IDS" in caplog.text
+
+    def test_stays_quiet_when_the_setting_is_empty(self, db, monkeypatch, caplog):
+        _lawyer(db, "A")
+        monkeypatch.setattr(settings, "SYNC_LAWYER_IDS", "")
+        with caplog.at_level(logging.INFO):
+            _active_lawyer_ids_by_staleness(db)
+        assert "SYNC_LAWYER_IDS" not in caplog.text

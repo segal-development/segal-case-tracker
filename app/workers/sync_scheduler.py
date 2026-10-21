@@ -214,7 +214,19 @@ def _active_lawyer_ids_by_staleness(db: Session) -> list[int]:
         .filter(Lawyer.is_active.is_(True))
     )
     if settings.SYNC_LAWYER_IDS.strip():
-        query = query.filter(Lawyer.id.in_(settings.sync_lawyer_ids_list))
+        wanted = settings.sync_lawyer_ids_list
+        # Say it out loud: this setting is edited by hand in the .env of each
+        # machine, and failing closed on a typo means the worker goes quiet.
+        # Without a log line that silence looks exactly like a crashed cycle.
+        if wanted:
+            logger.info("SYNC_LAWYER_IDS restricts this cycle to lawyers %s", wanted)
+        else:
+            logger.warning(
+                "SYNC_LAWYER_IDS=%r holds no usable lawyer id, so this cycle "
+                "visits nobody. Clear it to sync every active lawyer.",
+                settings.SYNC_LAWYER_IDS,
+            )
+        query = query.filter(Lawyer.id.in_(wanted))
     rows = query.all()
     # Sort in Python: NULLS FIRST is dialect-dependent (SQLite in tests).
     rows.sort(key=lambda r: (r.last_ok is not None, r.last_ok or datetime.min, r.id))
