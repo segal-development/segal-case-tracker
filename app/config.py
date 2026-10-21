@@ -374,6 +374,11 @@ class Settings(BaseSettings):
     # (e.g. "civil,laboral") without a code change.
     SYNC_COMPETENCIAS: str = "civil"
 
+    # Restrict the sync cycle to these lawyer ids (CSV, e.g. "1,7,16"). Used to
+    # split the caseload across machines or to isolate one lawyer in a test.
+    # Empty (default) = every active lawyer, i.e. unchanged behaviour.
+    SYNC_LAWYER_IDS: str = ""
+
     # Sync commit resilience (Mac -> Cloud SQL Auth Proxy long-write drops).
     # SyncService.sync_cases commits progress every SYNC_COMMIT_CHUNK_SIZE
     # upserted cases instead of one commit for the whole batch, so a dropped
@@ -405,6 +410,16 @@ class Settings(BaseSettings):
     def sync_competencias_list(self) -> list[str]:
         """Split SYNC_COMPETENCIAS on commas, strip whitespace, drop empties."""
         return [c.strip() for c in self.SYNC_COMPETENCIAS.split(",") if c.strip()]
+
+    @property
+    def sync_lawyer_ids_list(self) -> list[int]:
+        """Split SYNC_LAWYER_IDS on commas, strip whitespace, keep integers only.
+
+        Non-numeric tokens are dropped rather than raised: a typo in an env var
+        must not stop the worker from booting. Callers that must not widen the
+        scope on a typo (the sync cycle) check the raw setting too.
+        """
+        return [int(t) for t in (c.strip() for c in self.SYNC_LAWYER_IDS.split(",")) if t.isdigit()]
 
     @property
     def effective_debug(self) -> bool:
