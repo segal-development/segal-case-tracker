@@ -382,6 +382,94 @@ class TestTwoItemsPerCase:
         assert review["urgency"] is None
 
 
+class TestMirroredReviewNotDuplicated:
+    """``DecisionEngine`` mirrors the plazo into ``next_review_at`` whenever a
+    case has one, so such a case must yield ONE item, not a deadline plus a
+    redundant review on the same date (which doubled the Agenda KPIs)."""
+
+    def test_case_with_deadline_yields_single_deadline_item(
+        self, authed_client, db, lawyer, court
+    ):
+        due = TODAY + timedelta(days=2)
+        c = _make_case(
+            db, lawyer, court, "C-1401-2026",
+            next_deadline_at=due,
+            next_deadline_fatal=True,
+            next_review_at=due,
+            recommended_action_code="oponer_excepciones",
+            semaforo="rojo",
+        )
+        body = authed_client.get("/api/v1/calendar").json()
+        items = [i for i in body["items"] if i["case_id"] == c.id]
+        assert [i["kind"] for i in items] == ["deadline"]
+        assert items[0]["fatal"] is True
+        assert body["summary"]["total"] == 1
+
+    def test_overdue_deadline_counts_once(self, authed_client, db, lawyer, court):
+        due = TODAY - timedelta(days=3)
+        _make_case(
+            db, lawyer, court, "C-1402-2026",
+            next_deadline_at=due,
+            next_review_at=due,
+            semaforo="rojo",
+        )
+        summary = authed_client.get("/api/v1/calendar").json()["summary"]
+        assert summary["total"] == 1
+        assert summary["overdue_count"] == 1
+
+    def test_case_without_deadline_keeps_its_review_item(
+        self, authed_client, db, lawyer, court
+    ):
+        c = _make_case(
+            db, lawyer, court, "C-1403-2026",
+            next_review_at=TODAY + timedelta(days=5),
+            recommended_action_code="oponer_excepciones",
+            semaforo="amarillo",
+        )
+        items = [
+            i for i in authed_client.get("/api/v1/calendar").json()["items"]
+            if i["case_id"] == c.id
+        ]
+        assert [i["kind"] for i in items] == ["review"]
+
+    def test_mixed_cases_are_each_counted_once(self, authed_client, db, lawyer, court):
+        due = TODAY + timedelta(days=1)
+        _make_case(
+            db, lawyer, court, "C-1404-2026",
+            next_deadline_at=due, next_deadline_fatal=True, next_review_at=due,
+            semaforo="rojo",
+        )
+        _make_case(
+            db, lawyer, court, "C-1405-2026",
+            next_deadline_at=TODAY - timedelta(days=2), next_review_at=TODAY - timedelta(days=2),
+            semaforo="rojo",
+        )
+        _make_case(
+            db, lawyer, court, "C-1406-2026",
+            next_review_at=TODAY + timedelta(days=6),
+            recommended_action_code="oponer_excepciones",
+            semaforo="amarillo",
+        )
+        body = authed_client.get("/api/v1/calendar").json()
+        assert sorted(i["kind"] for i in body["items"]) == ["deadline", "deadline", "review"]
+        assert body["summary"]["total"] == 3
+        assert body["summary"]["overdue_count"] == 1
+
+    def test_fatal_count_unchanged_by_dedup(self, authed_client, db, lawyer, court):
+        due = TODAY + timedelta(days=1)
+        _make_case(
+            db, lawyer, court, "C-1407-2026",
+            next_deadline_at=due, next_deadline_fatal=True, next_review_at=due,
+            semaforo="rojo",
+        )
+        _make_case(
+            db, lawyer, court, "C-1408-2026",
+            next_deadline_at=due, next_deadline_fatal=False, next_review_at=due,
+            semaforo="amarillo",
+        )
+        assert authed_client.get("/api/v1/calendar").json()["summary"]["fatal_count"] == 1
+
+
 # ---------------------------------------------------------------------------
 # Fatal flag + summary
 # ---------------------------------------------------------------------------

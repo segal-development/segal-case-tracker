@@ -184,7 +184,7 @@ async def get_calendar(
     case (``resolve_case_scope`` / ``apply_case_scope``). Archived cases are
     excluded. Each case contributes up to two items: a ``deadline`` item
     when ``next_deadline_at`` falls in the window, and a ``review`` item
-    when ``next_review_at`` does — the review item's ``recommended_action``
+    when ``next_review_at`` does and differs from the plazo — the review item's ``recommended_action``
     text/urgency is resolved from ``Case.recommended_action_code`` via
     ``app.core.decision_rules.resolve_rule`` (same resolution the
     ``/cases/{id}/deadlines`` endpoint uses).
@@ -249,7 +249,16 @@ async def get_calendar(
                     )
                 )
 
-        if case.next_review_at is not None:
+        # DecisionEngine mirrors the plazo into next_review_at when a case has one,
+        # so the same date would surface twice (deadline + review) and double the
+        # KPI totals. The deadline item already carries it, plus fatal and label.
+        # Only a review with its own date (no plazo: abandono, prescripción, apremio)
+        # is a distinct agenda entry.
+        review_mirrors_deadline = (
+            case.next_deadline_at is not None
+            and case.next_review_at == case.next_deadline_at
+        )
+        if case.next_review_at is not None and not review_mirrors_deadline:
             include, overdue = _resolve_window(
                 case.next_review_at, today, horizon_end, include_overdue, case
             )
