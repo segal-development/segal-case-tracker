@@ -27,7 +27,8 @@ todas de abogados distintos. Relacionado: `bug-de-identidad-rol-tribunal.md`.
 - [x] T3c · S5 · PR aparte · `sync_cases` deduplica por (rol, court, procedure) entre dueños y crea bajo `firm_lawyer_id`; `ingest_service` lookups (:482,:601,:697)
 - [x] T4 · S5 · PR aparte · hash de documentos incluye tribunal (prerrequisito, ver bug-de-identidad)
 - [x] T5a · S5 · worker · informe de limpieza SOLO LECTURA (`scripts/dedup_cases_report.py`) + runbook; sin escribir en la base
-- [ ] T5b · S5 · requiere visto bueno de Marcelo · corrida real por lotes y reanudable, con backup previo; `run_case_merge` hoy procesa todos los grupos en una transacción
+- [x] T5b1 · S5 · worker · `run_case_merge` por lotes (`group_limit`/`only_group_keys`), verificación y re-own acotados al lote (#396)
+- [ ] T5b2 · S5 · worker · ejecutor `scripts/dedup_cases_run.py` (dry-run por defecto, `--apply` + `--backup-ref` + worker quieto + confirmación MERGE) y runbook; la CORRIDA REAL requiere visto bueno de Marcelo
 
 ## Log
 
@@ -44,3 +45,4 @@ todas de abogados distintos. Relacionado: `bug-de-identidad-rol-tribunal.md`.
 - L9: Verificación independiente de T3c (solo lectura) halló 2 defectos reales, corregidos antes de publicar: (7) la rotación prestaba el api_case de otro tribunal a una fila cuyo tribunal no está en el listado (doble scrape + fila hermana primera para siempre); ahora esa fila se salta ese ciclo salvo que el ROL tenga un solo tribunal. (5) una creación concurrente de la misma identidad bajo el dueño canónico (dos abogados) rompía todo el chunk con PendingRollbackError; ahora la creación va en SAVEPOINT y ante IntegrityError se reusa la fila existente. Avisos sin corregir: tribunal vacío es '' en sync y 'Desconocido' en ingest; cuaderno sin normalizar (igual que el índice).
 - L10: #394 (T3c) mergeado y desplegado; worker reiniciado 12:16 local, primer ciclo con código nuevo esperado ~14:16. Marcelo aprobó armar el dry-run de T5 en paralelo ("Si"): informe de solo lectura, nunca un rollback-transaction sobre la base real.
 - L11: Informe real (2026-10-22): 2.945 grupos, 3.086 filas sobrantes, 0 vacías y 0 solo-avistamiento: todas cuelgan cartera_snapshots (6.117) y case_lawyer_source (3.288), 28.157 alerts, 25.118 movimientos (24.284 ya en el ganador, 834 en 205 grupos se unirían). Corrige la estimación previa de "1.968 borrables sin pérdida" (solo miraba movimientos/plazos/alertas): no hay pasada 1 sin riesgo. El merge por lotes (group_limit en run_case_merge) pasa a ser requisito de T5b. Costo del merge en una transacción: ~4,6 h.
+- L12: Marcelo aprobó armar el ejecutor por lotes ("si"). Solo herramienta + tests; ninguna corrida sobre datos. #395 y #396 mergeados y desplegados en QA (la corrida 751 de Deploy QA quedó con estado colgado en GitHub pese a que sus dos trabajos terminaron en success; la API de cancelación responde 409; sin impacto).
