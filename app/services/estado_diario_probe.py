@@ -233,6 +233,8 @@ def staleness_stats(
     normalised equality, to a known ``courts.name`` and none of this lawyer's
     cases with that ROL sits in such a court.
     """
+    from app.services.sync_service import case_belongs_to_lawyer
+
     unique = sorted({r.rol for r in rows})
     tribunals_by_rol: dict = {}
     for r in rows:
@@ -242,7 +244,7 @@ def staleness_stats(
     try:
         found = (
             db.query(Case.rol, Case.last_detail_checked_at, Case.court_id)
-            .filter(Case.rol.in_(unique), Case.lawyer_id == lawyer_id)
+            .filter(Case.rol.in_(unique), case_belongs_to_lawyer(lawyer_id))
             .all()
         )
         found_rols = {rol for rol, _, _ in found}
@@ -252,7 +254,7 @@ def staleness_stats(
             elsewhere = {
                 rol
                 for (rol,) in db.query(Case.rol)
-                .filter(Case.rol.in_(missing), Case.lawyer_id != lawyer_id)
+                .filter(Case.rol.in_(missing), ~case_belongs_to_lawyer(lawyer_id))
                 .distinct()
                 .all()
             }

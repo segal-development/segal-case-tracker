@@ -23,7 +23,7 @@ from dataclasses import dataclass, field, fields as dataclass_fields
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Iterable, List, Optional, Tuple, Awaitable, TypeVar
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import OperationalError
 
 logger = logging.getLogger(__name__)
@@ -1794,6 +1794,24 @@ def _select_cases_for_movement_check(
     return api_cases[:max_cases]
 
 
+def case_belongs_to_lawyer(lawyer_id: int):
+    """SQL clause: ``lawyer_id`` owns the case OR has a sighting of it.
+
+    Transitional (T3b): once cases are owned by the firm lawyer,
+    ``Case.lawyer_id == L`` no longer identifies L's caseload; the sighting in
+    ``case_lawyer_source`` does. Uses an IN subquery (not a JOIN) so row counts
+    never change.
+    """
+    return or_(
+        Case.lawyer_id == lawyer_id,
+        Case.id.in_(
+            select(CaseLawyerSource.case_id).where(
+                CaseLawyerSource.lawyer_id == lawyer_id
+            )
+        ),
+    )
+
+
 def _select_cases_for_detail_rotation(
     db: Session,
     lawyer_id: int,
@@ -2034,7 +2052,7 @@ def _select_cases_for_detail_rotation(
         )
         order_clauses.insert(0, pending_docs.desc())
 
-    base_filter = (Case.lawyer_id == lawyer_id, Case.competencia == competencia)
+    base_filter = (case_belongs_to_lawyer(lawyer_id), Case.competencia == competencia)
 
     # Freshness/backlog cut (DETAIL_ROTATION_SCOPE). It is ADDED to the filters
     # above; "all" adds nothing.
@@ -2185,13 +2203,13 @@ def _oldest_unchecked_label(db: Session, lawyer_id: int) -> str:
     """
     never_checked = (
         db.query(func.count(Case.id))
-        .filter(Case.lawyer_id == lawyer_id, Case.last_detail_checked_at.is_(None))
+        .filter(case_belongs_to_lawyer(lawyer_id), Case.last_detail_checked_at.is_(None))
         .scalar()
         or 0
     )
     oldest_checked = (
         db.query(func.min(Case.last_detail_checked_at))
-        .filter(Case.lawyer_id == lawyer_id, Case.last_detail_checked_at.isnot(None))
+        .filter(case_belongs_to_lawyer(lawyer_id), Case.last_detail_checked_at.isnot(None))
         .scalar()
     )
     if oldest_checked is None:
@@ -2830,9 +2848,9 @@ async def detect_and_sync_movements(
         # it to advance last_detail_checked_at even on failure (rotation fairness).
         normalized_rol = api_case.rol.strip().upper()
         db_case = db.query(Case).filter(
-            Case.lawyer_id == lawyer_id,
+            case_belongs_to_lawyer(lawyer_id),
             Case.rol == normalized_rol,
-        ).first()
+        ).order_by(Case.id).first()
 
         async def _do_fetch() -> Tuple[int, int]:
             """Run ``_do_fetch_inner`` with ``expire_on_commit`` off.
