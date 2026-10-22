@@ -185,3 +185,40 @@ class TestSiblingStamp:
         few = await run("C-5-2026", 1)
         many = await run("C-6-2026", 8)
         assert many == few
+
+
+class TestOtherCourtNotInListing:
+    def test_row_of_unlisted_court_does_not_borrow_the_listed_api_case(self, db, world):
+        firm, a, c1, c2 = world
+        _case(db, firm, a, c2, "C-4-2026", checked=datetime(2026, 1, 1))
+        _case(db, firm, a, c1, "C-4-2026", checked=datetime(2026, 2, 1))
+        picked = _select(db, a, [_api("C-4-2026", COURT_1)])
+        assert len(picked) == 1
+
+    @pytest.mark.asyncio
+    async def test_unlisted_court_row_cannot_hold_the_front_forever(self, db, world):
+        firm, a, c1, c2 = world
+        _case(db, firm, a, c2, "C-4-2026", checked=datetime(2026, 1, 1))
+        _case(db, firm, a, c1, "C-4-2026", checked=datetime(2026, 2, 1))
+        _case(db, firm, a, c1, "C-8-2026", checked=datetime(2026, 3, 1))
+        apis = [_api("C-4-2026", COURT_1), _api("C-8-2026", COURT_1)]
+        picked = _select(db, a, apis, batch_size=2)
+        assert sorted(p.rol for p in picked) == ["C-4-2026", "C-8-2026"]
+
+    def test_single_court_with_unmatched_tribunal_text_is_still_picked_once(self, db, world):
+        firm, a, c1, _ = world
+        _case(db, firm, a, c1, "C-4-2026", "Principal")
+        _case(db, firm, a, c1, "C-4-2026", "Medida prejudicial")
+        picked = _select(db, a, [_api("C-4-2026", "Nombre raro del tribunal")])
+        assert [p.rol for p in picked] == ["C-4-2026"]
+
+    @pytest.mark.asyncio
+    async def test_listed_court_row_is_still_visited_after_the_skip(self, db, world):
+        firm, a, c1, c2 = world
+        _case(db, firm, a, c2, "C-4-2026", checked=datetime(2026, 1, 1))
+        listed = _case(db, firm, a, c1, "C-4-2026", checked=datetime(2026, 2, 1))
+        new, _, errors = await _detect(db, a, [_api("C-4-2026", COURT_1)])
+        assert new == 1 and not errors
+        db.expire_all()
+        assert listed.last_detail_checked_at > datetime(2026, 2, 1)
+        assert db.query(Movement).filter(Movement.case_id == listed.id).count() == 1

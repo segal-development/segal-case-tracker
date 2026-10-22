@@ -24,7 +24,7 @@ from datetime import date, datetime, timedelta
 from typing import Any, Callable, Iterable, List, Optional, Tuple, Awaitable, TypeVar
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, func, or_, select
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 logger = logging.getLogger(__name__)
 
@@ -1441,19 +1441,21 @@ class SyncService:
         # Parse fecha_ingreso
         filed_at = self._parse_date(scraped.fecha_ingreso)
         
-        if existing:
-            # Update existing case
-            existing.court_id = court.id
-            existing.plaintiff = plaintiff
-            existing.defendant = defendant
-            existing.status = self._map_status(scraped.estado_cuaderno)
-            existing.procedure = scraped.cuaderno
-            existing.competencia = competencia
+        def _update(row: Case) -> Tuple[Case, bool]:
+            row.court_id = court.id
+            row.plaintiff = plaintiff
+            row.defendant = defendant
+            row.status = self._map_status(scraped.estado_cuaderno)
+            row.procedure = scraped.cuaderno
+            row.competencia = competencia
             if filed_at:
-                existing.filed_at = filed_at
-            self._observe_listing_fingerprint(existing, normalized_rol, listing_rows_by_rol)
-            existing.updated_at = datetime.utcnow()
-            return existing, False
+                row.filed_at = filed_at
+            self._observe_listing_fingerprint(row, normalized_rol, listing_rows_by_rol)
+            row.updated_at = datetime.utcnow()
+            return row, False
+
+        if existing:
+            return _update(existing)
         else:
             # Create new case
             case = Case(
@@ -1470,8 +1472,29 @@ class SyncService:
                 updated_at=datetime.utcnow(),
             )
             self._observe_listing_fingerprint(case, normalized_rol, listing_rows_by_rol)
-            self.db.add(case)
-            self.db.flush()  # Get the ID
+            try:
+                # SAVEPOINT: a concurrent sync may have created this identity
+                # under the firm owner since the preload. The unique violation
+                # then rolls back only this insert, not the whole chunk.
+                with self.db.begin_nested():
+                    self.db.add(case)
+                    self.db.flush()  # Get the ID
+            except IntegrityError:
+                row = (
+                    self.db.query(Case)
+                    .filter(
+                        Case.lawyer_id == owner_id,
+                        Case.rol == normalized_rol,
+                        Case.court_id == court.id,
+                        func.coalesce(Case.procedure, "") == (scraped.cuaderno or ""),
+                    )
+                    .order_by(Case.id)
+                    .first()
+                )
+                if row is None:
+                    raise
+                existing_by_identity[identity] = row
+                return _update(row)
             # Make the just-created case visible to later scraped entries in
             # this same batch that share the same identity (duplicate guard).
             existing_by_identity[identity] = case
@@ -2285,16 +2308,26 @@ def _select_cases_for_detail_rotation(
         )
     picked_causas: set = set()
     used_api_ids: set = set()
+    courts_by_rol: dict = {}
+    for c in db_cases:
+        courts_by_rol.setdefault(c.rol.strip().upper(), set()).add(c.court_id)
 
     def _api_case_for(db_case):
         candidates = api_lookup.get(db_case.rol.strip().upper(), [])
         want = normalize_court_name(court_names.get(db_case.court_id))
-        free = [ac for ac in candidates if id(ac) not in used_api_ids] or candidates
+        free = [ac for ac in candidates if id(ac) not in used_api_ids]
         for ac in free:
             tribunal = getattr(ac, "tribunal", None)
             if want and isinstance(tribunal, str) and normalize_court_name(tribunal) == want:
                 return ac
-        return free[0] if free else None
+        # No tribunal match. Only when the lawyer's rows for this ROL span ONE
+        # court is there nothing to confuse, so the first unused listing row is
+        # safe (covers court names that normalize differently). With several
+        # courts, borrowing would scrape one causa twice and leave the other
+        # row unstamped at the front of the order: skip it this cycle.
+        if len(courts_by_rol.get(db_case.rol.strip().upper(), ())) == 1 and free:
+            return free[0]
+        return None
 
     feed_picked: list = []
     feed_waiting = 0

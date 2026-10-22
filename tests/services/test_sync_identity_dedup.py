@@ -313,3 +313,31 @@ class TestDetectCourtMatch:
         assert new == 1 and not errors
         assert db.query(Movement).filter(Movement.case_id == second.id).count() == 1
         assert db.query(Movement).filter(Movement.case_id == first.id).count() == 0
+
+
+class TestConcurrentCreate:
+    def test_identity_created_concurrently_is_updated_and_chunk_survives(self, db, world):
+        firm, a, _ = world
+        court = Court(code="X1", name=COURT_1, region="RM", type="civil")
+        db.add(court)
+        db.flush()
+        db.add(
+            Case(
+                lawyer_id=firm.id, court_id=court.id, rol="C-5-2025",
+                competencia="civil", plaintiff="OLD", defendant="OLD",
+                status="active", procedure="Principal",
+            )
+        )
+        db.commit()
+
+        svc = SyncService(db)
+        svc._load_cases_by_identity = lambda rols: {}  # stale preload: C-5 looks new
+        result = svc.sync_cases(
+            a.id, [_scraped(rol="C-6-2025"), _scraped(rol="C-5-2025"), _scraped(rol="C-7-2025")]
+        )
+
+        assert not result.errors
+        assert (result.cases_new, result.cases_updated) == (2, 1)
+        assert sorted(r.rol for r in _rows(db)) == ["C-5-2025", "C-6-2025", "C-7-2025"]
+        assert db.query(Case).filter_by(rol="C-5-2025").one().plaintiff == "BANCO ITAU"
+        assert db.query(SyncHistory).one().status == "completed"
