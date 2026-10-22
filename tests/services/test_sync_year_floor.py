@@ -35,6 +35,16 @@ def sqlite_db():
         engine.dispose()
 
 
+@pytest.fixture(autouse=True)
+def _firm_lawyer(sqlite_db, lawyer):
+    """sync_cases creates cases under the firm lawyer (Approach C).
+
+    Depends on ``lawyer`` so the individual lawyer keeps its id.
+    """
+    sqlite_db.add(Lawyer(rut="16021492-9", name="Firm", is_active=True))
+    sqlite_db.commit()
+
+
 @pytest.fixture()
 def lawyer(sqlite_db):
     lw = Lawyer(rut="12345678-9", name="Abogada Test", email="t@segal.cl", is_active=True,
@@ -102,6 +112,7 @@ def test_existing_pre_min_year_case_still_updates(sqlite_db, lawyer):
     sqlite_db.commit()
     old = Case(lawyer_id=lawyer.id, court_id=court.id, rol="C-500-2019",
                plaintiff="X", defendant="Y", competencia="civil",
+               procedure="Principal",  # part of the case identity (rol, court, procedure)
                created_at=datetime.utcnow(), updated_at=datetime.utcnow())
     sqlite_db.add(old)
     sqlite_db.commit()
