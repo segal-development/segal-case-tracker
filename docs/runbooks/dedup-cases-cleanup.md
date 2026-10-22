@@ -2,16 +2,19 @@
 
 > **STATUS: NOTHING IN THIS DOCUMENT HAS BEEN EXECUTED.** It is the plan for a
 > future real run and needs Marcelo's explicit go before step 1. Spec:
-> `odd/tasks/duplicados-por-abogado.md` (T5a produced the report, T5b is the run).
+> `odd/tasks/duplicados-por-abogado.md` (T5a produced the report, T5b1 the batched
+> `run_case_merge`, T5b2 the runner `scripts/dedup_cases_run.py`). The runner is
+> built and tested on SQLite only; it has never touched real data.
 
 **Goal:** remove the surplus `cases` rows that share `(rol, court_id,
 coalesce(procedure,''))` (measured 2026-10-21: ~2,945 groups, ~3,083 surplus rows,
 all from different lawyers) without losing information.
 
-**Why two passes:** `run_case_merge` processes every group in ONE transaction at
-~40 queries per loser; at 135 ms per round trip through the Cloud SQL proxy that
-is hours inside a single transaction. The report prints the exact estimate for the
-real data (`estimate` in the JSON).
+**Why batches:** `run_case_merge` over every group in ONE transaction costs ~40
+queries per loser; at 135 ms per round trip through the Cloud SQL proxy that is
+hours inside a single transaction. `scripts/dedup_cases_run.py` runs it N groups
+per transaction, committing each batch, and a re-run resumes. The report prints
+the exact estimate for the real data (`estimate` in the JSON).
 
 ## Measured on the real database (2026-10-22, read-only report, nothing executed)
 
@@ -29,14 +32,33 @@ unioned into it. Estimated cost of the existing merge in one transaction: 4.63 h
 
 Consequence: skip pass 1 as written below unless it is redefined to carry the
 sighting and the snapshots to the winner first; plan the real run as the batched
-merge (section 0 is therefore REQUIRED, not optional).
+merge, i.e. `scripts/dedup_cases_run.py` (section 5).
 
-## 0. Required follow-up before pass 2 (NOT implemented)
+## 0. Batched merge and runner (implemented, NOT executed)
 
-`run_case_merge(db)` takes no batch parameter. Pass 2 needs a **later PR** adding
-`group_limit` and/or `only_group_keys` to `run_case_merge` (and to
-`_find_duplicate_identity_groups`) so one call merges N groups and commits, and a
-re-run resumes with the remaining groups. Until that PR is merged, only pass 1 can run.
+`run_case_merge(db, *, group_limit, only_group_keys)` exists (T5b1, #396): one call
+merges N groups, verification and re-own are scoped to the batch, and a re-run
+resumes with the remaining groups. The runner `scripts/dedup_cases_run.py`
+(T5b2, `app/services/dedup_cases_runner.py`) drives it. Guards, all enforced in
+code:
+
+- **Dry-run by default.** Without `--apply` nothing is written and `run_case_merge`
+  is never called: it prints the plan (groups, batches needed, first batch keys).
+- **`--backup-ref` is mandatory with `--apply`** (the id of the verified backup, step 2).
+- **Quiescent database.** `--apply` refuses (nothing written) if `max(movements.created_at)`
+  or any `sync_history.started_at` / `completed_at` is within the last 10 minutes.
+  This is the code behind "stop the worker" (section 3).
+  `--i-know-the-worker-is-running` disables it and prints a loud warning: do not use it.
+- **Typed confirmation.** It shows how many groups the first batch will merge and
+  requires typing `MERGE`. `--yes` skips the prompt but still needs `--backup-ref`
+  and the quiescence check.
+- **First error stops the run.** The failing batch (including
+  `CaseMergeVerificationError`) is rolled back alone, earlier batches stay
+  committed, there is no retry and no skipping ahead.
+- **No progress stops the run** (a batch that merges 0 groups while groups remain).
+- **Orphan check** after the last batch and every 10 batches: one aggregate
+  `LEFT JOIN cases ... WHERE cases.id IS NULL` query per table of
+  `CHILD_TABLES_WITH_CASE_ID` (13 queries); any orphan stops the run.
 
 ## 1. Preconditions (all must be true)
 
@@ -57,14 +79,17 @@ gcloud sql backups list --instance=<INSTANCE> --limit=3
 ```
 
 Verification that the backup exists: the new entry shows `status: SUCCESSFUL` and
-a `windowStartTime` after the command above. Write down its `id`. **No backup id,
-no run.** `<INSTANCE>` and connection data: see
+a `windowStartTime` after the command above. Write down its `id`: it is the
+`--backup-ref` of the runner. **No backup id, no run** (the runner refuses `--apply`
+without it). `<INSTANCE>` and connection data: see
 `docs/runbooks/unificar-modelo-causas-migration.md`.
 
 ## 3. Worker stance: STOP the worker (recommended)
 
 Stop it for the whole run (`docker compose -f docker-compose.yml -f docker-compose.qa.yml stop worker`);
-restart it only after pass 2 verification.
+restart it only after the section 6 verification. The runner enforces this: it
+refuses to `--apply` while movements or sync history were written in the last
+10 minutes, so wait at least that long after stopping the worker.
 
 Why: the worker's sync reads and writes `cases`, `movements`, `documents` and
 `case_lawyer_source` for the same rows the cleanup deletes or repoints. A sync that
@@ -92,12 +117,45 @@ Scope: losers in `loser_classification.empty` (zero rows in **every** table of
   `NOT EXISTS` over every child table so a row that gained data is skipped, and the
   ids taken from a fresh report, never from an old JSON.
 
-## 5. Pass 2: merge the non-empty groups in resumable batches
+## 5. Pass 2: merge the non-empty groups with `scripts/dedup_cases_run.py`
 
-Requires the section 0 follow-up. Run `run_case_merge` with N groups per
-transaction (start small, e.g. N=25, and time one batch to confirm the estimate),
-commit per batch, repeat until the report shows 0 groups. A batch that raises
-`CaseMergeVerificationError` rolls back only that batch; stop and investigate.
+All commands from the repo root, with the production `DATABASE_URL` configured as
+for the report. Replace `<BACKUP_ID>` with the id from step 2.
+
+```bash
+# (a) Dry-run (default): prints the plan and writes nothing.
+PYTHONPATH=. poetry run python scripts/dedup_cases_run.py --batch-size 25
+
+# (b) First real run: ONE small batch, to time it and check the result.
+PYTHONPATH=. poetry run python scripts/dedup_cases_run.py \
+  --batch-size 5 --max-batches 1 --apply --backup-ref <BACKUP_ID> --json /tmp/dedup-run-1.json
+# Type MERGE when asked. Then re-run the report and the section 6 queries.
+
+# (c) Full run, sized from (b): `avg_seconds_per_group` in /tmp/dedup-run-1.json x
+#     ~2,945 groups = total time. Stop-file and time budget bound each session.
+PYTHONPATH=. poetry run python scripts/dedup_cases_run.py \
+  --batch-size 25 --apply --backup-ref <BACKUP_ID> \
+  --stop-file /tmp/dedup-stop --time-budget-minutes 120 --json /tmp/dedup-run-2.json
+```
+
+Per-batch output: `lote N: grupos=.. perdedoras_borradas=.. filas_reasignadas=.. restantes=.. seg=..`.
+
+**Stop gracefully:** `touch /tmp/dedup-stop` from another shell. The runner checks
+the file before each batch, finishes the batch in flight, and stops
+(`stopped_because: stop_file`). Remove the file before the next run
+(`rm /tmp/dedup-stop`). The time budget is also checked only between batches.
+
+**Resume:** run the same command again. Merged groups are no longer duplicates, so
+the next batch starts from the first remaining group; nothing is merged twice or
+skipped. This is also how you continue after a stop, a time budget or an error.
+
+**On error** (`stopped_because: error`, `integrity_failed` or `no_progress`): only
+the failing batch was rolled back and earlier batches stay committed. Do NOT retry
+blindly: read `errors` in the JSON summary, investigate, and if committed data
+looks wrong restore the backup (section 7).
+
+Exit code is 0 for dry-run, completed, `max_batches`, `stop_file` and `time_budget`,
+and 1 for any refusal or error stop.
 
 ## 6. Verification after EACH pass
 
@@ -138,7 +196,8 @@ re-pointed or deduped children back. Do not rely on it.
 - [ ] Report numbers reviewed (groups, surplus, empty vs source_only vs non_empty, unioned movements).
 - [ ] Duplicate count not growing over one full worker cycle.
 - [ ] Backup id recorded and `SUCCESSFUL`.
-- [ ] Worker stopped; extension write freeze decided.
-- [ ] Pass 1 delete script reviewed; section 0 PR merged before pass 2.
+- [ ] Worker stopped (the runner's quiescence guard passes without `--i-know-the-worker-is-running`); extension write freeze decided.
+- [ ] Pass 1 delete script reviewed (or pass 1 skipped); runner dry-run output (5a) reviewed.
+- [ ] First small apply (5b) done and verified before the full run (5c).
 - [ ] Time window agreed using the report's `estimate` (hours at 135 ms/round trip).
 - [ ] Post-pass verification queries and rollback owner named.
