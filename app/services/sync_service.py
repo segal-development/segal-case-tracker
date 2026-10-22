@@ -98,6 +98,7 @@ T = TypeVar("T")
 
 from app.config import settings
 from app.models.case import Case
+from app.models.case_lawyer_source import CaseLawyerSource
 from app.models.movement import Movement
 from app.models.court import Court
 from app.models.alert import Alert
@@ -956,6 +957,7 @@ class SyncService:
                     chunk_updated = 0
                     chunk_year_skipped = 0
                     chunk_errors: List[str] = []
+                    touched_cases: List[Case] = []
                     for scraped in chunk:
                         # Year floor: never CREATE a case older than DETAIL_MIN_YEAR
                         # (the firm only works 2021+). Existing rows still update
@@ -972,12 +974,14 @@ class SyncService:
                                 lawyer_id, scraped, competencia, existing_by_rol,
                                 listing_rows_by_rol=listing_rows_by_rol,
                             )
+                            touched_cases.append(case)
                             if is_new:
                                 chunk_new += 1
                             else:
                                 chunk_updated += 1
                         except Exception as e:
                             chunk_errors.append(f"Error syncing {scraped.rol}: {str(e)}")
+                    self._record_case_lawyer_sightings(lawyer_id, touched_cases)
                     return chunk_new, chunk_updated, chunk_year_skipped, chunk_errors
 
                 (
@@ -1025,6 +1029,45 @@ class SyncService:
             self.db.expire_on_commit = original_expire_on_commit
 
         return result
+
+    def _record_case_lawyer_sightings(self, lawyer_id: int, cases: List[Case]) -> None:
+        """Record that ``lawyer_id`` saw ``cases`` in their live list.
+
+        Bulk, same semantics as ``IngestService._bulk_upsert_case_lawyer_source``:
+        ONE SELECT for the existing rows, the missing ones added, ``last_seen_at``
+        refreshed on the rest. Flush-only; runs inside the chunk's transaction.
+        Cases are flushed first so freshly created ones have an id; ``cases`` is
+        rebuilt by every (re)application of the chunk, so nothing stale is held
+        across a ``_commit_with_retry`` rollback.
+        """
+        if not cases:
+            return
+        self.db.flush()
+        case_ids = list(dict.fromkeys(c.id for c in cases))
+        seen_at = datetime.utcnow()
+        existing = {
+            row.case_id: row
+            for row in self.db.query(CaseLawyerSource).filter(
+                CaseLawyerSource.lawyer_id == lawyer_id,
+                CaseLawyerSource.case_id.in_(case_ids),
+            )
+        }
+        missing = []
+        for case_id in case_ids:
+            row = existing.get(case_id)
+            if row is None:
+                missing.append(
+                    CaseLawyerSource(
+                        case_id=case_id,
+                        lawyer_id=lawyer_id,
+                        first_seen_at=seen_at,
+                        last_seen_at=seen_at,
+                    )
+                )
+            else:
+                row.last_seen_at = seen_at
+        if missing:
+            self.db.add_all(missing)
 
     def _commit_with_retry(self, work_fn: Callable[[], T], caches: Tuple[dict, ...] = ()) -> T:
         """(Re)apply ``work_fn()`` and commit, retrying on OperationalError.

@@ -22,7 +22,9 @@ todas de abogados distintos. Relacionado: `bug-de-identidad-rol-tribunal.md`.
 
 - [x] T1 · S1 · inline · migración 072 + modelo · 8596ab6
 - [x] T2 · S2-S4 · worker · merge generalizado (clave + tablas hijas) · 7fabee8
-- [ ] T3 · S5 · PR aparte · `sync_cases` escribe `firm_lawyer_id` y mapa por la clave nueva; `ingest_service` lookups
+- [ ] T3a · S5 · worker · migración 073 backfill `case_lawyer_source` desde `Case.lawyer_id` + `sync_cases` registra el avistamiento (aditivo, sin cambio de comportamiento)
+- [ ] T3b · S5 · PR aparte · rotación, `detect_and_sync_movements`, `client_sync`, `estado_diario_probe`, `/status` y scripts leen `lawyer_id == L OR case_lawyer_source(L)` (transitorio)
+- [ ] T3c · S5 · PR aparte · `sync_cases` deduplica por (rol, court, procedure) entre dueños y crea bajo `firm_lawyer_id`; `ingest_service` lookups (:482,:601,:697)
 - [ ] T4 · S5 · PR aparte · hash de documentos incluye tribunal (prerrequisito, ver bug-de-identidad)
 - [ ] T5 · S5 · requiere visto bueno · limpieza real (dry-run primero, backup antes)
 
@@ -32,3 +34,5 @@ todas de abogados distintos. Relacionado: `bug-de-identidad-rol-tribunal.md`.
   migración de la clave `(rol, court_id, procedure)`", y "Si" a "el merge generalizado, con tests en RED".
 - L2: Medido: 2.942 grupos duplicados; 1.191 con historial en 2+ copias: 1.107 el más rico contiene
   a las demás, 84 repartidos (284 movimientos). Dueño canónico `lawyer_id=1` (5.698 filas).
+- L3: (2026-10-21) Exploración: cambiar `sync_cases` al dueño canónico rompe en silencio `detect_and_sync_movements` (sync_service.py:2790), la rotación (:1994), `client_sync.py:110` y otros; Approach C movió la atribución a `case_lawyer_source` pero el camino del worker nunca se migró. Marcelo aprobó dividir T3 en T3a/T3b/T3c ("si").
+- L4: #388 (T1) y #390 (T2) mergeados en main. #389 se mergeó contra una rama squasheada y no llegó a main: no apilar PRs sobre ramas que se squashean.
