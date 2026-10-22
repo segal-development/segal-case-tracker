@@ -70,6 +70,16 @@ def sqlite_db(sqlite_engine):
         session.close()
 
 
+@pytest.fixture(autouse=True)
+def _firm_lawyer(sqlite_db, lawyer):
+    """sync_cases creates cases under the firm lawyer (Approach C).
+
+    Depends on ``lawyer`` so the individual lawyer keeps its id.
+    """
+    sqlite_db.add(Lawyer(rut="16021492-9", name="Firm", is_active=True))
+    sqlite_db.commit()
+
+
 @pytest.fixture()
 def lawyer(sqlite_db):
     db = sqlite_db
@@ -97,6 +107,11 @@ def _scraped_case(**kwargs):
     )
     defaults.update(kwargs)
     return ScrapedCase(**defaults)
+
+
+def _firm_id(db):
+    """New cases are owned by the firm lawyer (Approach C), not the syncing one."""
+    return db.query(Lawyer).filter(Lawyer.rut == "16021492-9").one().id
 
 
 def _batch(n, offset=0, tribunales=None):
@@ -135,6 +150,27 @@ def count_selects(engine, tables):
 # ---------------------------------------------------------------------------
 
 class TestChunkedCommitCount:
+    def test_existing_individually_owned_case_keeps_its_owner(self, sqlite_db, lawyer):
+        """Updating a case never rewrites ``lawyer_id`` (legacy rows keep theirs)."""
+        court = Court(code="TA", name="Tribunal A", region="RM", type="civil")
+        sqlite_db.add(court)
+        sqlite_db.flush()
+        legacy = Case(
+            lawyer_id=lawyer.id, court_id=court.id, rol="C-0-2025",
+            plaintiff="OLD", defendant="OLD", status="active",
+            competencia="civil", procedure="Principal",
+        )
+        sqlite_db.add(legacy)
+        sqlite_db.commit()
+
+        result = SyncService(sqlite_db).sync_cases(
+            lawyer_id=lawyer.id, scraped_cases=_batch(1), competencia="civil"
+        )
+
+        assert (result.cases_new, result.cases_updated) == (0, 1)
+        sqlite_db.refresh(legacy)
+        assert legacy.lawyer_id == lawyer.id
+
     def test_commits_roughly_once_per_chunk(self, sqlite_db, lawyer, monkeypatch):
         """Syncing N cases with chunk size K performs one commit per chunk
         plus one final commit that finalizes the SyncHistory record
@@ -154,7 +190,7 @@ class TestChunkedCommitCount:
 
         assert result.cases_new == 50
         assert result.cases_updated == 0
-        assert sqlite_db.query(Case).filter(Case.lawyer_id == lawyer.id).count() == 50
+        assert sqlite_db.query(Case).filter(Case.lawyer_id == _firm_id(sqlite_db)).count() == 50
 
         # ceil(50/10) == 5 chunk commits + 1 final commit == 6.
         # Old behavior would be exactly 1.
@@ -212,7 +248,7 @@ class TestPartialProgressSurvivesDrop:
         sqlite_db.commit = real_commit
         sqlite_db.rollback()
 
-        persisted = sqlite_db.query(Case).filter(Case.lawyer_id == lawyer.id).all()
+        persisted = sqlite_db.query(Case).filter(Case.lawyer_id == _firm_id(sqlite_db)).all()
         assert len(persisted) == 1
         assert persisted[0].rol == "C-0-2025"
 
@@ -270,7 +306,7 @@ class TestCommitRetrySucceeds:
         assert result.cases_new == 5
         # 1 failed + 1 successful retry for the single chunk, + 1 final commit.
         assert call_count["n"] == 3
-        assert sqlite_db.query(Case).filter(Case.lawyer_id == lawyer.id).count() == 5
+        assert sqlite_db.query(Case).filter(Case.lawyer_id == _firm_id(sqlite_db)).count() == 5
 
 
 # ---------------------------------------------------------------------------

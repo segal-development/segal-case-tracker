@@ -41,6 +41,13 @@ def sqlite_db(sqlite_engine):
         session.close()
 
 
+@pytest.fixture(autouse=True)
+def _firm_lawyer(sqlite_db):
+    """sync_cases creates cases under the firm lawyer (Approach C)."""
+    sqlite_db.add(Lawyer(rut="16021492-9", name="Firm", is_active=True))
+    sqlite_db.commit()
+
+
 def _lawyer(db, rut):
     lawyer = Lawyer(
         rut=rut,
@@ -103,7 +110,8 @@ class TestSyncRecordsSighting:
         cases = sqlite_db.query(Case).order_by(Case.id).all()
         rows = _sources(sqlite_db, lawyer.id)
         assert [r.case_id for r in rows] == [c.id for c in cases]
-        assert all(c.lawyer_id == lawyer.id for c in cases)  # ownership unchanged
+        firm = sqlite_db.query(Lawyer).filter(Lawyer.rut == "16021492-9").one()
+        assert all(c.lawyer_id == firm.id for c in cases)  # T3c: firm-owned
         assert all(r.first_seen_at and r.last_seen_at for r in rows)
 
     def test_resync_does_not_duplicate_and_refreshes_last_seen(self, sqlite_db):
@@ -124,7 +132,7 @@ class TestSyncRecordsSighting:
         assert row.first_seen_at == old
         assert row.last_seen_at > old
 
-    def test_two_lawyers_same_rol_each_get_their_own_row(self, sqlite_db):
+    def test_two_lawyers_same_rol_share_one_case_and_each_get_a_sighting(self, sqlite_db):
         l1 = _lawyer(sqlite_db, "33333333-3")
         l2 = _lawyer(sqlite_db, "44444444-4")
         sync = SyncService(sqlite_db)
@@ -132,10 +140,11 @@ class TestSyncRecordsSighting:
         sync.sync_cases(l1.id, [_scraped("C-9-2025")], "civil")
         sync.sync_cases(l2.id, [_scraped("C-9-2025")], "civil")
 
-        c1 = sqlite_db.query(Case).filter(Case.lawyer_id == l1.id).one()
-        c2 = sqlite_db.query(Case).filter(Case.lawyer_id == l2.id).one()
-        assert [r.case_id for r in _sources(sqlite_db, l1.id)] == [c1.id]
-        assert [r.case_id for r in _sources(sqlite_db, l2.id)] == [c2.id]
+        firm = sqlite_db.query(Lawyer).filter(Lawyer.rut == "16021492-9").one()
+        case = sqlite_db.query(Case).one()
+        assert case.lawyer_id == firm.id
+        assert [r.case_id for r in _sources(sqlite_db, l1.id)] == [case.id]
+        assert [r.case_id for r in _sources(sqlite_db, l2.id)] == [case.id]
 
     def test_year_skipped_case_gets_no_row(self, sqlite_db):
         lawyer = _lawyer(sqlite_db, "55555555-5")

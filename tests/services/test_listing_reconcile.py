@@ -39,6 +39,16 @@ def sqlite_db():
         engine.dispose()
 
 
+@pytest.fixture(autouse=True)
+def _firm_lawyer(sqlite_db, lawyer):
+    """sync_cases creates cases under the firm lawyer (Approach C).
+
+    Depends on ``lawyer`` so the individual lawyer keeps its id.
+    """
+    sqlite_db.add(Lawyer(rut="16021492-9", name="Firm", is_active=True))
+    sqlite_db.commit()
+
+
 @pytest.fixture()
 def lawyer(sqlite_db):
     lw = Lawyer(rut="12345678-9", name="Abogada Test", email="t@segal.cl", is_active=True,
