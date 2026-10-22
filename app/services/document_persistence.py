@@ -36,6 +36,7 @@ def document_identity_hash(
     doc_type: str,
     case_rol: str,
     scope_key: str = "",
+    court_id: Optional[int] = None,
 ) -> str:
     """Compute a stable 64-char hex identity for a document slot.
 
@@ -50,12 +51,46 @@ def document_identity_hash(
         case_rol:  Case ROL, e.g. "C-0001-2026".
         scope_key: Movement natural key (folio) for movement-level docs;
                    empty string for case-level docs.
+        court_id:  Optional qualifier for causas that share a ROL across courts.
+                   ``None`` keeps the legacy formula byte-for-byte (the extension
+                   ingest path relies on it); otherwise ``|court:<id>`` is appended.
 
     Returns:
         64-character lowercase hex SHA-256 digest.
     """
     raw = f"{doc_type}|{case_rol}|{scope_key}"
+    if court_id is not None:
+        raw = f"{raw}|court:{court_id}"
     return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _effective_hash(
+    doc_type: str,
+    case_rol: str,
+    scope_key: str,
+    case_id: int,
+    court_id: Optional[int],
+    existing_docs: dict,
+    case_courts: dict,
+) -> str:
+    """Resolve the identity hash a document of ``case_id`` must be stored under.
+
+    The legacy hash is kept unless a Document that belongs to ANOTHER case in a
+    DIFFERENT court already owns it (same ROL, different causa): then the
+    court-qualified hash is used. Documents already owned by this case, not stored
+    yet, or owned by a sibling Case row of the same court (the per-lawyer duplicate
+    rows, still shared on purpose until they are merged) keep the legacy hash, so
+    existing rows are never rehashed. Pure in-memory lookup on the prefetched maps
+    (``case_courts`` is ``{case_id: court_id}`` for the prefetched owners).
+    """
+    legacy = document_identity_hash(doc_type, case_rol, scope_key)
+    owner = existing_docs.get(legacy)
+    if owner is None or owner.case_id == case_id or court_id is None:
+        return legacy
+    owner_court = case_courts.get(owner.case_id)
+    if owner_court is None or owner_court == court_id:
+        return legacy
+    return document_identity_hash(doc_type, case_rol, scope_key, court_id=court_id)
 
 
 class DocumentPersistenceService:
@@ -121,22 +156,35 @@ class DocumentPersistenceService:
         # phase. Compute the detail's token_hashes up front (pure Python) and fetch
         # exactly those rows — mirroring the old per-doc SELECT, which filtered on
         # token_hash alone.
+        #
+        # The same ROL can also belong to different causas (different courts): those
+        # hold their documents under a court-qualified hash (see ``_effective_hash``),
+        # so BOTH variants are prefetched in the same single query.
+        from app.models.case import Case
+
+        # identity-map hit in the sync path (the Case is already loaded): no SELECT.
+        case_row = db.get(Case, case_id) if case_id is not None else None
+        court_id = case_row.court_id if case_row is not None else None
         wanted_hashes: set = set()
+
+        def _want(doc_type: str, scope_key: str) -> None:
+            wanted_hashes.add(document_identity_hash(doc_type, case_rol, scope_key))
+            if court_id is not None:
+                wanted_hashes.add(
+                    document_identity_hash(
+                        doc_type, case_rol, scope_key, court_id=court_id
+                    )
+                )
+
         for pjud_doc in detail.case_documents:
             if pjud_doc.doc_type:
-                wanted_hashes.add(
-                    document_identity_hash(pjud_doc.doc_type, case_rol, scope_key="")
-                )
+                _want(pjud_doc.doc_type, "")
         for pjud_movement in detail.movements:
             if not pjud_movement.folio:
                 continue
             for pjud_doc in pjud_movement.documentos:
                 if pjud_doc.doc_type:
-                    wanted_hashes.add(
-                        document_identity_hash(
-                            pjud_doc.doc_type, case_rol, scope_key=pjud_movement.folio
-                        )
-                    )
+                    _want(pjud_doc.doc_type, pjud_movement.folio)
         # Escritos live in their own PJUD pane and have no folio, so their identity
         # is scoped by the escrito's own natural key. The same PDF arriving later
         # as a movement (once the court resolves the escrito) hashes under the
@@ -144,19 +192,20 @@ class DocumentPersistenceService:
         # two panes share.
         escrito_docs = self._escritos_with_documents(detail, case_id, db, escrito_rows)
         for escrito_row, pjud_doc, _scope in escrito_docs:
-            wanted_hashes.add(
-                document_identity_hash(pjud_doc.doc_type, case_rol, scope_key=_scope)
-            )
-        existing_docs: dict = (
-            {
-                d.pjud_token_hash: d
-                for d in db.query(Document)
+            _want(pjud_doc.doc_type, _scope)
+        # The owner's court rides on the same query (join), so telling a sibling row
+        # of the same court from a different causa costs no extra round-trip.
+        existing_docs: dict = {}
+        case_courts: dict = {}
+        if wanted_hashes:
+            for d, owner_court in (
+                db.query(Document, Case.court_id)
+                .outerjoin(Case, Case.id == Document.case_id)
                 .filter(Document.pjud_token_hash.in_(wanted_hashes))
                 .all()
-            }
-            if wanted_hashes
-            else {}
-        )
+            ):
+                existing_docs[d.pjud_token_hash] = d
+                case_courts[d.case_id] = owner_court
         # Movements ARE case-scoped (a movement row belongs to exactly one case), so
         # the folio lookup is correctly scoped by case_id.
         movements_by_folio: dict = {
@@ -179,10 +228,14 @@ class DocumentPersistenceService:
             for pjud_doc in detail.case_documents:
                 if not pjud_doc.doc_type:
                     continue
-                token_hash = document_identity_hash(
+                token_hash = _effective_hash(
                     pjud_doc.doc_type,
                     case_rol,
-                    scope_key="",
+                    "",
+                    case_id,
+                    court_id,
+                    existing_docs,
+                    case_courts,
                 )
                 doc = self._upsert_document(
                     db=db,
@@ -252,10 +305,14 @@ class DocumentPersistenceService:
                 for pjud_doc in pjud_movement.documentos:
                     if not pjud_doc.doc_type:
                         continue
-                    token_hash = document_identity_hash(
+                    token_hash = _effective_hash(
                         pjud_doc.doc_type,
                         case_rol,
-                        scope_key=pjud_movement.folio,
+                        pjud_movement.folio,
+                        case_id,
+                        court_id,
+                        existing_docs,
+                        case_courts,
                     )
                     if pjud_doc.doc_type == "escrito_doc" and movement_id is not None:
                         self._adopt_escrito_document(
@@ -288,8 +345,14 @@ class DocumentPersistenceService:
                 if row.fecha_ingreso is not None
             )
             for escrito_row, pjud_doc, scope in escrito_docs:
-                token_hash = document_identity_hash(
-                    pjud_doc.doc_type, case_rol, scope_key=scope
+                token_hash = _effective_hash(
+                    pjud_doc.doc_type,
+                    case_rol,
+                    scope,
+                    case_id,
+                    court_id,
+                    existing_docs,
+                    case_courts,
                 )
                 # Same-date guard (a deliberate HEURISTIC, not a real dedup).
                 # When the court resolves an escrito, the same PDF reappears as a
