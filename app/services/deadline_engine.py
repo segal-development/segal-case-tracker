@@ -29,7 +29,7 @@ from zoneinfo import ZoneInfo
 
 from dateutil.relativedelta import relativedelta
 
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 import re as _re
@@ -185,6 +185,31 @@ def _normalize_text(value: Optional[str]) -> str:
     decomposed = unicodedata.normalize("NFKD", value or "")
     stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
     return " ".join(stripped.lower().split())
+
+
+_MEDIDA_PREJUDICIAL = "medida prejudicial"
+
+
+def is_medida_prejudicial(procedure: Optional[str]) -> bool:
+    """True when a case's ``procedure`` is exactly 'Medida prejudicial'.
+
+    The firm is always the solicitante there and does not run the ejecutivo
+    flow, so such a row is neutral (see ``DeadlineEngine.neutralize_medida_prejudicial``).
+    Compared after ``_normalize_text`` (case, accents, whitespace); None and
+    blank (or non-string) are NOT a medida prejudicial.
+    """
+    return isinstance(procedure, str) and _normalize_text(procedure) == _MEDIDA_PREJUDICIAL
+
+
+def medida_prejudicial_clause():
+    """SQL twin of ``is_medida_prejudicial`` on ``Case.procedure``.
+
+    Case- and edge-whitespace-insensitive (accents and inner runs of spaces are
+    left to the Python predicate: the stored value has no such variants).
+    NULL procedure yields False, never NULL, so ``~medida_prejudicial_clause()``
+    keeps the NULL rows.
+    """
+    return func.lower(func.trim(func.coalesce(Case.procedure, ""))) == _MEDIDA_PREJUDICIAL
 
 
 def _is_demandado_opposition_escrito(escrito: CaseEscrito) -> bool:
@@ -343,6 +368,16 @@ class DeadlineEngine:
         """
         old_semaforo = case.semaforo
         old_fatal = bool(case.next_deadline_fatal)
+
+        # A medida prejudicial is neutral: no flow, no plazos, no apremio.
+        if is_medida_prejudicial(case.procedure):
+            cls.neutralize_medida_prejudicial(db, case)
+            return SemaforoTransition(
+                old_semaforo=old_semaforo,
+                new_semaforo=case.semaforo,
+                old_fatal=old_fatal,
+                new_fatal=bool(case.next_deadline_fatal),
+            )
 
         # Apremio detection runs unconditionally so it is set on every code path
         # (success, GRIS safe-fail, and non-civil guard) without touching _write_gris.
@@ -1248,6 +1283,37 @@ class DeadlineEngine:
             return None
         except Exception:
             return None
+
+    @classmethod
+    def neutralize_medida_prejudicial(cls, db: Session, case: Case) -> None:
+        """Make a 'Medida prejudicial' row neutral (flush-only, idempotent).
+
+        Same state as ``_write_gris`` plus what it leaves alone (``en_apremio``
+        and the manual semáforo override). Every NON-manual ``case_deadlines``
+        row is marked ``superseded`` with ``verdict`` NULL in ONE statement;
+        manual rows and the rows themselves (history) are kept.
+        """
+        case.en_apremio = False
+        case._apremio_substage = None
+        case.semaforo_override = None
+        case.semaforo_override_at = None
+        case.semaforo_override_by = None
+        cls._write_gris(case, db)
+        (
+            db.query(CaseDeadline)
+            .filter(
+                CaseDeadline.case_id == case.id,
+                CaseDeadline.is_manual == False,  # noqa: E712
+                or_(
+                    CaseDeadline.status != "superseded",
+                    CaseDeadline.verdict.isnot(None),
+                ),
+            )
+            .update(
+                {CaseDeadline.status: "superseded", CaseDeadline.verdict: None},
+                synchronize_session="evaluate",
+            )
+        )
 
     @staticmethod
     def _write_gris(case: Case, db: Session) -> None:

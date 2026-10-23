@@ -138,6 +138,7 @@ from app.services.deadline_engine import (
     LoadedMovements,
     SemaforoTransition,
     _today_chile,
+    is_medida_prejudicial,
 )
 from app.services.matriz_classifier import MatrizMappingCache, classify_case
 
@@ -2684,6 +2685,17 @@ def _maybe_recompute_deadlines(
                 them instead of querying again.
     """
     if (case.competencia or "").lower() != "civil":
+        return
+    if is_medida_prejudicial(case.procedure):
+        # Neutral row: no plazos, so no deadline/ratification alert fan-out.
+        try:
+            DeadlineEngine.neutralize_medida_prejudicial(db, case)
+        except Exception:
+            logger.exception(
+                "medida prejudicial neutralization failed for case_id=%s; "
+                "sync continues",
+                getattr(case, "id", "?"),
+            )
         return
     try:
         # `loaded` is only forwarded when asked for, so every other caller keeps

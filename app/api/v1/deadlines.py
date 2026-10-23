@@ -43,7 +43,7 @@ from app.models.case_deadline import CaseDeadline
 from app.models.case_litigante import CaseLitigante
 from app.models.lawyer import Lawyer
 from app.services.business_days import count_business_days_remaining, add_business_days
-from app.services.deadline_engine import _today_chile
+from app.services.deadline_engine import _today_chile, is_medida_prejudicial
 
 from zoneinfo import ZoneInfo
 
@@ -762,8 +762,11 @@ async def get_case_deadlines(
     today = datetime.now(_CHILE_TZ).date()
 
     # Fetch active deadline rows ordered by due_date ASC
+    # A medida prejudicial carries no plazos: stale rows must not leak.
     deadline_rows: list[CaseDeadline] = (
-        db.query(CaseDeadline)
+        []
+        if is_medida_prejudicial(case.procedure)
+        else db.query(CaseDeadline)
         .filter(
             CaseDeadline.case_id == case_id,
             # active + audited (cumplido/no_cumplido) so the lawyer SEES audited
