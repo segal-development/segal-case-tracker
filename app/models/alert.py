@@ -15,7 +15,7 @@ class Alert(Base):
     id = Column(Integer, primary_key=True, index=True)
     lawyer_id = Column(Integer, ForeignKey("lawyers.id"), nullable=False)
     case_id = Column(Integer, ForeignKey("cases.id"), nullable=False)
-    movement_id = Column(Integer, ForeignKey("movements.id"), nullable=True)
+    movement_id = Column(Integer, ForeignKey("movements.id"), nullable=True, index=True)
 
     # Polymorphic entity target (ADR-003)
     # Identifies the non-movement entity that triggered this alert.
