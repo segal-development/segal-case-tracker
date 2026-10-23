@@ -85,10 +85,12 @@ SCALE_EXCEPCIONES_8D = Scale(
 SCALE_PODER_3D = Scale(
     "acreditar_poder_3d", 3, verde=(1, 1), amarillo=(2, 2), rojo=(3, 3)
 )
-# Semaforo 3 -- apelacion, art. 475 CPC (ejecutado side, solo efecto devolutivo).
-# One known term, so unlike excepciones there is nothing to confirm.
+# Semaforo 3 -- apelacion de la sentencia definitiva, art. 189 CPC (10 dias
+# habiles). One known term, so unlike excepciones there is nothing to confirm.
+# The "5d" in the name is historical (it was a 5-day scale): the key is persisted
+# and part of the Sysgal contract. Bands are the old 5-day ones, doubled.
 SCALE_APELACION_5D = Scale(
-    "apelacion_5d", 5, verde=(1, 2), amarillo=(3, 4), rojo=(5, 5)
+    "apelacion_5d", 10, verde=(1, 5), amarillo=(6, 9), rojo=(10, 10)
 )
 
 EXCEPCIONES_SCALE_BY_TERM = {

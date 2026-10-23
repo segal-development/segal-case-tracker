@@ -22,7 +22,7 @@ ventana que sigue abierta: se pierde un derecho irreparable.
 
 ## Tasks
 
-- [ ] T1 · S1-S4 · worker · motor: días, base legal, escala del semáforo, rótulo y descripción del endpoint; tests
+- [x] T1 · S1-S4 · worker · motor: días, base legal, escala del semáforo, rótulo y descripción del endpoint; tests
 - [ ] T2 · S4 · verificar tras el deploy · recálculo guardado de las causas con plazo de apelación vencido/activo y reinicio del worker de la estación
 
 ## Log
@@ -36,3 +36,4 @@ ventana que sigue abierta: se pierde un derecho irreparable.
   (647) y "art. 187/475 CPC" (140). Todo en el motor (deadlines_config.py:95), semáforo
   (semaforo_config.py:90 `SCALE_APELACION_5D`, deadline_semaforo.py:48/128) y descripción del endpoint
   (api/v1/deadlines.py:93).
+- L4: T1 hecha (worker + revisión + suite completa: 3.937 passed; 29 fallos solo en la corrida conjunta, tests de logs que dependen del orden; en aislamiento queda test_sync_movements_n1, independiente). Hallazgos: el motor YA revive los plazos vencidos cuando su fecha se corre hacia adelante (paso 4 pone `active`, el 6b los vuelve a vencer si ya pasaron): no hizo falta código de revivida. La apelación vencida no es rojo, pero SÍ lo es el último día de un plazo opcional vivo (comportamiento existente, fijado en una prueba). `legal_basis` de las filas viejas ("art. 475 CPC") no se reescribe al recalcular: sin efecto en los cálculos. Se corrigió también el texto de la recomendación `evaluar_apelacion` (decision_rules.py, "10 días", art. 189 / 475). Pendiente aparte: `oponer_prescripcion` cita "art. 98 DFL 707" para el pagaré (corresponde Ley 18.092).

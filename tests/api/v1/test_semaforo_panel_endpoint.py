@@ -59,7 +59,7 @@ def make_case(db, people, owner="ana", rol="C-1-2026", status="active"):
 
 
 def make_live(db, case, type_="excepciones_8d", triggered=TRIGGER, **kw):
-    days = {"excepciones_8d": 8, "acreditar_poder_3d": 3, "apelacion_5d": 5}[type_]
+    days = {"excepciones_8d": 8, "acreditar_poder_3d": 3, "apelacion_5d": 10}[type_]
     row = CaseDeadline(
         case_id=case.id, deadline_type=type_, triggered_at=triggered,
         due_date=add_business_days(triggered, days), status="active", **kw,
@@ -173,9 +173,9 @@ def test_apelacion_is_painted_with_its_single_confirmed_term(client, db, people)
 
     assert len(rows) == 1
     assert rows[0]["deadline_type"] == "apelacion_5d"
-    assert rows[0]["level"] == "amarillo"  # day 3 of 5
+    assert rows[0]["level"] == "verde"  # day 3 of 10 (verde 1-5)
     assert rows[0]["term_confirmed"] is True
-    assert [r["term_days"] for r in rows[0]["readings"]] == [5]
+    assert [r["term_days"] for r in rows[0]["readings"]] == [10]
 
 
 def test_counterparty_plazo_is_not_returned(client, db, people) -> None:

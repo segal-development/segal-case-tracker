@@ -214,9 +214,9 @@ def test_post_manual_deadline_creates_is_manual_true(client, db, case_with_deadl
     data = resp.json()
     assert data["is_manual"] is True
     assert data["deadline_type"] == "apelacion_5d"
-    assert data["legal_basis"] == "art. 475 CPC"  # from catalog
-    # due_date is derived = start_date + 5 días hábiles (apelacion_5d), NOT sent by the client
-    assert data["due_date"] == str(add_business_days(start, 5))
+    assert data["legal_basis"] == "art. 189 CPC"  # from catalog
+    # due_date is derived = start_date + 10 días hábiles (apelacion_5d), NOT sent by the client
+    assert data["due_date"] == str(add_business_days(start, 10))
     assert data["triggered_at"] == str(start)
 
     # Alert created for case's owning lawyer
