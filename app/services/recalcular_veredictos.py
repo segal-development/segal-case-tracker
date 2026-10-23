@@ -176,7 +176,9 @@ def planificar(
                 resultado.evaluadas += 1
             result = evaluate_deadline(
                 row.deadline_type,
-                DeadlineEngine._current_due_date(row),
+                # The case's movements let excepciones_8d count from the
+                # requerimiento de pago, like the live engine does.
+                DeadlineEngine._current_due_date(row, movements.get(row.case_id, [])),
                 movements.get(row.case_id, []),
                 today,
                 publication_margin_days=publication_margin_days,
