@@ -62,7 +62,7 @@ from app.services.deadline_verdict import (
     verdict_uses_escritos,
 )
 from app.services.poder_deadline import find_poder_obligation
-from app.services.procedural_classifier import MovementClassifier, anchor_date
+from app.services.procedural_classifier import MovementClassifier, anchor_date, due_anchor_date
 
 logger = logging.getLogger(__name__)
 
@@ -461,7 +461,14 @@ class DeadlineEngine:
 
         for deadline_type, trigger in triggers.items():
             triggered_at = cls._triggered_at_date(trigger)
-            due_date = add_business_days(triggered_at, deadline_type.dias_habiles)
+            # triggered_at (the row identity) stays the notification's; only the
+            # due date counts from the requerimiento de pago for excepciones_8d.
+            due_date = add_business_days(
+                triggered_at
+                if isinstance(trigger, date)
+                else due_anchor_date(deadline_type, trigger, movements),
+                deadline_type.dias_habiles,
+            )
 
             new_trigger_keys[deadline_type.value] = triggered_at
 
@@ -691,7 +698,7 @@ class DeadlineEngine:
                 row.status == "active"
                 and row.marked_by is None
                 and row.marked_at is None
-                and cls._term_elapsed(row, today)
+                and cls._term_elapsed(row, today, movements)
             ):
                 row.status = "expired"
         db.flush()
@@ -821,7 +828,7 @@ class DeadlineEngine:
 
         # Judged against the due_date the plazo SHOULD have (a stale row may
         # still carry the pre-diligencia one); the row's own field is not edited.
-        due = cls._current_due_date(row)
+        due = cls._current_due_date(row, movements)
         earliest = cls._earliest_defense_evidence(
             escritos, opposition_movements, row.triggered_at
         )
@@ -883,11 +890,11 @@ class DeadlineEngine:
             opposition_movements = [mv for mv in movements if _is_opposition_movement(mv)]
             for row in rows:
                 if row.status == "no_cumplido":
-                    cls._correct_late_miss(row, escrito_days, opposition_movements)
+                    cls._correct_late_miss(row, escrito_days, opposition_movements, movements)
                     continue
                 result = evaluate_deadline(
                     row.deadline_type,
-                    cls._current_due_date(row),
+                    cls._current_due_date(row, movements),
                     movements,
                     today,
                     triggered_at=row.triggered_at,
@@ -901,7 +908,7 @@ class DeadlineEngine:
                 earliest = cls._earliest_defense_evidence(
                     escrito_days, opposition_movements, row.triggered_at
                 )
-                if earliest is not None and earliest[0] <= cls._current_due_date(row):
+                if earliest is not None and earliest[0] <= cls._current_due_date(row, movements):
                     verdict, movement_id, acted_on = Verdict.CUMPLIDO, earliest[1], earliest[0]
                 if verdict is None or verdict_rank(verdict) <= verdict_rank(row.verdict):
                     continue
@@ -916,6 +923,7 @@ class DeadlineEngine:
         row: CaseDeadline,
         escrito_days: list[date],
         opposition_movements: list[Movement],
+        movements: list[Movement],
     ) -> None:
         """Upgrade the engine's own late-escrito miss to ``cumplido`` if disproved.
 
@@ -924,14 +932,18 @@ class DeadlineEngine:
         engine-set shape is touched (the caller's query already excluded manual
         and auditor-marked rows; a miss without the ``fuera_de_plazo`` verdict
         has unknown provenance). Upgrade-only: with no evidence on or before the
-        plazo the row is left exactly as it is.
+        plazo the row is left exactly as it is, except that its ``due_date`` is
+        refreshed to the one it should have (the plazo may now count from the
+        requerimiento de pago, later than the cédula the row was built on).
         """
         if row.status != "no_cumplido" or row.verdict != Verdict.FUERA_DE_PLAZO.value:
             return
+        due = cls._current_due_date(row, movements)
+        row.due_date = due
         earliest = cls._earliest_defense_evidence(
             escrito_days, opposition_movements, row.triggered_at
         )
-        if earliest is None or earliest[0] > cls._current_due_date(row):
+        if earliest is None or earliest[0] > due:
             return
         row.status = "cumplido"
         cls._write_verdict(row, Verdict.CUMPLIDO, earliest[1], earliest[0])
@@ -1018,7 +1030,7 @@ class DeadlineEngine:
         try:
             result = evaluate_deadline(
                 row.deadline_type,
-                cls._current_due_date(row),
+                cls._current_due_date(row, movements),
                 movements,
                 today,
                 triggered_at=row.triggered_at,
@@ -1043,7 +1055,12 @@ class DeadlineEngine:
             cls._clear_verdict(row)
 
     @classmethod
-    def _term_elapsed(cls, row: CaseDeadline, today: date) -> bool:
+    def _term_elapsed(
+        cls,
+        row: CaseDeadline,
+        today: date,
+        movements: Optional[list[Movement]] = None,
+    ) -> bool:
         """Whether ``row`` is genuinely finished, so it may leave the active set.
 
         Judged on the EFFECTIVE due date (``_current_due_date``), never the raw
@@ -1054,16 +1071,22 @@ class DeadlineEngine:
         verdict to protect, so their term ends on the due date.
         """
         margin = default_margin_days(row.deadline_type) if row.deadline_type in DETECTORS else 0
-        return cls._current_due_date(row) + timedelta(days=margin) < today
+        return cls._current_due_date(row, movements) + timedelta(days=margin) < today
 
     @staticmethod
-    def _current_due_date(row: CaseDeadline) -> date:
+    def _current_due_date(
+        row: CaseDeadline, movements: Optional[list] = None
+    ) -> date:
         """due_date the plazo SHOULD have today.
 
         A row created before the diligencia-date anchor change can still carry
         the old due_date when it closes (it is never revisited once the type
         leaves the triggers). Re-derive it from the source notification so the
         verdict is judged against the current rule. Row fields are not touched.
+
+        ``movements`` (the case's) lets ``excepciones_8d`` count from the
+        requerimiento de pago (see ``due_anchor_date``); without them the
+        notification anchor is used, as before.
         """
         source = row.source_movement
         if source is None:
@@ -1072,7 +1095,9 @@ class DeadlineEngine:
             dtype = DeadlineType(row.deadline_type)
         except ValueError:
             return row.due_date
-        return add_business_days(anchor_date(source), dtype.dias_habiles)
+        return add_business_days(
+            due_anchor_date(dtype, source, movements or []), dtype.dias_habiles
+        )
 
     @classmethod
     def _sync_parallel_deadlines(

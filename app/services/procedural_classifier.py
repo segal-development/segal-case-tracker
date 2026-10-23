@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Union
 
 from app.core.deadlines_config import (
@@ -83,6 +83,66 @@ def anchor_date(movement: object) -> date:
     if dil is not None and dil <= published:
         return dil
     return published
+
+
+# Longest gap, in calendar days, between the notification and the requerimiento
+# de pago that still moves the excepciones_8d anchor. Measured on 300 real
+# plazos: the requerimiento comes 0-7 days after the notification in 298 of
+# them; the two outliers (22 and 141 days) must not move a FATAL plazo.
+_MAX_REQUERIMIENTO_GAP_DAYS = 30
+
+_REQUERIMIENTO_RE = re.compile(r"^\s*requerimiento\s+de\s+pago", re.IGNORECASE)
+_REQUERIMIENTO_PAGA_RE = re.compile(r"\(\s*paga\s*\)", re.IGNORECASE)
+_ANNULLED_RE = re.compile(r"^\s*\[nulo\]", re.IGNORECASE)
+
+
+def requerimiento_anchor(notification_anchor: date, movements: list) -> date:
+    """Start date of the excepciones_8d plazo: the requerimiento de pago.
+
+    The plazo runs from the REQUERIMIENTO DE PAGO, not from the delivery of
+    the cédula (Carla Segal, 2026-10-23). Returns the ``Diligencia:`` date of
+    the EARLIEST "Requerimiento de Pago" movement (Ficto / Personal /
+    Realizada / bare) that has a parseable ``Diligencia:`` date, is not
+    "(Paga)" (the debtor paid) nor annulled, and falls between the
+    notification anchor and ``_MAX_REQUERIMIENTO_GAP_DAYS`` after it. A
+    requerimiento without ``Diligencia:`` is never used: its date is a
+    publication date and may be later than the real act, which would push a
+    fatal due date forward unsafely. With none valid, or if it would start
+    earlier, the notification anchor is returned (never earlier).
+
+    Known limitation: the tabla de emplazamiento (extra days for a defendant
+    outside the territory) is NOT modelled; the place of requerimiento is not
+    stored.
+    """
+    limit = notification_anchor + timedelta(days=_MAX_REQUERIMIENTO_GAP_DAYS)
+    best: date | None = None
+    for mv in movements:
+        desc = getattr(mv, "description", None) or ""
+        if (
+            _REQUERIMIENTO_RE.search(desc) is None
+            or _REQUERIMIENTO_PAGA_RE.search(desc)
+            or _ANNULLED_RE.search(desc)
+        ):
+            continue
+        dil = parse_diligencia_date(desc)
+        if dil is None or not notification_anchor <= dil <= limit:
+            continue
+        if best is None or dil < best:
+            best = dil
+    return best if best is not None else notification_anchor
+
+
+def due_anchor_date(deadline_type: object, trigger: object, movements: list) -> date:
+    """Date the due date of *deadline_type* counts from (its trigger's anchor).
+
+    Same as ``anchor_date`` except for ``excepciones_8d``, which counts from the
+    requerimiento de pago (see ``requerimiento_anchor``). The row identity
+    (``triggered_at``) stays the notification's: only the due date moves.
+    """
+    base = anchor_date(trigger)
+    if getattr(deadline_type, "value", deadline_type) == DeadlineType.EXCEPCIONES_8D.value:
+        return requerimiento_anchor(base, movements)
+    return base
 
 
 # Type alias — a deadline trigger is either a movement (has movement_date)
