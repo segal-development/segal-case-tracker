@@ -46,7 +46,11 @@ from app.models.case import Case
 from app.models.case_deadline import CaseDeadline
 from app.models.lawyer import Lawyer
 from app.models.webhook import Webhook
-from app.services.deadline_engine import _firm_side, _today_chile
+from app.services.deadline_engine import (
+    _firm_side,
+    _today_chile,
+    medida_prejudicial_clause,
+)
 from app.services.deadline_verdict import Verdict
 from app.services.deadline_semaforo import (
     EXCEPCIONES,
@@ -192,6 +196,7 @@ def _candidates(db: Session, today: date) -> List[CaseDeadline]:
             CaseDeadline.is_manual == False,  # noqa: E712
             CaseDeadline.due_date >= today,
             Case.status != "archived",
+            ~medida_prejudicial_clause(),
         )
         .order_by(CaseDeadline.id)
         .all()
@@ -214,6 +219,7 @@ def expired_unfiled_deadlines(db: Session, today: date) -> List[CaseDeadline]:
             CaseDeadline.due_date < today,
             CaseDeadline.verdict.in_(_NOT_ACTED_VERDICTS),
             Case.status == "active",
+            ~medida_prejudicial_clause(),
         )
     )
     window = settings.SEMAFORO_EXPIRED_WINDOW_DAYS
@@ -402,6 +408,7 @@ def _dispatch_expired(db: Session, today: date, svc: NotificationService) -> int
             CaseDeadline.verdict.in_(_NOT_ACTED_VERDICTS),
             CaseDeadline.due_date < today,
             Case.status == "active",
+            ~medida_prejudicial_clause(),
         )
     )
     window = settings.SEMAFORO_EXPIRED_WINDOW_DAYS

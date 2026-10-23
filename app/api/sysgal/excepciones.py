@@ -48,7 +48,7 @@ from app.models.case_litigante import CaseLitigante
 from app.models.court import Court
 from app.models.movement import Movement
 from app.services.business_days import count_business_days_remaining
-from app.services.deadline_engine import _today_chile
+from app.services.deadline_engine import _today_chile, is_medida_prejudicial
 from app.services.deadline_verdict import Verdict, evaluate_deadline, is_excepciones_escrito
 from app.utils.rut import normalize_rut
 
@@ -266,9 +266,11 @@ def get_excepciones(
     ):
         escritos_by_case.setdefault(esc.case_id, []).append(esc)
 
+    # A medida prejudicial carries no plazos: its stale rows must not leak.
+    plazo_case_ids = [c.id for c in cases if not is_medida_prejudicial(c.procedure)]
     deadlines: Dict[tuple, List[CaseDeadline]] = {}
     for row in db.query(CaseDeadline).filter(
-        CaseDeadline.case_id.in_(case_ids),
+        CaseDeadline.case_id.in_(plazo_case_ids),
         CaseDeadline.deadline_type.in_(
             [DeadlineType.EXCEPCIONES_8D.value, DeadlineType.ACREDITAR_PODER_3D.value]
         ),

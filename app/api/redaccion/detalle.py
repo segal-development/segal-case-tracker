@@ -43,6 +43,7 @@ from app.models.case_litigante import CaseLitigante
 from app.models.case_notificacion import CaseNotificacion
 from app.models.movement import Movement
 from app.services.business_days import count_business_days_remaining
+from app.services.deadline_engine import is_medida_prejudicial
 
 router = APIRouter()
 
@@ -303,8 +304,11 @@ def get_causa_detalle(
 
     # -- plazos (DeadlineEngine outputs) ----------------------------------
     today = datetime.now(_CHILE_TZ).date()
+    # A medida prejudicial carries no plazos: stale rows must not leak.
     deadline_rows: List[CaseDeadline] = (
-        db.query(CaseDeadline)
+        []
+        if is_medida_prejudicial(case.procedure)
+        else db.query(CaseDeadline)
         .filter(
             CaseDeadline.case_id == case_id,
             CaseDeadline.status != "superseded",

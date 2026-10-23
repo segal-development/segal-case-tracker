@@ -29,6 +29,7 @@ from app.models.case import Case
 from app.models.case_deadline import CaseDeadline
 from app.models.lawyer import Lawyer
 from app.services.business_days import count_business_days_remaining
+from app.services.deadline_engine import medida_prejudicial_clause
 from app.services.deadline_semaforo import Assessment, assess
 from app.services.estado_diario_probe import normalize_court_name
 from app.services.semaforo_alerts import (
@@ -170,6 +171,7 @@ def _por_vencer(db: Session, today: date, case_ids: Optional[Collection[int]]) -
             CaseDeadline.status == "active",
             CaseDeadline.due_date >= today,
             Case.status == "active",
+            ~medida_prejudicial_clause(),
         )
     )
     if case_ids is not None:

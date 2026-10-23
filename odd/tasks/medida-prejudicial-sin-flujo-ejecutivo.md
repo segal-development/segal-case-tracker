@@ -28,7 +28,7 @@ solicitante y no defiende un ejecutivo. Mapa de impacto: explorer 2026-10-22 (ve
 
 ## Tasks
 
-- [ ] T1 · S1-S5 · worker · backend: helper + early-return neutral en `recompute_case`, supersede de plazos no manuales, corto-circuito de alertas, exclusión en lecturas directas de `case_deadlines`, script de backfill (dry-run por defecto)
+- [x] T1 · S1-S5 · worker · backend: helper + early-return neutral en `recompute_case`, supersede de plazos no manuales, corto-circuito de alertas, exclusión en lecturas directas de `case_deadlines`, script de backfill (dry-run por defecto)
 - [ ] T2 · S5 · requiere visto bueno · correr el backfill sobre la base real (dry-run primero)
 - [ ] T3 · S2-S3 · PR aparte (repo frontend) · `ProcesoStepper`/`CausaDetalle`: rótulo "Medida prejudicial" sin flujo ejecutivo
 
@@ -51,3 +51,4 @@ solicitante y no defiende un ejecutivo. Mapa de impacto: explorer 2026-10-22 (ve
   (:269-300), /cases/{id}/deadlines, redaccion/detalle.py, emit_ratification_alert. `_write_gris`
   no resetea `en_apremio` ni `semaforo_override*`. No causado por T3c (4.265 de las 4.484 ya
   existían).
+- L4: T1 hecha (worker + revisión del diff + suite completa: 3.866 passed; 29 fallos solo en la corrida conjunta, son los tests de logs que dependen del orden, en aislamiento queda 1: test_movement_selects_do_not_scale_with_n, que también falla en main). Estado neutro por fila vía `DeadlineEngine.neutralize_medida_prejudicial`; lecturas directas excluidas con `medida_prejudicial_clause()`; `_dispatch_pending` no se toca (solo envía alertas guardadas con status active: correr el backfill justo después del deploy). Sin verificar en Postgres. Otros cuadernos secundarios (Incidente, Apremio, Tercería: ~1.500 filas) quedan fuera, a conversar con Carla.
