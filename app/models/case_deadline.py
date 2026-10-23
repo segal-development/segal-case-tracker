@@ -52,7 +52,7 @@ class CaseDeadline(Base):
 
     # Optional: the movement that triggered this deadline (nullable for computed triggers).
     source_movement_id = Column(
-        Integer, ForeignKey("movements.id"), nullable=True
+        Integer, ForeignKey("movements.id"), nullable=True, index=True
     )
 
     computed_at = Column(DateTime, nullable=True)
@@ -69,7 +69,7 @@ class CaseDeadline(Base):
     # survives ``superseded``. NULL = sin determinar. See deadline_verdict.py.
     verdict = Column(String(20), nullable=True)
     verdict_movement_id = Column(
-        Integer, ForeignKey("movements.id", ondelete="SET NULL"), nullable=True
+        Integer, ForeignKey("movements.id", ondelete="SET NULL"), nullable=True, index=True
     )
     verdict_acted_on = Column(Date, nullable=True)
     verdict_computed_at = Column(DateTime, nullable=True)
