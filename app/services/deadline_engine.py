@@ -53,8 +53,10 @@ from app.models.movement import Movement
 from app.services.business_days import add_business_days, count_business_days_remaining
 from app.services.deadline_verdict import (
     DETECTORS,
+    Verdict,
     default_margin_days,
     evaluate_deadline,
+    is_annulled,
     is_excepciones_escrito,
     verdict_rank,
     verdict_uses_escritos,
@@ -524,7 +526,9 @@ class DeadlineEngine:
                     ),
                     and_(
                         CaseDeadline.deadline_type == DeadlineType.EXCEPCIONES_8D.value,
-                        CaseDeadline.status.in_(("superseded", "expired")),
+                        # "no_cumplido": the engine's own late-escrito miss. An
+                        # auditor's mark carries marked_by/marked_at, excluded here.
+                        CaseDeadline.status.in_(("superseded", "expired", "no_cumplido")),
                         CaseDeadline.marked_by.is_(None),
                         CaseDeadline.marked_at.is_(None),
                         # NULL verdict is excluded on purpose: a closed row without
@@ -548,7 +552,7 @@ class DeadlineEngine:
 
         closed_candidates = [
             r for r in all_active
-            if r.status == "superseded" or _is_rebeldia_closure(r)
+            if r.status in ("superseded", "no_cumplido") or _is_rebeldia_closure(r)
         ]
         all_active = [r for r in all_active if r not in closed_candidates]
         for row in all_active:
@@ -775,14 +779,22 @@ class DeadlineEngine:
         row is touched: manual rows and rows an auditor judged are never
         overwritten (same guard as ``_record_verdict``).
 
-        * escrito dated on or before due_date  -> status ``cumplido``
-        * escrito dated after due_date         -> status ``no_cumplido`` (the
-          audit trail must say it was late). Both leave the active set, so
-          neither keeps the semáforo red: nothing is pending for the firm.
-        * movement-only evidence: its date is PJUD's PUBLICATION date, not the
-          filing date, so it cannot prove on-time or late by itself. The row is
-          closed as ``superseded`` (the engine's long-standing treatment) and
-          the margin-aware verdict says what can honestly be claimed.
+        The on-time test uses the EARLIEST evidence date (see
+        ``_earliest_defense_evidence``): an opposition movement is dated when
+        PJUD PUBLISHED it, so the escrito was filed that day or before. That
+        proves ON TIME, never late.
+
+        * earliest evidence on or before due_date, escrito on file -> status
+          ``cumplido``
+        * every escrito after due_date, no earlier movement -> status
+          ``no_cumplido`` (the audit trail must say it was late). Both leave
+          the active set, so neither keeps the semáforo red: nothing is
+          pending for the firm.
+        * movement-only evidence: published after due_date it cannot prove
+          late (publication lag), so the row is closed as ``superseded`` (the
+          engine's long-standing treatment) and the margin-aware verdict says
+          what can honestly be claimed. Published on or before due_date the
+          closure is the same, but the verdict is ``cumplido``.
         """
         if row.is_manual or row.status != "active":
             return False
@@ -800,14 +812,18 @@ class DeadlineEngine:
         # Judged against the due_date the plazo SHOULD have (a stale row may
         # still carry the pre-diligencia one); the row's own field is not edited.
         due = cls._current_due_date(row)
-        if escritos:
-            filed_on = min(escritos)
-            on_time = filed_on <= due
-            row.status = "cumplido" if on_time else "no_cumplido"
-            row.verdict = "cumplido" if on_time else "fuera_de_plazo"
-            row.verdict_movement_id = None
-            row.verdict_acted_on = filed_on
-            row.verdict_computed_at = datetime.now(timezone.utc)
+        earliest = cls._earliest_defense_evidence(
+            escritos, opposition_movements, row.triggered_at
+        )
+        if earliest is not None and earliest[0] <= due:
+            if escritos:
+                row.status = "cumplido"
+            else:
+                row.status = "superseded"  # movement-only: long-standing closure
+            cls._write_verdict(row, Verdict.CUMPLIDO, earliest[1], earliest[0])
+        elif escritos:
+            row.status = "no_cumplido"
+            cls._write_verdict(row, Verdict.FUERA_DE_PLAZO, None, min(escritos))
         else:
             # Same closure the engine always gave a movement-shown opposition
             # (superseded + margin-aware verdict).
@@ -825,15 +841,20 @@ class DeadlineEngine:
         escritos: _EscritosOfCase,
         rows: list[CaseDeadline],
     ) -> None:
-        """Re-judge CLOSED excepciones rows against the escritos now on file.
+        """Re-judge CLOSED excepciones rows against the evidence now on file.
 
         The filing date (``case_escritos.fecha_ingreso``) can arrive after the
         row was closed (superseded / expired) with a movement-only verdict, and
         a closed row is never visited by the live-plazo steps again. ``rows``
         are pre-selected by the step-5 query (excepciones, closed, automatic,
-        not marked by an auditor, verdict a miss). Rules:
+        not marked by an auditor, verdict a miss). Opposition movements are
+        evidence too, but only of being ON TIME (see
+        ``_earliest_defense_evidence``). Rules:
 
-        * Only ``verdict*`` is written, never ``status``.
+        * ``verdict*`` is rewritten; ``status`` is changed ONLY for the engine's
+          own late-escrito miss (``no_cumplido`` / ``fuera_de_plazo``), and only
+          to ``cumplido`` when the earliest evidence is within the plazo. It
+          is left alone otherwise.
         * Monotone: the verdict is replaced ONLY by a strictly better one, so
           this can never turn a ``cumplido`` into a miss.
         * Auditor decisions always win: manual rows, rows with ``marked_by`` /
@@ -844,9 +865,16 @@ class DeadlineEngine:
         if not rows:
             return
         try:
-            if not any(is_excepciones_escrito(e) for e in escritos.get()):
-                return
+            escrito_days = [
+                _day_of(e.fecha_ingreso)
+                for e in escritos.get()
+                if _is_demandado_opposition_escrito(e)
+            ]
+            opposition_movements = [mv for mv in movements if _is_opposition_movement(mv)]
             for row in rows:
+                if row.status == "no_cumplido":
+                    cls._correct_late_miss(row, escrito_days, opposition_movements)
+                    continue
                 result = evaluate_deadline(
                     row.deadline_type,
                     cls._current_due_date(row),
@@ -855,17 +883,88 @@ class DeadlineEngine:
                     triggered_at=row.triggered_at,
                     escritos=escritos.get(),
                 )
-                if result.verdict is None or verdict_rank(result.verdict) <= verdict_rank(
-                    row.verdict
-                ):
+                verdict, movement_id, acted_on = (
+                    result.verdict, result.movement_id, result.acted_on
+                )
+                # An opposition movement published within the plazo proves it
+                # was met whatever its "Trámite" (the detector wants "Escrito").
+                earliest = cls._earliest_defense_evidence(
+                    escrito_days, opposition_movements, row.triggered_at
+                )
+                if earliest is not None and earliest[0] <= cls._current_due_date(row):
+                    verdict, movement_id, acted_on = Verdict.CUMPLIDO, earliest[1], earliest[0]
+                if verdict is None or verdict_rank(verdict) <= verdict_rank(row.verdict):
                     continue
-                row.verdict = result.verdict.value
-                row.verdict_movement_id = result.movement_id
-                row.verdict_acted_on = result.acted_on
-                row.verdict_computed_at = datetime.now(timezone.utc)
+                cls._write_verdict(row, verdict, movement_id, acted_on)
             db.flush()
         except Exception as exc:
             logger.exception("re-judging closed excepciones failed: %s — skipping", exc)
+
+    @classmethod
+    def _correct_late_miss(
+        cls,
+        row: CaseDeadline,
+        escrito_days: list[date],
+        opposition_movements: list[Movement],
+    ) -> None:
+        """Upgrade the engine's own late-escrito miss to ``cumplido`` if disproved.
+
+        ``_close_excepciones_on_defense`` closes a late escrito as ``no_cumplido``
+        / ``fuera_de_plazo``; no other step revisits such a row. Only that exact
+        engine-set shape is touched (the caller's query already excluded manual
+        and auditor-marked rows; a miss without the ``fuera_de_plazo`` verdict
+        has unknown provenance). Upgrade-only: with no evidence on or before the
+        plazo the row is left exactly as it is.
+        """
+        if row.status != "no_cumplido" or row.verdict != Verdict.FUERA_DE_PLAZO.value:
+            return
+        earliest = cls._earliest_defense_evidence(
+            escrito_days, opposition_movements, row.triggered_at
+        )
+        if earliest is None or earliest[0] > cls._current_due_date(row):
+            return
+        row.status = "cumplido"
+        cls._write_verdict(row, Verdict.CUMPLIDO, earliest[1], earliest[0])
+        row.computed_at = datetime.now(timezone.utc)
+
+    @staticmethod
+    def _earliest_defense_evidence(
+        escrito_days: list[date],
+        opposition_movements: list[Movement],
+        triggered_at: Optional[date],
+    ) -> Optional[tuple[date, Optional[int]]]:
+        """(date, movement id) of the earliest proof the defense was filed.
+
+        An escrito's ``fecha_ingreso`` is the filing date; an opposition
+        movement's date is its PUBLICATION date, so the filing was that day or
+        earlier: both bound the filing date from above and the smaller wins.
+        On a tie the escrito wins (movement id None). An annulled
+        ("[Nulo]") movement, or one before ``triggered_at`` (it predates the
+        plazo), is not evidence. ``None`` when
+        there is no evidence at all.
+        """
+        best: Optional[tuple[date, Optional[int]]] = (
+            (min(escrito_days), None) if escrito_days else None
+        )
+        for mv in opposition_movements:
+            day = _day_of(mv.movement_date)
+            if is_annulled(mv) or (triggered_at is not None and day < triggered_at):
+                continue
+            if best is None or day < best[0]:
+                best = (day, mv.id)
+        return best
+
+    @staticmethod
+    def _write_verdict(
+        row: CaseDeadline,
+        verdict: Verdict,
+        movement_id: Optional[int],
+        acted_on: date,
+    ) -> None:
+        row.verdict = verdict.value
+        row.verdict_movement_id = movement_id
+        row.verdict_acted_on = acted_on
+        row.verdict_computed_at = datetime.now(timezone.utc)
 
     @staticmethod
     def _clear_verdict(row: CaseDeadline) -> None:

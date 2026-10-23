@@ -114,6 +114,11 @@ def _day(movement: object) -> date:
     return mv_dt.date() if isinstance(mv_dt, datetime) else mv_dt
 
 
+def is_annulled(movement: object) -> bool:
+    """True for a movement the court annulled ("[Nulo] ..."): never evidence."""
+    return bool(_NULO_RE.search(getattr(movement, "description", None) or ""))
+
+
 def is_excepciones_filing(movement: object) -> bool:
     """True only for the debtor's own filing opposing the execution.
 
@@ -128,7 +133,7 @@ def is_excepciones_filing(movement: object) -> bool:
     return (
         procedure == "escrito"
         and bool(_OPONE_EXCEPCIONES_RE.search(description))
-        and not _NULO_RE.search(description)
+        and not is_annulled(movement)
     )
 
 
