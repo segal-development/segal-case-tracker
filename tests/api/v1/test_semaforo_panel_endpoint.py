@@ -166,16 +166,12 @@ def test_row_whose_assess_level_is_none_is_excluded(client, db, people) -> None:
     assert get(client)["por_vencer"] == []
 
 
-def test_apelacion_is_painted_with_its_single_confirmed_term(client, db, people) -> None:
+def test_apelacion_is_not_on_the_panel(client, db, people) -> None:
+    # The appeal is a right, not an obligation: the firm asked for it to stay out
+    # of the semáforo, the home panel included.
     make_live(db, make_case(db, people), "apelacion_5d")
 
-    rows = get(client)["por_vencer"]
-
-    assert len(rows) == 1
-    assert rows[0]["deadline_type"] == "apelacion_5d"
-    assert rows[0]["level"] == "verde"  # day 3 of 10 (verde 1-5)
-    assert rows[0]["term_confirmed"] is True
-    assert [r["term_days"] for r in rows[0]["readings"]] == [10]
+    assert get(client)["por_vencer"] == []
 
 
 def test_counterparty_plazo_is_not_returned(client, db, people) -> None:
@@ -314,8 +310,8 @@ def _twin(db, people, owner, court_name, rol="C-8085-2025"):
 
 
 def test_same_case_under_two_lawyers_collapses_to_one_row_for_admin(client, db, people) -> None:
-    first = make_live(db, _twin(db, people, "ana", "5º Juzgado Civil de Santiago"), "apelacion_5d")
-    make_live(db, _twin(db, people, "otro", "5° JUZGADO CIVIL DE  SANTIAGO", rol="c-8085-2025"), "apelacion_5d")
+    first = make_live(db, _twin(db, people, "ana", "5º Juzgado Civil de Santiago"), "excepciones_8d")
+    make_live(db, _twin(db, people, "otro", "5° JUZGADO CIVIL DE  SANTIAGO", rol="c-8085-2025"), "excepciones_8d")
 
     (row,) = get(client, ADMIN_RUT)["por_vencer"]
 
@@ -332,8 +328,8 @@ def test_expired_duplicates_collapse_too(client, db, people) -> None:
 
 
 def test_lawyer_own_view_is_unchanged_by_the_collapse(client, db, people) -> None:
-    make_live(db, _twin(db, people, "ana", "5º Juzgado Civil de Santiago"), "apelacion_5d")
-    make_live(db, _twin(db, people, "otro", "5º Juzgado Civil de Santiago"), "apelacion_5d")
+    make_live(db, _twin(db, people, "ana", "5º Juzgado Civil de Santiago"), "excepciones_8d")
+    make_live(db, _twin(db, people, "otro", "5º Juzgado Civil de Santiago"), "excepciones_8d")
 
     (row,) = get(client, RUT)["por_vencer"]
 
@@ -350,10 +346,10 @@ def test_different_court_type_or_due_date_are_not_collapsed(client, db, people) 
     db.commit()
     people = {**people, "e1": extra[0], "e2": extra[1]}
     court5 = "5º Juzgado Civil de Santiago"
-    make_live(db, _twin(db, people, "ana", court5, "C-1-2026"), "apelacion_5d")
-    make_live(db, _twin(db, people, "otro", "6º Juzgado Civil de Santiago", "C-1-2026"), "apelacion_5d")
+    make_live(db, _twin(db, people, "ana", court5, "C-1-2026"), "excepciones_8d")
+    make_live(db, _twin(db, people, "otro", "6º Juzgado Civil de Santiago", "C-1-2026"), "excepciones_8d")
     make_live(
-        db, _twin(db, people, "e1", court5, "C-1-2026"), "apelacion_5d",
+        db, _twin(db, people, "e1", court5, "C-1-2026"), "excepciones_8d",
         triggered=date(2026, 11, 3),
     )
     make_live(db, _twin(db, people, "e2", court5, "C-1-2026"), "acreditar_poder_3d")

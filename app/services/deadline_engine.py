@@ -42,6 +42,7 @@ from app.core.deadlines_config import (
     DeadlineType,
     MANDATORY_ACTIONABLE_VALUES,
     OPTIONAL_ACTIONABLE_VALUES,
+    SEMAFORO_EXCLUDED_VALUES,
     PARALLEL_DEADLINE_VALUES,
     ProceduralState,
     actionable_sets,
@@ -1279,7 +1280,8 @@ class DeadlineEngine:
                      (rebeldía for demandante, awaiting court sentencia, or an
                      optional window that already closed).
         Deadlines outside the firm's actionable set for the given side and expired
-        OPTIONAL_ACTIONABLE (APELACION_5D) NEVER by themselves produce ROJO.
+        OPTIONAL_ACTIONABLE (APELACION_5D) NEVER by themselves produce ROJO. The
+        appeal window never colours at all (SEMAFORO_EXCLUDED_VALUES), open or not.
         """
         if state in (ProceduralState.INDETERMINATE, ProceduralState.TERMINADA):
             return "gris"
@@ -1292,7 +1294,7 @@ class DeadlineEngine:
             .filter(
                 CaseDeadline.case_id == case_id,
                 CaseDeadline.status == "active",
-                CaseDeadline.deadline_type.in_(actionable_values),
+                CaseDeadline.deadline_type.in_(actionable_values - SEMAFORO_EXCLUDED_VALUES),
             )
             .order_by(CaseDeadline.due_date.asc())
             .all()

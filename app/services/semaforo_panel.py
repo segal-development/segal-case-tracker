@@ -23,7 +23,11 @@ from typing import Collection, List, Optional
 
 from sqlalchemy.orm import Session
 
-from app.core.deadlines_config import DEADLINE_LABELS, FATAL_DEADLINE_VALUES
+from app.core.deadlines_config import (
+    DEADLINE_LABELS,
+    FATAL_DEADLINE_VALUES,
+    SEMAFORO_EXCLUDED_VALUES,
+)
 from app.core.semaforo_config import URGENCY, Level
 from app.models.case import Case
 from app.models.case_deadline import CaseDeadline
@@ -167,7 +171,7 @@ def _por_vencer(db: Session, today: date, case_ids: Optional[Collection[int]]) -
         db.query(CaseDeadline, Case)
         .join(Case, Case.id == CaseDeadline.case_id)
         .filter(
-            CaseDeadline.deadline_type.in_(FATAL_DEADLINE_VALUES),
+            CaseDeadline.deadline_type.in_(FATAL_DEADLINE_VALUES - SEMAFORO_EXCLUDED_VALUES),
             CaseDeadline.status == "active",
             CaseDeadline.due_date >= today,
             Case.status == "active",
