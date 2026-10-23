@@ -1238,12 +1238,28 @@ class TestFirmSide:
 class TestAbandonoDisponible:
     """abandono_disponible column set by DeadlineEngine.recompute_case."""
 
-    def test_pre_sentencia_7_months_ago_is_true(self, db) -> None:
-        """Pre-sentencia (notificado) + last movement 7 months ago → abandono_disponible = True."""
+    def test_notificado_without_defense_7_months_ago_is_false(self, db) -> None:
+        """Notified, no excepciones opposed + 7 months ago → abandono_disponible = False.
+
+        Carla Segal (2026-10-23): when no defense was presented the abandono term
+        is 3 years (art. 153), not 6 months. This test used to expect True.
+        """
         case = _make_case(db)
         notif_date = TODAY - relativedelta(months=7)
         _add_movement(db, case.id, notif_date, "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)")
         _recompute(db, case)
+        assert case.procedural_state == "notificado"
+        assert case.abandono_disponible is False
+
+    def test_with_excepciones_opposed_7_months_ago_is_true(self, db) -> None:
+        """Excepciones opposed and no sentencia on them + 7 months idle → 6-month rule applies."""
+        case = _make_case(db)
+        _add_movement(
+            db, case.id, TODAY - relativedelta(months=8), "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)"
+        )
+        _add_movement(db, case.id, TODAY - relativedelta(months=7), "Excepciones", "Opone excepciones")
+        _recompute(db, case)
+        assert case.procedural_state == "excepciones"
         assert case.abandono_disponible is True
 
     def test_pre_sentencia_3_months_ago_is_false(self, db) -> None:
