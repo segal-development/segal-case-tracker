@@ -251,16 +251,18 @@ class TestApelacionStaysOptional:
         assert row.status == "expired"
         assert case.semaforo == "verde"
 
-    def test_last_day_urgency_is_unchanged(self, db, owner, monkeypatch) -> None:
-        # PRESERVE: the case semáforo has always turned rojo on the last day of
-        # ANY live actionable plazo, optional ones included (0 days remaining).
-        # Only the due date moved (5 -> 10 días); the rule itself did not.
+    def test_last_day_does_not_turn_the_case_rojo(self, db, owner, monkeypatch) -> None:
+        # The appeal no longer colours the semáforo, not even on its last day
+        # (the firm asked for the semáforo to show everything else). The window
+        # itself stays live on the case.
         _freeze(monkeypatch, date(2026, 10, 26))
         case = _sentencia_case(db, owner, SENTENCIA_WED)
 
         DeadlineEngine.recompute_case(db, case)
 
-        assert case.semaforo == "rojo"
+        (row,) = _rows(db, case)
+        assert row.status == "active"
+        assert case.semaforo == "verde"
 
 
 class TestScaleCoversTheTenDays:
