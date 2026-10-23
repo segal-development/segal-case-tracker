@@ -32,6 +32,12 @@ dentro del plazo, el motor da por perdido un plazo que se cumplió.
   publicado 2026-02-05; `case_escritos` solo tiene un "Opone excepciones" (Demandado) con
   `fecha_ingreso` 2026-10-14 (probable reingreso tras la certificación tardía de la notificación,
   movimientos del 2026-10-09). El motor registró verdict=`fuera_de_plazo`, `verdict_acted_on`=2026-10-14.
-- L2: Hallazgo aparte (NO es parte de este cambio): el motor cuenta el sábado como hábil; 6 de las 9
-  causas marcadas habrían presentado exactamente el último día si el sábado no cuenta. Pendiente de
-  la respuesta de Carla.
+- L2: CORREGIDO (2026-10-23). El sábado ES hábil: Carla (Dirección Jurídica) lo confirmó el 2026-09-29
+  (art. 66 CPC, solo domingos y festivos) y también que el plazo de excepciones es siempre de 8 días;
+  el motor ya lo cuenta así (PR #296). Lo que NO está explicado: de 51 escritos de excepciones del
+  demandado con fecha de presentación conocida, 42 están en plazo, 3 tarde con cualquier regla y 6 se
+  presentaron exactamente un día hábil después del vencimiento (C-578-2026, C-6216-2026, C-11312-2026,
+  C-1102-2026, C-9790-2026, C-6751-2026; 3 de ellos posteriores a la confirmación). Hipótesis, sin
+  datos que las distingan: (1) alguien cuenta sin el sábado y presentó un día tarde; (2) el plazo
+  empieza después de la fecha de la diligencia (p. ej. notificación por cédula, art. 44). Pendiente
+  de Carla; no es parte de este cambio.
