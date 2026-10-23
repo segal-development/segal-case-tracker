@@ -89,9 +89,13 @@ _SEMAFORO_AMARILLO_MAX = 5  # 2–5 → AMARILLO; >5 → VERDE
 # Abandono del procedimiento (art. 152/153 CPC) — state classification sets
 # ---------------------------------------------------------------------------
 
+# Abandono thresholds depend on whether the ejecutado presented a defense
+# (Carla Segal, 2026-10-23): 6 months (art. 152) only when excepciones were
+# opposed and there is no sentencia on them yet; 3 years (art. 153 inc. 2) once
+# there is a sentencia OR when no defense was presented. MANDAMIENTO (not
+# notified yet) keeps the general 6 months: it was not covered.
 _PRE_SENTENCIA_STATES: frozenset[ProceduralState] = frozenset({
     ProceduralState.MANDAMIENTO,
-    ProceduralState.NOTIFICADO,
     ProceduralState.EXCEPCIONES,
     ProceduralState.TRASLADO_EJECUTANTE,
     ProceduralState.ADMISIBILIDAD,
@@ -99,9 +103,12 @@ _PRE_SENTENCIA_STATES: frozenset[ProceduralState] = frozenset({
     ProceduralState.CITACION_SENTENCIA,
 })
 
+# NOTIFICADO is the state of an ejecutado who was notified and has NOT opposed
+# excepciones (an opposition moves the state on), i.e. "no se presentó defensa".
 _POST_SENTENCIA_STATES: frozenset[ProceduralState] = frozenset({
     ProceduralState.SENTENCIA,
     ProceduralState.REBELDE,
+    ProceduralState.NOTIFICADO,
 })
 
 
@@ -112,8 +119,11 @@ def _compute_abandono(
 ) -> bool:
     """Art. 152/153 CPC abandono del procedimiento advisory signal.
 
-    Pre-sentencia states: 6-month inactivity threshold (art. 152 CPC).
-    Post-sentencia states: 3-year inactivity threshold (art. 153 inc. 2 CPC).
+    Excepciones opposed and no sentencia on them (and MANDAMIENTO, not notified
+    yet): 6-month inactivity threshold (art. 152 CPC).
+    Sentencia dictated, or no defense presented (NOTIFICADO, REBELDE): 3-year
+    inactivity threshold (art. 153 inc. 2 CPC), from the last "gestión útil" of
+    the ejecutante, approximated by the last movement of any kind.
     TERMINADA, INDETERMINATE, and unrecognised states: always False (excluded).
     """
     if proc_state is None:
