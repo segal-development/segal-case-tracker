@@ -92,7 +92,14 @@ class DeadlineType(str, Enum):
     # memory/juicio-ejecutivo-defense-rules.md. Corrected from the prior
     # dual-basis "art. 187/475 CPC" (which mixed in the ejecutante's ambos-
     # efectos rule the firm never actually exercises).
-    APELACION_5D = ("apelacion_5d", 5, "art. 475 CPC", True)
+    #
+    # HISTORICAL NAME — DO NOT "FIX" IT BY REVERTING THE DAYS: the appeal that a
+    # sentencia definitiva starts lasts 10 días hábiles (art. 189 CPC; confirmed
+    # by Carla Segal on 2026-10-23; Saturday is hábil). The identifier
+    # "apelacion_5d" / APELACION_5D predates that and is kept on purpose: it is
+    # persisted in case_deadlines, keys the semáforo scale and is part of the
+    # Sysgal contract. Only the days, the legal basis and the scale changed.
+    APELACION_5D = ("apelacion_5d", 10, "art. 189 CPC", True)
     # PARALLEL plazo: it is NOT started by a ClassifierRule (see
     # app/services/poder_deadline.py and DeadlineEngine's parallel step).
     # Court resolution "Previo a proveer" ordering to ratify the signature /
@@ -393,8 +400,8 @@ CLASSIFIER_RULES: list[ClassifierRule] = [
     # Rule 9 — Sentencia definitiva → SENTENCIA + APELACION_5D
     # Real data: "Dicta sentencia", "Sentencia Definitiva", "Sentencia" (exact),
     #            "Notificación de la sentencia".
-    # The 5-day apelación plazo runs from the date the sentencia is issued
-    # (art. 187 CPC, applied by art. 475 for juicio ejecutivo).
+    # The 10-day apelación plazo (art. 189 CPC) runs from the date the sentencia
+    # is issued. The "5d" in APELACION_5D is historical (see DeadlineType).
     # min_state=CITACION_SENTENCIA: sentencia can only be issued after
     # the citación stage has been reached.
     ClassifierRule(

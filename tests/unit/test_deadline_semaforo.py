@@ -34,6 +34,9 @@ DAY_DATE = {
     6: date(2026, 11, 9),
     7: date(2026, 11, 10),
     8: date(2026, 11, 11),
+    9: date(2026, 11, 12),
+    10: date(2026, 11, 13),
+    11: date(2026, 11, 14),
 }
 
 
@@ -77,9 +80,11 @@ class TestScaleBoundaries:
         assert SCALE_PODER_3D.level_for_day(day) == expected
 
     @pytest.mark.parametrize(
-        "day,expected", [(1, V), (2, V), (3, A), (4, A), (5, R), (6, None)]
+        "day,expected",
+        [(1, V), (5, V), (6, A), (9, A), (10, R), (11, None)],
     )
-    def test_apelacion_5_days(self, day, expected) -> None:
+    def test_apelacion_10_days(self, day, expected) -> None:
+        # The scale keeps its historical "5d" name; the term is 10 días (art. 189).
         assert SCALE_APELACION_5D.level_for_day(day) == expected
 
     def test_day_zero_has_no_level_on_the_scale_itself(self) -> None:
@@ -186,21 +191,24 @@ class TestRatificacion:
 
 
 class TestApelacion:
-    """Art. 475 CPC: ONE known term of 5 business days, so never unconfirmed."""
+    """Art. 189 CPC: ONE known term of 10 business days, so never unconfirmed.
+
+    The "apelacion_5d" identifier and the "5d" slot are historical names.
+    """
 
     @pytest.mark.parametrize(
-        "day,expected", [(1, V), (2, V), (3, A), (4, A), (5, R)]
+        "day,expected", [(1, V), (5, V), (6, A), (9, A), (10, R)]
     )
-    def test_five_day_scale(self, day, expected) -> None:
+    def test_ten_day_scale(self, day, expected) -> None:
         a = assess("apelacion_5d", TRIGGER, DAY_DATE[day])
         assert a is not None
         assert a.level == expected
         assert a.day == day
         assert a.slot == "5d"
-        assert a.readings[0].due_date == DAY_DATE[5]
+        assert a.readings[0].due_date == DAY_DATE[10]
 
-    def test_over_from_day_6(self) -> None:
-        a = assess("apelacion_5d", TRIGGER, DAY_DATE[6])
+    def test_over_from_day_11(self) -> None:
+        a = assess("apelacion_5d", TRIGGER, DAY_DATE[11])
         assert a is not None
         assert a.level is None
         assert a.readings[0].level is None
@@ -210,7 +218,7 @@ class TestApelacion:
         a = assess("apelacion_5d", TRIGGER, DAY_DATE[2])
         assert a is not None
         assert a.confirmed is True
-        assert [r.term_days for r in a.readings] == [5]
+        assert [r.term_days for r in a.readings] == [10]
 
     def test_a_confirmed_term_argument_is_ignored(self) -> None:
         a = assess("apelacion_5d", TRIGGER, DAY_DATE[2], confirmed_term_days=8)
