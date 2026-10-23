@@ -269,6 +269,7 @@ class RiskBoardRiesgo(BaseModel):
     en_apremio: int
     plazo_fatal_proximo: int
     plazo_fatal_vencido: int
+    plazo_fatal_incumplido: int = 0
 
     model_config = ConfigDict(from_attributes=True)
 

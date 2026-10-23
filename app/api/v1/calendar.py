@@ -83,12 +83,14 @@ class OpportunityResponse(BaseModel):
 
 class CalendarSummaryResponse(BaseModel):
     """``total``/``overdue_count``/``fatal_count`` count dated ``items`` only;
-    opportunities have their own counter so they never inflate the KPIs."""
+    opportunities and lost fatal plazos (``incumplido_count``) have their own
+    counters so they never inflate the KPIs."""
 
     total: int
     overdue_count: int
     fatal_count: int
     opportunities_count: int
+    incumplido_count: int = 0
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -250,7 +252,12 @@ async def get_calendar(
         .options(joinedload(Case.court))
         .filter(
             Case.status != "archived",
-            or_(Case.next_deadline_at.isnot(None), Case.next_review_at.isnot(None)),
+            # A lost fatal plazo has no dates but must still be counted.
+            or_(
+                Case.next_deadline_at.isnot(None),
+                Case.next_review_at.isnot(None),
+                Case.plazo_fatal_incumplido.is_(True),
+            ),
         )
     )
     query = apply_case_scope(query, scope)
@@ -328,6 +335,7 @@ async def get_calendar(
         overdue_count=sum(1 for i in items if i.overdue),
         fatal_count=sum(1 for i in items if i.fatal),
         opportunities_count=len(opportunities),
+        incumplido_count=sum(1 for c in cases if c.plazo_fatal_incumplido),
     )
 
     return CalendarResponse(items=items, summary=summary, opportunities=opportunities)
