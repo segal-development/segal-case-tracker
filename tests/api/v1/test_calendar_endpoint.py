@@ -878,6 +878,7 @@ class TestOpportunities:
         assert body["opportunities"] == []
         assert body["summary"] == {
             "total": 1, "overdue_count": 0, "fatal_count": 1, "opportunities_count": 0,
+            "incumplido_count": 0,
         }
 
     def test_opportunities_respect_scope(self, authed_client, db, lawyer, other_lawyer, court):

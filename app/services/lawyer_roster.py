@@ -618,6 +618,7 @@ def firm_risk_board(db: Session, account_rut: str) -> dict:
             Case.en_apremio,
             Case.next_deadline_fatal,
             Case.next_deadline_at,
+            Case.plazo_fatal_incumplido,
         )
         .filter(Case.competencia == "civil", Case.status != "archived")
         .all()
@@ -643,6 +644,9 @@ def firm_risk_board(db: Session, account_rut: str) -> dict:
         "en_apremio": 0,
         "plazo_fatal_proximo": 0,
         "plazo_fatal_vencido": 0,
+        # Lost fatal plazo: next_deadline_at is NULL so it never reaches the
+        # proximo/vencido buckets above; counted as its own axis.
+        "plazo_fatal_incumplido": 0,
     }
 
     for c in cases:
@@ -653,6 +657,8 @@ def firm_risk_board(db: Session, account_rut: str) -> dict:
             riesgo_totals["prescripcion_cumplida"] += 1
         if c.en_apremio:
             riesgo_totals["en_apremio"] += 1
+        if c.plazo_fatal_incumplido:
+            riesgo_totals["plazo_fatal_incumplido"] += 1
         if c.next_deadline_fatal and c.next_deadline_at is not None:
             if c.next_deadline_at >= today:
                 riesgo_totals["plazo_fatal_proximo"] += 1
@@ -701,7 +707,8 @@ def firm_risk_board(db: Session, account_rut: str) -> dict:
         })
     by_lawyer.sort(key=lambda x: x["rojo"], reverse=True)
 
-    # top_critical: rojo first, then soonest next_deadline_at (cases without
+    # top_critical: lost fatal plazo first (it has no date, so it would sink
+    # into the undated group), then rojo first, then soonest next_deadline_at (cases without
     # one sort last within their group), fatal before non-fatal as tiebreak.
     court_ids = {c.court_id for c in cases if c.court_id is not None}
     court_names = {}
@@ -728,6 +735,7 @@ def firm_risk_board(db: Session, account_rut: str) -> dict:
         is_overdue = has_deadline and c.next_deadline_at < today
         days_from_today = abs((c.next_deadline_at - today).days) if has_deadline else 0
         return (
+            0 if c.plazo_fatal_incumplido else 1,
             0 if c.semaforo == "rojo" else 1,
             0 if has_deadline else 1,
             1 if is_overdue else 0,

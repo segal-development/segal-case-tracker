@@ -20,8 +20,8 @@ desaparece justo cuando ocurrió lo peor. Auditoría de código 2026-10-21; mapa
 
 ## Tasks
 
-- [ ] T1 · S1 · worker · backend: conteo de causas con el flag en `firm_risk_board` (`riesgo_totals`), en el summary de `/calendar` (`incumplido_count`) y orden de "top críticos"; tests que pinean las formas
-- [ ] T2 · S1 · PR aparte (repo frontend) · tile en Riesgo, KPI en Agenda, badge del menú lateral y conteo server-side en lugar de `incumplidasAll`
+- [x] T1 · S1 · worker · backend: conteo de causas con el flag en `firm_risk_board` (`riesgo_totals`), en el summary de `/calendar` (`incumplido_count`) y orden de "top críticos"; tests que pinean las formas
+- [x] T2 · S1 · PR aparte (repo frontend) · tile en Riesgo, KPI en Agenda, badge del menú lateral y conteo server-side en lugar de `incumplidasAll`
 - [ ] T3 · revisión humana · las 3 causas antiguas sin aviso: C-16984-2025 (hace 260 días), C-6216-2026 (87), C-578-2026 (90)
 
 ## Log
@@ -38,3 +38,4 @@ desaparece justo cuando ocurrió lo peor. Auditoría de código 2026-10-21; mapa
   `PlazoIncumplidoBadge`, la tarjeta "Incumplidos" de Plazos.tsx (limitada a 6.000 causas por
   MAX_PAGES), y el panel/alerta `plazo_vencido`. Presupuesto de round-trips del recompute
   (`test_roundtrips_per_case.py`) no se toca: el conteo va fuera del recompute.
+- L4: T1 hecha (worker + revisión del diff + suite completa: 3.891 passed; 29 fallos solo en la corrida conjunta, tests de logs que dependen del orden; en aislamiento queda test_sync_movements_n1, inestable e independiente de este cambio). Claves nuevas: `riesgo.plazo_fatal_incumplido` (GET /stats/risk-board) y `summary.incumplido_count` (GET /calendar), ambas con default 0; 0 consultas adicionales (se agregó la columna a un select existente y se amplió el `or_` del calendario). Top críticos: la marca va primero. T2 hecha en el repo del frontend (PR #168). Pendiente fuera de este alcance: tarjeta "Incumplidos" de Plazos con conteo server-side, KPI "Plazos urgentes" del Dashboard, correo diario, Sysgal; revisión humana de las 3 causas antiguas (T3).

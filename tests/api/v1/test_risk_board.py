@@ -576,7 +576,7 @@ class TestRiskBoardEndpoint:
         assert set(data["semaforo"].keys()) == {"rojo", "amarillo", "verde", "gris"}
         assert set(data["riesgo"].keys()) == {
             "abandono_disponible", "prescripcion_cumplida", "en_apremio",
-            "plazo_fatal_proximo", "plazo_fatal_vencido",
+            "plazo_fatal_proximo", "plazo_fatal_vencido", "plazo_fatal_incumplido",
         }
         assert data["total"] == 1
         row = data["by_lawyer"][0]
