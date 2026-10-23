@@ -167,6 +167,7 @@ def run_case_merge(
 
         for loser in losers:
             _merge_children(db, loser.id, winner.id)
+            _repoint_audit_winner(db, loser.id, winner.id)
             db.flush()
 
     loser_ids = [loser.id for losers in losers_by_identity.values() for loser in losers]
@@ -393,6 +394,23 @@ def _backfill_case_lawyer_source(db: Session, winner: Case, cases: List[Case]) -
                 )
             )
     db.flush()
+
+
+def _repoint_audit_winner(db: Session, loser_id: int, winner_id: int) -> None:
+    """Keep the audit trail when a former winner loses a later merge.
+
+    ``case_merge_audit.winner_case_id`` is a foreign key to ``cases.id``. An EARLIER merge
+    (migration 024) recorded some cases as winners, and a case like that can lose a new
+    merge: deleting it then violates the foreign key and the whole batch rolls back
+    (measured on QA: 229 old audit rows, 167 still-duplicated cases among them).
+
+    The old rows are not deleted: they are re-pointed to the case that now holds the
+    data, so the chain reads "X went into Y, and Y into Z". ``loser_case_id`` is not a
+    foreign key and needs no change.
+    """
+    db.query(CaseMergeAudit).filter(CaseMergeAudit.winner_case_id == loser_id).update(
+        {CaseMergeAudit.winner_case_id: winner_id}, synchronize_session=False
+    )
 
 
 def _merge_children(db: Session, loser_id: int, winner_id: int) -> None:
@@ -682,6 +700,18 @@ def _verify_invariants(
             )
 
     procedure_key = func.coalesce(Case.procedure, "")
+    stray_audit = (
+        db.query(func.count(CaseMergeAudit.id))
+        .filter(CaseMergeAudit.winner_case_id.in_(loser_ids or [0]))
+        .scalar()
+        or 0
+    )
+    if stray_audit:
+        failures.append(
+            f"case_merge_audit: {stray_audit} row(s) still name a to-be-deleted loser as "
+            "winner_case_id — audit repoint incomplete"
+        )
+
     dupe_query = (
         db.query(Case.rol, Case.court_id, procedure_key)
         .filter(Case.competencia == "civil", ~Case.id.in_(loser_ids or [0]))
