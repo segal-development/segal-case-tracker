@@ -28,7 +28,7 @@ Con notificación por cédula (art. 44) el requerimiento es posterior, y el moto
 
 ## Tasks
 
-- [ ] T1 · S1-S4 · worker · motor: ancla de `excepciones_8d` en el requerimiento, recálculo de filas existentes, tests
+- [x] T1 · S1-S4 · worker · motor: ancla de `excepciones_8d` en el requerimiento, recálculo de filas existentes, tests
 - [ ] T2 · S4 · verificar tras el deploy · recálculo guardado de las causas con plazo `excepciones_8d` afectado (esperado: solo cambian las 300 y, de las 8 marcadas, solo C-11187-2026)
 
 ## Log
@@ -46,3 +46,4 @@ Con notificación por cédula (art. 44) el requerimiento es posterior, y el moto
   deadlines_config.py (`NOTIFICACION_EXITOSA`, ~:303-312); `_current_due_date(row)`
   (deadline_engine.py:1050) re-deriva el vencimiento desde `row.source_movement`;
   `_triggered_at_date` (:1317). La fila se identifica por (case_id, deadline_type, triggered_at).
+- L4: T1 hecha (worker + revisión del diff + suite completa: 3.933 passed; 29 fallos solo en la corrida conjunta, tests de logs que dependen del orden; en aislamiento queda test_sync_movements_n1, independiente). Diseño A: la identidad de la fila (`triggered_at`) sigue siendo la fecha de la notificación y solo se corre el vencimiento (`due_anchor_date`, `requerimiento_anchor`); el ancla de `excepciones_8d` es la diligencia del primer "Requerimiento de Pago" válido (con fecha de diligencia, no "(Paga)", no anulado, entre 0 y 30 días después de la notificación). `_correct_late_miss` también refresca `due_date` de las filas no_cumplido del motor. `recalcular_veredictos.py` ahora pasa los movimientos a `_current_due_date`. Limitaciones: la tabla de emplazamiento no se modela (no se guarda el lugar del requerimiento); una fila sin `source_movement_id` conserva el vencimiento guardado; `scripts/backfill_plazos_excepciones.py` sigue usando `anchor_date`. De las 8 marcadas solo C-11187-2026 tiene un movimiento de requerimiento; las otras 7 siguen igual y requieren revisión humana del acta del receptor.
