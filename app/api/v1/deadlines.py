@@ -92,7 +92,8 @@ _DEADLINE_ACTIONS: dict[str, str] = {
     "sentencia_10d": "Vence el plazo para dictar sentencia definitiva (arts. 162/470 CPC).",
     "apelacion_5d": (
         "Vence el plazo para apelar de la sentencia; el ejecutado apela con "
-        "solo efecto devolutivo, por lo que el apremio continúa (art. 475 CPC)."
+        "solo efecto devolutivo, por lo que el apremio continúa (art. 475 CPC). "
+        "El plazo para apelar la sentencia definitiva es de 10 días hábiles (art. 189 CPC)."
     ),
 }
 

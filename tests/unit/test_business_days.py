@@ -29,6 +29,8 @@ from datetime import date
 
 import pytest
 
+from app.core.deadlines_config import DeadlineType
+
 from app.services.business_days import (
     _is_business_day,
     add_business_days,
@@ -51,14 +53,14 @@ class TestAddBusinessDays:
         assert result == date(2026, 6, 16)
 
     def test_apelacion_5d_standard(self) -> None:
-        """APELACION_5D: 5 días hábiles from 2026-06-16 (Tuesday) → 2026-06-22.
+        """APELACION_5D (historical name): 10 días hábiles from 2026-06-16 (Tuesday).
 
-        Spec scenario: trigger_date=2026-06-16, no intervening holiday.
         Count: Wed 17(1), Thu 18(2), Fri 19(3), Sat 20(4, hábil), [Sun 21 skip],
-               Mon 22(5). = 5 ✓
+               Mon 22(5), Tue 23(6), Wed 24(7), Thu 25(8), Fri 26(9),
+               Sat 27(10, hábil). = 10 ✓
         """
-        result = add_business_days(date(2026, 6, 16), 5)
-        assert result == date(2026, 6, 22)
+        result = add_business_days(date(2026, 6, 16), DeadlineType.APELACION_5D.dias_habiles)
+        assert result == date(2026, 6, 27)
 
     def test_traslado_4d_crosses_weekend(self) -> None:
         """TRASLADO_EJECUTANTE_4D: 4 días hábiles from 2026-07-01 (Wed) → 2026-07-06.

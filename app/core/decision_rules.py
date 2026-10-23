@@ -125,8 +125,8 @@ def _is_excepciones_window(ctx: DecisionContext) -> bool:
 
 
 def _is_apelacion_window(ctx: DecisionContext) -> bool:
-    """Sentencia condenatoria notified, within the 5-día apelación window
-    (art. 475 CPC — ejecutado: solo efecto devolutivo)."""
+    """Sentencia condenatoria notified, within the 10-día apelación window
+    (art. 189 CPC; ejecutado: solo efecto devolutivo, art. 475 CPC)."""
     return (
         ctx.procedural_state == ProceduralState.SENTENCIA.value
         and _has_open_fatal_window(ctx)
@@ -187,8 +187,8 @@ DECISION_RULES: list[DecisionRule] = [
     ),
     DecisionRule(
         code="evaluar_apelacion",
-        action_text="Evaluar apelación (5 días, solo efecto devolutivo)",
-        legal_basis="art. 475 CPC",
+        action_text="Evaluar apelación (10 días, solo efecto devolutivo)",
+        legal_basis="art. 189 / 475 CPC",
         urgency=Urgency.CRITICA,
         predicate=_is_apelacion_window,
     ),

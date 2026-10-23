@@ -745,11 +745,11 @@ class TestApelacion5D:
             .first()
         )
         assert apelacion_row is not None, "APELACION_5D must be active after sentencia"
-        expected_due = add_business_days(sentencia_date, 5)
+        expected_due = add_business_days(sentencia_date, 10)
         assert apelacion_row.due_date == expected_due, (
             f"APELACION_5D due_date: expected {expected_due}, got {apelacion_row.due_date}"
         )
-        assert apelacion_row.legal_basis == "art. 475 CPC"
+        assert apelacion_row.legal_basis == "art. 189 CPC"
         # SENTENCIA_10D from citación must be superseded
         sentencia_10d_row = (
             db.query(CaseDeadline)
