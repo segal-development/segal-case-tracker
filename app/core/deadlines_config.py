@@ -181,6 +181,11 @@ PARALLEL_DEADLINE_VALUES: frozenset[str] = frozenset(d.value for d in PARALLEL_D
 MANDATORY_ACTIONABLE_VALUES: frozenset[str] = frozenset(d.value for d in MANDATORY_ACTIONABLE)
 OPTIONAL_ACTIONABLE_VALUES: frozenset[str] = frozenset(d.value for d in OPTIONAL_ACTIONABLE)
 ACTIONABLE_DEADLINE_VALUES: frozenset[str] = frozenset(d.value for d in ACTIONABLE_DEADLINES)
+# Plazos that never colour the semáforo (per-case colour and home panel). The
+# appeal is a right the firm may or may not exercise, not an obligation, and the
+# firm asked for the semáforo to show everything else. The window itself stays on
+# the case (deadline row, next_deadline_at, Agenda).
+SEMAFORO_EXCLUDED_VALUES: frozenset[str] = frozenset({DeadlineType.APELACION_5D.value})
 # Plazos whose loss is irreparable. NOTE: some fatal types (excepciones_8d) are
 # only actionable for ONE side, so "actionable and fatal" must be evaluated
 # against the per-side ``actionable_sets``, never against the global
