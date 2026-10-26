@@ -70,6 +70,14 @@ _previous_cycle: Optional[tuple[datetime, datetime]] = None
 
 _SYNC_JOB_ID = "sync_all_lawyers"
 
+#: Key ``sync_lawyer_cases`` sets on its failure dict when PJUD rejected the
+#: session it had JUST re-authenticated (the source IP is likely flagged).
+AUTH_REJECTED_KEY = "auth_rejected_after_reauth"
+
+# When the session-rejection breaker last tripped, the moment the cooldown ends.
+# In memory on purpose: a process restart clears it.
+_auth_block_until: Optional[datetime] = None
+
 
 def _wall_now() -> datetime:
     """Timezone-aware local wall clock (tests replace it)."""
@@ -683,6 +691,9 @@ async def sync_lawyer_cases(
             new_session, _reason = await _reauth(lawyer, store)
         return new_session
 
+    # True once a fresh re-login was done because PJUD rejected the cached session.
+    reauthed_after_rejection = False
+
     try:
         scraper = get_scraper(competencia)
         session = pjud_session  # PJUDSession object from Redis
@@ -739,6 +750,7 @@ async def sync_lawyer_cases(
             if fresh_session is None:
                 raise
             session = fresh_session
+            reauthed_after_rejection = True
             with timed("listing"):
                 cases = await scraper.get_my_cases(
                     session=session,
@@ -898,7 +910,14 @@ async def sync_lawyer_cases(
         db.add(sync_record)
         db.commit()
 
-        return {"success": False, "error": str(e)}
+        failure = {"success": False, "error": str(e)}
+        if (
+            reauthed_after_rejection
+            and isinstance(e, SessionNotAuthenticatedError)
+            and not isinstance(e, ShapeChallengeError)
+        ):
+            failure[AUTH_REJECTED_KEY] = True
+        return failure
 
     finally:
         if 'scraper' in locals():
@@ -951,6 +970,7 @@ async def sync_all_lawyers():
 
 async def _run_sync_cycle(timer: CycleTimer):
     """The body of one scheduled cycle (see ``sync_all_lawyers``)."""
+    global _auth_block_until
     cycle_started_at = timer.started_at
     logger.info("=" * 60)
     logger.info("Starting scheduled sync for all lawyers")
@@ -1053,6 +1073,18 @@ async def _run_sync_cycle(timer: CycleTimer):
         )
         return
 
+    # Session-rejection cooldown. Like the guard above it sits AFTER the
+    # maintenance block (credential scan, Sysgal refresh, health check, plazo
+    # alerts: none of it needs PJUD, and lawyers must keep getting their alerts)
+    # and only skips the PJUD lawyer-sync loop.
+    if _auth_block_until is not None and _wall_now() < _auth_block_until:
+        logger.info(
+            "Skipping the PJUD lawyer sync loop: session-rejection cooldown "
+            "active until %s",
+            _auth_block_until.isoformat(timespec="seconds"),
+        )
+        return
+
     if not lawyer_ids:
         logger.info("No active lawyers found, nothing to sync")
         return
@@ -1065,10 +1097,19 @@ async def _run_sync_cycle(timer: CycleTimer):
         "skipped": 0,
         "fresh": 0,
         "failed": 0,
+        "aborted": 0,
     }
     timer.results = results
 
+    _auth_block_until = None  # the cooldown, if any, has elapsed
+    reject_trip = settings.SYNC_AUTH_REJECT_TRIP
+    consecutive_rejections: list[int] = []
+    tripped = False
+
     for lawyer_id in lawyer_ids:
+        if tripped:
+            results["aborted"] += 1
+            continue
         for competencia in COMPETENCIAS:
             # Fresh, short-lived session PER (lawyer, competencia) work unit.
             # If the Cloud SQL Auth Proxy drops the connection mid-batch, the
@@ -1084,6 +1125,7 @@ async def _run_sync_cycle(timer: CycleTimer):
                     # work at all, so it must be visible at the level we log at.
                     # Same "Skipping lawyer ..." style as the credential skips.
                     results["fresh"] += 1
+                    consecutive_rejections.clear()
                     logger.info(
                         "Skipping lawyer %s %s: %s",
                         lawyer_id, competencia,
@@ -1095,10 +1137,14 @@ async def _run_sync_cycle(timer: CycleTimer):
 
                 if result.get("skipped"):
                     results["skipped"] += 1
+                    consecutive_rejections.clear()
                 elif result.get("success"):
                     results["synced"] += 1
+                    consecutive_rejections.clear()
                 else:
                     results["failed"] += 1
+                    if result.get(AUTH_REJECTED_KEY):
+                        consecutive_rejections.append(lawyer_id)
             except Exception as iter_exc:
                 # A single work-unit failure (e.g. a dropped connection that
                 # poisoned work_db) must NOT abort the cycle — count it and
@@ -1112,6 +1158,21 @@ async def _run_sync_cycle(timer: CycleTimer):
                 results["failed"] += 1
             finally:
                 work_db.close()
+
+            if len(consecutive_rejections) >= reject_trip:
+                tripped = True
+                _auth_block_until = _wall_now() + timedelta(
+                    minutes=settings.SYNC_AUTH_BLOCK_COOLDOWN_MINUTES
+                )
+                logger.error(
+                    "PJUD rejected %d consecutive fresh sessions (lawyer ids: %s); "
+                    "the egress IP is likely flagged. Stopping the cycle; next cycle "
+                    "after %s",
+                    len(consecutive_rejections),
+                    consecutive_rejections,
+                    _auth_block_until.isoformat(timespec="seconds"),
+                )
+                break
 
             # Small delay between requests to avoid overwhelming PJUD
             with timed("waits"):

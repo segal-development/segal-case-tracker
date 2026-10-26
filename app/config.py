@@ -386,6 +386,12 @@ class Settings(BaseSettings):
     SYNC_COMMIT_CHUNK_SIZE: int = 200       # Cases processed between commits
     SYNC_COMMIT_MAX_RETRIES: int = 2        # Max commit attempts on OperationalError (incl. the first)
 
+    # Session-rejection breaker: stop the cycle after this many CONSECUTIVE
+    # lawyers whose freshly re-authenticated session PJUD rejected, then do
+    # nothing until the cooldown passes (in-memory: a worker restart clears it).
+    SYNC_AUTH_REJECT_TRIP: int = 3
+    SYNC_AUTH_BLOCK_COOLDOWN_MINUTES: int = 90
+
     # Presentación worker (Slice 2a — scaffolding). Master gate defaults OFF:
     # while False the station-side worker only logs queue depth and claims/
     # processes NOTHING (the OJV/PJUD automation lands in Slice 2b).
