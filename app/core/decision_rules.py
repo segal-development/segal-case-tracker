@@ -3,7 +3,7 @@
 Chilean juicio ejecutivo. Every rule below is a DEFENSE action taken by the
 ejecutado/deudor, and encodes a CONFIRMED-by-the-firm action (2026-07-09);
 see ``memory/juicio-ejecutivo-defense-rules.md`` for the legal source
-(CPC + Ley 21.394 + CC art. 2515 + DFL 707).
+(CPC + Ley 21.394 + CC art. 2515 + Ley 18.092 + DFL 707).
 
 The firm's side is NOT fixed, despite what this docstring used to claim:
 PJUD's litigante rows show 431 civil cases where a firm lawyer is the
@@ -195,7 +195,7 @@ DECISION_RULES: list[DecisionRule] = [
     DecisionRule(
         code="oponer_prescripcion",
         action_text="Oponer prescripción de la acción",
-        legal_basis="art. 98 DFL 707 / 2515 CC",
+        legal_basis="art. 98 Ley 18.092 / 2515 CC",
         urgency=Urgency.ALTA,
         predicate=_is_prescripcion,
     ),
