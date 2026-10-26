@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Optional
+from typing import Iterable, Optional
 from zoneinfo import ZoneInfo
 
 from dateutil.relativedelta import relativedelta
@@ -39,11 +39,13 @@ from app.core.deadlines_config import (
     ACTIONABLE_DEADLINE_VALUES,
     FATAL_DEADLINE_VALUES,
     DEADLINE_DISCLAIMER,
+    CLASSIFIER_RULES,
     DeadlineType,
     MANDATORY_ACTIONABLE_VALUES,
     OPTIONAL_ACTIONABLE_VALUES,
     SEMAFORO_EXCLUDED_VALUES,
     PARALLEL_DEADLINE_VALUES,
+    ProcEvent,
     ProceduralState,
     actionable_sets,
 )
@@ -63,7 +65,13 @@ from app.services.deadline_verdict import (
     verdict_uses_escritos,
 )
 from app.services.poder_deadline import find_poder_obligation
-from app.services.procedural_classifier import MovementClassifier, anchor_date, due_anchor_date
+from app.services.procedural_classifier import (
+    _REQUERIMIENTO_PAGA_RE,
+    _REQUERIMIENTO_RE,
+    MovementClassifier,
+    anchor_date,
+    due_anchor_date,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -140,28 +148,66 @@ def _compute_abandono(
     return False
 
 
+_NOTIFICACION_RULE = next(
+    rule for rule in CLASSIFIER_RULES if rule.event == ProcEvent.NOTIFICACION_EXITOSA
+)
+
+
+def _demanda_notified_by(
+    movements: Iterable[Movement], deadline: date
+) -> bool:
+    """True when the demanda was notified on or before *deadline*.
+
+    Same notion of "notified" as the classifier (successful NOTIFICACIÓN DE
+    DEMANDA) plus a Requerimiento de Pago that is neither annulled nor
+    "(Paga)" (the effective notification). Dated by ``anchor_date`` (the
+    ``Diligencia:`` date). Only the upper bound is checked: a notification
+    dated before ``filed_at`` is odd data and, on doubt, counts as notified.
+    """
+    for mv in movements:
+        if is_annulled(mv):
+            continue
+        desc = mv.description or ""
+        notifies = _NOTIFICACION_RULE.matches(desc, mv.stage or "") or (
+            _REQUERIMIENTO_RE.search(desc) is not None
+            and _REQUERIMIENTO_PAGA_RE.search(desc) is None
+        )
+        if notifies and anchor_date(mv) <= deadline:
+            return True
+    return False
+
+
 def _compute_prescripcion(
     case: "Case",
     today: date,
+    movements: Iterable[Movement] = (),
 ) -> tuple[bool, "Optional[date]"]:
     """Statute-of-limitations advisory signal (Chilean law).
 
-    The prescription clock starts from the DEMAND FILING DATE
-    (``Case.filed_at``, "Fecha de ingreso"), NOT the title's vencimiento.
+    Prescription is flagged when EITHER rule holds (the first one wins the
+    reported date):
 
-    Plazo by título type:
-      {"pagare", "letra", "cheque"} → 1 year
-        (art. 98 Ley 18.092 / art. 34 Ley 18.552)
-      everything else (None, "otro", "escritura_publica", "sentencia", ...) →
-        3 years — the GENERAL acción ejecutiva prescription (art. 2515 CC).
-        # 3yr general per art. 2515 CC — confirm exact from-date basis with
-        # legal review. Reusing filed_at (the same base date as the 1yr
-        # títulos-de-crédito path) is a conservative placeholder pending
-        # legal sign-off, not a confirmed art. 2515 CC interpretation.
+    1. Demanda not notified within a year of filing (Carla Segal, 2026-10-26:
+       "si no se logro notificar la demanda dentro de un año desde su
+       presentación, se puede pedir la prescripción"): ``filed_at + 1 year``
+       is strictly before *today* and *movements* hold no notification of the
+       demanda dated on or before that day (see ``_demanda_notified_by``). A
+       later notification does not count. Date = ``filed_at + 1 year``. With
+       no movement at all the rule does not fire (unknown, not "unnotified").
+    2. Previous rule, kept because Carla did not rule on it: the plazo counts
+       from the DEMAND FILING DATE (``Case.filed_at``, "Fecha de ingreso"),
+       not the title's vencimiento.
+         {"pagare", "letra", "cheque"} → 1 year
+           (art. 98 Ley 18.092 / art. 34 Ley 18.552)
+         everything else (None, "otro", "escritura_publica", "sentencia", ...)
+           → 3 years — the GENERAL acción ejecutiva prescription (art. 2515 CC).
+           # 3yr general per art. 2515 CC — confirm exact from-date basis with
+           # legal review. Reusing filed_at is a conservative placeholder
+           # pending legal sign-off, not a confirmed art. 2515 CC reading.
 
     Returns (prescripcion_cumplida, prescripcion_fecha).
     If filed_at is None → (False, None) (nothing computable either way).
-    prescripcion_cumplida = prescripcion_fecha < today (strictly less than).
+    Both rules compare strictly (date < today).
     """
     titulo_tipo = (getattr(case, "titulo_tipo", None) or "").lower().strip()
 
@@ -170,6 +216,17 @@ def _compute_prescripcion(
         return (False, None)
 
     start = filed_at.date()
+    first_year_end = start + relativedelta(years=1)
+    movements = list(movements)
+    # A case with NO published movement at all is unknown, not "never notified":
+    # PJUD may simply not have delivered its history. The rule needs evidence.
+    if (
+        movements
+        and first_year_end < today
+        and not _demanda_notified_by(movements, first_year_end)
+    ):
+        return (True, first_year_end)
+
     plazo_years = 1 if titulo_tipo in {"pagare", "letra", "cheque"} else 3
     prescripcion_fecha = start + relativedelta(years=plazo_years)
     prescripcion_cumplida = prescripcion_fecha < today
@@ -719,7 +776,7 @@ class DeadlineEngine:
         abandono = _compute_abandono(proc_state, latest_mv_date, today)
 
         # Step 7c: prescripción advisory signal (statute of limitations).
-        prescripcion_cumplida, prescripcion_fecha = _compute_prescripcion(case, today)
+        prescripcion_cumplida, prescripcion_fecha = _compute_prescripcion(case, today, movements)
 
         # Step 8: write denormalized Case columns.
         case.procedural_state = proc_state.value
