@@ -57,6 +57,10 @@ class CalendarItemResponse(BaseModel):
     semaforo: Optional[str] = None
     fatal: Optional[bool] = None
     label: Optional[str] = None
+    # Machine-readable plazo type (``DeadlineType.value``), so a client can decide
+    # what to count without matching on the human ``label``. None when no active
+    # row backs the case's next_deadline_at.
+    deadline_type: Optional[str] = None
     overdue: bool
 
     model_config = ConfigDict(from_attributes=True)
@@ -156,8 +160,26 @@ def _caratulado(case: Case) -> str:
     return f"{case.plaintiff or ''}/{case.defendant or ''}"
 
 
+def _label_of(deadline_type: Optional[str]) -> Optional[str]:
+    return None if deadline_type is None else DEADLINE_LABELS.get(deadline_type, deadline_type)
+
+
 def _deadline_labels_by_case(db: Session, cases: List[Case]) -> dict:
     """Map ``{case_id: label}`` for the cases' next active deadline, in ONE query.
+
+    Same resolution ``GET /cases/{id}/deadlines`` performs: the CaseDeadline row's
+    ``deadline_type`` mapped through the shared ``DEADLINE_LABELS`` catalog. A view
+    over ``_deadline_types_by_case`` (one query, never one per case: the sidebar
+    calls this endpoint on every page load).
+    """
+    return {
+        case_id: DEADLINE_LABELS.get(dtype, dtype)
+        for case_id, dtype in _deadline_types_by_case(db, cases).items()
+    }
+
+
+def _deadline_types_by_case(db: Session, cases: List[Case]) -> dict:
+    """Map ``{case_id: deadline_type}`` for the cases' next active deadline, in ONE query.
 
     Reuses the SAME resolution ``GET /cases/{id}/deadlines`` already performs
     (look up the CaseDeadline row and map its ``deadline_type`` through the
@@ -191,14 +213,14 @@ def _deadline_labels_by_case(db: Session, cases: List[Case]) -> dict:
         .all()
     )
 
-    labels: dict = {}
+    types: dict = {}
     for row in rows:
         # Same predicate the per-case query applied: the row must match the
         # case's own next_deadline_at, and the LOWEST id wins.
-        if row.due_date != wanted.get(row.case_id) or row.case_id in labels:
+        if row.due_date != wanted.get(row.case_id) or row.case_id in types:
             continue
-        labels[row.case_id] = DEADLINE_LABELS.get(row.deadline_type, row.deadline_type)
-    return labels
+        types[row.case_id] = row.deadline_type
+    return types
 
 
 @router.get("", response_model=CalendarResponse)
@@ -275,7 +297,7 @@ async def get_calendar(
             query = query.filter(Case.id.in_(list(allowed_ids)))
 
     cases = query.all()
-    deadline_labels = _deadline_labels_by_case(db, cases)
+    deadline_types = _deadline_types_by_case(db, cases)
 
     today = _today_chile()
     horizon_end = today + timedelta(days=days)
@@ -301,7 +323,8 @@ async def get_calendar(
                         court_name=court_name,
                         semaforo=case.semaforo,
                         fatal=bool(case.next_deadline_fatal),
-                        label=deadline_labels.get(case.id),
+                        label=_label_of(deadline_types.get(case.id)),
+                        deadline_type=deadline_types.get(case.id),
                         overdue=overdue,
                     )
                 )
