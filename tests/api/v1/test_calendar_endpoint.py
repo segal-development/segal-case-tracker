@@ -602,6 +602,50 @@ class TestDeadlineLabel:
         assert item["label"] is None
 
 
+class TestDeadlineType:
+    """The item carries the machine-readable plazo type, so a client can decide
+    what to count (e.g. leave the appeal out of "plazos urgentes") without
+    matching on the human label."""
+
+    def test_item_carries_the_deadline_type(self, authed_client, db, lawyer, court):
+        c = _make_case(
+            db, lawyer, court, "C-1801-2026",
+            next_deadline_at=TODAY + timedelta(days=2),
+            next_deadline_fatal=False,
+            semaforo="amarillo",
+        )
+        db.add(CaseDeadline(
+            case_id=c.id, deadline_type="apelacion_5d", legal_basis="art. 189 CPC",
+            due_date=TODAY + timedelta(days=2), triggered_at=TODAY, status="active",
+        ))
+        db.commit()
+
+        response = authed_client.get("/api/v1/calendar")
+
+        item = next(
+            i for i in response.json()["items"]
+            if i["case_id"] == c.id and i["kind"] == "deadline"
+        )
+        assert item["deadline_type"] == "apelacion_5d"
+        assert item["label"]  # the label is untouched
+
+    def test_item_without_backing_row_has_no_type(self, authed_client, db, lawyer, court):
+        c = _make_case(
+            db, lawyer, court, "C-1802-2026",
+            next_deadline_at=TODAY + timedelta(days=2),
+            next_deadline_fatal=False,
+            semaforo="amarillo",
+        )
+
+        response = authed_client.get("/api/v1/calendar")
+
+        item = next(
+            i for i in response.json()["items"]
+            if i["case_id"] == c.id and i["kind"] == "deadline"
+        )
+        assert item["deadline_type"] is None
+
+
 # ---------------------------------------------------------------------------
 # Archived cases excluded
 # ---------------------------------------------------------------------------
