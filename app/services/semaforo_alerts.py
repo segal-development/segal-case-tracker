@@ -24,6 +24,7 @@ import logging
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 
+from sqlalchemy import and_
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -210,6 +211,11 @@ def expired_unfiled_deadlines(db: Session, today: date) -> List[CaseDeadline]:
     are independent: a ``superseded`` row can carry ``no_cumplido``). Only
     ``due_date`` within ``SEMAFORO_EXPIRED_WINDOW_DAYS`` of ``today`` (<= 0 =
     no window) on a case that is still ``active``.
+
+    One exception to "never on the status": a plazo an AUDITOR signed as
+    ``cumplido`` (``marked_by`` set) is met, whatever the engine's verdict still
+    says. The verdict is evidence the engine computed; the auditor's decision
+    overrides it, and the plazo must not keep showing as lost or raise alerts.
     """
     query = (
         db.query(CaseDeadline)
@@ -218,6 +224,7 @@ def expired_unfiled_deadlines(db: Session, today: date) -> List[CaseDeadline]:
             CaseDeadline.deadline_type.in_(_EXPIRED_NOTICE_TYPES),
             CaseDeadline.due_date < today,
             CaseDeadline.verdict.in_(_NOT_ACTED_VERDICTS),
+            ~and_(CaseDeadline.status == "cumplido", CaseDeadline.marked_by.isnot(None)),
             Case.status == "active",
             ~medida_prejudicial_clause(),
         )
