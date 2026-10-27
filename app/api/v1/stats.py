@@ -4,6 +4,7 @@ from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.api.deps import (
@@ -17,6 +18,7 @@ from app.api.deps import (
 from app.models.case import Case
 from app.models.goal import Goal
 from app.models.lawyer import Lawyer
+from app.services.deadline_engine import medida_prejudicial_clause
 from app.services.lawyer_roster import (
     firm_dashboard_stats,
     firm_dashboard_stats_all,
@@ -133,29 +135,15 @@ async def get_public_overview(db: Session = Depends(get_db)):
     """PUBLIC (no auth): firm semáforo counts for the login screen marquee.
 
     Exposes ONLY aggregated counts (no case data, no names, no personal info).
-    The firm account is the one configured via FIRM_LAWYER_RUT (default the study
-    account); falls back to the lawyer with the most civil cases.
+    Counts EVERY civil case of the firm. It used to count only the cases owned by
+    one account (``FIRM_LAWYER_RUT``); since the duplicate cleanup a case belongs
+    to a single lawyer, so that account held about half of the portfolio and the
+    marquee under-reported it. A medida prejudicial is neutral (no plazos) and
+    stays out, like everywhere else.
     """
-    import os
-    from sqlalchemy import func
-
-    firm_rut = os.environ.get("FIRM_LAWYER_RUT", "16021492-9")
-    lawyer = db.query(Lawyer).filter(Lawyer.rut == firm_rut).first()
-    if lawyer is None:
-        row = (
-            db.query(Case.lawyer_id, func.count(Case.id).label("c"))
-            .filter(Case.competencia == "civil")
-            .group_by(Case.lawyer_id)
-            .order_by(func.count(Case.id).desc())
-            .first()
-        )
-        lawyer = db.get(Lawyer, row.lawyer_id) if row else None
-    if lawyer is None:
-        return PublicOverview(rojo=0, amarillo=0, verde=0)
-
     counts = dict(
         db.query(Case.semaforo, func.count(Case.id))
-        .filter(Case.lawyer_id == lawyer.id, Case.competencia == "civil")
+        .filter(Case.competencia == "civil", ~medida_prejudicial_clause())
         .group_by(Case.semaforo)
         .all()
     )
