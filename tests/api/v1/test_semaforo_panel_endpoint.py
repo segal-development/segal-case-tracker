@@ -383,3 +383,43 @@ class TestVencidosCarryTheirVerdict:
         filas = {f["rol"]: f for f in get(client)["vencidos"]}
         assert filas["C-900-2026"]["verdict"] == "fuera_de_plazo"
         assert filas["C-901-2026"]["verdict"] == "no_cumplido"
+
+
+def _audit(db, row, people, status, by_auditor=True):
+    from datetime import datetime
+
+    row.status = status
+    if by_auditor:
+        row.marked_by = people["ana"].id
+        row.marked_at = datetime(2026, 10, 27, 12, 0)
+    db.commit()
+
+
+def test_vencido_confirmed_cumplido_by_an_auditor_is_not_listed(client, db, people) -> None:
+    """The verdict is the engine's evidence; an auditor's cumplido overrides it.
+
+    Without this, a plazo an auditor confirmed as met keeps showing in the
+    "vencidos" list (and in the expired-notice alerts) because its verdict still
+    says fuera_de_plazo."""
+    case = make_case(db, people)
+    row = make_expired(db, case, verdict="fuera_de_plazo")
+    _audit(db, row, people, "cumplido")
+
+    assert get(client)["vencidos"] == []
+
+
+def test_vencido_cumplido_without_an_auditor_is_still_listed(client, db, people) -> None:
+    """Only an auditor-signed cumplido counts; a bare status change does not."""
+    case = make_case(db, people)
+    row = make_expired(db, case, verdict="fuera_de_plazo")
+    _audit(db, row, people, "cumplido", by_auditor=False)
+
+    assert [r["deadline_id"] for r in get(client)["vencidos"]] == [row.id]
+
+
+def test_vencido_marked_no_cumplido_by_an_auditor_is_still_listed(client, db, people) -> None:
+    case = make_case(db, people)
+    row = make_expired(db, case, verdict="no_cumplido")
+    _audit(db, row, people, "no_cumplido")
+
+    assert [r["deadline_id"] for r in get(client)["vencidos"]] == [row.id]
