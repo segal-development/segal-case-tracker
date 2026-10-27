@@ -42,3 +42,35 @@ def test_public_overview_no_data_returns_zeros(client, db):
     r = client.get("/api/v1/stats/public-overview")
     assert r.status_code == 200
     assert r.json() == {"rojo": 0, "amarillo": 0, "verde": 0}
+
+
+def _add_case(db, law, court, rol, sem, **kw):
+    db.add(Case(rol=rol, lawyer_id=law.id, court_id=court.id, competencia="civil", semaforo=sem, **kw))
+    db.commit()
+
+
+def test_public_overview_counts_every_civil_case_of_the_firm_not_only_one_owner(client, db):
+    """After the duplicate cleanup a case belongs to ONE lawyer; the marquee is the firm's total."""
+    firm = _seed_firm(db)  # 2 rojo, 1 amarillo, 3 verde owned by the firm account
+    other = Lawyer(rut="88888888-8", name="Other Lawyer")
+    db.add(other)
+    db.commit()
+    court = db.query(Court).first()
+    _add_case(db, other, court, "C-10-2025", "rojo")
+    _add_case(db, other, court, "C-11-2025", "verde")
+    _add_case(db, other, court, "C-12-2025", "verde")
+
+    body = client.get("/api/v1/stats/public-overview").json()
+
+    assert body == {"rojo": 3, "amarillo": 1, "verde": 5}
+
+
+def test_public_overview_leaves_out_medida_prejudicial(client, db):
+    """A medida prejudicial is neutral (no plazos): it must not inflate the marquee."""
+    firm = _seed_firm(db)
+    court = db.query(Court).first()
+    _add_case(db, firm, court, "C-20-2025", "rojo", procedure="Medida prejudicial")
+
+    body = client.get("/api/v1/stats/public-overview").json()
+
+    assert body == {"rojo": 2, "amarillo": 1, "verde": 3}
