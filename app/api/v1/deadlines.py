@@ -116,6 +116,10 @@ class DeadlineItemResponse(BaseModel):
     status: str
     is_manual: bool = False
     source_movement_id: Optional[int] = None
+    # True only for a live acreditar-poder plazo that is provably the firm's own
+    # (same rule the home panel uses). That plazo never colours the case's
+    # semáforo, so a client can show it next to a green "Al día" without lying.
+    firm_obligation: bool = False
 
     class Config:
         from_attributes = True
@@ -778,6 +782,13 @@ async def get_case_deadlines(
         .all()
     )
 
+    def _is_firm_obligation(row: CaseDeadline) -> bool:
+        if row.deadline_type != DeadlineType.ACREDITAR_PODER_3D.value or row.status != "active":
+            return False
+        from app.services.sync_service import poder_obligation_is_ours
+
+        return poder_obligation_is_ours(db, case, row, today) is not None
+
     active_deadlines: list[DeadlineItemResponse] = [
         DeadlineItemResponse(
             id=row.id,
@@ -790,6 +801,7 @@ async def get_case_deadlines(
             status=row.status,
             is_manual=row.is_manual,
             source_movement_id=row.source_movement_id,
+            firm_obligation=_is_firm_obligation(row),
         )
         for row in deadline_rows
     ]

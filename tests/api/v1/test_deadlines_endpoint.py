@@ -512,3 +512,53 @@ class TestRecommendedAction:
         response = authed_client.get(f"/api/v1/cases/{civil_case.id}/deadlines")
         assert response.status_code == 200
         assert response.json()["recommended_action"] is None
+
+
+# ---------------------------------------------------------------------------
+# firm_obligation: the acreditar-poder plazo is only the firm's when the panel says so
+# ---------------------------------------------------------------------------
+
+
+def _add_deadline(db, case, dtype, due, status="active"):
+    db.add(CaseDeadline(
+        case_id=case.id, deadline_type=dtype.value, legal_basis="art. 7 CPC",
+        due_date=due, triggered_at=date.today() - timedelta(days=2), status=status,
+        computed_at=datetime.utcnow(),
+    ))
+    db.commit()
+
+
+def _item(authed_client, case, dtype):
+    body = authed_client.get(f"/api/v1/cases/{case.id}/deadlines").json()
+    return next(i for i in body["active_deadlines"] if i["deadline_type"] == dtype.value)
+
+
+class TestFirmObligation:
+    def test_poder_plazo_that_is_ours_is_flagged(self, authed_client, db, civil_case):
+        from unittest.mock import patch
+
+        _add_deadline(db, civil_case, DeadlineType.ACREDITAR_PODER_3D, date.today() + timedelta(days=1))
+        with patch("app.services.sync_service.poder_obligation_is_ours", return_value=object()):
+            assert _item(authed_client, civil_case, DeadlineType.ACREDITAR_PODER_3D)["firm_obligation"] is True
+
+    def test_poder_plazo_that_is_not_provably_ours_is_not_flagged(self, authed_client, db, civil_case):
+        from unittest.mock import patch
+
+        _add_deadline(db, civil_case, DeadlineType.ACREDITAR_PODER_3D, date.today() + timedelta(days=1))
+        with patch("app.services.sync_service.poder_obligation_is_ours", return_value=None):
+            assert _item(authed_client, civil_case, DeadlineType.ACREDITAR_PODER_3D)["firm_obligation"] is False
+
+    def test_other_plazos_are_never_flagged(self, authed_client, db, civil_case):
+        from unittest.mock import patch
+
+        _add_deadline(db, civil_case, DeadlineType.EXCEPCIONES_8D, date.today() + timedelta(days=3))
+        with patch("app.services.sync_service.poder_obligation_is_ours", return_value=object()) as ours:
+            assert _item(authed_client, civil_case, DeadlineType.EXCEPCIONES_8D)["firm_obligation"] is False
+        ours.assert_not_called()
+
+    def test_an_already_closed_poder_row_is_not_flagged(self, authed_client, db, civil_case):
+        from unittest.mock import patch
+
+        _add_deadline(db, civil_case, DeadlineType.ACREDITAR_PODER_3D, date.today() - timedelta(days=4), status="expired")
+        with patch("app.services.sync_service.poder_obligation_is_ours", return_value=object()):
+            assert _item(authed_client, civil_case, DeadlineType.ACREDITAR_PODER_3D)["firm_obligation"] is False
