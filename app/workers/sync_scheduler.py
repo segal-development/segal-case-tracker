@@ -78,6 +78,42 @@ AUTH_REJECTED_KEY = "auth_rejected_after_reauth"
 # In memory on purpose: a process restart clears it.
 _auth_block_until: Optional[datetime] = None
 
+#: Upper bound on how long the breaker waits for its operator notification
+#: (Telegram has a 10 s HTTP timeout; the DB write is fast). The notification
+#: must never hold up the cycle stop.
+_NOTIFY_TIMEOUT_SECONDS = 15.0
+
+
+def _notify_ip_block(rejections: int, cooldown_minutes: int) -> None:
+    """Tell the operator the breaker tripped (Telegram + persisted event).
+
+    Runs in a worker thread with its own short-lived session. SAFE-FAIL: an
+    alert that breaks the worker is worse than no alert.
+    """
+    try:
+        from app.services.scraping_health import avisar_bloqueo_ip
+
+        notify_db = SessionLocal()
+        try:
+            avisar_bloqueo_ip(
+                notify_db, rechazos=rejections, minutos=cooldown_minutes
+            )
+        finally:
+            notify_db.close()
+    except Exception:
+        logger.exception("IP-block notification failed (non-fatal)")
+
+
+async def _notify_ip_block_best_effort(rejections: int, cooldown_minutes: int) -> None:
+    """Run ``_notify_ip_block`` off the event loop, bounded in time."""
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(_notify_ip_block, rejections, cooldown_minutes),
+            timeout=_NOTIFY_TIMEOUT_SECONDS,
+        )
+    except Exception:  # includes the timeout; the thread finishes on its own
+        logger.warning("IP-block notification did not complete in time (non-fatal)")
+
 
 def _wall_now() -> datetime:
     """Timezone-aware local wall clock (tests replace it)."""
@@ -1171,6 +1207,10 @@ async def _run_sync_cycle(timer: CycleTimer):
                     len(consecutive_rejections),
                     consecutive_rejections,
                     _auth_block_until.isoformat(timespec="seconds"),
+                )
+                await _notify_ip_block_best_effort(
+                    len(consecutive_rejections),
+                    settings.SYNC_AUTH_BLOCK_COOLDOWN_MINUTES,
                 )
                 break
 

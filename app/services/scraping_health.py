@@ -25,11 +25,19 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.models.alerta_operativa import AlertaOperativa
 from app.models.sync_history import SyncHistory
+from app.services.telegram_notifier import is_enabled as telegram_enabled
+from app.services.telegram_notifier import send_telegram
 
 logger = logging.getLogger(__name__)
 
 #: Identificador del aviso, para el cooldown y la bitácora.
 TIPO_SCRAPING = "scraping_detenido"
+
+#: Aviso de la traba de sesiones del worker (la IP de la estación, bloqueada).
+TIPO_BLOQUEO_IP = "scraping_bloqueo_ip"
+
+#: Cuánto tiempo un bloqueo de IP sigue contando como "vigente" para el panel.
+BLOQUEO_VENTANA_HORAS = 12
 
 ESTADO_OK = "ok"
 ESTADO_FALLANDO = "fallando"
@@ -200,12 +208,16 @@ def registrar_alerta_enviada(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _cuerpo(salud: SaludScraping) -> tuple[str, str]:
-    """(asunto, texto) del aviso. Dice qué pasó y qué hacer, sin adornos."""
-    titulo = {
+def _titulo(salud: SaludScraping) -> str:
+    return {
         ESTADO_FALLANDO: "El scraping está fallando",
         ESTADO_CAIDO: "El scraping dejó de traer datos",
     }.get(salud.estado, "Revisar el scraping")
+
+
+def _cuerpo(salud: SaludScraping) -> tuple[str, str]:
+    """(asunto, texto) del aviso. Dice qué pasó y qué hacer, sin adornos."""
+    titulo = _titulo(salud)
 
     ultimo = (
         f"{salud.ultimo_exito:%d-%m-%Y %H:%M} UTC" if salud.ultimo_exito else "nunca"
@@ -224,27 +236,32 @@ def _cuerpo(salud: SaludScraping) -> tuple[str, str]:
     return f"[Case Tracker] {titulo}", texto
 
 
-def enviar_alerta_scraping(
-    db: Session, salud: SaludScraping, *, ahora: Optional[datetime] = None
-) -> bool:
-    """Avisa por correo si corresponde. Devuelve True solo si se envió.
+def texto_telegram(salud: SaludScraping, *, ahora: Optional[datetime] = None) -> str:
+    """Texto plano y corto del aviso por Telegram.
 
-    Nunca levanta: una alerta que rompe el worker es peor que no tener alerta.
+    Sin datos de causas ni credenciales: el estado, el motivo, las horas sin
+    éxito y la hora del aviso. Es texto plano a propósito (sin ``parse_mode``):
+    el motivo trae mensajes de error con caracteres que romperían el formato.
     """
-    if not salud.requiere_aviso:
-        return False
+    ahora = ahora or datetime.utcnow()
+    if salud.ultimo_exito:
+        ultimo = f"{salud.ultimo_exito:%d-%m-%Y %H:%M} UTC"
+        if salud.horas_sin_exito is not None:
+            ultimo += f" (hace {salud.horas_sin_exito:.0f} h)"
+    else:
+        ultimo = "nunca"
+    return (
+        f"[Case Tracker] {_titulo(salud)}\n"
+        f"Estado: {salud.estado}\n"
+        f"{salud.motivo[:300]}\n"
+        f"Última corrida exitosa: {ultimo}\n"
+        f"Corridas fallidas seguidas: {salud.fallas_consecutivas}\n"
+        f"Aviso: {ahora:%d-%m-%Y %H:%M} UTC"
+    )
 
-    if not settings.SMTP_HOST or not settings.SCRAPING_ALERT_EMAIL:
-        logger.warning(
-            "SMTP_HOST/SCRAPING_ALERT_EMAIL sin configurar; no se avisa del "
-            "scraping (%s)",
-            salud.estado,
-        )
-        return False
 
-    if alerta_en_cooldown(db, TIPO_SCRAPING, ahora=ahora):
-        return False
-
+def _enviar_email(salud: SaludScraping) -> bool:
+    """Manda el correo del aviso. True solo si salió; nunca levanta."""
     asunto, texto = _cuerpo(salud)
     msg = EmailMessage()
     msg["Subject"] = asunto
@@ -263,12 +280,104 @@ def enviar_alerta_scraping(
     except Exception:
         logger.exception("No se pudo enviar la alerta de scraping")
         return False
+    return True
+
+
+def enviar_alerta_scraping(
+    db: Session, salud: SaludScraping, *, ahora: Optional[datetime] = None
+) -> bool:
+    """Avisa por todos los canales configurados (correo y Telegram).
+
+    Cada canal es independiente: Telegram funciona sin SMTP y viceversa.
+    Devuelve True si al menos un canal entregó; en ese caso la bitácora se
+    registra una sola vez. Mismo cooldown para todos.
+
+    Nunca levanta: una alerta que rompe el worker es peor que no tener alerta.
+    """
+    if not salud.requiere_aviso:
+        return False
+
+    por_correo = bool(settings.SMTP_HOST and settings.SCRAPING_ALERT_EMAIL)
+    por_telegram = telegram_enabled()
+    if not por_correo and not por_telegram:
+        logger.warning(
+            "Ningún canal de aviso configurado (SMTP_HOST/SCRAPING_ALERT_EMAIL o "
+            "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID); no se avisa del scraping (%s)",
+            salud.estado,
+        )
+        return False
+
+    if alerta_en_cooldown(db, TIPO_SCRAPING, ahora=ahora):
+        return False
+
+    entregado = False
+    if por_correo:
+        entregado = _enviar_email(salud) or entregado
+    if por_telegram:
+        entregado = send_telegram(texto_telegram(salud, ahora=ahora)) or entregado
+
+    if not entregado:
+        return False
 
     registrar_alerta_enviada(
         db, TIPO_SCRAPING, salud.motivo, estado=salud.estado, ahora=ahora
     )
     logger.warning("Alerta de scraping enviada (%s): %s", salud.estado, salud.motivo)
     return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bloqueo de IP (traba de sesiones del worker)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def avisar_bloqueo_ip(
+    db: Session,
+    *,
+    rechazos: int,
+    minutos: int,
+    ahora: Optional[datetime] = None,
+) -> bool:
+    """Avisa por Telegram que el PJUD rechaza sesiones nuevas y deja el evento.
+
+    El evento se persiste siempre (lo lee el banner de administradores y
+    sobrevive a un reinicio), haya o no Telegram. Un incidente es un mensaje:
+    dentro de la ventana de cooldown un segundo disparo no manda ni registra
+    nada. Devuelve True solo si el mensaje salió; nunca levanta por Telegram.
+    """
+    ahora = ahora or datetime.utcnow()
+    if alerta_en_cooldown(db, TIPO_BLOQUEO_IP, ahora=ahora):
+        return False
+
+    texto = (
+        f"El PJUD rechazó {rechazos} sesiones nuevas seguidas; la IP de la "
+        f"estación probablemente está bloqueada. El worker descansa {minutos} minutos."
+    )
+    try:
+        registrar_alerta_enviada(db, TIPO_BLOQUEO_IP, texto, ahora=ahora)
+    except Exception:
+        db.rollback()
+        logger.exception("No se pudo registrar el bloqueo de IP")
+    return send_telegram(texto)
+
+
+def ultimo_bloqueo_ip(
+    db: Session,
+    *,
+    ahora: Optional[datetime] = None,
+    horas: int = BLOQUEO_VENTANA_HORAS,
+) -> Optional[AlertaOperativa]:
+    """El bloqueo de IP más reciente dentro de las últimas ``horas``, o None."""
+    ahora = ahora or datetime.utcnow()
+    return (
+        db.query(AlertaOperativa)
+        .filter(
+            AlertaOperativa.tipo == TIPO_BLOQUEO_IP,
+            AlertaOperativa.enviada_at >= ahora - timedelta(hours=horas),
+        )
+        .order_by(desc(AlertaOperativa.enviada_at))
+        .first()
+    )
 
 
 def revisar_y_avisar(db: Session, *, ahora: Optional[datetime] = None) -> SaludScraping:
