@@ -47,6 +47,24 @@ class FakeWall:
         self.now += timedelta(**kw)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_telegram(monkeypatch):
+    """Telegram is a new channel these tests do not exercise: keep it off and
+    make any accidental HTTP call fail loudly instead of reaching the network."""
+    from app.config import settings as cfg
+    from app.services import telegram_notifier
+
+    monkeypatch.setattr(cfg, "TELEGRAM_BOT_TOKEN", "")
+    monkeypatch.setattr(cfg, "TELEGRAM_CHAT_ID", "")
+
+    def _forbidden(*_a, **_k):
+        raise AssertionError("unexpected real HTTP call")
+
+    monkeypatch.setattr(telegram_notifier.httpx, "post", _forbidden)
+    # The breaker now notifies on a trip; these tests pin the cycle, not the alert.
+    monkeypatch.setattr(scheduler, "_notify_ip_block", lambda *_a, **_k: None)
+
+
 @pytest.fixture
 def wall(monkeypatch) -> FakeWall:
     fake = FakeWall()

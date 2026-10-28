@@ -31,6 +31,22 @@ from app.services.scraping_health import (
 AHORA = datetime(2026, 9, 28, 12, 0, 0)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_telegram(monkeypatch):
+    """Telegram is a new channel these tests do not exercise: keep it off and
+    make any accidental HTTP call fail loudly instead of reaching the network."""
+    from app.config import settings as cfg
+    from app.services import telegram_notifier
+
+    monkeypatch.setattr(cfg, "TELEGRAM_BOT_TOKEN", "")
+    monkeypatch.setattr(cfg, "TELEGRAM_CHAT_ID", "")
+
+    def _forbidden(*_a, **_k):
+        raise AssertionError("unexpected real HTTP call")
+
+    monkeypatch.setattr(telegram_notifier.httpx, "post", _forbidden)
+
+
 @pytest.fixture
 def lawyer(db):
     obj = Lawyer(rut="11111111-1", name="Abogado Salud", is_firm_lawyer=True, is_active=True)

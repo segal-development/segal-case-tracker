@@ -1,6 +1,6 @@
 """Stats endpoint — firm dashboard aggregates for the authenticated account."""
 
-from datetime import date
+from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import (
     get_db,
     get_current_lawyer,
+    require_admin,
     require_auditor,
     _resolve_lawyer_id,
     resolve_case_scope,
@@ -19,6 +20,7 @@ from app.models.case import Case
 from app.models.goal import Goal
 from app.models.lawyer import Lawyer
 from app.services.deadline_engine import medida_prejudicial_clause
+from app.services.scraping_health import evaluar_salud_scraping, ultimo_bloqueo_ip
 from app.services.lawyer_roster import (
     firm_dashboard_stats,
     firm_dashboard_stats_all,
@@ -307,3 +309,50 @@ async def get_risk_board(
     breakdown and the top ~15 most urgent cases.
     """
     return firm_risk_board(db, auditor_rut)
+
+
+class ScrapingBloqueoIp(BaseModel):
+    desde: datetime
+    detalle: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ScrapingStatus(BaseModel):
+    estado: str
+    motivo: str
+    ultimo_exito: datetime | None
+    horas_sin_exito: float | None
+    fallas_consecutivas: int
+    bloqueo_ip: ScrapingBloqueoIp | None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    """Stored timestamps are naive UTC; emit them as UTC instants (``...Z``)."""
+    return value.replace(tzinfo=timezone.utc) if value is not None else None
+
+
+@router.get("/scraping-status", response_model=ScrapingStatus)
+async def get_scraping_status(
+    db: Session = Depends(get_db),
+    _admin_rut: str = Depends(require_admin),
+):
+    """Scraping health plus the last IP-block event (admin banner). Read-only."""
+    salud = evaluar_salud_scraping(db)
+    bloqueo = ultimo_bloqueo_ip(db)
+    return ScrapingStatus(
+        estado=salud.estado,
+        motivo=salud.motivo,
+        ultimo_exito=_as_utc(salud.ultimo_exito),
+        horas_sin_exito=(
+            round(salud.horas_sin_exito, 1) if salud.horas_sin_exito is not None else None
+        ),
+        fallas_consecutivas=salud.fallas_consecutivas,
+        bloqueo_ip=(
+            ScrapingBloqueoIp(desde=_as_utc(bloqueo.enviada_at), detalle=bloqueo.detalle or "")
+            if bloqueo is not None
+            else None
+        ),
+    )

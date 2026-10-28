@@ -151,6 +151,11 @@ class Settings(BaseSettings):
     #: Espera mínima entre dos avisos del mismo tipo.
     SCRAPING_ALERT_COOLDOWN_HOURS: int = 6
 
+    # Telegram channel for operational alerts. Both empty = channel disabled.
+    # The token is a secret: it must never be logged or returned.
+    TELEGRAM_BOT_TOKEN: str = ""
+    TELEGRAM_CHAT_ID: str = ""
+
     # Sysgal CRM (read-only client-coverage lookup by party RUT).
     # Both empty = integration disabled (sync is a no-op).
     #
