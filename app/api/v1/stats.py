@@ -334,6 +334,40 @@ def _as_utc(value: datetime | None) -> datetime | None:
     return value.replace(tzinfo=timezone.utc) if value is not None else None
 
 
+# A plazo or semaforo is only as good as the last sync that confirmed it. Past this
+# age the screens tell every user the data is unverified (product document R03).
+DATA_STALE_HOURS = 24
+
+
+class DataFreshness(BaseModel):
+    """Age of the last successful sync, for every signed-in role. No cause, no IP detail."""
+    verificado: bool
+    umbral_horas: int
+    horas_sin_exito: float | None
+    ultimo_exito: datetime | None
+
+
+@router.get("/data-freshness", response_model=DataFreshness)
+async def get_data_freshness(
+    db: Session = Depends(get_db),
+    _lawyer: dict = Depends(get_current_lawyer),
+):
+    """Is the PJUD data fresh enough to trust? Open to every signed-in role.
+
+    Unlike ``/scraping-status`` (admin only, with the IP-block detail) this exposes
+    only how old the last successful sync is. No sync on record is NOT verified:
+    nothing has confirmed the data.
+    """
+    salud = evaluar_salud_scraping(db)
+    horas = salud.horas_sin_exito
+    return DataFreshness(
+        verificado=horas is not None and horas <= DATA_STALE_HOURS,
+        umbral_horas=DATA_STALE_HOURS,
+        horas_sin_exito=round(horas, 1) if horas is not None else None,
+        ultimo_exito=_as_utc(salud.ultimo_exito),
+    )
+
+
 @router.get("/scraping-status", response_model=ScrapingStatus)
 async def get_scraping_status(
     db: Session = Depends(get_db),
