@@ -181,7 +181,7 @@ def firm_lawyer_id(db: Session) -> int:
     """Resolve the firm's canonical ``Lawyer.id`` from ``FIRM_LAWYER_RUT``.
 
     Centralizes the pattern duplicated at ``deps.py`` (``_resolve_lawyer_id``)
-    and ``stats.py`` (``get_public_overview``): the firm's canonical
+    and ``stats.py``: the firm's canonical
     ``lawyer_id`` is the sole owner of every ``Case`` row (Approach C).
     Defaults to ``"16021492-9"`` when the env var is unset, matching the
     existing auditor-firm convention.
