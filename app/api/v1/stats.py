@@ -4,7 +4,6 @@ from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.api.deps import (
@@ -16,10 +15,8 @@ from app.api.deps import (
     resolve_case_scope,
     ALL_CASES,
 )
-from app.models.case import Case
 from app.models.goal import Goal
 from app.models.lawyer import Lawyer
-from app.services.deadline_engine import medida_prejudicial_clause
 from app.services.scraping_health import evaluar_salud_scraping, ultimo_bloqueo_ip
 from app.services.lawyer_roster import (
     firm_dashboard_stats,
@@ -123,37 +120,6 @@ async def get_firm_stats(
     if not lawyer:
         raise HTTPException(status_code=404, detail="Lawyer not found")
     return firm_dashboard_stats(db, lawyer.rut)
-
-
-class PublicOverview(BaseModel):
-    """Aggregated firm semaforo counts for the (pre-auth) login screen — counts only."""
-    rojo: int
-    amarillo: int
-    verde: int
-
-
-@router.get("/public-overview", response_model=PublicOverview)
-async def get_public_overview(db: Session = Depends(get_db)):
-    """PUBLIC (no auth): firm semáforo counts for the login screen marquee.
-
-    Exposes ONLY aggregated counts (no case data, no names, no personal info).
-    Counts EVERY civil case of the firm. It used to count only the cases owned by
-    one account (``FIRM_LAWYER_RUT``); since the duplicate cleanup a case belongs
-    to a single lawyer, so that account held about half of the portfolio and the
-    marquee under-reported it. A medida prejudicial is neutral (no plazos) and
-    stays out, like everywhere else.
-    """
-    counts = dict(
-        db.query(Case.semaforo, func.count(Case.id))
-        .filter(Case.competencia == "civil", ~medida_prejudicial_clause())
-        .group_by(Case.semaforo)
-        .all()
-    )
-    return PublicOverview(
-        rojo=counts.get("rojo", 0),
-        amarillo=counts.get("amarillo", 0),
-        verde=counts.get("verde", 0),
-    )
 
 
 @router.get("/me", response_model=MyStatsResponse)
