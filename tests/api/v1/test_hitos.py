@@ -626,3 +626,44 @@ def test_bulk_approve_skips_nonexistent_ids(client, db, admin, lawyer, tipo):
     body = r.json()
     assert body["procesados"] == 2  # only the real ones
     assert sorted(body["ids"]) == sorted(ids)
+
+
+# --- Field length on the authenticated form: a clear 422, never a database 500 ---
+LARGOS = {"rol_causa": 50, "procedimiento": 100, "descripcion": 500, "tribunal": 255,
+          "etapa_sysgal": 100, "tramite_sysgal": 255}
+
+
+@pytest.mark.parametrize("field", list(LARGOS))
+def test_create_over_the_column_length_is_422_and_saves_nothing(client, db, admin, tipo, field):
+    r = client.post("/api/v1/hitos", headers=_h(ADMIN_RUT),
+                    data={"hito_tipo_id": tipo.id, "fecha_hito": "2026-07-15",
+                          field: "x" * (LARGOS[field] + 1)})
+
+    assert r.status_code == 422
+    assert field in r.json()["detail"] and str(LARGOS[field]) in r.json()["detail"]
+    assert db.query(Hito).count() == 0
+
+
+@pytest.mark.parametrize("field", list(LARGOS))
+def test_create_exactly_at_the_column_length_is_accepted(client, db, admin, tipo, field):
+    r = client.post("/api/v1/hitos", headers=_h(ADMIN_RUT),
+                    data={"hito_tipo_id": tipo.id, "fecha_hito": "2026-07-15",
+                          field: "x" * LARGOS[field]})
+
+    assert r.status_code == 201, r.text
+
+
+@pytest.mark.parametrize("field", ["rol_causa", "procedimiento", "descripcion", "tribunal"])
+def test_edit_over_the_column_length_is_422_and_keeps_the_hito(client, db, admin, tipo, field):
+    hid = _create(client, _h(ADMIN_RUT), tipo.id).json()["id"]
+    before = db.get(Hito, hid).procedimiento
+
+    r = client.put(f"/api/v1/hitos/{hid}", headers=_h(ADMIN_RUT), json={
+        "hito_tipo_id": tipo.id, "fecha_hito": "2026-07-16",
+        field: "x" * (LARGOS[field] + 1),
+    })
+
+    assert r.status_code == 422
+    assert field in r.json()["detail"] and str(LARGOS[field]) in r.json()["detail"]
+    db.expire_all()
+    assert db.get(Hito, hid).procedimiento == before

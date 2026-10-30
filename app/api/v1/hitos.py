@@ -430,6 +430,14 @@ async def _create_hito(
     the period lock, tipo lookup, dedup and normalization rules live in one place.
     Authorization (may ``actor`` write for ``target_lawyer_id``?) is the caller's job.
     """
+    # Over-long text must be a clear 422, not a varchar overflow (500) at INSERT; checked
+    # before anything is stored so a rejection never leaves an orphan upload.
+    for name, value in (
+        ("rol_causa", rol_causa), ("procedimiento", procedimiento), ("descripcion", descripcion),
+        ("tribunal", tribunal), ("etapa_sysgal", etapa_sysgal), ("tramite_sysgal", tramite_sysgal),
+    ):
+        _check_text_length(name, (value or "").strip())
+
     if cierre_svc.is_cerrado(db, cierre_svc.periodo_de_fecha(fecha_hito)):
         raise HTTPException(status_code=409, detail="El período de ese hito está cerrado")
 
@@ -496,12 +504,30 @@ def _falta_evidencia_para_aprobar(hito: Hito) -> bool:
     return hito.origen == ORIGEN_FORMULARIO and not hito.tiene_evidencia
 
 
+def _form_text_limit(field: str) -> Optional[int]:
+    """Maximum length of a hitos text column, so an over-long form value is a clear
+    422 and not a 500 from the database (varchar overflow)."""
+    column = getattr(Hito, field, None)
+    return getattr(getattr(column, "type", None), "length", None)
+
+
+def _check_text_length(field: str, text: str) -> None:
+    """422 naming the field when ``text`` does not fit its column."""
+    limit = _form_text_limit(field)
+    if limit is not None and len(text) > limit:
+        raise HTTPException(
+            status_code=422,
+            detail=f"El campo {field} admite hasta {limit} caracteres (escribiste {len(text)})",
+        )
+
+
 def _required_form_text(value: Optional[str], field: str) -> str:
     """Public-form fields are mandatory server-side (the form cannot be bypassed
     by posting directly): blank after strip is a 422 naming the field."""
     text = (value or "").strip()
     if not text:
         raise HTTPException(status_code=422, detail=f"El campo {field} es obligatorio")
+    _check_text_length(field, text)
     return text
 
 
@@ -2056,6 +2082,9 @@ async def update_hito(
         raise HTTPException(status_code=409, detail="El período de ese hito está cerrado")
     if cierre_svc.is_cerrado(db, cierre_svc.periodo_de_fecha(body.fecha_hito)):
         raise HTTPException(status_code=409, detail="El período de destino está cerrado")
+
+    for name in ("rol_causa", "procedimiento", "descripcion", "tribunal"):
+        _check_text_length(name, (getattr(body, name) or "").strip())
 
     tipo = db.query(HitoTipo).filter(HitoTipo.id == body.hito_tipo_id, HitoTipo.activo.is_(True)).first()
     if tipo is None:
