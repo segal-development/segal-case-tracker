@@ -8,7 +8,7 @@ Uses SelectorRegistry for configurable, hot-reloadable selectors.
 import asyncio
 import logging
 import re
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from playwright.async_api import Page
 
@@ -47,6 +47,41 @@ COMPETENCIA_CIVIL = "3"
 
 # Global selector registry instance (shared across all CivilScraper instances)
 _selector_registry: Optional[SelectorRegistry] = None
+
+
+_HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+_MOVEMENT_DATE = re.compile(r"^\d{2}/\d{2}/\d{4}$")
+# Columns before Description: Folio, Doc, Anexo, Etapa, Trámite.
+_FIRST_DESCRIPTION_CELL = 5
+
+
+def strip_html_comments(row: str) -> str:
+    """Drop HTML comments so a commented-out <td> is not counted as a cell."""
+    return _HTML_COMMENT.sub("", row)
+
+
+def locate_movement_columns(cleaned_cells: List[str]) -> Tuple[str, str, Optional[str]]:
+    """Return (descripcion, fecha, foja) from the cleaned cells of a movement row.
+
+    The date cell is found by shape (first dd/mm/yyyy cell after Trámite);
+    Description is the cell before it and Foja the cell after it, so the
+    result does not depend on how many cells precede the date. Without a date
+    cell the fecha is empty and the documented layout is used for the rest.
+    """
+    def cell(i: int) -> Optional[str]:
+        return cleaned_cells[i] if 0 <= i < len(cleaned_cells) else None
+
+    date_idx = next(
+        (
+            i
+            for i in range(_FIRST_DESCRIPTION_CELL + 1, len(cleaned_cells))
+            if _MOVEMENT_DATE.match(cleaned_cells[i])
+        ),
+        None,
+    )
+    if date_idx is None:
+        return cell(_FIRST_DESCRIPTION_CELL) or "", "", cell(_FIRST_DESCRIPTION_CELL + 2)
+    return cell(date_idx - 1) or "", cleaned_cells[date_idx], cell(date_idx + 1)
 
 
 def get_selector_registry() -> SelectorRegistry:
@@ -617,7 +652,8 @@ class CivilScraper(PJUDBaseScraper):
             
             # Split by </td> to get cells
             # Columns: 0=Folio, 1=Doc, 2=Anexo, 3=Etapa, 4=Tramite, 5=Desc, 6=Fecha, 7=Foja, 8=Geo
-            raw_cells = re.split(r'</td>', row, flags=re.IGNORECASE)
+            # (Desc/Fecha/Foja are located by the date cell; comments are stripped first)
+            raw_cells = re.split(r'</td>', strip_html_comments(row), flags=re.IGNORECASE)
             if len(raw_cells) < 7:
                 continue
             
@@ -690,19 +726,15 @@ class CivilScraper(PJUDBaseScraper):
                     url_type='docuN',
                 ))
             
-            # Get fecha from cell 7
-            fecha = ""
-            fecha_match = re.search(r'(\d{2}/\d{2}/\d{4})', cells[7] if len(cells) > 7 else '')
-            if fecha_match:
-                fecha = fecha_match.group(1)
+            descripcion, fecha, foja = locate_movement_columns([clean(c) for c in cells])
             
             movements.append(PJUDMovement(
                 folio=clean(cells[0]),
                 etapa=clean(cells[3]) if len(cells) > 3 else "",
                 tipo_tramite=clean(cells[4]) if len(cells) > 4 else "",
-                descripcion=clean(cells[6]) if len(cells) > 6 else "",
+                descripcion=descripcion,
                 fecha=fecha,
-                foja=clean(cells[8]) if len(cells) > 8 else None,
+                foja=foja,
                 documento_token=doc_token,
                 documentos=documentos,
                 tiene_documento=len(documentos) > 0,
