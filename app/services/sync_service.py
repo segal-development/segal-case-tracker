@@ -28,6 +28,9 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 
 logger = logging.getLogger(__name__)
 
+# A description that is just a dd/mm/yyyy date means the columns shifted.
+_DATE_ONLY = re.compile(r"^\s*\d{2}/\d{2}/\d{4}\s*$")
+
 # Maximum concurrent case detail fetches
 MAX_CONCURRENT_FETCHES = 3
 
@@ -1250,6 +1253,8 @@ class SyncService:
             movement, is_new = self._upsert_movement(
                 case_id, scraped, existing_by_key=existing_movements
             )
+            if movement is None:
+                continue
             if is_new:
                 new_count += 1
                 for recipient in recipients:
@@ -1552,7 +1557,7 @@ class SyncService:
         case_id: int,
         scraped: ScrapedMovement,
         existing_by_key: Optional[dict] = None,
-    ) -> Tuple[Movement, bool]:
+    ) -> Tuple[Optional[Movement], bool]:
         """
         Insert movement if it doesn't exist.
 
@@ -1560,10 +1565,21 @@ class SyncService:
         by the caller) is provided, the existence check is an in-memory lookup
         instead of a per-movement SELECT — see sync_movements' batch prefetch.
 
+        A movement whose date does not parse, or whose description is only a
+        date (a shifted-column scrape), is skipped with a WARNING instead of
+        being stored with ``movement_date = now``.
+
         Returns:
-            Tuple of (movement, is_new)
+            Tuple of (movement, is_new); ``(None, False)`` when skipped.
         """
         movement_date = self._parse_date(scraped.fecha)
+        if movement_date is None or _DATE_ONLY.match(scraped.descripcion or ""):
+            logger.warning(
+                "skipping corrupted movement case_id=%s folio=%s fecha=%r "
+                "descripcion=%r",
+                case_id, scraped.folio, scraped.fecha, scraped.descripcion,
+            )
+            return None, False
         key = (scraped.folio, scraped.descripcion)
 
         # Check if movement already exists (by folio + description)
@@ -1588,7 +1604,7 @@ class SyncService:
             stage=scraped.etapa,
             procedure=scraped.tipo_tramite,
             description=scraped.descripcion,
-            movement_date=movement_date or datetime.utcnow(),
+            movement_date=movement_date,
             created_at=datetime.utcnow(),
         )
         self.db.add(movement)
