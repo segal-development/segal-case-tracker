@@ -3,9 +3,12 @@
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict
+import re
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy import case, func, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, get_current_lawyer, require_admin, _resolve_lawyer_id
@@ -13,6 +16,7 @@ from app.core.security import hash_password
 from app.models.case import Case
 from app.models.lawyer import Lawyer
 from app.services.lawyer_roster import firm_roster
+from app.utils.rut import normalize_rut, validate_rut
 
 _STALE_THRESHOLD_DAYS = 7
 
@@ -32,6 +36,52 @@ class AccountUpdateBody(BaseModel):
     email: Optional[str] = None
     role: Optional[str] = None
     new_password: Optional[str] = None
+
+
+_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_NIVELES = {"junior", "pleno"}
+
+
+class LawyerCreateBody(BaseModel):
+    """POST /lawyers: add a person to the firm by hand (they used to appear only via the PJUD sync)."""
+    rut: str
+    name: str
+    email: Optional[str] = None
+    nivel: Optional[str] = None
+
+    @field_validator("rut")
+    @classmethod
+    def _rut(cls, v: str) -> str:
+        if not validate_rut(v):
+            raise ValueError("RUT inválido (revisa el dígito verificador)")
+        return normalize_rut(v)
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("El nombre es obligatorio")
+        if len(v) > 255:
+            raise ValueError("El nombre admite hasta 255 caracteres")
+        return v
+
+    @field_validator("email")
+    @classmethod
+    def _email(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or not v.strip():
+            return None
+        v = v.strip().lower()
+        if not _EMAIL.match(v) or len(v) > 255:
+            raise ValueError("Correo inválido")
+        return v
+
+    @field_validator("nivel")
+    @classmethod
+    def _nivel(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in _NIVELES:
+            raise ValueError("El nivel debe ser 'junior' o 'pleno'")
+        return v
 
 
 class SyncStatusItem(BaseModel):
@@ -123,6 +173,42 @@ def list_accounts(db: Session = Depends(get_db)):
         }
         for l in lawyers
     ]
+
+
+@router.post("", status_code=status.HTTP_201_CREATED)
+def create_lawyer(
+    body: LawyerCreateBody,
+    _admin_rut: str = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Add a person to the firm (admin only). No password, hito link or PJUD credential is
+    created: the admin issues those afterwards with the existing actions."""
+    existing = db.query(Lawyer).filter(Lawyer.rut == body.rut).first()
+    if existing is not None:
+        raise HTTPException(status_code=409, detail=f"Ya existe una persona con ese RUT: {existing.name}")
+    if body.email and db.query(Lawyer).filter(Lawyer.email == body.email).first() is not None:
+        raise HTTPException(status_code=409, detail="Ya existe una persona con ese correo")
+
+    lawyer = Lawyer(
+        rut=body.rut, name=body.name, email=body.email, nivel=body.nivel,
+        role="lawyer", is_firm_lawyer=True, is_active=True,
+    )
+    db.add(lawyer)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Ya existe una persona con ese RUT o correo")
+    db.refresh(lawyer)
+    return {
+        "id": lawyer.id,
+        "rut": lawyer.rut,
+        "name": lawyer.name,
+        "email": lawyer.email,
+        "role": lawyer.role,
+        "nivel": lawyer.nivel,
+        "has_password": lawyer.password_hash is not None,
+    }
 
 
 @router.put("/{id}/account")
