@@ -20,6 +20,7 @@ from app.scrapper.pjud.base import (
     CompetencyConfig,
     PJUD_BASE_URL,
 )
+from app.scrapper.pjud.civil import locate_movement_columns, strip_html_comments
 from app.scrapper.pjud.exceptions import ScrapingError
 from app.scrapper.pjud.selectors import SelectorRegistry
 from app.services.pjud_session import PJUDSession
@@ -312,7 +313,8 @@ class LaboralScraper(PJUDBaseScraper):
             
             # Split by </td> to get cells
             # Columns: 0=Folio, 1=Doc, 2=Anexo, 3=Etapa, 4=Tramite, 5=Desc, 6=Fecha, 7=Foja, 8=Geo
-            raw_cells = re.split(r'</td>', row, flags=re.IGNORECASE)
+            # (Desc/Fecha/Foja are located by the date cell; comments are stripped first)
+            raw_cells = re.split(r'</td>', strip_html_comments(row), flags=re.IGNORECASE)
             if len(raw_cells) < 7:
                 continue
             
@@ -363,19 +365,15 @@ class LaboralScraper(PJUDBaseScraper):
                     url_type='docuN',
                 ))
             
-            # Get fecha from cell 7
-            fecha = ""
-            fecha_match = re.search(r'(\d{2}/\d{2}/\d{4})', cells[7] if len(cells) > 7 else '')
-            if fecha_match:
-                fecha = fecha_match.group(1)
+            descripcion, fecha, foja = locate_movement_columns([clean(c) for c in cells])
             
             movements.append(PJUDMovement(
                 folio=clean(cells[0]),
                 etapa=clean(cells[3]) if len(cells) > 3 else "",
                 tipo_tramite=clean(cells[4]) if len(cells) > 4 else "",
-                descripcion=clean(cells[6]) if len(cells) > 6 else "",
+                descripcion=descripcion,
                 fecha=fecha,
-                foja=clean(cells[8]) if len(cells) > 8 else None,
+                foja=foja,
                 documento_token=doc_token,
                 documentos=documentos,
                 tiene_documento=len(documentos) > 0,
