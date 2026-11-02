@@ -206,10 +206,18 @@ class CaseSummaryResponse(BaseModel):
     sysgal_sin_dato: int = 0
 
 
+class FacetAbogado(BaseModel):
+    rut: str
+    nombre: str
+
+
 class CaseFacetsResponse(BaseModel):
     """Distinct filter values present in the scoped case set."""
     tribunals: List[str]
     materias: List[str]
+    # Active firm lawyers, for the "Abogado" filter. Only a viewer with firm-wide
+    # scope (admin/auditor) gets them: a plain lawyer cannot look at a colleague's caseload.
+    abogados: List[FacetAbogado] = []
 
 
 class LitiganteResponse(BaseModel):
@@ -1017,7 +1025,7 @@ async def cases_facets(
     scoped set, sorted alphabetically, excluding null/empty. Respects
     competencia/status/abogado_rut, not the quick-filters.
     """
-    base, _lawyer_id, _scope = _scoped_cases_query(
+    base, _lawyer_id, scope = _scoped_cases_query(
         db,
         current_lawyer,
         competencia=competencia,
@@ -1036,7 +1044,17 @@ async def cases_facets(
     tribunals = sorted({name for (name,) in tribunal_rows if name and name.strip()})
     materias = sorted({proc for (proc,) in materia_rows if proc and proc.strip()})
 
-    return CaseFacetsResponse(tribunals=tribunals, materias=materias)
+    abogados: List[FacetAbogado] = []
+    if scope is ALL_CASES:
+        firm = (
+            db.query(Lawyer.rut, Lawyer.name)
+            .filter(Lawyer.is_firm_lawyer.is_(True), Lawyer.is_active.is_(True))
+            .order_by(Lawyer.name)
+            .all()
+        )
+        abogados = [FacetAbogado(rut=rut, nombre=name) for rut, name in firm if rut and name]
+
+    return CaseFacetsResponse(tribunals=tribunals, materias=materias, abogados=abogados)
 
 
 def _effective_lawyer_name(case: Case) -> Optional[str]:
