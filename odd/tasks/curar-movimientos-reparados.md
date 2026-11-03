@@ -1,0 +1,17 @@
+# Heal repaired movements in place instead of inserting duplicates
+2,706 movements (319 cases) were repaired by hand: their `movement_date` now holds the real date but `description` is still the date text (dd/mm/yyyy), because the real text was lost. When the worker re-reads those cases it must restore the real description IN PLACE, without inserting a second row and without creating alerts or notifications.
+
+## Specs
+- S1. Context (production, 2026-11-03): a "repaired row" is a movement with `description` matching `^\d{2}/\d{2}/\d{4}$` AND `strftime(movement_date, "%d/%m/%Y") == description` (it came from the column-shift bug; movement_date was copied from the description). Today `_upsert_movement` (app/services/sync_service.py ~1555-1615) keys movements by `(folio, description)`, so the correctly scraped movement (real description, same folio, same date) is INSERTED as a new row and `sync_movements` (~1255-1300) then creates an alert and may email/webhook for it (no age guard). Re-reading 2,706 old movements would resend spurious "movimiento nuevo" alerts and emails with 2022-2025 history.
+- S2. Heal rule in `_upsert_movement`: when no row matches `(folio, description)`, look in the case's already-loaded movements (the `existing_by_key` prefetch map: keys are `(folio, description)`; when it is None, query the DB) for a repaired row with the SAME folio whose date text equals the scraped date (`scraped.fecha` parsed to dd/mm/yyyy). If exactly one such row exists: UPDATE it in place (`description`, `stage`, `procedure` from the scraped movement; keep `id`, `created_at`, `movement_date`, documents and alerts linked to it), update the prefetch map (remove the old key, add the new one), flush, and return `(movement, False)` so the caller treats it as NOT new. If the dates differ, or more than one candidate exists, do not heal: keep today's behaviour (insert).
+- S3. `sync_movements` must create NO alert and send NO notification, webhook or digest entry for a healed movement (it already skips alerts when `is_new` is False; add a test that proves it end to end, including that the new-movement counters do not count it).
+- S4. Log one INFO line per healed row: `healed repaired movement case_id=... folio=... description=...`, and count them if the surrounding code already aggregates per-case counters; do not invent new infrastructure.
+- S5. Do NOT touch the dedup key, the skip rule for corrupted rows, the deadline engine, or any other path. `last_movement_at` is unaffected (date unchanged).
+- S6. Tests first (strict TDD, show RED): (a) a repaired row + the scraped movement with the same folio/date and real description -> one row, healed in place, `is_new` False, same id; (b) no alert, no notification and no counter increment through `sync_movements`; (c) different date -> inserted as new (no heal); (d) two candidate repaired rows with the same folio -> no heal; (e) a normal row (real description) is untouched; (f) re-running the same sync twice is idempotent; (g) documents and alerts previously linked to the repaired row stay linked to it; (h) works with and without the prefetch map.
+- S7. Out of scope: any data change in production, the rotation order, `last_detail_checked_at`, deleting rows, the 41 cases that already have both rows, any frontend change.
+
+## Tasks
+- T1 (S1-S7) route: worker. Commit: none (the parent reviews, then commits).
+
+## Log
+L1. "la limpieza final de la tanda B" / "si" to the plan: step 1 = code change that heals repaired movements in place without alerts.
