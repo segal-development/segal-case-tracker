@@ -22,12 +22,11 @@ from sqlalchemy import func
 
 from app.core.security import (
     create_access_token,
-    get_current_lawyer,
     encrypt_pjud_password,
     hash_password,
     verify_password,
 )
-from app.api.deps import require_admin
+from app.api.deps import get_current_rut as get_current_lawyer, require_admin
 from app.scrapper.pjud_civil import PJUDCivilScraper, LoginError
 from app.scrapper.pjud.browser import BrowserFactory
 from app.scrapper.pjud.clave_unica import (
@@ -277,6 +276,10 @@ def web_login(body: WebLoginRequest, db: Session = Depends(get_db)):
     ).first()
     if not lawyer or not lawyer.password_hash or not verify_password(body.password, lawyer.password_hash):
         raise HTTPException(status_code=401, detail="Credenciales inválidas")
+    # Only after the password is right, so a wrong guess never reveals that an account is blocked.
+    # A missing flag (None) still means active.
+    if lawyer.is_active is False:
+        raise HTTPException(status_code=403, detail="Tu cuenta está bloqueada. Contacta al administrador.")
     token = create_access_token({"sub": lawyer.rut})
     return WebLoginResponse(access_token=token)
 

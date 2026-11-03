@@ -36,6 +36,8 @@ class AccountUpdateBody(BaseModel):
     email: Optional[str] = None
     role: Optional[str] = None
     new_password: Optional[str] = None
+    # False blocks the person (sign-in and open sessions stop; nothing is deleted); True reactivates.
+    is_active: Optional[bool] = None
 
 
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -169,6 +171,8 @@ def list_accounts(db: Session = Depends(get_db)):
             "name": l.name,
             "email": l.email,
             "role": l.role,
+            "nivel": l.nivel,
+            "is_active": l.is_active is not False,
             "has_password": l.password_hash is not None,
         }
         for l in lawyers
@@ -215,7 +219,7 @@ def create_lawyer(
 def update_account(
     id: int,
     body: AccountUpdateBody,
-    _admin_rut: str = Depends(require_admin),
+    admin_rut: str = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Update a lawyer's email, role, and/or password (admin only)."""
@@ -231,6 +235,14 @@ def update_account(
     if body.email is not None:
         lawyer.email = body.email
 
+    if body.is_active is not None:
+        if body.is_active is False:
+            if normalize_rut(lawyer.rut) == normalize_rut(admin_rut):
+                raise HTTPException(status_code=409, detail="No puedes bloquear tu propia cuenta")
+            # The public hito link dies with the access; reactivating issues a new one if needed.
+            lawyer.hito_form_token = None
+        lawyer.is_active = body.is_active
+
     if body.new_password is not None:
         if len(body.new_password) < 8:
             raise HTTPException(status_code=422, detail="Password must be at least 8 characters")
@@ -244,6 +256,8 @@ def update_account(
         "name": lawyer.name,
         "email": lawyer.email,
         "role": lawyer.role,
+        "nivel": lawyer.nivel,
+        "is_active": lawyer.is_active is not False,
         "has_password": lawyer.password_hash is not None,
     }
 

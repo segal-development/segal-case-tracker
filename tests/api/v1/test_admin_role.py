@@ -171,9 +171,10 @@ def test_get_me_regular_lawyer(client, regular_lawyer, lawyer_headers):
 
 
 def test_get_me_unauthorized(client):
-    """No token → 403 (HTTPBearer raises 403 when no Authorization header)."""
+    """No token → 401, like every other protected endpoint (the /auth routes used to answer
+    403 because they had their own copy of the dependency, without the blocked-person check)."""
     resp = client.get("/api/v1/auth/me")
-    assert resp.status_code == 403
+    assert resp.status_code == 401
 
 
 # ---------------------------------------------------------------------------
