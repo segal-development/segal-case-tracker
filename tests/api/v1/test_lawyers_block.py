@@ -178,3 +178,125 @@ class TestList:
         row = next(a for a in client.get("/api/v1/lawyers/accounts", headers=_h(ADMIN_RUT)).json() if a["id"] == old.id)
 
         assert row["is_active"] is True
+
+
+class TestDates:
+    def test_blocking_stamps_when_and_reactivating_clears_it(self, client, db, admin, ana):
+        assert _block(client, ana.id, False).json()["blocked_at"] is not None
+        db.refresh(ana)
+        assert ana.blocked_at is not None
+
+        r = _block(client, ana.id, True)
+
+        assert r.json()["blocked_at"] is None
+        db.refresh(ana)
+        assert ana.blocked_at is None
+
+    def test_the_list_carries_the_block_date(self, client, db, admin, ana):
+        _block(client, ana.id, False)
+
+        row = next(a for a in client.get("/api/v1/lawyers/accounts", headers=_h(ADMIN_RUT)).json() if a["id"] == ana.id)
+
+        assert row["blocked_at"] is not None and row["is_active"] is False
+
+    def test_setting_a_password_stamps_the_change_date(self, client, db, admin):
+        nueva = _lawyer(db, "44444444-4", "Nueva", email="nueva@segal.cl")
+        nueva.password_hash = None
+        db.commit()
+
+        r = client.put(f"/api/v1/lawyers/{nueva.id}/account", headers=_h(ADMIN_RUT), json={"new_password": "clave-nueva-123"})
+
+        assert r.status_code == 200 and r.json()["password_changed_at"] is not None
+
+    def test_other_edits_do_not_move_the_password_date(self, client, db, admin, ana):
+        ana.password_changed_at = None
+        db.commit()
+
+        client.put(f"/api/v1/lawyers/{ana.id}/account", headers=_h(ADMIN_RUT), json={"email": "otra@segal.cl"})
+
+        db.refresh(ana)
+        assert ana.password_changed_at is None
+
+    def test_changing_my_own_password_stamps_it(self, client, db, ana):
+        r = client.post(
+            "/api/v1/auth/change-password", headers=_h(ana.rut),
+            json={"current_password": PASSWORD, "new_password": "otra-clave-segura-2"},
+        )
+
+        assert r.status_code == 200, r.text
+        db.refresh(ana)
+        assert ana.password_changed_at is not None
+
+
+class TestCreateWithPassword:
+    URL = "/api/v1/lawyers"
+    BODY = {"rut": "12.345.678-5", "name": "Bea Gomez", "email": "bea@segal.cl", "nivel": "junior"}
+
+    def test_a_password_gives_immediate_access(self, client, db, admin):
+        r = client.post(self.URL, headers=_h(ADMIN_RUT), json={**self.BODY, "password": "clave-segura-123"})
+
+        assert r.status_code == 201, r.text
+        assert r.json()["has_password"] is True and r.json()["password_changed_at"] is not None
+        assert _login(client, "bea@segal.cl", "clave-segura-123").status_code == 200
+
+    def test_a_short_password_is_422_and_saves_nothing(self, client, db, admin):
+        r = client.post(self.URL, headers=_h(ADMIN_RUT), json={**self.BODY, "password": "corta"})
+
+        assert r.status_code == 422
+        assert db.query(Lawyer).filter(Lawyer.rut == "12345678-5").first() is None
+
+    def test_without_a_password_it_is_as_before(self, client, db, admin):
+        r = client.post(self.URL, headers=_h(ADMIN_RUT), json=self.BODY)
+
+        assert r.status_code == 201 and r.json()["has_password"] is False and r.json()["password_changed_at"] is None
+
+    @pytest.mark.parametrize("role,ok", [("lawyer", True), ("admin", True), ("auditor", False), ("root", False)])
+    def test_only_lawyer_or_admin_can_be_chosen(self, client, db, admin, role, ok):
+        r = client.post(self.URL, headers=_h(ADMIN_RUT), json={**self.BODY, "role": role})
+
+        assert (r.status_code == 201) is ok
+        if ok:
+            assert r.json()["role"] == role
+
+
+class TestDelete:
+    def test_a_person_without_history_can_be_deleted(self, client, db, admin, ana):
+        r = client.delete(f"/api/v1/lawyers/{ana.id}", headers=_h(ADMIN_RUT))
+
+        assert r.status_code == 204
+        assert db.query(Lawyer).filter(Lawyer.id == ana.id).first() is None
+
+    def test_a_person_with_history_is_refused_and_kept(self, client, db, admin, ana):
+        from app.models.alerta_operativa import AlertaOperativa  # noqa: F401  (ensures models are loaded)
+        from app.models.case import Case
+        from app.models.court import Court
+
+        court = Court(code="T1", name="Primer Juzgado", region="RM", type="civil")
+        db.add(court)
+        db.commit()
+        db.add(Case(rol="C-1-2026", lawyer_id=ana.id, court_id=court.id, competencia="civil"))
+        db.commit()
+
+        r = client.delete(f"/api/v1/lawyers/{ana.id}", headers=_h(ADMIN_RUT))
+
+        assert r.status_code == 409
+        assert "bloqu" in r.json()["detail"].lower()
+        assert db.query(Lawyer).filter(Lawyer.id == ana.id).first() is not None
+        assert db.query(Case).filter(Case.lawyer_id == ana.id).count() == 1
+
+    def test_an_admin_cannot_delete_herself(self, client, db, admin):
+        r = client.delete(f"/api/v1/lawyers/{admin.id}", headers=_h(ADMIN_RUT))
+
+        assert r.status_code == 409
+        assert db.query(Lawyer).filter(Lawyer.id == admin.id).first() is not None
+
+    def test_only_an_admin_can_delete(self, client, db, admin, ana):
+        other = _lawyer(db, "22222222-2", "Otro", email="otro@segal.cl")
+
+        r = client.delete(f"/api/v1/lawyers/{other.id}", headers=_h(ana.rut))
+
+        assert r.status_code == 403
+        assert db.query(Lawyer).filter(Lawyer.id == other.id).first() is not None
+
+    def test_unknown_person_is_404(self, client, db, admin):
+        assert client.delete("/api/v1/lawyers/999999", headers=_h(ADMIN_RUT)).status_code == 404

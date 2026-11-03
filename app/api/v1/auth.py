@@ -321,6 +321,7 @@ def set_password(
     if not lawyer:
         raise HTTPException(status_code=404, detail="Lawyer not found")
     lawyer.password_hash = hash_password(body.new_password)
+    lawyer.password_changed_at = datetime.utcnow()
     db.commit()
     return {"ok": True}
 
@@ -354,6 +355,7 @@ def change_own_password(
             detail="La contraseña nueva debe ser distinta de la actual",
         )
     lawyer.password_hash = hash_password(body.new_password)
+    lawyer.password_changed_at = datetime.utcnow()
     db.commit()
     return {"ok": True}
 

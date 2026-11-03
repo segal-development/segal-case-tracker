@@ -61,6 +61,10 @@ class Lawyer(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     last_login_at = Column(DateTime, nullable=True)
+    # When the person was blocked (is_active False); NULL = not blocked.
+    blocked_at = Column(DateTime, nullable=True)
+    # When the app password last changed; NULL = unknown or none.
+    password_changed_at = Column(DateTime, nullable=True)
 
     # Set when a supervisor credential-change alert email has been sent for
     # this lawyer's current credential-failure episode (de-dup: one alert per
