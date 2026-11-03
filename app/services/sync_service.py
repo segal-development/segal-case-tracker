@@ -1597,6 +1597,10 @@ class SyncService:
         if existing:
             return existing, False
 
+        repaired = self._find_repaired_movement(case_id, scraped, existing_by_key)
+        if repaired is not None:
+            return self._heal_movement(repaired, scraped, existing_by_key), False
+
         # Create new movement
         movement = Movement(
             case_id=case_id,
@@ -1615,6 +1619,56 @@ class SyncService:
             existing_by_key[key] = movement
         return movement, True
     
+    def _find_repaired_movement(
+        self,
+        case_id: int,
+        scraped: ScrapedMovement,
+        existing_by_key: Optional[dict],
+    ) -> Optional[Movement]:
+        """Return the single hand-repaired row this scrape corresponds to.
+
+        A repaired row has the date text as its description and that text
+        equals its own ``movement_date``. It matches when it has the scraped
+        folio and the scraped date. Zero or several candidates -> None.
+        """
+        date_text = self._parse_date(scraped.fecha).strftime("%d/%m/%Y")
+        if existing_by_key is not None:
+            candidates = [
+                m for (folio, _), m in existing_by_key.items()
+                if folio == scraped.folio
+            ]
+        else:
+            candidates = self.db.query(Movement).filter(
+                and_(Movement.case_id == case_id, Movement.folio == scraped.folio)
+            ).all()
+        matches = [
+            m for m in candidates
+            if m.description == date_text
+            and m.movement_date.strftime("%d/%m/%Y") == date_text
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    def _heal_movement(
+        self,
+        movement: Movement,
+        scraped: ScrapedMovement,
+        existing_by_key: Optional[dict],
+    ) -> Movement:
+        """Restore the real text on a repaired row, keeping its id and links."""
+        old_key = (movement.folio, movement.description)
+        movement.description = scraped.descripcion
+        movement.stage = scraped.etapa
+        movement.procedure = scraped.tipo_tramite
+        self.db.flush()
+        if existing_by_key is not None:
+            existing_by_key.pop(old_key, None)
+            existing_by_key[(movement.folio, movement.description)] = movement
+        logger.info(
+            "healed repaired movement case_id=%s folio=%s description=%r",
+            movement.case_id, movement.folio, movement.description,
+        )
+        return movement
+
     def _create_movement_alert(
         self, case: Case, movement: Movement, lawyer_id: int
     ) -> Optional[Alert]:
