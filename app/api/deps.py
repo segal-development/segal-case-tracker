@@ -44,9 +44,36 @@ async def get_current_lawyer(
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    # TODO: Fetch lawyer from database using payload["sub"]
-    # For now, return the payload
+    # A blocked person (is_active False) loses the session at once, not when the token
+    # expires. A missing flag (None) still means active; an unknown subject keeps the
+    # previous behaviour (the route that needs the person answers 404 itself).
+    from app.models.lawyer import Lawyer
+
+    sub = payload.get("sub") or payload.get("lawyer_id")
+    if sub is not None:
+        try:
+            lawyer = db.query(Lawyer).filter(Lawyer.id == int(sub)).first()
+        except (TypeError, ValueError):
+            lawyer = db.query(Lawyer).filter(Lawyer.rut == str(sub)).first()
+        if lawyer is not None and lawyer.is_active is False:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Cuenta bloqueada",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
     return payload
+
+
+async def get_current_rut(payload: dict = Depends(get_current_lawyer)) -> str:
+    """The signed-in person's RUT (JWT subject). Goes through ``get_current_lawyer``, so a
+    blocked person is refused here too."""
+    rut = payload.get("sub")
+    if not rut:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token no contiene RUT",
+        )
+    return str(rut)
 
 
 async def require_admin(
