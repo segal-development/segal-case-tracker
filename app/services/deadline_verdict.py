@@ -81,7 +81,12 @@ from typing import Callable, Optional, Sequence
 
 from app.config import settings
 from app.core.deadlines_config import DeadlineType
-from app.services.poder_deadline import is_compliance_movement
+from app.services.poder_deadline import (
+    is_compliance_movement,
+    is_extended_compliance_movement,
+    is_extended_trigger,
+    is_previo_a_proveer,
+)
 
 
 class Verdict(str, Enum):
@@ -162,7 +167,18 @@ def _detect_poder(
     """
     if triggered_at is None:
         return None
-    acts = [m for m in movements if is_compliance_movement(m) and _day(m) > triggered_at]
+    # ``Cumple lo ordenado`` only fulfils an extended trigger (Mero trámite /
+    # Apercibimiento poder) dated ``triggered_at``, never a ``Previo a proveer``.
+    same_day = [m for m in movements if _day(m) == triggered_at]
+    accepts_cumple = any(is_extended_trigger(m) for m in same_day) and not any(
+        is_previo_a_proveer(m) for m in same_day
+    )
+    acts = [
+        m
+        for m in movements
+        if (is_compliance_movement(m) or (accepts_cumple and is_extended_compliance_movement(m)))
+        and _day(m) > triggered_at
+    ]
     return min(acts, key=_day) if acts else None
 
 
