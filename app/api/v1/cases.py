@@ -33,6 +33,8 @@ from app.models.cliente_sysgal_estado import ClienteSysgalEstado
 from app.services.sysgal_cobertura import COBERTURAS, derive_cobertura
 from app.services.timeline_service import build_case_timeline
 from app.services.case_diagnostico import classify, days_since
+from app.services.deadline_engine import is_medida_prejudicial
+from app.services.procedural_classifier import MovementClassifier
 from app.utils.rut import clean_rut
 
 logger = logging.getLogger(__name__)
@@ -343,6 +345,8 @@ class CaseDetailResponse(BaseModel):
     escritos_count: int
     exhortos: List[ExhortoResponse]
     exhortos_count: int
+    # Stage value -> ISO date the stage was reached (see MovementClassifier.stage_history).
+    stage_dates: dict[str, str] = {}
 
 
 # ============================================================================
@@ -1166,6 +1170,7 @@ async def get_case(
         case=case_response,
         movements=movements_response,
         movements_count=len(movements),
+        stage_dates=_stage_dates(case, movements),
         litigantes=[LitiganteResponse.model_validate(r) for r in litigantes],
         litigantes_count=len(litigantes),
         notificaciones=[NotificacionResponse.model_validate(r) for r in notificaciones],
@@ -1175,6 +1180,17 @@ async def get_case(
         exhortos=[ExhortoResponse.model_validate(r) for r in exhortos],
         exhortos_count=len(exhortos),
     )
+
+
+def _stage_dates(case: Case, movements: list) -> dict[str, str]:
+    """Stage value -> ISO date reached, from the already-loaded movements.
+
+    A medida prejudicial has no ejecutivo flow, so it gets no dates.
+    """
+    if is_medida_prejudicial(case.procedure):
+        return {}
+    history = MovementClassifier().stage_history(movements, date.today())
+    return {state.value: reached.isoformat() for state, reached in history}
 
 
 @router.get("/{case_id}/movements", response_model=List[MovementResponse])
