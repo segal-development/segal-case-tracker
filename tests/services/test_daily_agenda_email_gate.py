@@ -82,3 +82,26 @@ def test_orchestration_only_carla_digest_goes_out(
     assert "Plazos fatales del estudio" in msg["Subject"]
     assert summary["carla_digest_sent"] is True
     assert summary["sent"] == 0
+
+
+def test_carla_is_picked_deterministically_among_admins(db, carla, smtp, carla_only):  # noqa: F811
+    """'Carla' is the first admin with an e-mail. With more than one admin that choice must not
+    depend on whatever order the database happens to return: it is the lowest id, so the e-mail
+    gate (which lists her address) never blocks her digest by accident."""
+    from sqlalchemy import event
+
+    statements = []
+
+    def spy(conn, cursor, statement, params, context, executemany):
+        if "FROM lawyers" in statement and "role" in statement and "email IS NOT NULL" in statement:
+            statements.append(statement)
+
+    engine = db.get_bind()
+    event.listen(engine, "before_cursor_execute", spy)
+    try:
+        send_daily_calendar_emails(db, TARGET_DAY)
+    finally:
+        event.remove(engine, "before_cursor_execute", spy)
+
+    assert statements, "the admin lookup did not run"
+    assert all("ORDER BY lawyers.id" in s for s in statements)

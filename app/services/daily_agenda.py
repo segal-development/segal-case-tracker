@@ -637,6 +637,9 @@ def send_daily_calendar_emails(db, target_day: date) -> dict:
     carla = (
         db.query(Lawyer)
         .filter(Lawyer.role == "admin", Lawyer.email.isnot(None))
+        # More than one admin exists (Carla and the developer): the choice must not depend on the
+        # order the database happens to return. The lowest id is the firm's head of legal.
+        .order_by(Lawyer.id)
         .first()
     )
     carla_email = carla.email if carla else None
