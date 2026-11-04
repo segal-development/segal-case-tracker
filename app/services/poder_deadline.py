@@ -287,3 +287,18 @@ def responds_to_excepciones_filing(movements: list, trigger: object) -> bool:
         m is not trigger and _order_key(m) < key and is_excepciones_filing(m)
         for m in movements
     )
+
+
+def obligation_is_ours(movements: list, source_movement_id: object, side: str) -> bool:
+    """Whether the plazo opened by movement ``source_movement_id`` is the firm's own.
+
+    Pure part of ``sync_service.poder_obligation_is_ours`` (same heuristic, no
+    query, no due-date check): the trigger must be among ``movements``, an
+    excepciones filing must precede it and the firm must not be the demandante.
+    """
+    if source_movement_id is None:
+        return False
+    trigger = next((m for m in movements if getattr(m, "id", None) == source_movement_id), None)
+    if trigger is None or not responds_to_excepciones_filing(movements, trigger):
+        return False
+    return side != "demandante"
