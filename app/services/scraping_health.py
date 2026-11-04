@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.models.alerta_operativa import AlertaOperativa
 from app.models.sync_history import SyncHistory
+from app.services.email_gate import SCRAPING, email_allowed
 from app.services.telegram_notifier import is_enabled as telegram_enabled
 from app.services.telegram_notifier import send_telegram
 
@@ -268,6 +269,9 @@ def _enviar_email(salud: SaludScraping) -> bool:
     msg["From"] = settings.SMTP_FROM or settings.FROM_EMAIL
     msg["To"] = settings.SCRAPING_ALERT_EMAIL
     msg.set_content(texto)
+
+    if not email_allowed(SCRAPING, settings.SCRAPING_ALERT_EMAIL):
+        return False
 
     try:
         context = ssl.create_default_context()

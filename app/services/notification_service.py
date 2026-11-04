@@ -8,6 +8,7 @@ import smtplib
 import ssl
 from datetime import datetime
 from email.message import EmailMessage
+from email.utils import getaddresses
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -23,6 +24,13 @@ from app.models.lawyer import Lawyer
 from app.models.movement import Movement
 from app.models.webhook import Webhook
 from app.services.cycle_timing import timed
+from app.services.email_gate import (
+    MOVIMIENTOS,
+    NOTIFICACIONES,
+    PLAZOS,
+    PLAZOS_VERDE,
+    email_allowed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -93,9 +101,20 @@ class NotificationService:
     # Public API
     # ------------------------------------------------------------------
 
-    def _deliver(self, msg: EmailMessage) -> None:
+    def _deliver(self, msg: EmailMessage, kind: str) -> bool:
         """Send one message on the shared connection, reconnecting once if the
-        provider dropped it. Raises on failure; callers own the error contract."""
+        provider dropped it. Raises on failure; callers own the error contract.
+
+        Returns False, sending nothing, when the e-mail gate suppresses this
+        ``kind``/recipients; True once the message was handed to SMTP."""
+        addresses = [
+            addr
+            for _, addr in getaddresses(
+                [str(v) for h in ("To", "Cc", "Bcc") for v in msg.get_all(h, [])]
+            )
+        ]
+        if not email_allowed(kind, *addresses):
+            return False
         # Charged to the cycle's "email" bucket (no-op outside a worker cycle).
         with timed("email"):
             try:
@@ -133,6 +152,7 @@ class NotificationService:
                     raise
                 self._drop_smtp()
                 self._smtp_connection().send_message(msg)
+        return True
 
     def send_email_alert(self, alert: Alert, lawyer: Lawyer) -> bool:
         """
@@ -165,7 +185,8 @@ class NotificationService:
             msg["To"] = lawyer.email
             msg.set_content(alert.message)
 
-            self._deliver(msg)
+            if not self._deliver(msg, NOTIFICACIONES):
+                return False
 
             alert.email_sent = True
             alert.email_sent_at = datetime.utcnow()
@@ -371,7 +392,8 @@ class NotificationService:
         msg.set_content(text_body)
         msg.add_alternative(html_body, subtype="html")
 
-        self._deliver(msg)
+        if not self._deliver(msg, MOVIMIENTOS):
+            return False
 
         # Only now -- the digest really left -- mark the alerts it covered.
         # Only the alerts actually rendered: the ones that merely fed the "y N
@@ -465,7 +487,8 @@ class NotificationService:
         msg["To"] = lawyer.email
         msg.set_content(text_body)
         msg.add_alternative(html_body, subtype="html")
-        self._deliver(msg)
+        if not self._deliver(msg, PLAZOS):
+            return False
         self._mark_sent_and_commit([alert])
         return True
 
@@ -518,7 +541,8 @@ class NotificationService:
         msg["To"] = lawyer.email
         msg.set_content(text_body)
         msg.add_alternative(html_body, subtype="html")
-        self._deliver(msg)
+        if not self._deliver(msg, PLAZOS_VERDE):
+            return False
         # Every queued entry is rendered (no cap), so every one is marked.
         self._mark_sent_and_commit([entry.alert for entry in bucket.entries])
         logger.info(
