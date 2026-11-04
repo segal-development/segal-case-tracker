@@ -35,6 +35,7 @@ from app.models.alert import Alert
 from app.models.case import Case
 from app.models.case_litigante import CaseLitigante
 from app.models.lawyer import Lawyer
+from app.services.email_gate import AGENDA, PLAZOS_FATALES_ESTUDIO, email_allowed
 from app.services.lawyer_roster import case_ids_for_abogado
 from app.utils.rut import format_rut
 
@@ -574,8 +575,13 @@ def _send_email(
     html_body: str,
     text_body: str,
     cc: Optional[list] = None,
+    *,
+    kind: str,
 ) -> bool:
     """Send one email via blocking SMTP. Returns True on success, else False.
+
+    False without sending when the e-mail gate suppresses ``kind`` or any
+    recipient (To/Cc).
 
     Mirrors ``supervisor_alert_service._send_smtp_sync`` config (SMTP_HOST/
     PORT/USE_TLS/USER/PASSWORD, From = SMTP_FROM or FROM_EMAIL) but is generic
@@ -586,6 +592,9 @@ def _send_email(
         logger.warning(
             "SMTP_HOST not configured; skipping daily agenda email to %s", to
         )
+        return False
+
+    if not email_allowed(kind, to, *(cc or [])):
         return False
 
     msg = EmailMessage()
@@ -628,6 +637,9 @@ def send_daily_calendar_emails(db, target_day: date) -> dict:
     carla = (
         db.query(Lawyer)
         .filter(Lawyer.role == "admin", Lawyer.email.isnot(None))
+        # More than one admin exists (Carla and the developer): the choice must not depend on the
+        # order the database happens to return. The lowest id is the firm's head of legal.
+        .order_by(Lawyer.id)
         .first()
     )
     carla_email = carla.email if carla else None
@@ -685,7 +697,9 @@ def send_daily_calendar_emails(db, target_day: date) -> dict:
                 else []
             )
 
-            ok = _send_email(lawyer.email, subject, html_body, text_body, cc=cc)
+            ok = _send_email(
+                lawyer.email, subject, html_body, text_body, cc=cc, kind=AGENDA
+            )
             if ok:
                 sent += 1
                 if cc:
@@ -706,7 +720,9 @@ def send_daily_calendar_emails(db, target_day: date) -> dict:
     if carla_email and digest_groups:
         try:
             d_subject, d_html, d_text = render_novedades_digest(target_day, digest_groups)
-            if _send_email(carla_email, d_subject, d_html, d_text):
+            if _send_email(
+                carla_email, d_subject, d_html, d_text, kind=PLAZOS_FATALES_ESTUDIO
+            ):
                 carla_digest_sent = True
             else:
                 errors += 1

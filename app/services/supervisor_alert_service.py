@@ -22,9 +22,11 @@ import smtplib
 import ssl
 from datetime import datetime
 from email.message import EmailMessage
+from email.utils import getaddresses
 from zoneinfo import ZoneInfo
 
 from app.config import settings
+from app.services.email_gate import SUPERVISOR, email_allowed
 
 logger = logging.getLogger(__name__)
 
@@ -188,8 +190,12 @@ def render_supervisor_credential_alert(lawyer, reason: str = "") -> tuple[str, s
     return subject, html_body, text_body
 
 
-def _send_smtp_sync(msg: EmailMessage) -> None:
-    """Blocking SMTP send — must run off the event loop (thread executor)."""
+def _send_smtp_sync(msg: EmailMessage) -> bool:
+    """Blocking SMTP send — must run off the event loop (thread executor).
+
+    Returns False, sending nothing, when the e-mail gate suppresses it."""
+    if not email_allowed(SUPERVISOR, *(a for _, a in getaddresses(msg.get_all("To", [])))):
+        return False
     context = ssl.create_default_context()
     with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT, timeout=10) as server:
         if settings.SMTP_USE_TLS:
@@ -197,6 +203,7 @@ def _send_smtp_sync(msg: EmailMessage) -> None:
         if settings.SMTP_USER:
             server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
         server.send_message(msg)
+    return True
 
 
 async def send_supervisor_credential_alert(lawyer, reason: str = "") -> bool:
@@ -228,7 +235,8 @@ async def send_supervisor_credential_alert(lawyer, reason: str = "") -> bool:
 
     try:
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, _send_smtp_sync, msg)
+        if not await loop.run_in_executor(None, _send_smtp_sync, msg):
+            return False
         logger.info(
             "Supervisor credential alert sent for lawyer %s",
             getattr(lawyer, "id", None),

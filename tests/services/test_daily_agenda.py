@@ -311,7 +311,7 @@ class TestSendDailyCalendarEmails:
 
         calls = []
 
-        def _fake_send(to, subject, html_body, text_body, cc=None):
+        def _fake_send(to, subject, html_body, text_body, cc=None, kind=None):
             calls.append((to, cc or []))
             return True
 
@@ -439,7 +439,7 @@ class TestCarlaDigest:
 
         calls = []
 
-        def _fake_send(to, subject, html_body, text_body, cc=None):
+        def _fake_send(to, subject, html_body, text_body, cc=None, kind=None):
             calls.append((to, subject, html_body))
             return True
 
@@ -464,7 +464,7 @@ class TestCarlaDigest:
 
         recipients = []
 
-        def _fake_send(to, subject, html_body, text_body, cc=None):
+        def _fake_send(to, subject, html_body, text_body, cc=None, kind=None):
             recipients.append(to)
             return True
 
