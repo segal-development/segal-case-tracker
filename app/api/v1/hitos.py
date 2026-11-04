@@ -348,6 +348,12 @@ def _is_admin(lawyer: Optional[Lawyer]) -> bool:
     return bool(lawyer and lawyer.role == "admin")
 
 
+def _es_abogado_comun(lawyer: Optional[Lawyer]) -> bool:
+    """Plain lawyer: role lawyer without ``can_manage_evaluaciones`` (Melissa, Carla
+    and Marcelo are not). Plain lawyers get the strict public-form rules."""
+    return bool(lawyer and lawyer.role == "lawyer" and not lawyer.can_manage_evaluaciones)
+
+
 def _store_evidencia(lawyer_id: int, data: bytes, upload: UploadFile) -> tuple[str, Optional[str], str]:
     """Validate an evidence upload and store it; return ``(storage_key, filename, content_type)``.
 
@@ -708,7 +714,8 @@ async def create_hito(
     db: Session = Depends(get_db),
     current_lawyer: dict = Depends(get_current_lawyer),
 ):
-    """Register a hito. PJUD evidence is optional."""
+    """Register a hito. PJUD evidence is optional, except for a plain lawyer, who
+    gets the strict public-form rules (every field + evidence, origen formulario)."""
     actor = _resolve_lawyer(db, current_lawyer)
     if actor is None:
         raise HTTPException(status_code=401, detail="No se pudo resolver el abogado")
@@ -722,11 +729,21 @@ async def create_hito(
             raise HTTPException(status_code=404, detail="Abogado no encontrado")
         target_lawyer_id = lawyer_id
 
+    origen = ORIGEN_MANUAL
+    if _es_abogado_comun(actor):
+        hito_tipo_id, fecha_hito, rol_causa, descripcion, tribunal, procedimiento, evidencia = (
+            await _validate_public_form_fields(
+                hito_tipo_id, fecha_hito, rol_causa, descripcion, tribunal, procedimiento, evidencia,
+            )
+        )
+        origen = ORIGEN_FORMULARIO
+
     hito = await _create_hito(
         db, actor, target_lawyer_id,
         hito_tipo_id=hito_tipo_id, fecha_hito=fecha_hito, rol_causa=rol_causa,
         procedimiento=procedimiento, descripcion=descripcion, tribunal=tribunal,
         etapa_sysgal=etapa_sysgal, tramite_sysgal=tramite_sysgal, evidencia=evidencia,
+        origen=origen,
     )
     return _to_response(hito)
 

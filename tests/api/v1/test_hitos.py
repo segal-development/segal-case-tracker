@@ -56,6 +56,8 @@ def _h(rut):
 
 def _create(client, headers, tipo_id, lawyer_id=None):
     data = {"hito_tipo_id": tipo_id, "fecha_hito": "2026-07-15", "rol_causa": "C-1-2026"}
+    if headers == _h(LAWYER_RUT):  # a plain lawyer must send every field (strict rules)
+        data.update(descripcion="C-9-2026", tribunal="1º Juzgado Civil", procedimiento="Ejecutivo")
     if lawyer_id is not None:
         data["lawyer_id"] = lawyer_id
     return client.post(
