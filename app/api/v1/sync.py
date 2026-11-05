@@ -20,6 +20,7 @@ from app.models.lawyer import Lawyer
 from app.services.sync_service import (
     SyncService,
     SyncResult,
+    case_belongs_to_lawyer,
     convert_api_cases_to_scraped,
     detect_and_sync_movements,
     rol_year_ok,
@@ -259,7 +260,7 @@ async def get_sync_status(
 
     activity_q = db.query(func.max(Case.last_detail_checked_at))
     if not is_transversal:
-        activity_q = activity_q.filter(Case.lawyer_id == lawyer_id)
+        activity_q = activity_q.filter(case_belongs_to_lawyer(lawyer_id))
     last_activity = activity_q.scalar()
 
     if is_transversal:

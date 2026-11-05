@@ -32,6 +32,8 @@ _CHROME_UA = (
 
 from app.config import settings
 from app.services.pjud_session import PJUDSession
+from app.scrapper.pjud.dns_probe import maybe_probe_name_resolution
+from app.scrapper.pjud.dns_resolver import chromium_dns_bypass_args
 from app.scrapper.pjud.exceptions import (
     CredentialExpiredError,
     InvalidCredentialsError,
@@ -608,6 +610,11 @@ class PJUDBaseScraper(ABC):
         else:
             logger.info("Using Playwright bundled Chromium")
 
+        # Opt-in: map the PJUD host to an address we resolved ourselves, so
+        # Chromium never asks the (measurably broken) macOS system resolver.
+        # Returns [] — today's behaviour — when off or when resolution fails.
+        launch_args += await chromium_dns_bypass_args()
+
         self._playwright = await async_playwright().start()
         if user_data_dir:
             self._persistent_context = True
@@ -925,7 +932,12 @@ class PJUDBaseScraper(ABC):
         from app.scrapper.pjud_civil import RECAPTCHA_SITEKEY, RECAPTCHA_ACTION_LOGIN
 
         page = await self._get_page()
-        await page.goto(PJUD_HOME_URL, wait_until="domcontentloaded")
+        try:
+            await page.goto(PJUD_HOME_URL, wait_until="domcontentloaded")
+        except Exception as nav_exc:
+            # TEMPORARY diagnostic (see dns_probe.py): observe-only, then re-raise untouched.
+            maybe_probe_name_resolution(str(nav_exc), PJUD_HOME_URL)
+            raise
 
         token = await self._generate_recaptcha_token(
             page, RECAPTCHA_SITEKEY, RECAPTCHA_ACTION_LOGIN
@@ -1140,6 +1152,10 @@ class PJUDBaseScraper(ABC):
         except LoginError:
             raise
         except Exception as e:
+            # TEMPORARY diagnostic (see dns_probe.py): observe-only. The only
+            # navigation that can raise a raw ERR_NAME_NOT_RESOLVED here is the
+            # home goto; the call is a no-op for any other error.
+            maybe_probe_name_resolution(str(e), PJUD_HOME_URL)
             logger.error(f"Login error: {e}")
             raise LoginError(f"Error during login: {str(e)}", cause=e)
     
@@ -1283,6 +1299,8 @@ class PJUDBaseScraper(ABC):
                 await page.goto(PJUD_INDEX_URL, wait_until="domcontentloaded")
                 await asyncio.sleep(2)
             except Exception as nav_exc:
+                # TEMPORARY diagnostic (see dns_probe.py): observe-only, never raises.
+                maybe_probe_name_resolution(str(nav_exc), PJUD_INDEX_URL)
                 return False, str(nav_exc)
 
         # Let any client-side redirect after the initial load settle before we
@@ -1454,7 +1472,26 @@ class PJUDBaseScraper(ABC):
                     break
                 
                 current_page += 1
-            
+
+            # Reconcile what PJUD said exists against what pagination actually
+            # collected. A shortfall here is rows the scraper never brought
+            # back, which no amount of persistence logic can recover -- and it
+            # is invisible otherwise, because every row that DOES arrive is
+            # stored. `missing` is the number to watch; 0 is healthy.
+            collected = len(all_cases)
+            missing = (total_count - collected) if total_count else 0
+            logger.info(
+                "LISTING_PAGINATION_RECONCILE reported=%s collected=%d missing=%d "
+                "pages_expected=%s pages_read=%d max_pages=%s",
+                total_count, collected, missing, total_pages, current_page, max_pages,
+            )
+            if missing > 0:
+                logger.warning(
+                    "LISTING_SHORTFALL reported=%s collected=%d missing=%d: PJUD "
+                    "listed more causas than pagination returned.",
+                    total_count, collected, missing,
+                )
+
             return all_cases
             
         except Exception as e:

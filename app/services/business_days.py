@@ -154,3 +154,17 @@ def count_business_days_remaining(due_date: date, today: date) -> int:
             if _is_business_day(current):
                 count += 1
         return -count
+
+
+def business_days_elapsed(start: date, end: date) -> int:
+    """Count the días hábiles in ``(start, end]``: how many have gone by since
+    *start*, which is day 0 and is not counted (the inverse of
+    ``add_business_days``). ``end <= start`` gives 0.
+    """
+    count = 0
+    current = start
+    while current < end:
+        current += timedelta(days=1)
+        if _is_business_day(current):
+            count += 1
+    return count

@@ -43,6 +43,13 @@ ACTIONABLE_ALERT_TYPES = frozenset(
         "status_change",
         # Fatal "ratificar firma" plazo that is provably the firm's own.
         "ratificar_firma",
+        # Plazo semaforo (amarillo / rojo): immediate, one per plazo, never part
+        # of a digest. The grouped "plazo_verde" is deliberately NOT here: it is
+        # activity, announced once a day in one email.
+        "plazo_amarillo",
+        "plazo_rojo",
+        # Fatal plazo that expired with no filing from the firm (one per plazo).
+        "plazo_vencido",
     }
 )
 

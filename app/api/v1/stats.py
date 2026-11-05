@@ -1,6 +1,6 @@
 """Stats endpoint — firm dashboard aggregates for the authenticated account."""
 
-from datetime import date
+from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
@@ -9,14 +9,15 @@ from sqlalchemy.orm import Session
 from app.api.deps import (
     get_db,
     get_current_lawyer,
+    require_admin,
     require_auditor,
     _resolve_lawyer_id,
     resolve_case_scope,
     ALL_CASES,
 )
-from app.models.case import Case
 from app.models.goal import Goal
 from app.models.lawyer import Lawyer
+from app.services.scraping_health import evaluar_salud_scraping, ultimo_bloqueo_ip
 from app.services.lawyer_roster import (
     firm_dashboard_stats,
     firm_dashboard_stats_all,
@@ -119,51 +120,6 @@ async def get_firm_stats(
     if not lawyer:
         raise HTTPException(status_code=404, detail="Lawyer not found")
     return firm_dashboard_stats(db, lawyer.rut)
-
-
-class PublicOverview(BaseModel):
-    """Aggregated firm semaforo counts for the (pre-auth) login screen — counts only."""
-    rojo: int
-    amarillo: int
-    verde: int
-
-
-@router.get("/public-overview", response_model=PublicOverview)
-async def get_public_overview(db: Session = Depends(get_db)):
-    """PUBLIC (no auth): firm semáforo counts for the login screen marquee.
-
-    Exposes ONLY aggregated counts (no case data, no names, no personal info).
-    The firm account is the one configured via FIRM_LAWYER_RUT (default the study
-    account); falls back to the lawyer with the most civil cases.
-    """
-    import os
-    from sqlalchemy import func
-
-    firm_rut = os.environ.get("FIRM_LAWYER_RUT", "16021492-9")
-    lawyer = db.query(Lawyer).filter(Lawyer.rut == firm_rut).first()
-    if lawyer is None:
-        row = (
-            db.query(Case.lawyer_id, func.count(Case.id).label("c"))
-            .filter(Case.competencia == "civil")
-            .group_by(Case.lawyer_id)
-            .order_by(func.count(Case.id).desc())
-            .first()
-        )
-        lawyer = db.get(Lawyer, row.lawyer_id) if row else None
-    if lawyer is None:
-        return PublicOverview(rojo=0, amarillo=0, verde=0)
-
-    counts = dict(
-        db.query(Case.semaforo, func.count(Case.id))
-        .filter(Case.lawyer_id == lawyer.id, Case.competencia == "civil")
-        .group_by(Case.semaforo)
-        .all()
-    )
-    return PublicOverview(
-        rojo=counts.get("rojo", 0),
-        amarillo=counts.get("amarillo", 0),
-        verde=counts.get("verde", 0),
-    )
 
 
 @router.get("/me", response_model=MyStatsResponse)
@@ -269,6 +225,7 @@ class RiskBoardRiesgo(BaseModel):
     en_apremio: int
     plazo_fatal_proximo: int
     plazo_fatal_vencido: int
+    plazo_fatal_incumplido: int = 0
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -318,3 +275,84 @@ async def get_risk_board(
     breakdown and the top ~15 most urgent cases.
     """
     return firm_risk_board(db, auditor_rut)
+
+
+class ScrapingBloqueoIp(BaseModel):
+    desde: datetime
+    detalle: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ScrapingStatus(BaseModel):
+    estado: str
+    motivo: str
+    ultimo_exito: datetime | None
+    horas_sin_exito: float | None
+    fallas_consecutivas: int
+    bloqueo_ip: ScrapingBloqueoIp | None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    """Stored timestamps are naive UTC; emit them as UTC instants (``...Z``)."""
+    return value.replace(tzinfo=timezone.utc) if value is not None else None
+
+
+# A plazo or semaforo is only as good as the last sync that confirmed it. Past this
+# age the screens tell every user the data is unverified (product document R03).
+DATA_STALE_HOURS = 24
+
+
+class DataFreshness(BaseModel):
+    """Age of the last successful sync, for every signed-in role. No cause, no IP detail."""
+    verificado: bool
+    umbral_horas: int
+    horas_sin_exito: float | None
+    ultimo_exito: datetime | None
+
+
+@router.get("/data-freshness", response_model=DataFreshness)
+async def get_data_freshness(
+    db: Session = Depends(get_db),
+    _lawyer: dict = Depends(get_current_lawyer),
+):
+    """Is the PJUD data fresh enough to trust? Open to every signed-in role.
+
+    Unlike ``/scraping-status`` (admin only, with the IP-block detail) this exposes
+    only how old the last successful sync is. No sync on record is NOT verified:
+    nothing has confirmed the data.
+    """
+    salud = evaluar_salud_scraping(db)
+    horas = salud.horas_sin_exito
+    return DataFreshness(
+        verificado=horas is not None and horas <= DATA_STALE_HOURS,
+        umbral_horas=DATA_STALE_HOURS,
+        horas_sin_exito=round(horas, 1) if horas is not None else None,
+        ultimo_exito=_as_utc(salud.ultimo_exito),
+    )
+
+
+@router.get("/scraping-status", response_model=ScrapingStatus)
+async def get_scraping_status(
+    db: Session = Depends(get_db),
+    _admin_rut: str = Depends(require_admin),
+):
+    """Scraping health plus the last IP-block event (admin banner). Read-only."""
+    salud = evaluar_salud_scraping(db)
+    bloqueo = ultimo_bloqueo_ip(db)
+    return ScrapingStatus(
+        estado=salud.estado,
+        motivo=salud.motivo,
+        ultimo_exito=_as_utc(salud.ultimo_exito),
+        horas_sin_exito=(
+            round(salud.horas_sin_exito, 1) if salud.horas_sin_exito is not None else None
+        ),
+        fallas_consecutivas=salud.fallas_consecutivas,
+        bloqueo_ip=(
+            ScrapingBloqueoIp(desde=_as_utc(bloqueo.enviada_at), detalle=bloqueo.detalle or "")
+            if bloqueo is not None
+            else None
+        ),
+    )

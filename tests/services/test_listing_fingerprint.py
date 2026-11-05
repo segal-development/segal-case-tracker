@@ -110,6 +110,16 @@ def db(engine):
     s.close()
 
 
+@pytest.fixture(autouse=True)
+def _firm_lawyer(db, lawyer):
+    """sync_cases creates cases under the firm lawyer (Approach C).
+
+    Depends on ``lawyer`` so the individual lawyer keeps its id.
+    """
+    db.add(Lawyer(rut="16021492-9", name="Firm", is_active=True))
+    db.commit()
+
+
 @pytest.fixture()
 def lawyer(db):
     lw = Lawyer(
@@ -154,9 +164,13 @@ def _sync(db, lawyer, row, **kw):
     )
 
 
-def _case(db):
+def _case(db, procedure=None):
+    """The one Case, or the one with ``procedure`` (cuaderno is part of the identity,
+    so a ROL listed with several cuadernos has one Case per cuaderno)."""
     db.expire_all()
-    return db.query(Case).one()
+    if procedure is None:
+        return db.query(Case).one()
+    return db.query(Case).filter(Case.procedure == procedure).one()
 
 
 def _changed_lines(records):
@@ -201,15 +215,15 @@ class TestPersistence:
     def test_changed_row_rewrites_and_logs_old_and_new(self, db, lawyer, sync_logs):
         _sync(db, lawyer, _row())
         old_fp = _case(db).listing_fingerprint
-        _sync(db, lawyer, _row(estado_cuaderno="Archivada", cuaderno="Apremio"))
+        _sync(db, lawyer, _row(estado_cuaderno="Archivada"))
         c = _case(db)
         assert c.listing_fingerprint != old_fp
         assert c.listing_estado_raw == "Archivada"
-        assert c.listing_cuaderno_raw == "Apremio"
+        assert c.listing_cuaderno_raw == "Principal"
         lines = _changed_lines(sync_logs)
         assert len(lines) == 1
         msg = lines[0].getMessage()
-        for needle in ("C-1234-2025", "Tramitación", "Archivada", "Principal", "Apremio"):
+        for needle in ("C-1234-2025", "Tramitación", "Archivada", "Principal"):
             assert needle in msg
 
     def test_row_without_baseline_is_baselined_silently(self, db, lawyer, sync_logs):
@@ -246,11 +260,11 @@ class TestFailureNeverBreaksSync:
             raise RuntimeError("fingerprint exploded")
 
         monkeypatch.setattr(sync_module, "compute_listing_set_fingerprint", boom)
-        result = _sync(db, lawyer, _row(cuaderno="Apremio"))
+        result = _sync(db, lawyer, _row(caratulado="OTRO/DEUDOR"))
         assert result.errors == []
         assert result.cases_updated == 1
         # the rest of the upsert still happened
-        assert _case(db).procedure == "Apremio"
+        assert _case(db).plaintiff == "OTRO"
         assert any(
             "fingerprint exploded" in r.getMessage() or r.exc_info for r in sync_logs
             if r.levelno >= logging.WARNING
@@ -333,10 +347,10 @@ class TestSetThroughTheRealUpsert:
         arrival order must now be silent and must not rewrite anything."""
         rows = [_row(**PRINCIPAL), _row(**INCIDENTE), _row(**MEDIDA)]
         _sync(db, lawyer, rows)
-        first = _case(db)
+        first = _case(db, PRINCIPAL["cuaderno"])
         fp, at = first.listing_fingerprint, first.listing_fingerprint_at
         _sync(db, lawyer, list(reversed(rows)))
-        c = _case(db)
+        c = _case(db, PRINCIPAL["cuaderno"])
         assert c.listing_fingerprint == fp
         assert c.listing_fingerprint_at == at
         assert _changed_lines(sync_logs) == []
@@ -350,6 +364,23 @@ class TestSetThroughTheRealUpsert:
         assert "rows=1->2" in msg
         assert "changed=cuaderno" in msg
 
+    def test_a_new_cuaderno_is_a_second_case_and_the_rol_set_still_changes(
+        self, db, lawyer, sync_logs
+    ):
+        """``cuaderno`` is part of the case identity (rol, court, procedure): the
+        same ROL listed with a NEW cuaderno creates a second Case row instead of
+        rewriting the first one. The fingerprint observation groups listing rows
+        by ROL, so the already-known Case still sees the ROL-level set change.
+        """
+        _sync(db, lawyer, [_row(**PRINCIPAL)])
+        _sync(db, lawyer, [_row(**PRINCIPAL), _row(**INCIDENTE)])
+        assert db.query(Case).count() == 2
+        assert _case(db, PRINCIPAL["cuaderno"]).listing_fingerprint == _case(
+            db, INCIDENTE["cuaderno"]
+        ).listing_fingerprint
+        (line,) = _changed_lines(sync_logs)
+        assert "rows=1->2" in line.getMessage()
+
     def test_duplicate_rows_in_one_pass_are_one_row(self, db, lawyer, sync_logs):
         _sync(db, lawyer, [_row(), _row()])
         assert _case(db).listing_fingerprint == _legacy_single_row_hash(_row())
@@ -358,11 +389,12 @@ class TestSetThroughTheRealUpsert:
 
     def test_rows_of_one_rol_group_regardless_of_rol_case_and_spaces(self, db, lawyer):
         _sync(db, lawyer, [_row(rol="c-1234-2025 ", **PRINCIPAL), _row(**INCIDENTE)])
-        c = _case(db)
-        # one case, and its fingerprint covers BOTH rows
-        assert c.listing_fingerprint == compute_listing_set_fingerprint(
+        # one case per cuaderno, and each fingerprint covers BOTH rows of the ROL
+        expected = compute_listing_set_fingerprint(
             [_row(rol="c-1234-2025 ", **PRINCIPAL), _row(**INCIDENTE)]
         )
+        for procedure in (PRINCIPAL["cuaderno"], INCIDENTE["cuaderno"]):
+            assert _case(db, procedure).listing_fingerprint == expected
 
     def test_distinct_rols_never_mix(self, db, lawyer):
         _sync(db, lawyer, [_row(rol="C-1-2025"), _row(rol="C-2-2025", **INCIDENTE)])
@@ -377,12 +409,16 @@ class TestSetThroughTheRealUpsert:
     def test_multi_row_raw_columns_do_not_depend_on_order(self, db, lawyer):
         rows = [_row(**PRINCIPAL), _row(**INCIDENTE)]
         _sync(db, lawyer, rows)
-        a = (_case(db).listing_estado_raw, _case(db).listing_cuaderno_raw)
-        c = _case(db)
+        procedure = PRINCIPAL["cuaderno"]
+        a = (
+            _case(db, procedure).listing_estado_raw,
+            _case(db, procedure).listing_cuaderno_raw,
+        )
+        c = _case(db, procedure)
         c.listing_fingerprint = None
         db.commit()
         _sync(db, lawyer, list(reversed(rows)))
-        c = _case(db)
+        c = _case(db, procedure)
         assert (c.listing_estado_raw, c.listing_cuaderno_raw) == a
 
     def test_single_row_raw_columns_keep_none_as_none(self, db, lawyer):
@@ -426,11 +462,11 @@ class TestPartialPass:
     ):
         full = [_row(**PRINCIPAL), _row(**INCIDENTE)]
         _sync(db, lawyer, full)
-        before = _case(db)
+        before = _case(db, PRINCIPAL["cuaderno"])
         fp, at, raw = before.listing_fingerprint, before.listing_fingerprint_at, before.listing_rows_raw
         # PJUD cut the listing: only ONE of the two rows arrived
         _sync(db, lawyer, [_row(**PRINCIPAL)], listing_complete=False)
-        after = _case(db)
+        after = _case(db, PRINCIPAL["cuaderno"])
         assert (after.listing_fingerprint, after.listing_fingerprint_at, after.listing_rows_raw) == (
             fp, at, raw,
         )
@@ -471,13 +507,16 @@ class TestPartialPass:
 
 class TestChangeLogCarriesAllSevenCells:
     def test_every_cell_logs_old_and_new(self, db, lawyer, sync_logs):
+        """Tribunal and cuaderno are part of the causa's identity since T3c, so a
+        change there creates a new Case row and is not logged as an in-place
+        change: they stay equal here and only the other cells mutate."""
         old = dict(
-            rol="C-1234-2025", tribunal="T-old", caratulado="CAR-old", fecha_ingreso="01/01/2025",
-            estado_cuaderno="EST-old", cuaderno="CUA-old", institucion="INS-old",
+            rol="C-1234-2025", tribunal="T-same", caratulado="CAR-old", fecha_ingreso="01/01/2025",
+            estado_cuaderno="EST-old", cuaderno="CUA-same", institucion="INS-old",
         )
         new = dict(
-            rol="C-1234-2025", tribunal="T-new", caratulado="CAR-new", fecha_ingreso="02/02/2025",
-            estado_cuaderno="EST-new", cuaderno="CUA-new", institucion="INS-new",
+            rol="C-1234-2025", tribunal="T-same", caratulado="CAR-new", fecha_ingreso="02/02/2025",
+            estado_cuaderno="EST-new", cuaderno="CUA-same", institucion="INS-new",
         )
         _sync(db, lawyer, ScrapedCase(**old))
         _sync(db, lawyer, ScrapedCase(**new))
@@ -515,12 +554,15 @@ class TestChangeLogCarriesAllSevenCells:
         assert "estado_cuaderno='Tramitación'->'Tramitación'" in msg
 
     def test_old_values_survive_a_chain_of_changes(self, db, lawyer, sync_logs):
-        _sync(db, lawyer, _row(cuaderno="A"))
-        _sync(db, lawyer, _row(cuaderno="B"))
-        _sync(db, lawyer, _row(cuaderno="C"))
+        """Tribunal and cuaderno are part of the causa's identity since T3c, so a
+        change there creates a new Case row and is not logged as an in-place
+        change: the chain mutates ``estado_cuaderno`` instead."""
+        _sync(db, lawyer, _row(estado_cuaderno="A"))
+        _sync(db, lawyer, _row(estado_cuaderno="B"))
+        _sync(db, lawyer, _row(estado_cuaderno="C"))
         msgs = [r.getMessage() for r in _changed_lines(sync_logs)]
-        assert "cuaderno='A'->'B'" in msgs[0]
-        assert "cuaderno='B'->'C'" in msgs[1]
+        assert "estado_cuaderno='A'->'B'" in msgs[0]
+        assert "estado_cuaderno='B'->'C'" in msgs[1]
 
 
 def test_cell_values_render_in_a_stable_order():

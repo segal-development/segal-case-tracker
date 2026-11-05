@@ -180,7 +180,15 @@ def test_reassignment_does_not_break_sync_dedup(db, lawyer_a, lawyer_b, court):
     asignación-por-nivel override."""
     from app.services.sync_service import ScrapedCase, SyncService
 
-    case = _make_case(db, lawyer_a, court, "C-500-2024", matriz="M1 Baja")
+    # sync_cases needs the firm lawyer to exist (new cases are firm-owned).
+    # Seeded here, not in a fixture: other tests in this file count lawyers.
+    db.add(Lawyer(rut="16021492-9", name="Firm", is_active=True))
+    db.commit()
+
+    case = _make_case(
+        db, lawyer_a, court, "C-500-2024", matriz="M1 Baja",
+        procedure="Ejecutivo",  # part of the case identity (rol, court, procedure)
+    )
     case.assigned_lawyer_id = lawyer_b.id
     case.assigned_at = datetime.utcnow()
     case.assigned_by_rut = ADMIN_RUT

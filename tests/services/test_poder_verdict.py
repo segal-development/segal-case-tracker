@@ -236,13 +236,13 @@ class TestEngine:
         DeadlineEngine.recompute_case(db, case)
         assert _row(db, case).status == with_verdict == "cumplido"
 
-    def test_active_row_without_compliance_keeps_active_status_and_no_verdict_yet(
+    def test_overdue_row_without_compliance_is_closed_with_a_no_cumplido_verdict(
         self, db, case
     ) -> None:
         _add(db, case, TRIGGER, PREVIO)
         DeadlineEngine.recompute_case(db, case)  # TODAY is 12 days past due, beyond margin
         row = _row(db, case)
-        assert row.status == "active"
+        assert row.status == "expired"  # past its term AND margin: no longer live
         assert row.verdict == "no_cumplido"
 
     def test_existing_engine_written_cumplido_row_gets_its_verdict_on_next_recompute(

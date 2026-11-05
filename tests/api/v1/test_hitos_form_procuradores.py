@@ -354,3 +354,57 @@ def test_duplicado_nombra_el_hito_existente(client, db, storage, link, tipo, law
     assert "09-09-2026" in detail
     assert "aprobado" in detail
     assert "CARLA PATRICIA LAVÍN BENITO" in detail
+
+
+# --------------------------------------------------------------------------- #
+# Field length: a too-long text is a clear 422, never a 500 from the database
+# --------------------------------------------------------------------------- #
+# The limits are the columns' own (hitos.procedimiento is varchar(100), etc.).
+LIMITES = {"rol_causa": 50, "procedimiento": 100, "descripcion": 500, "tribunal": 255}
+
+REAL_PROCEDIMIENTO = (
+    "Recurso de Protección con documentación. Liquidación de sueldo, "
+    "Correo RR.HH y domicilio del cliente."
+)  # the text that produced the 500 in production
+
+
+def test_the_real_text_that_broke_production_is_a_422_naming_the_field(
+    client, db, storage, link, tipo, lawyer
+):
+    assert len(REAL_PROCEDIMIENTO) > LIMITES["procedimiento"]
+
+    r = _post(client, _form(tipo.id, lawyer.id, procedimiento=REAL_PROCEDIMIENTO))
+
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert "procedimiento" in detail
+    assert "100" in detail
+    assert str(len(REAL_PROCEDIMIENTO)) in detail
+
+
+@pytest.mark.parametrize("field", list(LIMITES))
+def test_one_character_over_the_limit_is_rejected_and_nothing_is_saved(
+    client, db, storage, link, tipo, lawyer, field
+):
+    r = _post(client, _form(tipo.id, lawyer.id, **{field: "x" * (LIMITES[field] + 1)}))
+
+    assert r.status_code == 422
+    assert field in r.json()["detail"]
+    assert db.query(Hito).count() == 0
+    assert storage.store == {}, "a rejected hito must not leave an orphan upload"
+
+
+@pytest.mark.parametrize("field", list(LIMITES))
+def test_exactly_at_the_limit_is_accepted(client, db, storage, link, tipo, lawyer, field):
+    r = _post(client, _form(tipo.id, lawyer.id, **{field: "x" * LIMITES[field]}))
+
+    assert r.status_code == 201, r.text
+    assert db.query(Hito).count() == 1
+
+
+def test_surrounding_spaces_do_not_count_toward_the_limit(client, db, storage, link, tipo, lawyer):
+    padded = "  " + "x" * LIMITES["procedimiento"] + "  "
+
+    r = _post(client, _form(tipo.id, lawyer.id, procedimiento=padded))
+
+    assert r.status_code == 201, r.text

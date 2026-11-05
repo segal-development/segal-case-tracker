@@ -11,7 +11,6 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Text,
-    UniqueConstraint,
     func,
     text,
 )
@@ -31,13 +30,12 @@ class Case(Base):
     ``case_ids_for_abogado``), so a lawyer sees a case iff they are an
     abogado-of-record litigante on it — not by matching ``lawyer_id``.
 
-    ``uq_cases_lawyer_rol`` below therefore now effectively enforces ONE
-    canonical ``Case`` per ROL under the firm's ``lawyer_id`` (it degenerates
-    from "one case per (lawyer, rol) pair" to "one case per rol", since every
-    row shares the same firm ``lawyer_id``). This prevents duplicate `Case`
-    rows for the same ROL being created for different lawyers, which is the
-    exact bug Approach C's migration (``case_merge`` / migration 024)
-    resolves for pre-existing data.
+    ``uq_cases_identity`` (bottom of this module, migration 072) enforces ONE
+    canonical ``Case`` per (rol, court, cuaderno) under the firm's
+    ``lawyer_id``. It replaced ``uq_cases_lawyer_rol``, which keyed on ROL
+    alone and therefore could not represent the same ROL in two courts (two
+    different juicios). Duplicate rows for different lawyers are the bug
+    Approach C's migration (``case_merge`` / migration 024) resolves.
 
     Asignación por nivel (``assigned_lawyer_id``): a THIRD, independent axis
     on top of the two above. ``CaseLitigante``/``resolve_case_scope`` reflect
@@ -55,7 +53,6 @@ class Case(Base):
 
     __tablename__ = "cases"
     __table_args__ = (
-        UniqueConstraint("lawyer_id", "rol", name="uq_cases_lawyer_rol"),
         Index("ix_cases_assigned_lawyer_matriz", "assigned_lawyer_id", "matriz"),
     )
 
@@ -204,3 +201,16 @@ class Case(Base):
 # SQL-level equivalent of ``Case.effective_lawyer_id``, for use in queries
 # (filters, joins, group-by) so no call site hand-rolls the COALESCE.
 EFFECTIVE_LAWYER_ID = func.coalesce(Case.assigned_lawyer_id, Case.lawyer_id)
+
+
+# Identity of a causa: the same ROL in two courts, or in two cuadernos of one
+# court, are different rows (migration 072). ``procedure`` is coalesced so a
+# missing cuaderno cannot defeat the key (NULL != NULL in a plain unique).
+Index(
+    "uq_cases_identity",
+    Case.lawyer_id,
+    Case.rol,
+    Case.court_id,
+    func.coalesce(Case.procedure, ""),
+    unique=True,
+)

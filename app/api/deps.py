@@ -44,9 +44,36 @@ async def get_current_lawyer(
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    # TODO: Fetch lawyer from database using payload["sub"]
-    # For now, return the payload
+    # A blocked person (is_active False) loses the session at once, not when the token
+    # expires. A missing flag (None) still means active; an unknown subject keeps the
+    # previous behaviour (the route that needs the person answers 404 itself).
+    from app.models.lawyer import Lawyer
+
+    sub = payload.get("sub") or payload.get("lawyer_id")
+    if sub is not None:
+        try:
+            lawyer = db.query(Lawyer).filter(Lawyer.id == int(sub)).first()
+        except (TypeError, ValueError):
+            lawyer = db.query(Lawyer).filter(Lawyer.rut == str(sub)).first()
+        if lawyer is not None and lawyer.is_active is False:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Cuenta bloqueada",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
     return payload
+
+
+async def get_current_rut(payload: dict = Depends(get_current_lawyer)) -> str:
+    """The signed-in person's RUT (JWT subject). Goes through ``get_current_lawyer``, so a
+    blocked person is refused here too."""
+    rut = payload.get("sub")
+    if not rut:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token no contiene RUT",
+        )
+    return str(rut)
 
 
 async def require_admin(
@@ -181,7 +208,7 @@ def firm_lawyer_id(db: Session) -> int:
     """Resolve the firm's canonical ``Lawyer.id`` from ``FIRM_LAWYER_RUT``.
 
     Centralizes the pattern duplicated at ``deps.py`` (``_resolve_lawyer_id``)
-    and ``stats.py`` (``get_public_overview``): the firm's canonical
+    and ``stats.py``: the firm's canonical
     ``lawyer_id`` is the sole owner of every ``Case`` row (Approach C).
     Defaults to ``"16021492-9"`` when the env var is unset, matching the
     existing auditor-firm convention.
@@ -321,26 +348,33 @@ def resolve_case_scope(db: Session, current_lawyer: dict):
         raise HTTPException(status_code=401, detail="Invalid token")
 
     from app.models.lawyer import Lawyer
-    from app.services.lawyer_roster import case_ids_for_abogado
+    from app.services import lawyer_roster
 
     if isinstance(sub, int) or (isinstance(sub, str) and sub.isdigit()):
         lawyer = db.query(Lawyer).filter(Lawyer.id == int(sub)).first()
         if lawyer is None:
             return set()
-        if lawyer.role in ("auditor", "admin"):
-            return ALL_CASES
-        return case_ids_for_abogado(db, lawyer.rut, lawyer.rut) | _bootstrap_owned_case_ids(
-            db, lawyer.id
-        )
-
-    lawyer = db.query(Lawyer).filter(Lawyer.rut == sub).first()
-    if not lawyer:
-        raise HTTPException(status_code=404, detail="Lawyer not found")
+    else:
+        lawyer = db.query(Lawyer).filter(Lawyer.rut == sub).first()
+        if not lawyer:
+            raise HTTPException(status_code=404, detail="Lawyer not found")
     if lawyer.role in ("auditor", "admin"):
         return ALL_CASES
-    return case_ids_for_abogado(db, lawyer.rut, lawyer.rut) | _bootstrap_owned_case_ids(
-        db, lawyer.id
-    )
+
+    # Cache key carries id AND rut AND role (the lawyer row is still read per
+    # request, so a role change or deleted account is never served stale).
+    use_cache = lawyer_roster._scope_cache_ttl() > 0
+    key = ("scope", lawyer.id, lawyer.rut, lawyer.role)
+    if use_cache:
+        cached = lawyer_roster._scope_cache_get(key)
+        if cached is not None:
+            return set(cached)
+    scope = lawyer_roster.case_ids_for_abogado(
+        db, lawyer.rut, lawyer.rut
+    ) | _bootstrap_owned_case_ids(db, lawyer.id)
+    if use_cache:
+        lawyer_roster._scope_cache_put(key, frozenset(scope))
+    return scope
 
 
 def apply_case_scope(query, scope):

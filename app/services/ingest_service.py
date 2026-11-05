@@ -22,6 +22,7 @@ from app.api.deps import firm_lawyer_id
 from app.api.v1.auth import _get_or_create_lawyer
 from app.models.case import Case
 from app.models.case_lawyer_source import CaseLawyerSource
+from app.models.court import Court
 from app.models.document import Document
 from app.models.lawyer import Lawyer
 from app.models.movement import Movement
@@ -75,6 +76,11 @@ def _parse_filed_at(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def _court_name(c) -> str:
+    """Court name of a parsed listing row, as ``ingest_cases`` stores it."""
+    return (c.tribunal or "Desconocido").strip() or "Desconocido"
+
+
 def _rol_year(rol: str) -> Optional[int]:
     """Extract the 4-digit year from a ``C-<n>-<year>`` ROL, or ``None``."""
     match = re.search(r"-(\d{4})$", rol)
@@ -120,12 +126,14 @@ class IngestService:
             parsed.extend(scraper._parse_cases_html(html))
 
         # Dedup within the payload itself (same case can repeat across pages).
+        # Keyed on the case identity (rol, court, cuaderno), not the ROL: the
+        # same ROL in another court or cuaderno is a different causa.
         seen = set()
         unique = []
         for c in parsed:
-            rol = c.rol.strip().upper()
-            if rol not in seen:
-                seen.add(rol)
+            key = (c.rol.strip().upper(), _court_name(c), c.cuaderno or "")
+            if key not in seen:
+                seen.add(key)
                 unique.append(c)
 
         # Resolve the firm's canonical owner BEFORE touching any row — a
@@ -135,10 +143,24 @@ class IngestService:
         lawyer = _get_or_create_lawyer(self.db, rut=lawyer_rut)
         syncing_lawyer_id = int(lawyer.id)
 
-        existing_rols = {
-            r for (r,) in self.db.query(Case.rol).filter(Case.lawyer_id == owner_id)
+        payload_rols = {c.rol.strip().upper() for c in unique}
+        # name -> id of the courts that already exist. A payload row whose
+        # court does not exist yet cannot be an existing case.
+        court_ids: dict = {
+            name: cid
+            for (cid, name) in self.db.query(Court.id, Court.name).filter(
+                Court.name.in_({_court_name(c) for c in unique})
+            )
         }
-        new_cases = [c for c in unique if c.rol.strip().upper() not in existing_rols]
+        existing_identities = self._firm_identities(owner_id, payload_rols)
+
+        def _is_existing(c) -> bool:
+            cid = court_ids.get(_court_name(c))
+            return cid is not None and SyncService._identity_key(
+                c.rol.strip().upper(), cid, c.cuaderno
+            ) in existing_identities
+
+        new_cases = [c for c in unique if not _is_existing(c)]
 
         # Year floor: never INGEST cases whose ROL year is below DETAIL_MIN_YEAR.
         # The firm only works cases from that year onward; older ones would sit
@@ -157,19 +179,18 @@ class IngestService:
 
         if new_cases:
             sync = SyncService(self.db)
-            courts: dict = {}
             now = datetime.utcnow()
             mappings = []
             for c in new_cases:
-                name = (c.tribunal or "Desconocido").strip() or "Desconocido"
-                if name not in courts:
+                name = _court_name(c)
+                if name not in court_ids:
                     court = sync._get_or_create_court(name, competencia)
-                    courts[name] = court.id
+                    court_ids[name] = court.id
                 plaintiff, defendant = sync._parse_caratulado(c.caratulado)
                 mappings.append(
                     {
                         "lawyer_id": owner_id,
-                        "court_id": courts[name],
+                        "court_id": court_ids[name],
                         "rol": c.rol.strip().upper(),
                         "competencia": competencia,
                         "plaintiff": plaintiff,
@@ -191,10 +212,13 @@ class IngestService:
                 # concurrently. Roll back, re-check what's actually in the DB
                 # now, and retry with only the rols that are still missing.
                 self.db.rollback()
-                existing_rols_retry = {
-                    r for (r,) in self.db.query(Case.rol).filter(Case.lawyer_id == owner_id)
-                }
-                retry_mappings = [m for m in mappings if m["rol"] not in existing_rols_retry]
+                identities_retry = self._firm_identities(owner_id, payload_rols)
+                retry_mappings = [
+                    m
+                    for m in mappings
+                    if SyncService._identity_key(m["rol"], m["court_id"], m["procedure"])
+                    not in identities_retry
+                ]
                 skipped = len(mappings) - len(retry_mappings)
                 if retry_mappings:
                     self.db.bulk_insert_mappings(Case, retry_mappings)
@@ -206,16 +230,20 @@ class IngestService:
         # (new or already-existing under the firm id) via case_lawyer_source
         # — this is what lets get_pending_detail rotate per syncing lawyer
         # even though every Case is firm-owned (ADR-002).
-        all_rols = {c.rol.strip().upper() for c in unique}
-        if all_rols:
-            case_ids_by_rol = {
-                rol: cid
-                for (cid, rol) in self.db.query(Case.id, Case.rol).filter(
-                    Case.lawyer_id == owner_id, Case.rol.in_(all_rols)
+        if payload_rols:
+            case_ids_by_identity = self._firm_identities(owner_id, payload_rols)
+            sighted_ids = []
+            for c in unique:
+                cid = court_ids.get(_court_name(c))
+                if cid is None:
+                    continue  # skipped by the year floor: no court, no case
+                case_id = case_ids_by_identity.get(
+                    SyncService._identity_key(c.rol.strip().upper(), cid, c.cuaderno)
                 )
-            }
+                if case_id is not None:
+                    sighted_ids.append(case_id)
             self._bulk_upsert_case_lawyer_source(
-                case_ids_by_rol.values(), syncing_lawyer_id, datetime.utcnow()
+                sighted_ids, syncing_lawyer_id, datetime.utcnow()
             )
             self.db.commit()
 
@@ -236,6 +264,20 @@ class IngestService:
             )
 
         return result
+
+    def _firm_identities(self, owner_id: int, rols) -> dict:
+        """{(rol, court_id, procedure): case_id} of the firm's cases for ``rols``.
+
+        Lowest id wins when legacy duplicates share an identity (T5 merges them).
+        """
+        identities: dict = {}
+        for cid, rol, court_id, procedure in (
+            self.db.query(Case.id, Case.rol, Case.court_id, Case.procedure)
+            .filter(Case.lawyer_id == owner_id, Case.rol.in_(rols))
+            .order_by(Case.id)
+        ):
+            identities.setdefault(SyncService._identity_key(rol, court_id, procedure), cid)
+        return identities
 
     def _record_sync_history(self, lawyer_id: int, competencia: str) -> None:
         """Write a single completed ``SyncHistory`` row for a syncing lawyer.

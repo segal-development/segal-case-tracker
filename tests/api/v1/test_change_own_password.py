@@ -139,13 +139,12 @@ def test_user_without_password_is_rejected_with_clear_message(client, db):
 
 
 def test_requires_authentication(client, user):
-    # HTTPBearer on FastAPI 0.109 answers 403 (not 401) when the header is
-    # missing; this is the behavior of every protected endpoint in the app.
+    # No header -> 401, like every other protected endpoint (the /auth routes now share the
+    # dependency that also refuses a blocked person).
     resp = client.post(
         URL, json={"current_password": "oldpassword1", "new_password": "brandnewpass2"}
     )
-    assert resp.status_code in (401, 403)  # pinned below once observed
-    assert resp.status_code == 403
+    assert resp.status_code == 401
 
 
 def test_invalid_token_is_401(client, user):

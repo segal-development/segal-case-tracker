@@ -313,13 +313,13 @@ class TestSafety:
         assert DEADLINE_LABELS["reposicion_auto_prueba_3d"] == "Reposición del auto de prueba"
 
     def test_apelacion_5d_reflects_ejecutado_basis(self) -> None:
-        """Task 2: APELACION_5D reflects the DEFENSE (ejecutado) rule — art. 475
-        CPC, solo efecto devolutivo — since the firm is always the ejecutado
-        and never appeals as ejecutante (art. 187's ambos-efectos basis)."""
+        """APELACION_5D: 10 días hábiles under art. 189 CPC (Carla Segal,
+        2026-10-23); the identifier keeps its historical "5d". The label still
+        reflects the DEFENSE (ejecutado) rule — solo efecto devolutivo."""
         from app.core.deadlines_config import DEADLINE_LABELS
 
-        assert DeadlineType.APELACION_5D.legal_basis == "art. 475 CPC"
-        assert DeadlineType.APELACION_5D.dias_habiles == 5
+        assert DeadlineType.APELACION_5D.legal_basis == "art. 189 CPC"
+        assert DeadlineType.APELACION_5D.dias_habiles == 10
         assert DeadlineType.APELACION_5D.is_fatal is True
         assert "devolutivo" in DEADLINE_LABELS["apelacion_5d"].lower()
 
@@ -414,7 +414,7 @@ class TestSafety:
         assert state == ProceduralState.SENTENCIA
         assert DeadlineType.APELACION_5D in triggers
         from app.core.deadlines_config import DeadlineType as DT
-        assert DT.APELACION_5D.legal_basis == "art. 475 CPC"
+        assert DT.APELACION_5D.legal_basis == "art. 189 CPC"
         # Trigger date must be the sentencia movement date
         from datetime import datetime
         trigger = triggers[DeadlineType.APELACION_5D]

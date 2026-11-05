@@ -127,7 +127,7 @@ class TestVerdictOnClose:
         DeadlineEngine.recompute_case(db, case)
 
         (row,) = _exc_rows(db, case)
-        assert row.status == "active"  # overdue but nothing moved on: still ROJO
+        assert row.status == "expired"  # overdue, nothing moved on: closed, still ROJO (mandatory)
         assert row.verdict == Verdict.NO_CUMPLIDO.value
         assert row.verdict_movement_id is None
 

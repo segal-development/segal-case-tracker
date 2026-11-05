@@ -22,6 +22,7 @@ from sqlalchemy import or_
 from sqlalchemy.sql import nullslast
 
 from app.api.deps import (
+    ALL_CASES,
     get_current_lawyer,
     get_db,
     require_auditor,
@@ -34,6 +35,7 @@ from app.core.deadlines_config import (
     PARALLEL_DEADLINE_VALUES,
     DeadlineType,
 )
+from app.config import settings
 from app.core.decision_rules import RECOMMENDATION_DISCLAIMER, resolve_rule
 from app.models.alert import Alert
 from app.models.case import Case
@@ -41,6 +43,7 @@ from app.models.case_deadline import CaseDeadline
 from app.models.case_litigante import CaseLitigante
 from app.models.lawyer import Lawyer
 from app.services.business_days import count_business_days_remaining, add_business_days
+from app.services.deadline_engine import _today_chile, is_medida_prejudicial
 
 from zoneinfo import ZoneInfo
 
@@ -89,7 +92,8 @@ _DEADLINE_ACTIONS: dict[str, str] = {
     "sentencia_10d": "Vence el plazo para dictar sentencia definitiva (arts. 162/470 CPC).",
     "apelacion_5d": (
         "Vence el plazo para apelar de la sentencia; el ejecutado apela con "
-        "solo efecto devolutivo, por lo que el apremio continúa (art. 475 CPC)."
+        "solo efecto devolutivo, por lo que el apremio continúa (art. 475 CPC). "
+        "El plazo para apelar la sentencia definitiva es de 10 días hábiles (art. 189 CPC)."
     ),
 }
 
@@ -112,6 +116,10 @@ class DeadlineItemResponse(BaseModel):
     status: str
     is_manual: bool = False
     source_movement_id: Optional[int] = None
+    # True only for a live acreditar-poder plazo that is provably the firm's own
+    # (same rule the home panel uses). That plazo never colours the case's
+    # semáforo, so a client can show it next to a green "Al día" without lying.
+    firm_obligation: bool = False
 
     class Config:
         from_attributes = True
@@ -455,6 +463,74 @@ async def list_audited_deadlines(
     ]
 
 
+class SemaforoReadingResponse(BaseModel):
+    term_days: int
+    due_date: date
+    #: null once that reading's last day has gone by.
+    level: Optional[str] = None
+
+
+class SemaforoPanelRowResponse(BaseModel):
+    deadline_id: int
+    case_id: int
+    rol: str
+    caratula: str
+    tribunal: Optional[str] = None
+    abogado_id: Optional[int] = None
+    abogado_nombre: Optional[str] = None
+    deadline_type: str
+    label: str
+    due_date: date
+    #: Negative once expired.
+    dias_habiles_remaining: int
+    #: "verde" | "amarillo" | "rojo" from deadline_semaforo.assess; null in `vencidos`.
+    level: Optional[str] = None
+    #: false: several possible terms, none confirmed (see `readings`).
+    term_confirmed: Optional[bool] = None
+    #: Solo en ``vencidos``: no_cumplido = no se presento nada;
+    #: fuera_de_plazo = SI se presento, tarde. Son cosas distintas.
+    verdict: Optional[str] = None
+    readings: List[SemaforoReadingResponse] = []
+    #: Every lawyer on the plazo (several when the same case is stored under
+    #: more than one firm lawyer and was collapsed into this row).
+    abogados: List[str] = []
+
+
+class SemaforoPanelResponse(BaseModel):
+    today: date
+    expired_window_days: int
+    por_vencer: List[SemaforoPanelRowResponse]
+    vencidos: List[SemaforoPanelRowResponse]
+
+
+@router.get("/deadlines/semaforo", response_model=SemaforoPanelResponse)
+async def get_semaforo_panel(
+    current_lawyer: dict = Depends(get_current_lawyer),
+    db: Session = Depends(get_db),
+):
+    """Fatal plazos for the home-screen panel. Read-only.
+
+    ``por_vencer``: live plazos with the level from ``deadline_semaforo.assess``
+    (most urgent first). ``vencidos``: expired and unfiled inside
+    ``SEMAFORO_EXPIRED_WINDOW_DAYS``. Plazos that are the counterparty's are
+    never returned. Scoped via ``resolve_case_scope``: admin/auditor see the
+    firm, every other role its own cases.
+    """
+    from dataclasses import asdict
+
+    from app.services.semaforo_panel import build_panel
+
+    scope = resolve_case_scope(db, current_lawyer)
+    today = _today_chile()
+    panel = build_panel(db, today, None if scope is ALL_CASES else scope)
+    return SemaforoPanelResponse(
+        today=today,
+        expired_window_days=settings.SEMAFORO_EXPIRED_WINDOW_DAYS,
+        por_vencer=[SemaforoPanelRowResponse(**asdict(r)) for r in panel.por_vencer],
+        vencidos=[SemaforoPanelRowResponse(**asdict(r)) for r in panel.vencidos],
+    )
+
+
 @router.get("/deadlines/verdicts", response_model=list[DeadlineVerdictResponse])
 async def list_deadline_verdicts(
     current_lawyer: dict = Depends(get_current_lawyer),
@@ -691,8 +767,11 @@ async def get_case_deadlines(
     today = datetime.now(_CHILE_TZ).date()
 
     # Fetch active deadline rows ordered by due_date ASC
+    # A medida prejudicial carries no plazos: stale rows must not leak.
     deadline_rows: list[CaseDeadline] = (
-        db.query(CaseDeadline)
+        []
+        if is_medida_prejudicial(case.procedure)
+        else db.query(CaseDeadline)
         .filter(
             CaseDeadline.case_id == case_id,
             # active + audited (cumplido/no_cumplido) so the lawyer SEES audited
@@ -702,6 +781,13 @@ async def get_case_deadlines(
         .order_by(CaseDeadline.due_date.asc())
         .all()
     )
+
+    def _is_firm_obligation(row: CaseDeadline) -> bool:
+        if row.deadline_type != DeadlineType.ACREDITAR_PODER_3D.value or row.status != "active":
+            return False
+        from app.services.sync_service import poder_obligation_is_ours
+
+        return poder_obligation_is_ours(db, case, row, today) is not None
 
     active_deadlines: list[DeadlineItemResponse] = [
         DeadlineItemResponse(
@@ -715,6 +801,7 @@ async def get_case_deadlines(
             status=row.status,
             is_manual=row.is_manual,
             source_movement_id=row.source_movement_id,
+            firm_obligation=_is_firm_obligation(row),
         )
         for row in deadline_rows
     ]

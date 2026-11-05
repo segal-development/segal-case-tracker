@@ -14,7 +14,7 @@ class Document(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     case_id = Column(Integer, ForeignKey("cases.id"), nullable=False)
-    movement_id = Column(Integer, ForeignKey("movements.id"), nullable=True)
+    movement_id = Column(Integer, ForeignKey("movements.id"), nullable=True, index=True)
     # Slice 1: optional FK to the CaseEscrito that originated this cert document
     escrito_id = Column(Integer, ForeignKey("case_escritos.id"), nullable=True)
 

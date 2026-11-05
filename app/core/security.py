@@ -4,8 +4,7 @@ import base64
 from datetime import datetime, timedelta
 from typing import Optional, cast
 
-from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.security import HTTPBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from cryptography.fernet import Fernet, MultiFernet
@@ -58,37 +57,6 @@ def decode_access_token(token: str) -> Optional[dict]:
         return cast(dict, payload)
     except JWTError:
         return None
-
-
-async def get_current_lawyer(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-) -> str:
-    """
-    Dependency to get current lawyer RUT from JWT token.
-    
-    Usage:
-        @router.get("/my-cases")
-        async def get_my_cases(rut: str = Depends(get_current_lawyer)):
-            ...
-    """
-    token = credentials.credentials
-    payload = decode_access_token(token)
-    
-    if not payload:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token inválido o expirado",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
-    rut = payload.get("sub")
-    if not rut:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token no contiene RUT",
-        )
-
-    return str(rut)
 
 
 # =============================================================================

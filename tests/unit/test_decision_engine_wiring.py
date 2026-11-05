@@ -150,7 +150,12 @@ class TestDecisionEngineWiring:
         assert case.next_review_at is None
 
     def test_recompute_sets_solicitar_abandono_when_abandono_disponible(self, db) -> None:
-        case = _make_case(db, last_movement_at=datetime(2024, 1, 1))
+        # filed recently so the unnotified-demanda prescripción (which would take
+        # precedence) does not apply; the last movement is old enough for abandono.
+        case = _make_case(
+            db, filed_at=datetime.combine(TODAY - timedelta(days=100), datetime.min.time()),
+            last_movement_at=datetime(2024, 1, 1),
+        )
         _add_movement(db, case.id, date(2024, 1, 1), "Gestión", "Ordena despachar mandamiento")
         _recompute(db, case)
         assert case.abandono_disponible is True

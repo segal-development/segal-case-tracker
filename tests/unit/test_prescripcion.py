@@ -21,6 +21,7 @@ from app.core.database import Base
 from app.models.case import Case
 from app.models.court import Court
 from app.models.lawyer import Lawyer
+from app.models.movement import Movement
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +123,20 @@ class TestComputePrescripcion:
         d = TODAY - relativedelta(**delta)
         return datetime(d.year, d.month, d.day)
 
+    @staticmethod
+    def _notified(filed_at):
+        """A successful notification dated 10 days after filing (inside year 1).
+
+        Since 2026-10-26 a demanda NOT notified within a year of filing is
+        flagged by its own rule, so the tests of the older 1-year / 3-year
+        rules need a notified case to keep exercising those rules.
+        """
+        day = filed_at + relativedelta(days=10)
+        return [types.SimpleNamespace(
+            stage="Gestión", procedure="",
+            description="NOTIFICACIÓN DE DEMANDA (Exitosa)", movement_date=day,
+        )]
+
     def test_pagare_filed_2_years_ago_is_cumplida(self) -> None:
         """Pagaré filed 2 years ago → cumplida=True, fecha = filed_at + 1yr."""
         from app.services.deadline_engine import _compute_prescripcion
@@ -170,7 +185,7 @@ class TestComputePrescripcion:
 
         filed_at = self._filed(years=5)
         case = self._case(titulo_tipo="escritura_publica", filed_at=filed_at)
-        cumplida, prescripcion_fecha = _compute_prescripcion(case, TODAY)
+        cumplida, prescripcion_fecha = _compute_prescripcion(case, TODAY, self._notified(filed_at))
         assert cumplida is True
         assert prescripcion_fecha == filed_at.date() + relativedelta(years=3)
 
@@ -180,7 +195,7 @@ class TestComputePrescripcion:
 
         filed_at = self._filed(years=5)
         case = self._case(titulo_tipo="sentencia", filed_at=filed_at)
-        cumplida, prescripcion_fecha = _compute_prescripcion(case, TODAY)
+        cumplida, prescripcion_fecha = _compute_prescripcion(case, TODAY, self._notified(filed_at))
         assert cumplida is True
         assert prescripcion_fecha == filed_at.date() + relativedelta(years=3)
 
@@ -190,7 +205,7 @@ class TestComputePrescripcion:
 
         filed_at = self._filed(years=5)
         case = self._case(titulo_tipo="otro", filed_at=filed_at)
-        cumplida, prescripcion_fecha = _compute_prescripcion(case, TODAY)
+        cumplida, prescripcion_fecha = _compute_prescripcion(case, TODAY, self._notified(filed_at))
         assert cumplida is True
         assert prescripcion_fecha == filed_at.date() + relativedelta(years=3)
 
@@ -208,7 +223,7 @@ class TestComputePrescripcion:
 
         filed_at = self._filed(years=5)
         case = self._case(titulo_tipo=None, filed_at=filed_at)
-        cumplida, prescripcion_fecha = _compute_prescripcion(case, TODAY)
+        cumplida, prescripcion_fecha = _compute_prescripcion(case, TODAY, self._notified(filed_at))
         assert cumplida is True
         assert prescripcion_fecha == filed_at.date() + relativedelta(years=3)
 
@@ -219,7 +234,7 @@ class TestComputePrescripcion:
 
         filed_at = self._filed(years=2)
         case = self._case(titulo_tipo="escritura_publica", filed_at=filed_at)
-        cumplida, prescripcion_fecha = _compute_prescripcion(case, TODAY)
+        cumplida, prescripcion_fecha = _compute_prescripcion(case, TODAY, self._notified(filed_at))
         assert cumplida is False
         assert prescripcion_fecha == filed_at.date() + relativedelta(years=3)
 
@@ -258,6 +273,23 @@ class TestComputePrescripcion:
 # ---------------------------------------------------------------------------
 
 
+class TestUnnotifiedAfterFirstYear:
+    """Without a notification in year 1 the new rule flags even a 2-year-old case."""
+
+    def test_general_titulo_within_3yr_but_never_notified_is_cumplida(self) -> None:
+        from app.services.deadline_engine import _compute_prescripcion
+
+        filed_at = datetime(TODAY.year - 2, TODAY.month, TODAY.day)
+        case = types.SimpleNamespace(titulo_tipo="escritura_publica", filed_at=filed_at)
+        other = types.SimpleNamespace(
+            stage="", procedure="", description="Resolución que provee",
+            movement_date=filed_at + relativedelta(days=5),
+        )
+        cumplida, fecha = _compute_prescripcion(case, TODAY, [other])
+        assert cumplida is True
+        assert fecha == filed_at.date() + relativedelta(years=1)
+
+
 class TestPrescripcionRecompute:
     """Integration: recompute_case writes prescripcion_cumplida and prescripcion_fecha."""
 
@@ -282,6 +314,12 @@ class TestPrescripcionRecompute:
 
         filed_at = self._filed(years=5)
         case = _make_case(db, titulo_tipo="escritura_publica", filed_at=filed_at)
+        db.add(Movement(
+            case_id=case.id, stage="Gestión", procedure="",
+            movement_date=filed_at + relativedelta(days=10),
+            description="NOTIFICACIÓN DE DEMANDA (Exitosa)",
+        ))
+        db.flush()
         DeadlineEngine.recompute_case(db, case)
         assert case.prescripcion_cumplida is True
         assert case.prescripcion_fecha == filed_at.date() + relativedelta(years=3)

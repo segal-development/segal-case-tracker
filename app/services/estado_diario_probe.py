@@ -77,10 +77,17 @@ _TAG_RE = re.compile(r"<[^>]+>")
 
 @dataclass(frozen=True)
 class FeedRow:
-    """One row of the feed. ``tribunal`` is None when the feed did not carry it."""
+    """One row of the feed.
+
+    ``tribunal`` and ``caratulado`` are None when the feed row did not carry
+    them. ``caratulado`` is what tells us WHOSE a case is: a ROL missing from
+    our database says nothing on its own, but its caratulado says whether it is
+    one of the firm's clients or an unrelated third party.
+    """
 
     rol: str
     tribunal: Optional[str] = None
+    caratulado: Optional[str] = None
 
 
 @dataclass
@@ -165,6 +172,19 @@ def classify_response(response) -> ProbeResult:
 
     rol_idx = header_cells.index("rol")
     tribunal_idx = header_cells.index("tribunal") if "tribunal" in header_cells else None
+    # The header check above guarantees the column exists; a short data row
+    # still must not raise -- the probe never breaks the cycle.
+    caratulado_idx = header_cells.index("caratulado")
+    # The caratulado came back empty on the first real run. Log the shape the
+    # feed actually sends -- headers and the first row's cell count -- because
+    # guessing why is what wastes a cycle. One short line per probe.
+    logger.info(
+        "ESTADO_DIARIO_PROBE_SHAPE headers=%r rol_idx=%d caratulado_idx=%d "
+        "tribunal_idx=%s first_row_cells=%d first_row=%r",
+        header_cells, rol_idx, caratulado_idx, tribunal_idx,
+        len(data_rows[0]) if data_rows else 0,
+        data_rows[0][:6] if data_rows else [],
+    )
     feed_rows: List[FeedRow] = []
     for r in data_rows:
         if len(r) <= rol_idx or not r[rol_idx]:
@@ -172,7 +192,12 @@ def classify_response(response) -> ProbeResult:
         tribunal = None
         if tribunal_idx is not None and len(r) > tribunal_idx:
             tribunal = r[tribunal_idx] or None
-        feed_rows.append(FeedRow(rol=r[rol_idx].upper(), tribunal=tribunal))
+        caratulado = r[caratulado_idx] or None if len(r) > caratulado_idx else None
+        feed_rows.append(
+            FeedRow(
+                rol=r[rol_idx].upper(), tribunal=tribunal, caratulado=caratulado
+            )
+        )
     if not feed_rows:
         return ProbeResult(NO_ACTIVITY, status_n)
     return ProbeResult(OK, status_n, rows=feed_rows)
@@ -208,6 +233,8 @@ def staleness_stats(
     normalised equality, to a known ``courts.name`` and none of this lawyer's
     cases with that ROL sits in such a court.
     """
+    from app.services.sync_service import case_belongs_to_lawyer
+
     unique = sorted({r.rol for r in rows})
     tribunals_by_rol: dict = {}
     for r in rows:
@@ -217,7 +244,7 @@ def staleness_stats(
     try:
         found = (
             db.query(Case.rol, Case.last_detail_checked_at, Case.court_id)
-            .filter(Case.rol.in_(unique), Case.lawyer_id == lawyer_id)
+            .filter(Case.rol.in_(unique), case_belongs_to_lawyer(lawyer_id))
             .all()
         )
         found_rols = {rol for rol, _, _ in found}
@@ -227,7 +254,7 @@ def staleness_stats(
             elsewhere = {
                 rol
                 for (rol,) in db.query(Case.rol)
-                .filter(Case.rol.in_(missing), Case.lawyer_id != lawyer_id)
+                .filter(Case.rol.in_(missing), ~case_belongs_to_lawyer(lawyer_id))
                 .distinct()
                 .all()
             }
@@ -273,12 +300,25 @@ def staleness_stats(
             unknown += 1
 
     feed_tribunal: dict = {}
+    feed_caratulado: dict = {}
     for r in rows:
         if r.tribunal and (r.rol not in feed_tribunal or r.tribunal < feed_tribunal[r.rol]):
             feed_tribunal[r.rol] = r.tribunal
+        if r.caratulado and r.rol not in feed_caratulado:
+            feed_caratulado[r.rol] = r.caratulado
 
     def _sample(rols) -> List[FeedRow]:
-        return [FeedRow(rol=r, tribunal=feed_tribunal.get(r)) for r in sorted(rols)]
+        # Carry the caratulado through: a missing ROL says nothing on its own,
+        # its caratulado says whose case it is. Rebuilding the row without it
+        # is why the first real run logged "-" for every sample.
+        return [
+            FeedRow(
+                rol=r,
+                tribunal=feed_tribunal.get(r),
+                caratulado=feed_caratulado.get(r),
+            )
+            for r in sorted(rols)
+        ]
 
     nowhere = [r for r in missing if r not in elsewhere]
     samples = {
@@ -384,7 +424,9 @@ def _log_samples(lawyer_id, fecha: str, stats: Staleness) -> None:
             continue
         shown = rows[:SAMPLE_LIMIT]
         entries = "; ".join(
-            f"{r.rol}@{(r.tribunal or '-').replace(chr(34), chr(39))}" for r in shown
+            f"{r.rol}@{(r.tribunal or '-').replace(chr(34), chr(39))}"
+            f" | {(r.caratulado or '-').replace(chr(34), chr(39))}"
+            for r in shown
         )
         logger.info(
             'ESTADO_DIARIO_PROBE_SAMPLE lawyer=%s date=%s category=%s total=%d '

@@ -23,25 +23,30 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
-from typing import Optional
+from datetime import date, datetime, timedelta, timezone
+from typing import Iterable, Optional
 from zoneinfo import ZoneInfo
 
 from dateutil.relativedelta import relativedelta
 
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 import re as _re
 import unicodedata
 
+from app.config import settings
 from app.core.deadlines_config import (
     ACTIONABLE_DEADLINE_VALUES,
     FATAL_DEADLINE_VALUES,
     DEADLINE_DISCLAIMER,
+    CLASSIFIER_RULES,
     DeadlineType,
     MANDATORY_ACTIONABLE_VALUES,
     OPTIONAL_ACTIONABLE_VALUES,
+    SEMAFORO_EXCLUDED_VALUES,
     PARALLEL_DEADLINE_VALUES,
+    ProcEvent,
     ProceduralState,
     actionable_sets,
 )
@@ -50,9 +55,28 @@ from app.models.case_deadline import CaseDeadline
 from app.models.case_escrito import CaseEscrito
 from app.models.movement import Movement
 from app.services.business_days import add_business_days, count_business_days_remaining
-from app.services.deadline_verdict import evaluate_deadline
-from app.services.poder_deadline import find_poder_obligation
-from app.services.procedural_classifier import MovementClassifier, anchor_date
+from app.services.deadline_verdict import (
+    DETECTORS,
+    Verdict,
+    default_margin_days,
+    evaluate_deadline,
+    is_annulled,
+    is_excepciones_escrito,
+    verdict_rank,
+    verdict_uses_escritos,
+)
+from app.services.poder_deadline import (
+    find_poder_obligation,
+    obligation_is_ours,
+    parse_extended_from,
+)
+from app.services.procedural_classifier import (
+    _REQUERIMIENTO_PAGA_RE,
+    _REQUERIMIENTO_RE,
+    MovementClassifier,
+    anchor_date,
+    due_anchor_date,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -78,9 +102,13 @@ _SEMAFORO_AMARILLO_MAX = 5  # 2–5 → AMARILLO; >5 → VERDE
 # Abandono del procedimiento (art. 152/153 CPC) — state classification sets
 # ---------------------------------------------------------------------------
 
+# Abandono thresholds depend on whether the ejecutado presented a defense
+# (Carla Segal, 2026-10-23): 6 months (art. 152) only when excepciones were
+# opposed and there is no sentencia on them yet; 3 years (art. 153 inc. 2) once
+# there is a sentencia OR when no defense was presented. MANDAMIENTO (not
+# notified yet) keeps the general 6 months: it was not covered.
 _PRE_SENTENCIA_STATES: frozenset[ProceduralState] = frozenset({
     ProceduralState.MANDAMIENTO,
-    ProceduralState.NOTIFICADO,
     ProceduralState.EXCEPCIONES,
     ProceduralState.TRASLADO_EJECUTANTE,
     ProceduralState.ADMISIBILIDAD,
@@ -88,9 +116,12 @@ _PRE_SENTENCIA_STATES: frozenset[ProceduralState] = frozenset({
     ProceduralState.CITACION_SENTENCIA,
 })
 
+# NOTIFICADO is the state of an ejecutado who was notified and has NOT opposed
+# excepciones (an opposition moves the state on), i.e. "no se presentó defensa".
 _POST_SENTENCIA_STATES: frozenset[ProceduralState] = frozenset({
     ProceduralState.SENTENCIA,
     ProceduralState.REBELDE,
+    ProceduralState.NOTIFICADO,
 })
 
 
@@ -101,8 +132,11 @@ def _compute_abandono(
 ) -> bool:
     """Art. 152/153 CPC abandono del procedimiento advisory signal.
 
-    Pre-sentencia states: 6-month inactivity threshold (art. 152 CPC).
-    Post-sentencia states: 3-year inactivity threshold (art. 153 inc. 2 CPC).
+    Excepciones opposed and no sentencia on them (and MANDAMIENTO, not notified
+    yet): 6-month inactivity threshold (art. 152 CPC).
+    Sentencia dictated, or no defense presented (NOTIFICADO, REBELDE): 3-year
+    inactivity threshold (art. 153 inc. 2 CPC), from the last "gestión útil" of
+    the ejecutante, approximated by the last movement of any kind.
     TERMINADA, INDETERMINATE, and unrecognised states: always False (excluded).
     """
     if proc_state is None:
@@ -119,28 +153,66 @@ def _compute_abandono(
     return False
 
 
+_NOTIFICACION_RULE = next(
+    rule for rule in CLASSIFIER_RULES if rule.event == ProcEvent.NOTIFICACION_EXITOSA
+)
+
+
+def _demanda_notified_by(
+    movements: Iterable[Movement], deadline: date
+) -> bool:
+    """True when the demanda was notified on or before *deadline*.
+
+    Same notion of "notified" as the classifier (successful NOTIFICACIÓN DE
+    DEMANDA) plus a Requerimiento de Pago that is neither annulled nor
+    "(Paga)" (the effective notification). Dated by ``anchor_date`` (the
+    ``Diligencia:`` date). Only the upper bound is checked: a notification
+    dated before ``filed_at`` is odd data and, on doubt, counts as notified.
+    """
+    for mv in movements:
+        if is_annulled(mv):
+            continue
+        desc = mv.description or ""
+        notifies = _NOTIFICACION_RULE.matches(desc, mv.stage or "") or (
+            _REQUERIMIENTO_RE.search(desc) is not None
+            and _REQUERIMIENTO_PAGA_RE.search(desc) is None
+        )
+        if notifies and anchor_date(mv) <= deadline:
+            return True
+    return False
+
+
 def _compute_prescripcion(
     case: "Case",
     today: date,
+    movements: Iterable[Movement] = (),
 ) -> tuple[bool, "Optional[date]"]:
     """Statute-of-limitations advisory signal (Chilean law).
 
-    The prescription clock starts from the DEMAND FILING DATE
-    (``Case.filed_at``, "Fecha de ingreso"), NOT the title's vencimiento.
+    Prescription is flagged when EITHER rule holds (the first one wins the
+    reported date):
 
-    Plazo by título type:
-      {"pagare", "letra", "cheque"} → 1 year
-        (art. 98 Ley 18.092 / art. 34 Ley 18.552)
-      everything else (None, "otro", "escritura_publica", "sentencia", ...) →
-        3 years — the GENERAL acción ejecutiva prescription (art. 2515 CC).
-        # 3yr general per art. 2515 CC — confirm exact from-date basis with
-        # legal review. Reusing filed_at (the same base date as the 1yr
-        # títulos-de-crédito path) is a conservative placeholder pending
-        # legal sign-off, not a confirmed art. 2515 CC interpretation.
+    1. Demanda not notified within a year of filing (Carla Segal, 2026-10-26:
+       "si no se logro notificar la demanda dentro de un año desde su
+       presentación, se puede pedir la prescripción"): ``filed_at + 1 year``
+       is strictly before *today* and *movements* hold no notification of the
+       demanda dated on or before that day (see ``_demanda_notified_by``). A
+       later notification does not count. Date = ``filed_at + 1 year``. With
+       no movement at all the rule does not fire (unknown, not "unnotified").
+    2. Previous rule, kept because Carla did not rule on it: the plazo counts
+       from the DEMAND FILING DATE (``Case.filed_at``, "Fecha de ingreso"),
+       not the title's vencimiento.
+         {"pagare", "letra", "cheque"} → 1 year
+           (art. 98 Ley 18.092 / art. 34 Ley 18.552)
+         everything else (None, "otro", "escritura_publica", "sentencia", ...)
+           → 3 years — the GENERAL acción ejecutiva prescription (art. 2515 CC).
+           # 3yr general per art. 2515 CC — confirm exact from-date basis with
+           # legal review. Reusing filed_at is a conservative placeholder
+           # pending legal sign-off, not a confirmed art. 2515 CC reading.
 
     Returns (prescripcion_cumplida, prescripcion_fecha).
     If filed_at is None → (False, None) (nothing computable either way).
-    prescripcion_cumplida = prescripcion_fecha < today (strictly less than).
+    Both rules compare strictly (date < today).
     """
     titulo_tipo = (getattr(case, "titulo_tipo", None) or "").lower().strip()
 
@@ -149,6 +221,17 @@ def _compute_prescripcion(
         return (False, None)
 
     start = filed_at.date()
+    first_year_end = start + relativedelta(years=1)
+    movements = list(movements)
+    # A case with NO published movement at all is unknown, not "never notified":
+    # PJUD may simply not have delivered its history. The rule needs evidence.
+    if (
+        movements
+        and first_year_end < today
+        and not _demanda_notified_by(movements, first_year_end)
+    ):
+        return (True, first_year_end)
+
     plazo_years = 1 if titulo_tipo in {"pagare", "letra", "cheque"} else 3
     prescripcion_fecha = start + relativedelta(years=plazo_years)
     prescripcion_cumplida = prescripcion_fecha < today
@@ -179,13 +262,64 @@ def _normalize_text(value: Optional[str]) -> str:
     return " ".join(stripped.lower().split())
 
 
+_MEDIDA_PREJUDICIAL = "medida prejudicial"
+
+
+def is_medida_prejudicial(procedure: Optional[str]) -> bool:
+    """True when a case's ``procedure`` is exactly 'Medida prejudicial'.
+
+    The firm is always the solicitante there and does not run the ejecutivo
+    flow, so such a row is neutral (see ``DeadlineEngine.neutralize_medida_prejudicial``).
+    Compared after ``_normalize_text`` (case, accents, whitespace); None and
+    blank (or non-string) are NOT a medida prejudicial.
+    """
+    return isinstance(procedure, str) and _normalize_text(procedure) == _MEDIDA_PREJUDICIAL
+
+
+def medida_prejudicial_clause():
+    """SQL twin of ``is_medida_prejudicial`` on ``Case.procedure``.
+
+    Case- and edge-whitespace-insensitive (accents and inner runs of spaces are
+    left to the Python predicate: the stored value has no such variants).
+    NULL procedure yields False, never NULL, so ``~medida_prejudicial_clause()``
+    keeps the NULL rows.
+    """
+    return func.lower(func.trim(func.coalesce(Case.procedure, ""))) == _MEDIDA_PREJUDICIAL
+
+
 def _is_demandado_opposition_escrito(escrito: CaseEscrito) -> bool:
-    """True for a dated escrito in which the ejecutado opposes the execution."""
-    return (
-        escrito.fecha_ingreso is not None
-        and bool(_OPONE_EXCEPCIONES_RE.search(_normalize_text(escrito.tipo_escrito)))
-        and bool(_DEMANDADO_SOLICITANTE_RE.search(_normalize_text(escrito.solicitante)))
-    )
+    """True for a dated escrito in which the ejecutado opposes the execution.
+
+    One definition, shared with the verdict (``deadline_verdict``).
+    """
+    return is_excepciones_escrito(escrito)
+
+
+class _EscritosOfCase:
+    """The ``case_escritos`` of one case, loaded lazily and AT MOST ONCE.
+
+    A recompute touches several plazo rows of the same case; each used to be a
+    candidate for its own query. Cases that never need escritos (no excepciones
+    verdict to compute) never pay the query.
+    """
+
+    def __init__(self, db: Session, case_id: int) -> None:
+        self._db = db
+        self._case_id = case_id
+        self._rows: Optional[list[CaseEscrito]] = None
+
+    def get(self) -> list[CaseEscrito]:
+        if self._rows is None:
+            self._rows = (
+                self._db.query(CaseEscrito)
+                .filter(CaseEscrito.case_id == self._case_id)
+                .all()
+            )
+        return self._rows
+
+
+# Verdicts an escrito can still improve (a better one is never replaced).
+_REJUDGEABLE_VERDICTS = ("no_cumplido", "fuera_de_plazo", "registro_tardio")
 
 
 def _day_of(value: object) -> date:
@@ -310,6 +444,16 @@ class DeadlineEngine:
         old_semaforo = case.semaforo
         old_fatal = bool(case.next_deadline_fatal)
 
+        # A medida prejudicial is neutral: no flow, no plazos, no apremio.
+        if is_medida_prejudicial(case.procedure):
+            cls.neutralize_medida_prejudicial(db, case)
+            return SemaforoTransition(
+                old_semaforo=old_semaforo,
+                new_semaforo=case.semaforo,
+                old_fatal=old_fatal,
+                new_fatal=bool(case.next_deadline_fatal),
+            )
+
         # Apremio detection runs unconditionally so it is set on every code path
         # (success, GRIS safe-fail, and non-civil guard) without touching _write_gris.
         case.en_apremio = cls._compute_en_apremio(db, case)
@@ -364,6 +508,8 @@ class DeadlineEngine:
         if loaded is not None:
             loaded.movements = movements
 
+        escritos = _EscritosOfCase(db, case.id)
+
         # Step 3: classify.
         proc_state, triggers = _CLASSIFIER.classify(movements, today)
 
@@ -378,7 +524,14 @@ class DeadlineEngine:
 
         for deadline_type, trigger in triggers.items():
             triggered_at = cls._triggered_at_date(trigger)
-            due_date = add_business_days(triggered_at, deadline_type.dias_habiles)
+            # triggered_at (the row identity) stays the notification's; only the
+            # due date counts from the requerimiento de pago for excepciones_8d.
+            due_date = add_business_days(
+                triggered_at
+                if isinstance(trigger, date)
+                else due_anchor_date(deadline_type, trigger, movements),
+                deadline_type.dias_habiles,
+            )
 
             new_trigger_keys[deadline_type.value] = triggered_at
 
@@ -429,19 +582,59 @@ class DeadlineEngine:
         # including when new_trigger_keys is empty (TERMINADA, INDETERMINATE, SENTENCIA
         # after appeal window) — so that no stale "active" rows remain after the
         # case advances, preventing false ROJO from prior-state past-due deadlines.
+        # The same query also returns the closed excepciones rows an escrito could
+        # still correct (see ``_rejudge_closed_excepciones``), so re-judging them
+        # costs no extra round-trip.
         all_active = (
             db.query(CaseDeadline)
             .filter(
                 CaseDeadline.case_id == case.id,
-                CaseDeadline.status == "active",
                 CaseDeadline.is_manual == False,  # noqa: E712
                 # PARALLEL plazos are not in the classifier's triggers by design;
                 # without this exclusion they would be superseded on the next
                 # recompute (silently: no error, no log). Owned by step 5c.
                 CaseDeadline.deadline_type.notin_(PARALLEL_DEADLINE_VALUES),
+                or_(
+                    CaseDeadline.status == "active",
+                    # A plazo step 6b closed ("expired") is still ours to
+                    # supersede when the case advances: left alone it would
+                    # keep the semáforo ROJO for a state that no longer exists.
+                    and_(
+                        CaseDeadline.status == "expired",
+                        CaseDeadline.marked_by.is_(None),
+                        CaseDeadline.marked_at.is_(None),
+                    ),
+                    and_(
+                        CaseDeadline.deadline_type == DeadlineType.EXCEPCIONES_8D.value,
+                        # "no_cumplido": the engine's own late-escrito miss. An
+                        # auditor's mark carries marked_by/marked_at, excluded here.
+                        CaseDeadline.status.in_(("superseded", "expired", "no_cumplido")),
+                        CaseDeadline.marked_by.is_(None),
+                        CaseDeadline.marked_at.is_(None),
+                        # NULL verdict is excluded on purpose: a closed row without
+                        # one was cleared (re-anchored, stale due_date) and judging
+                        # it would invent a miss.
+                        CaseDeadline.verdict.in_(_REJUDGEABLE_VERDICTS),
+                    ),
+                ),
             )
             .all()
         )
+        # "expired" rows are re-derived like live ones, except the excepciones
+        # rebeldía closure (demandante), which is final by design and only
+        # re-judged against escritos.
+        def _is_rebeldia_closure(r: CaseDeadline) -> bool:
+            return (
+                r.status == "expired"
+                and r.deadline_type == DeadlineType.EXCEPCIONES_8D.value
+                and side == "demandante"
+            )
+
+        closed_candidates = [
+            r for r in all_active
+            if r.status in ("superseded", "no_cumplido") or _is_rebeldia_closure(r)
+        ]
+        all_active = [r for r in all_active if r not in closed_candidates]
         for row in all_active:
             current_trigger = new_trigger_keys.get(row.deadline_type)
             # DEMANDADO: a filed defense is judged FIRST. It must win over every
@@ -456,13 +649,13 @@ class DeadlineEngine:
                 side == "demandado"
                 and row.deadline_type == DeadlineType.EXCEPCIONES_8D.value
                 and not re_anchored
-                and cls._close_excepciones_on_defense(db, row, movements, today)
+                and cls._close_excepciones_on_defense(db, row, movements, today, escritos)
             ):
                 continue
             if current_trigger is None:
                 # The plazo closed because the case moved on: judge it BEFORE
                 # superseding, or the evidence is lost with the row's status.
-                cls._record_verdict(row, movements, today)
+                cls._record_verdict(row, movements, today, escritos)
                 row.status = "superseded"
             elif row.triggered_at != current_trigger:
                 # Re-anchored (e.g. the diligencia-date change): a NEW row for
@@ -501,7 +694,7 @@ class DeadlineEngine:
             )
             for row in still_active:
                 if row.due_date < today and latest_mv_date > row.due_date:
-                    cls._record_verdict(row, movements, today)
+                    cls._record_verdict(row, movements, today, escritos)
                     row.status = "superseded"
             db.flush()
 
@@ -538,13 +731,20 @@ class DeadlineEngine:
                 and not has_excepciones_movement
             ):
                 proc_state = ProceduralState.REBELDE
-                cls._record_verdict(exc_row, movements, today)
-                exc_row.status = "expired"
+                cls._record_verdict(exc_row, movements, today, escritos)
+                exc_row.status = "expired"  # rebeldía; also used by step 6b
                 db.flush()
 
         # Step 6b: an overdue plazo that is still active (nothing moved on yet)
         # is already a closed question: record it now instead of waiting for it
         # to be superseded. A plazo still in force stays sin determinar.
+        #
+        # Once its term (publication margin included) is over, the row is also
+        # CLOSED as "expired". Leaving it "active" made a plazo from months ago
+        # drive ``next_deadline_at`` and the semáforo forever. "expired" keeps
+        # the meaning the semáforo already gives it ("a MANDATORY plazo lapsed
+        # => ROJO"), so a missed obligation is not silently turned green. Rows
+        # an auditor touched are left alone.
         overdue_active = (
             db.query(CaseDeadline)
             .filter(
@@ -556,21 +756,34 @@ class DeadlineEngine:
             .all()
         )
         for row in overdue_active:
-            cls._record_verdict(row, movements, today)
+            cls._record_verdict(row, movements, today, escritos)
+            if (
+                row.status == "active"
+                and row.marked_by is None
+                and row.marked_at is None
+                and cls._term_elapsed(row, today, movements)
+            ):
+                row.status = "expired"
         db.flush()
+
+        # Step 6c: a plazo closed BEFORE its escrito was known keeps a stale miss
+        # forever unless it is judged again.
+        cls._rejudge_closed_excepciones(db, movements, today, escritos, closed_candidates)
 
         # Step 7a: compute semáforo from nearest active deadline.
         semaforo = cls._compute_semaforo(
             db, case.id, proc_state, today,
             actionable_values=actionable_values,
             mandatory_values=mandatory_values,
+            side=side,
+            movements=movements,
         )
 
         # Step 7b: abandono del procedimiento advisory signal (art. 152/153 CPC).
         abandono = _compute_abandono(proc_state, latest_mv_date, today)
 
         # Step 7c: prescripción advisory signal (statute of limitations).
-        prescripcion_cumplida, prescripcion_fecha = _compute_prescripcion(case, today)
+        prescripcion_cumplida, prescripcion_fecha = _compute_prescripcion(case, today, movements)
 
         # Step 8: write denormalized Case columns.
         case.procedural_state = proc_state.value
@@ -633,7 +846,12 @@ class DeadlineEngine:
 
     @classmethod
     def _close_excepciones_on_defense(
-        cls, db: Session, row: CaseDeadline, movements: list[Movement], today: date
+        cls,
+        db: Session,
+        row: CaseDeadline,
+        movements: list[Movement],
+        today: date,
+        escritos_of_case: Optional[_EscritosOfCase] = None,
     ) -> bool:
         """DEMANDADO: a filed "Opone excepciones" fulfils the art. 464 plazo.
 
@@ -643,20 +861,30 @@ class DeadlineEngine:
         row is touched: manual rows and rows an auditor judged are never
         overwritten (same guard as ``_record_verdict``).
 
-        * escrito dated on or before due_date  -> status ``cumplido``
-        * escrito dated after due_date         -> status ``no_cumplido`` (the
-          audit trail must say it was late). Both leave the active set, so
-          neither keeps the semáforo red: nothing is pending for the firm.
-        * movement-only evidence: its date is PJUD's PUBLICATION date, not the
-          filing date, so it cannot prove on-time or late by itself. The row is
-          closed as ``superseded`` (the engine's long-standing treatment) and
-          the margin-aware verdict says what can honestly be claimed.
+        The on-time test uses the EARLIEST evidence date (see
+        ``_earliest_defense_evidence``): an opposition movement is dated when
+        PJUD PUBLISHED it, so the escrito was filed that day or before. That
+        proves ON TIME, never late.
+
+        * earliest evidence on or before due_date, escrito on file -> status
+          ``cumplido``
+        * every escrito after due_date, no earlier movement -> status
+          ``no_cumplido`` (the audit trail must say it was late). Both leave
+          the active set, so neither keeps the semáforo red: nothing is
+          pending for the firm.
+        * movement-only evidence: published after due_date it cannot prove
+          late (publication lag), so the row is closed as ``superseded`` (the
+          engine's long-standing treatment) and the margin-aware verdict says
+          what can honestly be claimed. Published on or before due_date the
+          closure is the same, but the verdict is ``cumplido``.
         """
         if row.is_manual or row.status != "active":
             return False
+        if escritos_of_case is None:
+            escritos_of_case = _EscritosOfCase(db, row.case_id)
         escritos = [
             _day_of(e.fecha_ingreso)
-            for e in db.query(CaseEscrito).filter(CaseEscrito.case_id == row.case_id).all()
+            for e in escritos_of_case.get()
             if _is_demandado_opposition_escrito(e)
         ]
         opposition_movements = [mv for mv in movements if _is_opposition_movement(mv)]
@@ -665,22 +893,165 @@ class DeadlineEngine:
 
         # Judged against the due_date the plazo SHOULD have (a stale row may
         # still carry the pre-diligencia one); the row's own field is not edited.
-        due = cls._current_due_date(row)
-        if escritos:
-            filed_on = min(escritos)
-            on_time = filed_on <= due
-            row.status = "cumplido" if on_time else "no_cumplido"
-            row.verdict = "cumplido" if on_time else "fuera_de_plazo"
-            row.verdict_movement_id = None
-            row.verdict_acted_on = filed_on
-            row.verdict_computed_at = datetime.now(timezone.utc)
+        due = cls._current_due_date(row, movements)
+        earliest = cls._earliest_defense_evidence(
+            escritos, opposition_movements, row.triggered_at
+        )
+        if earliest is not None and earliest[0] <= due:
+            if escritos:
+                row.status = "cumplido"
+            else:
+                row.status = "superseded"  # movement-only: long-standing closure
+            cls._write_verdict(row, Verdict.CUMPLIDO, earliest[1], earliest[0])
+        elif escritos:
+            row.status = "no_cumplido"
+            cls._write_verdict(row, Verdict.FUERA_DE_PLAZO, None, min(escritos))
         else:
             # Same closure the engine always gave a movement-shown opposition
             # (superseded + margin-aware verdict).
             row.status = "superseded"
-            cls._apply_verdict(row, movements, today)
+            cls._apply_verdict(row, movements, today, escritos_of_case)
         row.computed_at = datetime.now(timezone.utc)
         return True
+
+    @classmethod
+    def _rejudge_closed_excepciones(
+        cls,
+        db: Session,
+        movements: list[Movement],
+        today: date,
+        escritos: _EscritosOfCase,
+        rows: list[CaseDeadline],
+    ) -> None:
+        """Re-judge CLOSED excepciones rows against the evidence now on file.
+
+        The filing date (``case_escritos.fecha_ingreso``) can arrive after the
+        row was closed (superseded / expired) with a movement-only verdict, and
+        a closed row is never visited by the live-plazo steps again. ``rows``
+        are pre-selected by the step-5 query (excepciones, closed, automatic,
+        not marked by an auditor, verdict a miss). Opposition movements are
+        evidence too, but only of being ON TIME (see
+        ``_earliest_defense_evidence``). Rules:
+
+        * ``verdict*`` is rewritten; ``status`` is changed ONLY for the engine's
+          own late-escrito miss (``no_cumplido`` / ``fuera_de_plazo``), and only
+          to ``cumplido`` when the earliest evidence is within the plazo. It
+          is left alone otherwise.
+        * Monotone: the verdict is replaced ONLY by a strictly better one, so
+          this can never turn a ``cumplido`` into a miss.
+        * Auditor decisions always win: manual rows, rows with ``marked_by`` /
+          ``marked_at`` never reach this method, and rows whose status an
+          auditor set (cumplido / no_cumplido) are not closed rows.
+        * Escritos are loaded only when there is a row to judge.
+        """
+        if not rows:
+            return
+        try:
+            escrito_days = [
+                _day_of(e.fecha_ingreso)
+                for e in escritos.get()
+                if _is_demandado_opposition_escrito(e)
+            ]
+            opposition_movements = [mv for mv in movements if _is_opposition_movement(mv)]
+            for row in rows:
+                if row.status == "no_cumplido":
+                    cls._correct_late_miss(row, escrito_days, opposition_movements, movements)
+                    continue
+                result = evaluate_deadline(
+                    row.deadline_type,
+                    cls._current_due_date(row, movements),
+                    movements,
+                    today,
+                    triggered_at=row.triggered_at,
+                    escritos=escritos.get(),
+                )
+                verdict, movement_id, acted_on = (
+                    result.verdict, result.movement_id, result.acted_on
+                )
+                # An opposition movement published within the plazo proves it
+                # was met whatever its "Trámite" (the detector wants "Escrito").
+                earliest = cls._earliest_defense_evidence(
+                    escrito_days, opposition_movements, row.triggered_at
+                )
+                if earliest is not None and earliest[0] <= cls._current_due_date(row, movements):
+                    verdict, movement_id, acted_on = Verdict.CUMPLIDO, earliest[1], earliest[0]
+                if verdict is None or verdict_rank(verdict) <= verdict_rank(row.verdict):
+                    continue
+                cls._write_verdict(row, verdict, movement_id, acted_on)
+            db.flush()
+        except Exception as exc:
+            logger.exception("re-judging closed excepciones failed: %s — skipping", exc)
+
+    @classmethod
+    def _correct_late_miss(
+        cls,
+        row: CaseDeadline,
+        escrito_days: list[date],
+        opposition_movements: list[Movement],
+        movements: list[Movement],
+    ) -> None:
+        """Upgrade the engine's own late-escrito miss to ``cumplido`` if disproved.
+
+        ``_close_excepciones_on_defense`` closes a late escrito as ``no_cumplido``
+        / ``fuera_de_plazo``; no other step revisits such a row. Only that exact
+        engine-set shape is touched (the caller's query already excluded manual
+        and auditor-marked rows; a miss without the ``fuera_de_plazo`` verdict
+        has unknown provenance). Upgrade-only: with no evidence on or before the
+        plazo the row is left exactly as it is, except that its ``due_date`` is
+        refreshed to the one it should have (the plazo may now count from the
+        requerimiento de pago, later than the cédula the row was built on).
+        """
+        if row.status != "no_cumplido" or row.verdict != Verdict.FUERA_DE_PLAZO.value:
+            return
+        due = cls._current_due_date(row, movements)
+        row.due_date = due
+        earliest = cls._earliest_defense_evidence(
+            escrito_days, opposition_movements, row.triggered_at
+        )
+        if earliest is None or earliest[0] > due:
+            return
+        row.status = "cumplido"
+        cls._write_verdict(row, Verdict.CUMPLIDO, earliest[1], earliest[0])
+        row.computed_at = datetime.now(timezone.utc)
+
+    @staticmethod
+    def _earliest_defense_evidence(
+        escrito_days: list[date],
+        opposition_movements: list[Movement],
+        triggered_at: Optional[date],
+    ) -> Optional[tuple[date, Optional[int]]]:
+        """(date, movement id) of the earliest proof the defense was filed.
+
+        An escrito's ``fecha_ingreso`` is the filing date; an opposition
+        movement's date is its PUBLICATION date, so the filing was that day or
+        earlier: both bound the filing date from above and the smaller wins.
+        On a tie the escrito wins (movement id None). An annulled
+        ("[Nulo]") movement, or one before ``triggered_at`` (it predates the
+        plazo), is not evidence. ``None`` when
+        there is no evidence at all.
+        """
+        best: Optional[tuple[date, Optional[int]]] = (
+            (min(escrito_days), None) if escrito_days else None
+        )
+        for mv in opposition_movements:
+            day = _day_of(mv.movement_date)
+            if is_annulled(mv) or (triggered_at is not None and day < triggered_at):
+                continue
+            if best is None or day < best[0]:
+                best = (day, mv.id)
+        return best
+
+    @staticmethod
+    def _write_verdict(
+        row: CaseDeadline,
+        verdict: Verdict,
+        movement_id: Optional[int],
+        acted_on: date,
+    ) -> None:
+        row.verdict = verdict.value
+        row.verdict_movement_id = movement_id
+        row.verdict_acted_on = acted_on
+        row.verdict_computed_at = datetime.now(timezone.utc)
 
     @staticmethod
     def _clear_verdict(row: CaseDeadline) -> None:
@@ -691,7 +1062,11 @@ class DeadlineEngine:
 
     @classmethod
     def _record_verdict(
-        cls, row: CaseDeadline, movements: list[Movement], today: date
+        cls,
+        row: CaseDeadline,
+        movements: list[Movement],
+        today: date,
+        escritos: Optional[_EscritosOfCase] = None,
     ) -> None:
         """Persist the verdict of a plazo that is closing (or already overdue).
 
@@ -701,11 +1076,15 @@ class DeadlineEngine:
         """
         if row.is_manual or row.status in ("cumplido", "no_cumplido"):
             return
-        cls._apply_verdict(row, movements, today)
+        cls._apply_verdict(row, movements, today, escritos)
 
     @classmethod
     def _apply_verdict(
-        cls, row: CaseDeadline, movements: list[Movement], today: date
+        cls,
+        row: CaseDeadline,
+        movements: list[Movement],
+        today: date,
+        escritos: Optional[_EscritosOfCase] = None,
     ) -> None:
         """Evaluate and write the verdict columns of ``row``. NEVER raises.
 
@@ -716,10 +1095,15 @@ class DeadlineEngine:
         try:
             result = evaluate_deadline(
                 row.deadline_type,
-                cls._current_due_date(row),
+                cls._current_due_date(row, movements),
                 movements,
                 today,
                 triggered_at=row.triggered_at,
+                escritos=(
+                    escritos.get()
+                    if escritos is not None and verdict_uses_escritos(row.deadline_type)
+                    else None
+                ),
             )
             if result.verdict is None:
                 cls._clear_verdict(row)
@@ -735,14 +1119,39 @@ class DeadlineEngine:
             )
             cls._clear_verdict(row)
 
+    @classmethod
+    def _term_elapsed(
+        cls,
+        row: CaseDeadline,
+        today: date,
+        movements: Optional[list[Movement]] = None,
+    ) -> bool:
+        """Whether ``row`` is genuinely finished, so it may leave the active set.
+
+        Judged on the EFFECTIVE due date (``_current_due_date``), never the raw
+        column, which can be stale on a re-anchored row. Types with a verdict
+        detector also wait out the publication margin: an act filed on time can
+        be published late, and closing the row earlier would freeze a false
+        miss (the bug fixed in PR #379). Types without a detector have no
+        verdict to protect, so their term ends on the due date.
+        """
+        margin = default_margin_days(row.deadline_type) if row.deadline_type in DETECTORS else 0
+        return cls._current_due_date(row, movements) + timedelta(days=margin) < today
+
     @staticmethod
-    def _current_due_date(row: CaseDeadline) -> date:
+    def _current_due_date(
+        row: CaseDeadline, movements: Optional[list] = None
+    ) -> date:
         """due_date the plazo SHOULD have today.
 
         A row created before the diligencia-date anchor change can still carry
         the old due_date when it closes (it is never revisited once the type
         leaves the triggers). Re-derive it from the source notification so the
         verdict is judged against the current rule. Row fields are not touched.
+
+        ``movements`` (the case's) lets ``excepciones_8d`` count from the
+        requerimiento de pago (see ``due_anchor_date``); without them the
+        notification anchor is used, as before.
         """
         source = row.source_movement
         if source is None:
@@ -751,7 +1160,9 @@ class DeadlineEngine:
             dtype = DeadlineType(row.deadline_type)
         except ValueError:
             return row.due_date
-        return add_business_days(anchor_date(source), dtype.dias_habiles)
+        return add_business_days(
+            due_anchor_date(dtype, source, movements or []), dtype.dias_habiles
+        )
 
     @classmethod
     def _sync_parallel_deadlines(
@@ -805,8 +1216,10 @@ class DeadlineEngine:
                         computed_at=datetime.now(timezone.utc),
                     )
                     db.add(current_row)
-                elif not existing.is_manual and existing.status == "active":
-                    # Only "active" rows are refreshed. Audited (cumplido /
+                elif not existing.is_manual and existing.status in ("active", "expired"):
+                    # Only "active" rows (and "expired", which step 6b writes
+                    # for a lapsed plazo and re-derives every run, so a late
+                    # act can still turn it cumplido) are refreshed. Audited (cumplido /
                     # no_cumplido) and manual rows are the auditor's call, and a
                     # "superseded" row is deliberately NOT resurrected: that keeps
                     # the step-5 exclusion the single guard against silent loss
@@ -834,7 +1247,7 @@ class DeadlineEngine:
                 .filter(
                     CaseDeadline.case_id == case_id,
                     CaseDeadline.deadline_type == dtype.value,
-                    CaseDeadline.status == "active",
+                    CaseDeadline.status.in_(("active", "expired")),
                     CaseDeadline.is_manual == False,  # noqa: E712
                 )
                 .all()
@@ -929,6 +1342,8 @@ class DeadlineEngine:
         *,
         actionable_values: frozenset[str] = ACTIONABLE_DEADLINE_VALUES,
         mandatory_values: frozenset[str] = MANDATORY_ACTIONABLE_VALUES,
+        side: Optional[str] = None,
+        movements: Optional[list] = None,
     ) -> str:
         """Derive semáforo color from the FIRM's own (actionable) deadlines only.
 
@@ -941,10 +1356,19 @@ class DeadlineEngine:
                      (rebeldía for demandante, awaiting court sentencia, or an
                      optional window that already closed).
         Deadlines outside the firm's actionable set for the given side and expired
-        OPTIONAL_ACTIONABLE (APELACION_5D) NEVER by themselves produce ROJO.
+        OPTIONAL_ACTIONABLE (APELACION_5D) NEVER by themselves produce ROJO. The
+        appeal window never colours at all (SEMAFORO_EXCLUDED_VALUES), open or not.
+
+        ROJO also when the firm (``side`` demandado) has an open or lapsed,
+        unfulfilled "acreditar poder" obligation that is provably its own and
+        was triggered on/after ``PODER_EXTENDED_FROM`` (see
+        ``_poder_forces_rojo``); that parallel plazo is otherwise not actionable.
         """
         if state in (ProceduralState.INDETERMINATE, ProceduralState.TERMINADA):
             return "gris"
+
+        if side is not None and cls._poder_forces_rojo(db, case_id, side, movements or []):
+            return "rojo"
 
         # Only the firm's actionable deadlines drive the color. Pick the nearest
         # one that still "counts": a past-due OPTIONAL window (apelación) is
@@ -954,7 +1378,7 @@ class DeadlineEngine:
             .filter(
                 CaseDeadline.case_id == case_id,
                 CaseDeadline.status == "active",
-                CaseDeadline.deadline_type.in_(actionable_values),
+                CaseDeadline.deadline_type.in_(actionable_values - SEMAFORO_EXCLUDED_VALUES),
             )
             .order_by(CaseDeadline.due_date.asc())
             .all()
@@ -988,6 +1412,39 @@ class DeadlineEngine:
 
         # Nothing pending for the firm → al día.
         return "verde"
+
+    @staticmethod
+    def _poder_forces_rojo(
+        db: Session, case_id: int, side: str, movements: list
+    ) -> bool:
+        """An automatic, unfulfilled ``acreditar_poder_3d`` row (active or
+        expired) triggered on/after the cutoff whose obligation is the firm's.
+
+        Cutoff OFF (empty/invalid setting) = never. ``cumplido`` / ``superseded``
+        / manual rows never count. Never raises.
+        """
+        try:
+            cutoff = parse_extended_from(settings.PODER_EXTENDED_FROM)
+            if cutoff is None:
+                return False
+            rows = (
+                db.query(CaseDeadline)
+                .filter(
+                    CaseDeadline.case_id == case_id,
+                    CaseDeadline.deadline_type == DeadlineType.ACREDITAR_PODER_3D.value,
+                    CaseDeadline.status.in_(("active", "expired")),
+                    CaseDeadline.is_manual == False,  # noqa: E712
+                    CaseDeadline.triggered_at >= cutoff,
+                )
+                .all()
+            )
+            return any(
+                obligation_is_ours(movements, row.source_movement_id, side)
+                for row in rows
+            )
+        except Exception:  # pragma: no cover - defensive boundary
+            logger.exception("poder rojo check failed for case_id=%s", case_id)
+            return False
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1069,6 +1526,37 @@ class DeadlineEngine:
             return None
         except Exception:
             return None
+
+    @classmethod
+    def neutralize_medida_prejudicial(cls, db: Session, case: Case) -> None:
+        """Make a 'Medida prejudicial' row neutral (flush-only, idempotent).
+
+        Same state as ``_write_gris`` plus what it leaves alone (``en_apremio``
+        and the manual semáforo override). Every NON-manual ``case_deadlines``
+        row is marked ``superseded`` with ``verdict`` NULL in ONE statement;
+        manual rows and the rows themselves (history) are kept.
+        """
+        case.en_apremio = False
+        case._apremio_substage = None
+        case.semaforo_override = None
+        case.semaforo_override_at = None
+        case.semaforo_override_by = None
+        cls._write_gris(case, db)
+        (
+            db.query(CaseDeadline)
+            .filter(
+                CaseDeadline.case_id == case.id,
+                CaseDeadline.is_manual == False,  # noqa: E712
+                or_(
+                    CaseDeadline.status != "superseded",
+                    CaseDeadline.verdict.isnot(None),
+                ),
+            )
+            .update(
+                {CaseDeadline.status: "superseded", CaseDeadline.verdict: None},
+                synchronize_session="evaluate",
+            )
+        )
 
     @staticmethod
     def _write_gris(case: Case, db: Session) -> None:

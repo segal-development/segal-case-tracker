@@ -23,10 +23,13 @@ from dataclasses import dataclass, field, fields as dataclass_fields
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Iterable, List, Optional, Tuple, Awaitable, TypeVar
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, func, select
-from sqlalchemy.exc import OperationalError
+from sqlalchemy import and_, func, or_, select
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 logger = logging.getLogger(__name__)
+
+# A description that is just a dd/mm/yyyy date means the columns shifted.
+_DATE_ONLY = re.compile(r"^\s*\d{2}/\d{2}/\d{4}\s*$")
 
 # Maximum concurrent case detail fetches
 MAX_CONCURRENT_FETCHES = 3
@@ -98,12 +101,15 @@ T = TypeVar("T")
 
 from app.config import settings
 from app.models.case import Case
+from app.models.case_lawyer_source import CaseLawyerSource
 from app.models.movement import Movement
 from app.models.court import Court
 from app.models.alert import Alert
 from app.models.lawyer import Lawyer
 from app.models.sync_history import SyncHistory
 from app.models.webhook import Webhook
+from app.models.case_deadline import CaseDeadline
+from app.core.deadlines_config import FATAL_DEADLINE_VALUES
 from app.models.case_litigante import CaseLitigante
 from app.models.case_notificacion import CaseNotificacion
 from app.models.case_escrito import CaseEscrito
@@ -135,6 +141,7 @@ from app.services.deadline_engine import (
     LoadedMovements,
     SemaforoTransition,
     _today_chile,
+    is_medida_prejudicial,
 )
 from app.services.matriz_classifier import MatrizMappingCache, classify_case
 
@@ -192,10 +199,31 @@ class SyncResult:
     cases_total: int = 0
     cases_new: int = 0
     cases_updated: int = 0
+    #: Nuevas descartadas por el piso de anio (DETAIL_MIN_YEAR). Se cuentan
+    #: para que el listado cuadre: sin esto, cases_new + cases_updated <
+    #: cases_total no se puede interpretar y una perdida real pasa inadvertida.
+    cases_year_skipped: int = 0
     movements_new: int = 0
     alerts_created: int = 0
     errors: List[str] = None
     
+    @property
+    def cases_unaccounted(self) -> int:
+        """Cases the listing produced that landed in no bucket.
+
+        Zero is the healthy value. Anything above it is a case the scraper saw
+        and the database never got, without an error and without the year
+        floor explaining it -- the silent leak.
+        """
+        return max(
+            0,
+            self.cases_total
+            - self.cases_new
+            - self.cases_updated
+            - self.cases_year_skipped
+            - len(self.errors or []),
+        )
+
     def __post_init__(self):
         if self.errors is None:
             self.errors = []
@@ -855,6 +883,14 @@ class SyncService:
         Returns:
             SyncResult with counts of what was synced
         """
+        # Resolve the firm's canonical owner BEFORE touching any row: a
+        # misconfigured FIRM_LAWYER_RUT must leave nothing persisted (not even
+        # the SyncHistory record below). Imported here to avoid a module-level
+        # cycle (app.api.deps -> services).
+        from app.api.deps import firm_lawyer_id
+
+        owner_id = firm_lawyer_id(self.db)
+
         # Create sync history record
         sync_record = SyncHistory(
             lawyer_id=lawyer_id,
@@ -868,28 +904,27 @@ class SyncService:
 
         result = SyncResult(cases_total=len(scraped_cases))
 
-        # N+1 fix: pre-load all of this lawyer's existing cases in ONE query
-        # instead of one SELECT per scraped case. Matches the exact filter
-        # the old per-case query used (lawyer_id + rol, NOT competencia —
-        # the unique constraint is (lawyer_id, rol), so a case can exist
-        # under a different competencia than the one being synced right now
-        # and must still be matched/updated, not duplicated).
+        # N+1 fix: pre-load the existing cases in ONE query (chunked IN) instead
+        # of one SELECT per scraped case.
         #
-        # Deliberately keyed on Case.lawyer_id, NEVER on the internal-
-        # assignment override (Case.assigned_lawyer_id / effective_lawyer_id
-        # — see app.api.v1.asignacion). lawyer_id is the sync/provenance
-        # key: it identifies whose PJUD account this ROL was scraped from,
-        # which is exactly what the next sync of THAT SAME account needs to
-        # find here. If this dedup ever switched to the effective lawyer,
-        # reassigning a causa to a different internal lawyer would make the
-        # originating lawyer's next sync miss it under their own account and
-        # silently re-create it as a duplicate Case row — undoing the
-        # reassignment. Business/visibility reads use the effective lawyer;
-        # this ingest path must not.
-        existing_by_rol = {
-            c.rol: c
-            for c in self.db.query(Case).filter(Case.lawyer_id == lawyer_id).all()
-        }
+        # Keyed on the case IDENTITY (rol, court_id, procedure) across ALL
+        # owners, not on the syncing lawyer: ``Case.lawyer_id`` is the firm's
+        # canonical owner (Approach C) and per-lawyer attribution lives in
+        # ``case_lawyer_source``, so lawyer B syncing a causa lawyer A already
+        # created must find A's row instead of creating a second one. The same
+        # ROL in another court, or in another cuaderno (Principal / Medida
+        # prejudicial), is a different causa (uq_cases_identity). competencia is
+        # deliberately NOT part of the filter: a case can exist under a
+        # different competencia than the one being synced right now and must
+        # still be matched/updated, not duplicated.
+        #
+        # Matching never reads Case.assigned_lawyer_id / effective_lawyer_id
+        # (see app.api.v1.asignacion) and updates never write Case.lawyer_id,
+        # so reassigning a causa to another internal lawyer cannot make the
+        # next sync miss it and re-create it.
+        existing_by_identity = self._load_cases_by_identity(
+            {s.rol.strip().upper() for s in scraped_cases}
+        )
 
         # Listing-fingerprint seam. _upsert_case runs once per listing ROW but
         # the fingerprint is about the SET of rows of a ROL, so the grouping is
@@ -916,7 +951,7 @@ class SyncService:
         # expire_on_commit gotcha: the default Session expires every
         # persistent object on commit. With chunked interim commits that
         # would expire self._court_cache's Court objects and the
-        # existing_by_rol Case objects pre-loaded above — the next attribute
+        # existing_by_identity Case objects pre-loaded above — the next attribute
         # access on a cache/map hit (e.g. `court.id`) would trigger a reload
         # SELECT, silently reintroducing the N+1 pattern across chunk
         # boundaries. Disable it for the duration of this sync run only
@@ -931,36 +966,59 @@ class SyncService:
                 def _process_chunk(chunk=chunk):
                     chunk_new = 0
                     chunk_updated = 0
+                    chunk_year_skipped = 0
                     chunk_errors: List[str] = []
+                    touched_cases: List[Case] = []
                     for scraped in chunk:
                         # Year floor: never CREATE a case older than DETAIL_MIN_YEAR
                         # (the firm only works 2021+). Existing rows still update
                         # (harmless); only brand-new pre-2021 ROLs are skipped so the
                         # worker stops re-ingesting the very cases the cleanup removed.
-                        if (
-                            scraped.rol.strip().upper() not in existing_by_rol
-                            and not rol_year_ok(scraped.rol)
+                        if not rol_year_ok(scraped.rol) and not self._identity_exists(
+                            scraped, existing_by_identity
                         ):
+                            chunk_year_skipped += 1
                             continue
                         try:
                             case, is_new = self._upsert_case(
-                                lawyer_id, scraped, competencia, existing_by_rol,
+                                owner_id, scraped, competencia, existing_by_identity,
                                 listing_rows_by_rol=listing_rows_by_rol,
                             )
+                            touched_cases.append(case)
                             if is_new:
                                 chunk_new += 1
                             else:
                                 chunk_updated += 1
                         except Exception as e:
                             chunk_errors.append(f"Error syncing {scraped.rol}: {str(e)}")
-                    return chunk_new, chunk_updated, chunk_errors
+                    self._record_case_lawyer_sightings(lawyer_id, touched_cases)
+                    return chunk_new, chunk_updated, chunk_year_skipped, chunk_errors
 
-                chunk_new, chunk_updated, chunk_errors = self._commit_with_retry(
-                    _process_chunk, caches=(existing_by_rol, self._court_cache)
+                (
+                    chunk_new,
+                    chunk_updated,
+                    chunk_year_skipped,
+                    chunk_errors,
+                ) = self._commit_with_retry(
+                    _process_chunk, caches=(existing_by_identity, self._court_cache)
                 )
                 result.cases_new += chunk_new
                 result.cases_updated += chunk_updated
+                result.cases_year_skipped += chunk_year_skipped
                 result.errors.extend(chunk_errors)
+
+            # Reconcile: every case the listing produced must land in exactly one
+            # bucket. `unaccounted` is the one that matters -- a case neither
+            # created, updated, year-skipped nor errored vanished silently, and
+            # that is the leak behind the cases whose caratulado is a client of
+            # the firm. Zero means the listing is fully persisted.
+            logger.info(
+                "LISTING_RECONCILE lawyer=%s competencia=%s scraped=%d new=%d "
+                "updated=%d year_skipped=%d errors=%d unaccounted=%d",
+                lawyer_id, competencia, result.cases_total, result.cases_new,
+                result.cases_updated, result.cases_year_skipped,
+                len(result.errors), result.cases_unaccounted,
+            )
 
             def _finalize_sync_record():
                 # Guards the (rare) case where this is the very first commit
@@ -981,6 +1039,45 @@ class SyncService:
             self.db.expire_on_commit = original_expire_on_commit
 
         return result
+
+    def _record_case_lawyer_sightings(self, lawyer_id: int, cases: List[Case]) -> None:
+        """Record that ``lawyer_id`` saw ``cases`` in their live list.
+
+        Bulk, same semantics as ``IngestService._bulk_upsert_case_lawyer_source``:
+        ONE SELECT for the existing rows, the missing ones added, ``last_seen_at``
+        refreshed on the rest. Flush-only; runs inside the chunk's transaction.
+        Cases are flushed first so freshly created ones have an id; ``cases`` is
+        rebuilt by every (re)application of the chunk, so nothing stale is held
+        across a ``_commit_with_retry`` rollback.
+        """
+        if not cases:
+            return
+        self.db.flush()
+        case_ids = list(dict.fromkeys(c.id for c in cases))
+        seen_at = datetime.utcnow()
+        existing = {
+            row.case_id: row
+            for row in self.db.query(CaseLawyerSource).filter(
+                CaseLawyerSource.lawyer_id == lawyer_id,
+                CaseLawyerSource.case_id.in_(case_ids),
+            )
+        }
+        missing = []
+        for case_id in case_ids:
+            row = existing.get(case_id)
+            if row is None:
+                missing.append(
+                    CaseLawyerSource(
+                        case_id=case_id,
+                        lawyer_id=lawyer_id,
+                        first_seen_at=seen_at,
+                        last_seen_at=seen_at,
+                    )
+                )
+            else:
+                row.last_seen_at = seen_at
+        if missing:
+            self.db.add_all(missing)
 
     def _commit_with_retry(self, work_fn: Callable[[], T], caches: Tuple[dict, ...] = ()) -> T:
         """(Re)apply ``work_fn()`` and commit, retrying on OperationalError.
@@ -1156,6 +1253,8 @@ class SyncService:
             movement, is_new = self._upsert_movement(
                 case_id, scraped, existing_by_key=existing_movements
             )
+            if movement is None:
+                continue
             if is_new:
                 new_count += 1
                 for recipient in recipients:
@@ -1215,35 +1314,116 @@ class SyncService:
                 _budget.remaining + notify_dispatched,  # original limit
             )
 
-        # Update last_movement_at on case
-        if scraped_movements:
-            latest_date = self._parse_date(scraped_movements[0].fecha)
-            if latest_date and (
-                not case.last_movement_at or latest_date > case.last_movement_at
-            ):
-                case.last_movement_at = latest_date
+        # Derive last_movement_at from the case's ROWS, not from this list.
+        #
+        # This used to read ``scraped_movements[0]`` and only move forward,
+        # which made the column depend on the order PJUD returned rows in AND
+        # on this one scrape having seen everything. Neither holds:
+        # ``_load_other_cuadernos`` appends another cuaderno's movements AFTER
+        # the principal ones, so the newest is routinely not at index 0, and
+        # several other paths (ingest, consulta) insert Movement rows without
+        # ever coming through here. Measured on QA, 2.113 active cases carried
+        # a last_movement_at OLDER than their own newest movement row.
+        #
+        # It is a decision input, not a label: deadline_engine compares it
+        # against a semaforo override, poda decides what is prunable with it,
+        # and lawyer_roster decides what is stale with it.
+        #
+        # Recomputing makes the invariant hold for every writer instead of
+        # patching them one by one, and it costs NO extra query: the N+1 fix
+        # above already prefetched every movement this case has, and
+        # _upsert_movement keeps that map complete as it inserts. It runs even
+        # for an empty scrape, so a case whose rows arrived through another
+        # path is still corrected the next time this one runs.
+        self._recompute_last_movement_at(case, existing_movements.values())
 
         self.db.commit()
         return new_count, alert_count
-    
+
+    @staticmethod
+    def _recompute_last_movement_at(case: Case, movements: Iterable[Movement]) -> None:
+        """Set ``case.last_movement_at`` to the newest date among ``movements``.
+
+        ``movements`` is the case's COMPLETE set — the prefetched map from
+        ``sync_movements``, which holds every row the case had plus every row
+        just inserted — so no query is needed and the result equals
+        ``max(movement_date)`` in the DB.
+
+        Only writes when the value actually changes, so an unchanged case does
+        not dirty the session. An empty set leaves the column alone: a sync
+        never deletes movements, so "nothing here" means this scrape told us
+        nothing, not that the case has no history.
+        """
+        dates = [m.movement_date for m in movements if m.movement_date is not None]
+        if not dates:
+            return
+        newest = max(dates)
+        if newest != case.last_movement_at:
+            case.last_movement_at = newest
+
+    @staticmethod
+    def _identity_key(rol: str, court_id: int, procedure: Optional[str]) -> tuple:
+        """Case identity, mirroring ``uq_cases_identity``: NULL and '' procedure are one."""
+        return (rol, court_id, procedure or "")
+
+    def _load_cases_by_identity(self, rols: Iterable[str]) -> dict:
+        """{identity: Case} for every case whose ROL is in ``rols``, any owner.
+
+        One SELECT per 500 ROLs. Legacy duplicates of one identity (T5 merges
+        them) resolve to the lowest id, deterministically.
+        """
+        rol_list = sorted(set(rols))
+        by_identity: dict = {}
+        for start in range(0, len(rol_list), 500):
+            batch = rol_list[start : start + 500]
+            for c in (
+                self.db.query(Case)
+                .filter(Case.rol.in_(batch))
+                .order_by(Case.id)
+                .all()
+            ):
+                by_identity.setdefault(
+                    self._identity_key(c.rol, c.court_id, c.procedure), c
+                )
+        return by_identity
+
+    def _identity_exists(self, scraped: ScrapedCase, existing_by_identity: dict) -> bool:
+        """True when ``scraped`` already has a Case. Creates no court.
+
+        Used by the year floor: a court that does not exist yet cannot own an
+        existing case, and a skipped row must not leave a Court behind.
+        """
+        name = scraped.tribunal.strip()
+        court = self._court_cache.get(name)
+        if court is None:
+            court = self.db.query(Court).filter(Court.name == name).first()
+            if court is None:
+                return False
+            self._court_cache[name] = court
+        key = self._identity_key(scraped.rol.strip().upper(), court.id, scraped.cuaderno)
+        return key in existing_by_identity
+
     def _upsert_case(
         self,
-        lawyer_id: int,
+        owner_id: int,
         scraped: ScrapedCase,
         competencia: str,
-        existing_by_rol: dict,
+        existing_by_identity: dict,
         listing_rows_by_rol: Optional[dict] = None,
     ) -> Tuple[Case, bool]:
         """
         Insert or update a case.
 
         Args:
-            existing_by_rol: pre-loaded map of {normalized_rol: Case} for this
-                lawyer (see sync_cases), built with ONE query instead of one
-                per case. Mutated in place when a new case is created so a
-                duplicate ROL later in the same batch resolves to the
-                just-created row (mirrors the old behavior, where the
-                per-case flush let the next per-case query find it).
+            owner_id: the firm's canonical lawyer id; owner of NEW cases.
+                Existing rows keep whatever owner they have.
+            existing_by_identity: pre-loaded map of
+                {(rol, court_id, procedure): Case} across all owners (see
+                sync_cases), built with ONE query instead of one per case.
+                Mutated in place when a new case is created so a duplicate
+                identity later in the same batch resolves to the just-created
+                row (mirrors the old behavior, where the per-case flush let
+                the next per-case query find it).
             listing_rows_by_rol: {normalized_rol: every listing row of that ROL
                 in this pass} for the listing fingerprint; None skips it.
 
@@ -1254,35 +1434,38 @@ class SyncService:
         # in rotation queries, preventing starvation from mixed-case PJUD responses.
         normalized_rol = scraped.rol.strip().upper()
 
-        # Find existing case by ROL and lawyer (from the pre-loaded map).
-        existing = existing_by_rol.get(normalized_rol)
-
-        # Get or create court
+        # Get or create court (the court is part of the identity)
         court = self._get_or_create_court(scraped.tribunal, competencia)
-        
+
+        # Find existing case by identity (from the pre-loaded map).
+        identity = self._identity_key(normalized_rol, court.id, scraped.cuaderno)
+        existing = existing_by_identity.get(identity)
+
         # Parse caratulado into plaintiff/defendant
         plaintiff, defendant = self._parse_caratulado(scraped.caratulado)
         
         # Parse fecha_ingreso
         filed_at = self._parse_date(scraped.fecha_ingreso)
         
-        if existing:
-            # Update existing case
-            existing.court_id = court.id
-            existing.plaintiff = plaintiff
-            existing.defendant = defendant
-            existing.status = self._map_status(scraped.estado_cuaderno)
-            existing.procedure = scraped.cuaderno
-            existing.competencia = competencia
+        def _update(row: Case) -> Tuple[Case, bool]:
+            row.court_id = court.id
+            row.plaintiff = plaintiff
+            row.defendant = defendant
+            row.status = self._map_status(scraped.estado_cuaderno)
+            row.procedure = scraped.cuaderno
+            row.competencia = competencia
             if filed_at:
-                existing.filed_at = filed_at
-            self._observe_listing_fingerprint(existing, normalized_rol, listing_rows_by_rol)
-            existing.updated_at = datetime.utcnow()
-            return existing, False
+                row.filed_at = filed_at
+            self._observe_listing_fingerprint(row, normalized_rol, listing_rows_by_rol)
+            row.updated_at = datetime.utcnow()
+            return row, False
+
+        if existing:
+            return _update(existing)
         else:
             # Create new case
             case = Case(
-                lawyer_id=lawyer_id,
+                lawyer_id=owner_id,
                 court_id=court.id,
                 rol=normalized_rol,
                 plaintiff=plaintiff,
@@ -1295,11 +1478,32 @@ class SyncService:
                 updated_at=datetime.utcnow(),
             )
             self._observe_listing_fingerprint(case, normalized_rol, listing_rows_by_rol)
-            self.db.add(case)
-            self.db.flush()  # Get the ID
+            try:
+                # SAVEPOINT: a concurrent sync may have created this identity
+                # under the firm owner since the preload. The unique violation
+                # then rolls back only this insert, not the whole chunk.
+                with self.db.begin_nested():
+                    self.db.add(case)
+                    self.db.flush()  # Get the ID
+            except IntegrityError:
+                row = (
+                    self.db.query(Case)
+                    .filter(
+                        Case.lawyer_id == owner_id,
+                        Case.rol == normalized_rol,
+                        Case.court_id == court.id,
+                        func.coalesce(Case.procedure, "") == (scraped.cuaderno or ""),
+                    )
+                    .order_by(Case.id)
+                    .first()
+                )
+                if row is None:
+                    raise
+                existing_by_identity[identity] = row
+                return _update(row)
             # Make the just-created case visible to later scraped entries in
-            # this same batch that share the same ROL (duplicate-ROL guard).
-            existing_by_rol[normalized_rol] = case
+            # this same batch that share the same identity (duplicate guard).
+            existing_by_identity[identity] = case
             return case, True
     
     def _observe_listing_fingerprint(
@@ -1353,7 +1557,7 @@ class SyncService:
         case_id: int,
         scraped: ScrapedMovement,
         existing_by_key: Optional[dict] = None,
-    ) -> Tuple[Movement, bool]:
+    ) -> Tuple[Optional[Movement], bool]:
         """
         Insert movement if it doesn't exist.
 
@@ -1361,10 +1565,21 @@ class SyncService:
         by the caller) is provided, the existence check is an in-memory lookup
         instead of a per-movement SELECT — see sync_movements' batch prefetch.
 
+        A movement whose date does not parse, or whose description is only a
+        date (a shifted-column scrape), is skipped with a WARNING instead of
+        being stored with ``movement_date = now``.
+
         Returns:
-            Tuple of (movement, is_new)
+            Tuple of (movement, is_new); ``(None, False)`` when skipped.
         """
         movement_date = self._parse_date(scraped.fecha)
+        if movement_date is None or _DATE_ONLY.match(scraped.descripcion or ""):
+            logger.warning(
+                "skipping corrupted movement case_id=%s folio=%s fecha=%r "
+                "descripcion=%r",
+                case_id, scraped.folio, scraped.fecha, scraped.descripcion,
+            )
+            return None, False
         key = (scraped.folio, scraped.descripcion)
 
         # Check if movement already exists (by folio + description)
@@ -1382,6 +1597,10 @@ class SyncService:
         if existing:
             return existing, False
 
+        repaired = self._find_repaired_movement(case_id, scraped, existing_by_key)
+        if repaired is not None:
+            return self._heal_movement(repaired, scraped, existing_by_key), False
+
         # Create new movement
         movement = Movement(
             case_id=case_id,
@@ -1389,7 +1608,7 @@ class SyncService:
             stage=scraped.etapa,
             procedure=scraped.tipo_tramite,
             description=scraped.descripcion,
-            movement_date=movement_date or datetime.utcnow(),
+            movement_date=movement_date,
             created_at=datetime.utcnow(),
         )
         self.db.add(movement)
@@ -1400,6 +1619,56 @@ class SyncService:
             existing_by_key[key] = movement
         return movement, True
     
+    def _find_repaired_movement(
+        self,
+        case_id: int,
+        scraped: ScrapedMovement,
+        existing_by_key: Optional[dict],
+    ) -> Optional[Movement]:
+        """Return the single hand-repaired row this scrape corresponds to.
+
+        A repaired row has the date text as its description and that text
+        equals its own ``movement_date``. It matches when it has the scraped
+        folio and the scraped date. Zero or several candidates -> None.
+        """
+        date_text = self._parse_date(scraped.fecha).strftime("%d/%m/%Y")
+        if existing_by_key is not None:
+            candidates = [
+                m for (folio, _), m in existing_by_key.items()
+                if folio == scraped.folio
+            ]
+        else:
+            candidates = self.db.query(Movement).filter(
+                and_(Movement.case_id == case_id, Movement.folio == scraped.folio)
+            ).all()
+        matches = [
+            m for m in candidates
+            if m.description == date_text
+            and m.movement_date.strftime("%d/%m/%Y") == date_text
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    def _heal_movement(
+        self,
+        movement: Movement,
+        scraped: ScrapedMovement,
+        existing_by_key: Optional[dict],
+    ) -> Movement:
+        """Restore the real text on a repaired row, keeping its id and links."""
+        old_key = (movement.folio, movement.description)
+        movement.description = scraped.descripcion
+        movement.stage = scraped.etapa
+        movement.procedure = scraped.tipo_tramite
+        self.db.flush()
+        if existing_by_key is not None:
+            existing_by_key.pop(old_key, None)
+            existing_by_key[(movement.folio, movement.description)] = movement
+        logger.info(
+            "healed repaired movement case_id=%s folio=%s description=%r",
+            movement.case_id, movement.folio, movement.description,
+        )
+        return movement
+
     def _create_movement_alert(
         self, case: Case, movement: Movement, lawyer_id: int
     ) -> Optional[Alert]:
@@ -1671,6 +1940,91 @@ def _select_cases_for_movement_check(
     return api_cases[:max_cases]
 
 
+def case_belongs_to_lawyer(lawyer_id: int):
+    """SQL clause: ``lawyer_id`` owns the case OR has a sighting of it.
+
+    Transitional (T3b): once cases are owned by the firm lawyer,
+    ``Case.lawyer_id == L`` no longer identifies L's caseload; the sighting in
+    ``case_lawyer_source`` does. Uses an IN subquery (not a JOIN) so row counts
+    never change.
+    """
+    return or_(
+        Case.lawyer_id == lawyer_id,
+        Case.id.in_(
+            select(CaseLawyerSource.case_id).where(
+                CaseLawyerSource.lawyer_id == lawyer_id
+            )
+        ),
+    )
+
+
+def _mark_detail_checked(db: Session, lawyer_id: int, db_case: Case) -> None:
+    """Stamp ``last_detail_checked_at`` on ``db_case`` and its siblings.
+
+    Siblings: same ROL, same court, same competencia, visible to the lawyer,
+    other id. One UPDATE, timestamp only (the visit scraped that ROL once; it
+    claims nothing about the siblings' own data beyond "checked"). Without it
+    the sibling would stay at the front of the rotation forever.
+    """
+    now = datetime.utcnow()
+    db_case.last_detail_checked_at = now
+    # Sibling ids come from the candidates query of _pick_db_case_for_api_case
+    # (no extra SELECT); a single-row ROL has none and costs no statement.
+    sibling_ids = getattr(db_case, "_sibling_ids", None)
+    if sibling_ids:
+        db.query(Case).filter(Case.id.in_(sibling_ids)).update(
+            {Case.last_detail_checked_at: now}, synchronize_session=False
+        )
+
+
+def _pick_db_case_for_api_case(
+    db: Session, lawyer_id: int, normalized_rol: str, api_case: Any
+) -> Optional[Case]:
+    """The lawyer's Case row for ``api_case``, preferring its court and cuaderno.
+
+    One lawyer can see the same ROL in several courts or cuadernos (separate
+    rows since uq_cases_identity), so ROL alone can pick the wrong one. Still
+    ONE query: the candidates come with their court name. Ranking: court match
+    first, then cuaderno match, then lowest id (also the fallback when nothing
+    matches, or when the api case carries no usable tribunal/cuaderno).
+    """
+    from app.services.estado_diario_probe import normalize_court_name
+
+    candidates = (
+        db.query(Case, Court.name)
+        .outerjoin(Court, Court.id == Case.court_id)
+        .filter(case_belongs_to_lawyer(lawyer_id), Case.rol == normalized_rol)
+        .order_by(Case.id)
+        .all()
+    )
+    if not candidates:
+        return None
+
+    tribunal = getattr(api_case, "tribunal", None)
+    cuaderno = getattr(api_case, "cuaderno", None)
+    want_court = normalize_court_name(tribunal) if isinstance(tribunal, str) else ""
+    want_proc = (cuaderno or "").strip().upper() if isinstance(cuaderno, str) else ""
+
+    def rank(candidate: Tuple[Case, Optional[str]]) -> Tuple[int, int]:
+        case, court_name = candidate
+        court_hit = bool(want_court) and normalize_court_name(court_name) == want_court
+        proc_hit = bool(want_proc) and (case.procedure or "").strip().upper() == want_proc
+        return (0 if court_hit else 1, 0 if proc_hit else 1)
+
+    # min() is stable: ties keep the lowest id (candidates are ordered by id).
+    chosen = min(candidates, key=rank)[0]
+    # Siblings = same ROL AND court AND competencia (same causa, other
+    # cuaderno): _mark_detail_checked stamps them with the chosen row.
+    chosen._sibling_ids = [
+        c.id
+        for c, _ in candidates
+        if c.id != chosen.id
+        and c.court_id == chosen.court_id
+        and c.competencia == chosen.competencia
+    ]
+    return chosen
+
+
 def _select_cases_for_detail_rotation(
     db: Session,
     lawyer_id: int,
@@ -1726,11 +2080,12 @@ def _select_cases_for_detail_rotation(
         return int(last) >= min_year
 
     # Build lookup: normalized_rol → api_case (live token + within the year scope).
-    api_lookup = {
-        ac.rol.strip().upper(): ac
-        for ac in api_cases
-        if ac.case_token and _year_ok(ac.rol)
-    }
+    # A ROL can list several rows (cuadernos, or one per court), so the value
+    # is the list of live api_cases of that ROL, in listing order.
+    api_lookup: dict = {}
+    for ac in api_cases:
+        if ac.case_token and _year_ok(ac.rol):
+            api_lookup.setdefault(ac.rol.strip().upper(), []).append(ac)
 
     # Year-scoped fallback used when DB rotation can't be applied.
     fallback = [ac for ac in api_cases if ac.case_token and _year_ok(ac.rol)][:batch_size]
@@ -1740,6 +2095,132 @@ def _select_cases_for_detail_rotation(
     order_clauses = []
     if reserved_first:
         order_clauses.append(Case.consulta_reserved.desc())
+
+    # A LIVE deadline (active, not yet due) is the one thing that cancels every
+    # demotion below. Built once and referenced by both clauses so the
+    # selection stays a single statement.
+    plazos_vivos = (
+        select(func.count(CaseDeadline.id))
+        .where(
+            CaseDeadline.case_id == Case.id,
+            CaseDeadline.status == "active",
+            CaseDeadline.due_date >= _today_chile(),
+        )
+        .correlate(Case)
+        .scalar_subquery()
+    )
+
+    # Secondary-cuaderno demotion. PJUD splits one judicial case into cuadernos:
+    # the main one ("Principal") plus secondary ones (medidas prejudiciales,
+    # incidentes, apremios). We keep ONE Case row per cuaderno, so without this
+    # the rotation spends most of its budget re-reading cuadernos instead of
+    # real cases -- measured 2026-10-20 on QA, 60% of the 1.082 daily detail
+    # reads, with one lawyer burning 131 of its 156 daily reads on 199 medidas
+    # prejudiciales re-read every 1,5 days.
+    #
+    # WHICH FIELD: Case.procedure, written as ``procedure = scraped.cuaderno``
+    # by sync/ingest. It is the per-row cuaderno and is never NULL in
+    # production (measured: 0 of 15.201 rows). Case.listing_cuaderno_raw is NOT
+    # usable here: it stores the whole listing cell, which CONCATENATES every
+    # cuaderno of that listing row ("Incidente Nulidad de lo Obrado |
+    # Principal"), and it is NULL for the 4.064 rows never detail-scraped.
+    #
+    # The rule SINKS a row, it never removes it. An inert secondary cuaderno
+    # read less than N days ago sorts below everything else; past N days it
+    # rejoins the rotation at its true age, and when there is nothing else to
+    # scrape it still fills the batch. Never sunk:
+    #   - the Principal cuaderno;
+    #   - a row whose cuaderno we cannot identify (NULL/blank): unknown means
+    #     "treat as a real case", because being wrong that way is safe and
+    #     being wrong the other way blinds the firm;
+    #   - any row carrying a LIVE deadline (active, not yet due). 13 of the 54
+    #     live deadlines measured that day lived on a secondary cuaderno, so
+    #     dropping those rows would blind a quarter of the live fatal plazos.
+    # Sits BELOW the fatal-plazo / pending-docs / reserved slots (inserted at
+    # the head below) and ABOVE the age rotation, so no priority slot loses.
+    if (
+        settings.DETAIL_SECONDARY_CUADERNO_DEMOTE
+        and settings.DETAIL_SECONDARY_CUADERNO_MIN_DAYS > 0
+    ):
+        cuaderno = func.lower(func.trim(func.coalesce(Case.procedure, "")))
+        leido_hace_poco = datetime.utcnow() - timedelta(
+            days=settings.DETAIL_SECONDARY_CUADERNO_MIN_DAYS
+        )
+        cuaderno_secundario_inerte = and_(
+            cuaderno != "",
+            cuaderno.notlike("principal%"),
+            plazos_vivos == 0,
+            Case.last_detail_checked_at.isnot(None),
+            Case.last_detail_checked_at > leido_hace_poco,
+        )
+        # False sorts before True, so the sunk rows go last.
+        order_clauses.append(cuaderno_secundario_inerte.asc())
+
+    # Dormancy demotion. A causa that has not produced a single movement in
+    # over DETAIL_DORMANT_DAYS days is re-read by the rotation at exactly the
+    # same frequency as one notified yesterday. Measured 2026-10-21 on the live
+    # QA DB, over the 15.201 rows in rotation: 2.976 had not moved in over a
+    # year (1.245 over two, 367 over three), and NONE of them carried a live
+    # deadline that day.
+    #
+    # WHY THIS IS SAFE: the rotation is not the firm's only eye. The OJV
+    # estado-diario feed reads PJUD's daily docket per lawyer and jumps the
+    # causas it names to the front of the queue (``priority_rols`` below,
+    # gated by DETAIL_FEED_PRIORITY_ENABLED, ON in the station). A dormant
+    # causa that WAKES UP is caught there. The rotation exists for what nobody
+    # told us about, and that is what gets the freed capacity.
+    #
+    # The rule SINKS a row, it never removes it. Past
+    # DETAIL_DORMANT_MIN_DAYS the row rejoins the rotation at its true age --
+    # and since the age order is "least recently read first", a dormant row
+    # that has waited that long is OLDER than the hot frontier and therefore
+    # wins its slot. So DETAIL_DORMANT_MIN_DAYS is the worst case a dormant
+    # causa can go unseen by the rotation, not a floor it drifts past. A
+    # cartera made only of dormant rows still fills its batch.
+    #
+    # Never sunk:
+    #   - a causa that moved inside the window;
+    #   - a causa with NO ``last_movement_at`` (3.699 rows, 1.758 of them never
+    #     detail-scraped at all). The absence of a movement on record is not
+    #     evidence of dormancy, it is the absence of evidence: being wrong
+    #     towards "real case" costs capacity, being wrong the other way blinds
+    #     the firm. Same rule the cuaderno clause applies to an unknown
+    #     cuaderno;
+    #   - any row carrying a LIVE deadline (active, not yet due), deliberately
+    #     broader than just the fatal types.
+    #
+    # COMPOSITION WITH THE CUADERNO CLAUSE: both are ORDER BY terms of this
+    # same statement, cuaderno first, so the sort key is
+    # ``(cuaderno inerte, durmiente, edad)`` and the buckets are
+    # real+viva < real+durmiente < cuaderno+viva < cuaderno+durmiente. A row
+    # that is BOTH lands last -- correctly, it is the least deserving row in
+    # the cartera. The windows do NOT add up: both predicates test the same
+    # ``last_detail_checked_at`` against their own window, so a both-row's
+    # effective minimum interval is max(14, 90) = 90 days, never 104.
+    #
+    # Sits BELOW the fatal-plazo / pending-docs / reserved slots (inserted at
+    # the head below) and ABOVE the age rotation, so no priority slot loses.
+    if (
+        settings.DETAIL_DORMANT_DEMOTE
+        and settings.DETAIL_DORMANT_DAYS > 0
+        and settings.DETAIL_DORMANT_MIN_DAYS > 0
+    ):
+        quieta_desde = datetime.utcnow() - timedelta(
+            days=settings.DETAIL_DORMANT_DAYS
+        )
+        releida_hace_poco = datetime.utcnow() - timedelta(
+            days=settings.DETAIL_DORMANT_MIN_DAYS
+        )
+        causa_durmiente = and_(
+            Case.last_movement_at.isnot(None),
+            Case.last_movement_at < quieta_desde,
+            plazos_vivos == 0,
+            Case.last_detail_checked_at.isnot(None),
+            Case.last_detail_checked_at > releida_hace_poco,
+        )
+        # False sorts before True, so the sunk rows go last.
+        order_clauses.append(causa_durmiente.asc())
+
     # NULLS FIRST only matters for scope "all" (never-detailed go first). Under
     # "fresh" there are no NULLs in the set, so this reads as "least recently
     # checked first"; under "backlog" every row is NULL, so filed_at DESC decides.
@@ -1753,6 +2234,29 @@ def _select_cases_for_detail_rotation(
     # the dominant backfill signal, so it goes FIRST — ahead of reserved/
     # last_detail/filed. A correlated scalar subquery keeps it portable across
     # Postgres and SQLite (no LEFT JOIN + GROUP BY needed).
+    # HIGHEST priority: a FATAL plazo about to expire. Re-reading the case
+    # before the window closes is the only way to notice the firm already
+    # acted -- otherwise we keep telling a lawyer to do what he did (real
+    # incident 2026-10-20, C-4124-2026) and we also miss a genuine lapse.
+    # Already-expired plazos are excluded on purpose: re-reading changes
+    # nothing for them and they would starve the live ones.
+    if settings.DETAIL_FATAL_PLAZO_DAYS > 0:
+        hoy = _today_chile()
+        plazo_fatal_inminente = (
+            select(func.count(CaseDeadline.id))
+            .where(
+                CaseDeadline.case_id == Case.id,
+                CaseDeadline.status == "active",
+                CaseDeadline.deadline_type.in_(tuple(FATAL_DEADLINE_VALUES)),
+                CaseDeadline.due_date >= hoy,
+                CaseDeadline.due_date
+                <= hoy + timedelta(days=settings.DETAIL_FATAL_PLAZO_DAYS),
+            )
+            .correlate(Case)
+            .scalar_subquery()
+        )
+        order_clauses.insert(0, plazo_fatal_inminente.desc())
+
     if settings.DETAIL_PENDING_DOCS_FIRST:
         pending_docs = (
             select(func.count(Document.id))
@@ -1762,7 +2266,7 @@ def _select_cases_for_detail_rotation(
         )
         order_clauses.insert(0, pending_docs.desc())
 
-    base_filter = (Case.lawyer_id == lawyer_id, Case.competencia == competencia)
+    base_filter = (case_belongs_to_lawyer(lawyer_id), Case.competencia == competencia)
 
     # Freshness/backlog cut (DETAIL_ROTATION_SCOPE). It is ADDED to the filters
     # above; "all" adds nothing.
@@ -1833,7 +2337,24 @@ def _select_cases_for_detail_rotation(
     feed_slots = 0
     if settings.DETAIL_FEED_PRIORITY_ENABLED and priority_rols:
         feed_keys = {r.strip().upper() for r in priority_rols if r and r.strip()}
-        feed_slots = min(max(settings.DETAIL_FEED_MAX_PER_BATCH, 0), batch_size)
+        # The cap is a SHARE of the batch, not an absolute number.
+        #
+        # It was written against DETAIL_BATCH_SIZE, the batch the scheduler
+        # passes. Other callers pass their own, and three of them are SMALLER
+        # than the cap: scripts/freshness_sync.py has CONSULTA_BATCH = 15 and
+        # CU_ROTATOR_BATCH = 15 against a cap of 20. With an absolute cap those
+        # runs hand the feed EVERY slot they have and leave the age rotation a
+        # floor of ZERO -- exactly the starvation the cap exists to prevent
+        # (see the measurement in the comment above: 190 notified causas,
+        # lawyer 17, 2026-10-15).
+        #
+        # Scaling it keeps the scheduler's own batch on the same number it has
+        # always had, since there batch_size == DETAIL_BATCH_SIZE.
+        base_lote = max(settings.DETAIL_BATCH_SIZE, 1)
+        tope = max(settings.DETAIL_FEED_MAX_PER_BATCH, 0)
+        if batch_size != base_lote:
+            tope = int(round(tope * batch_size / base_lote))
+        feed_slots = min(tope, batch_size)
 
     def _is_pending_feed_hit(db_case) -> bool:
         if db_case.rol.strip().upper() not in feed_keys:
@@ -1843,22 +2364,65 @@ def _select_cases_for_detail_rotation(
         checked = db_case.last_detail_checked_at
         return priority_since is None or checked is None or checked < priority_since
 
+    # Rows sharing (ROL, court) are siblings of one causa (Principal + Medida
+    # prejudicial...): one visit covers them all (detect_and_sync_movements
+    # stamps the siblings), so the batch never books the causa twice. The same
+    # ROL in ANOTHER court is a different causa and is picked on its own, with
+    # the api_case whose tribunal matches its court (one query for the names).
+    from app.services.estado_diario_probe import normalize_court_name
+
+    court_names: dict = {}
+    court_ids = {c.court_id for c in db_cases if c.court_id is not None}
+    if court_ids:
+        court_names = dict(
+            db.query(Court.id, Court.name).filter(Court.id.in_(court_ids)).all()
+        )
+    picked_causas: set = set()
+    used_api_ids: set = set()
+    courts_by_rol: dict = {}
+    for c in db_cases:
+        courts_by_rol.setdefault(c.rol.strip().upper(), set()).add(c.court_id)
+
+    def _api_case_for(db_case):
+        candidates = api_lookup.get(db_case.rol.strip().upper(), [])
+        want = normalize_court_name(court_names.get(db_case.court_id))
+        free = [ac for ac in candidates if id(ac) not in used_api_ids]
+        for ac in free:
+            tribunal = getattr(ac, "tribunal", None)
+            if want and isinstance(tribunal, str) and normalize_court_name(tribunal) == want:
+                return ac
+        # No tribunal match. Only when the lawyer's rows for this ROL span ONE
+        # court is there nothing to confuse, so the first unused listing row is
+        # safe (covers court names that normalize differently). With several
+        # courts, borrowing would scrape one causa twice and leave the other
+        # row unstamped at the front of the order: skip it this cycle.
+        if len(courts_by_rol.get(db_case.rol.strip().upper(), ())) == 1 and free:
+            return free[0]
+        return None
+
     feed_picked: list = []
     feed_waiting = 0
     rotation_picked: list = []
     for db_case in db_cases:
         if not _year_ok(db_case.rol):
             continue
-        api_case = api_lookup.get(db_case.rol.strip().upper())
+        causa = (db_case.rol.strip().upper(), db_case.court_id)
+        if causa in picked_causas:
+            continue
+        api_case = _api_case_for(db_case)
         if api_case is None:
             continue
         if feed_keys and _is_pending_feed_hit(db_case):
             if len(feed_picked) < feed_slots:
                 feed_picked.append(api_case)
+                picked_causas.add(causa)
+                used_api_ids.add(id(api_case))
             else:
                 feed_waiting += 1
             continue
         rotation_picked.append(api_case)
+        picked_causas.add(causa)
+        used_api_ids.add(id(api_case))
         if len(rotation_picked) >= batch_size and (
             not feed_keys or len(feed_picked) >= feed_slots
         ):
@@ -1896,13 +2460,13 @@ def _oldest_unchecked_label(db: Session, lawyer_id: int) -> str:
     """
     never_checked = (
         db.query(func.count(Case.id))
-        .filter(Case.lawyer_id == lawyer_id, Case.last_detail_checked_at.is_(None))
+        .filter(case_belongs_to_lawyer(lawyer_id), Case.last_detail_checked_at.is_(None))
         .scalar()
         or 0
     )
     oldest_checked = (
         db.query(func.min(Case.last_detail_checked_at))
-        .filter(Case.lawyer_id == lawyer_id, Case.last_detail_checked_at.isnot(None))
+        .filter(case_belongs_to_lawyer(lawyer_id), Case.last_detail_checked_at.isnot(None))
         .scalar()
     )
     if oldest_checked is None:
@@ -2038,6 +2602,50 @@ def _fan_out_case_alerts(
     return alert_count
 
 
+def poder_obligation_is_ours(
+    db: Session, case: Case, row, today: Optional[date] = None
+):
+    """The "Previo a proveer" movement when the ratification obligation behind
+    ``row`` is provably the firm's own, else ``None``.
+
+    HEURISTIC (see ``poder_deadline``): the obligation is ours when the
+    ``Previo a proveer`` comes after an excepciones filing AND the firm is on
+    the ejecutado's side (``_firm_side``; it defaults to "demandado" when the
+    side is unknown, so an unknown side errs toward alerting). ``row`` must be
+    the case's ACTIVE, automatic ``acreditar_poder_3d`` row, not yet expired.
+    Shared by ``emit_ratification_alert`` and the plazo semaforo so both agree
+    on whose obligation it is.
+    """
+    from app.services.deadline_engine import _firm_side
+    from app.services.poder_deadline import (
+        find_poder_obligation,
+        responds_to_excepciones_filing,
+    )
+
+    if row is None or row.source_movement_id is None:
+        return None
+    if row.due_date < (today or _today_chile()):
+        return None
+
+    movements = (
+        db.query(Movement)
+        .filter(Movement.case_id == case.id)
+        .order_by(Movement.movement_date.asc(), Movement.id.asc())
+        .all()
+    )
+    obligation = find_poder_obligation(movements)
+    if obligation is None or obligation.fulfilled:
+        return None
+    trigger = obligation.trigger
+    if getattr(trigger, "id", None) != row.source_movement_id:
+        return None
+    if not responds_to_excepciones_filing(movements, trigger):
+        return None
+    if _firm_side(db, case) == "demandante":
+        return None
+    return trigger
+
+
 def emit_ratification_alert(
     db: Session,
     case: Case,
@@ -2047,27 +2655,16 @@ def emit_ratification_alert(
 ) -> int:
     """Alert the firm of a FATAL "ratificar firma" plazo that is provably its own.
 
-    HEURISTIC (see ``poder_deadline``): the obligation is ours when the
-    ``Previo a proveer`` comes after an excepciones filing AND the firm is
-    on the ejecutado's side (``_firm_side``; it defaults to "demandado" when the
-    side is unknown, so an unknown side errs toward alerting — a missed fatal
-    plazo costs the defense, a spurious alert only noise). The precise path, the
-    folio parsed from the PDF text, is not implemented yet.
-
-    Runs OUTSIDE the semáforo: the plazo type stays informational, so this never
-    touches ``semaforo`` / ``next_deadline_at``. It requires an ACTIVE, not yet
-    expired plazo row, so already-fulfilled or long-lapsed obligations (the
-    backlog at first deploy) do not fire. De-duplicated per obligation by the
-    trigger movement id stored in ``Alert.movement_id``. Never raises.
+    Whose obligation it is: see ``poder_obligation_is_ours``. Runs OUTSIDE the
+    semáforo: the plazo type stays informational, so this never touches
+    ``semaforo`` / ``next_deadline_at``. It requires an ACTIVE, not yet expired
+    plazo row, so already-fulfilled or long-lapsed obligations (the backlog at
+    first deploy) do not fire. De-duplicated per obligation by the trigger
+    movement id stored in ``Alert.movement_id``. Never raises.
     """
     try:
         from app.core.deadlines_config import DeadlineType
         from app.models.case_deadline import CaseDeadline
-        from app.services.deadline_engine import _firm_side
-        from app.services.poder_deadline import (
-            find_poder_obligation,
-            responds_to_excepciones_filing,
-        )
 
         row = (
             db.query(CaseDeadline)
@@ -2080,26 +2677,8 @@ def emit_ratification_alert(
             .order_by(CaseDeadline.id.desc())
             .first()
         )
-        if row is None or row.source_movement_id is None:
-            return 0
-        if row.due_date < (today or _today_chile()):
-            return 0
-
-        movements = (
-            db.query(Movement)
-            .filter(Movement.case_id == case.id)
-            .order_by(Movement.movement_date.asc(), Movement.id.asc())
-            .all()
-        )
-        obligation = find_poder_obligation(movements)
-        if obligation is None or obligation.fulfilled:
-            return 0
-        trigger = obligation.trigger
-        if getattr(trigger, "id", None) != row.source_movement_id:
-            return 0
-        if not responds_to_excepciones_filing(movements, trigger):
-            return 0
-        if _firm_side(db, case) == "demandante":
+        trigger = poder_obligation_is_ours(db, case, row, today)
+        if trigger is None:
             return 0
 
         already = (
@@ -2176,6 +2755,17 @@ def _maybe_recompute_deadlines(
                 them instead of querying again.
     """
     if (case.competencia or "").lower() != "civil":
+        return
+    if is_medida_prejudicial(case.procedure):
+        # Neutral row: no plazos, so no deadline/ratification alert fan-out.
+        try:
+            DeadlineEngine.neutralize_medida_prejudicial(db, case)
+        except Exception:
+            logger.exception(
+                "medida prejudicial neutralization failed for case_id=%s; "
+                "sync continues",
+                getattr(case, "id", "?"),
+            )
         return
     try:
         # `loaded` is only forwarded when asked for, so every other caller keeps
@@ -2525,10 +3115,7 @@ async def detect_and_sync_movements(
         # Resolve DB case BEFORE the try block so the except branch can reference
         # it to advance last_detail_checked_at even on failure (rotation fairness).
         normalized_rol = api_case.rol.strip().upper()
-        db_case = db.query(Case).filter(
-            Case.lawyer_id == lawyer_id,
-            Case.rol == normalized_rol,
-        ).first()
+        db_case = _pick_db_case_for_api_case(db, lawyer_id, normalized_rol, api_case)
 
         async def _do_fetch() -> Tuple[int, int]:
             """Run ``_do_fetch_inner`` with ``expire_on_commit`` off.
@@ -2631,13 +3218,14 @@ async def detect_and_sync_movements(
 
             # 2. Sync entity types in priority order (S1-T12 + S2-T03).
             # Litigantes are stored but SILENT (ADR-004); the rest alert + notify.
+            escrito_rows = None
             for entity_list, spec in [
                 (detail.litigantes, SPEC_LITIGANTE),
                 (detail.notificaciones, SPEC_NOTIFICACION),
                 (detail.escritos, SPEC_ESCRITO),
                 (detail.exhortos, SPEC_EXHORTO),
             ]:
-                _sync_entities(
+                synced = _sync_entities(
                     db,
                     int(db_case.id),
                     entity_list,
@@ -2648,18 +3236,20 @@ async def detect_and_sync_movements(
                     notification_svc=notification_svc,
                     budget=shared_budget,
                 )
+                if spec is SPEC_ESCRITO:
+                    escrito_rows = synced
 
             # 3. Persist document tokens (Slice 1 — S1-T13).
             # Must run after sync_movements so that Movement rows exist for
             # the folio-based lookup inside persist_from_detail.
             persisted_docs = DocumentPersistenceService().persist_from_detail(
-                detail, int(db_case.id), db
+                detail, int(db_case.id), db, escrito_rows=escrito_rows
             )
 
             # Mark this case as detail-checked so the rotation scheduler
             # advances it to the back of the queue for the next run.
             # Runs even on 0-movement fetches — guarantees full-cycle coverage.
-            db_case.last_detail_checked_at = datetime.utcnow()
+            _mark_detail_checked(db, lawyer_id, db_case)
 
             # Recompute procedural deadlines (civil only; flush-only; never raises).
             # Shares this call's NotifyBudget (ADR-005) so a ROJO-entry/fatal
@@ -2945,7 +3535,7 @@ async def detect_and_sync_movements(
                 if is_timeout:
                     scraper._panel_loaded = False
                 if db_case is not None:
-                    db_case.last_detail_checked_at = datetime.utcnow()
+                    _mark_detail_checked(db, lawyer_id, db_case)
                     try:
                         db.commit()
                     except Exception:
@@ -2989,7 +3579,7 @@ async def detect_and_sync_movements(
                 pass
             scraper._panel_loaded = False
             if db_case is not None:
-                db_case.last_detail_checked_at = datetime.utcnow()
+                _mark_detail_checked(db, lawyer_id, db_case)
                 try:
                     db.commit()
                 except Exception:
@@ -3053,7 +3643,7 @@ async def detect_and_sync_movements(
                 # Case-specific error (detail parse, not-found, etc.). Advance so a
                 # persistently-failing case rotates to the back and doesn't block
                 # the rotation batch on every scheduled run.
-                db_case.last_detail_checked_at = datetime.utcnow()
+                _mark_detail_checked(db, lawyer_id, db_case)
                 try:
                     db.commit()
                 except Exception:
@@ -3245,20 +3835,23 @@ async def sync_via_consulta(
                         case.rol, new_count, alert_count,
                     )
 
+                escrito_rows = None
                 for entity_list, spec in [
                     (detail.litigantes, SPEC_LITIGANTE),
                     (detail.notificaciones, SPEC_NOTIFICACION),
                     (detail.escritos, SPEC_ESCRITO),
                     (detail.exhortos, SPEC_EXHORTO),
                 ]:
-                    _sync_entities(
+                    synced = _sync_entities(
                         db, int(case.id), entity_list, spec,
                         case=case, lawyer=lawyer, webhooks=webhooks,
                         notification_svc=notification_svc, budget=shared_budget,
                     )
+                    if spec is SPEC_ESCRITO:
+                        escrito_rows = synced
 
                 persisted_docs = DocumentPersistenceService().persist_from_detail(
-                    detail, int(case.id), db
+                    detail, int(case.id), db, escrito_rows=escrito_rows
                 )
 
                 case.consulta_reserved = False

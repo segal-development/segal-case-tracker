@@ -41,7 +41,7 @@ class CarteraSnapshot(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     periodo = Column(String(7), nullable=False, index=True)  # "YYYY-MM"
-    case_id = Column(Integer, ForeignKey("cases.id"), nullable=False)
+    case_id = Column(Integer, ForeignKey("cases.id"), nullable=False, index=True)
     lawyer_id = Column(Integer, ForeignKey("lawyers.id"), nullable=True)
     nivel = Column(String(10), nullable=True)  # frozen at snapshot time
 

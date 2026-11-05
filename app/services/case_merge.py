@@ -1,11 +1,14 @@
 """Case merge pipeline (ADR-008, Slice 2) — merges duplicate Case rows.
 
 Pre-Approach-C ingest wrote one Case per (syncing lawyer, ROL). Approach C
-(PR1a/PR1b) fixed ingest to upsert one Case per ROL under the firm's
+(PR1a/PR1b) fixed ingest to upsert one Case per causa under the firm's
 canonical ``lawyer_id`` going forward, but historical duplicates already
-exist (the same ROL under Carla's id AND under one or more per-lawyer ids).
-This module merges those duplicates: exactly one Case row survives per ROL,
-owned by the firm ``lawyer_id``, with every child row re-pointed and deduped.
+exist (the same causa under Carla's id AND under one or more per-lawyer ids).
+This module merges those duplicates: exactly one Case row survives per causa
+identity ``(rol, court_id, procedure)``, owned by the firm ``lawyer_id``, with
+every child row re-pointed and deduped. A causa is NEVER identified by ROL
+alone: the same ROL in two courts, or in two cuadernos of one court
+(``procedure``), are different juicios and both survive.
 
 ``run_case_merge`` is a pure, DB-session based pipeline — it never commits.
 The caller (the Alembic migration, or a test) controls the transaction
@@ -14,16 +17,16 @@ boundary, which is what makes the verify-before-delete gate meaningful: if
 transaction (repoint + dedupe + audit rows included), not just skip the
 delete step.
 
-Idempotent: re-running after a successful merge finds zero duplicate ROLs
-and zero non-firm-owned survivors, so it is a no-op.
+Idempotent: re-running after a successful merge finds zero duplicate
+identities and zero non-firm-owned survivors, so it is a no-op.
 """
 
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple
+from typing import Collection, Dict, List, Optional, Tuple
 
-from sqlalchemy import func
+from sqlalchemy import func, tuple_
 from sqlalchemy.orm import Session
 
 from app.api.deps import firm_lawyer_id
@@ -36,12 +39,18 @@ from app.models.case_lawyer_source import CaseLawyerSource
 from app.models.case_litigante import CaseLitigante
 from app.models.case_merge_audit import CaseMergeAudit
 from app.models.case_notificacion import CaseNotificacion
+from app.models.cartera_snapshot import CarteraSnapshot
 from app.models.document import Document
+from app.models.generated_document import GeneratedDocument
+from app.models.hito import Hito
+from app.models.liberacion import LiberacionRequest
 from app.models.movement import Movement
 
-# The 8 child tables that carry a `case_id` FK and must be re-pointed
-# loser -> winner before the loser Case row is deleted (spec: "Data
-# migration invariants" requirement, design ADR-008 section 9).
+# Every table with a ``case_id`` FK to ``cases.id`` (case_merge_audit's
+# ``winner_case_id`` is excluded: it points at the WINNER, not a child). Each
+# must be re-pointed loser -> winner before the loser Case row is deleted and
+# is checked by ``_verify_invariants``. A metadata-driven test pins this list
+# against ``Base.metadata`` so a future table cannot be forgotten silently.
 CHILD_TABLES_WITH_CASE_ID = [
     Movement,
     Document,
@@ -51,7 +60,15 @@ CHILD_TABLES_WITH_CASE_ID = [
     CaseExhorto,
     CaseDeadline,
     Alert,
+    Hito,
+    LiberacionRequest,
+    GeneratedDocument,
+    CarteraSnapshot,
+    CaseLawyerSource,
 ]
+
+# (rol, court_id, procedure) with NULL and '' treated as the same cuaderno.
+Identity = Tuple[str, int, str]
 
 
 class CaseMergeVerificationError(RuntimeError):
@@ -70,19 +87,27 @@ class CaseMergeResult:
     audit_rows_created: int = 0
     reowned_case_count: int = 0
     merged_rols: List[str] = field(default_factory=list)
+    remaining_groups: int = 0
+    group_keys: List[Identity] = field(default_factory=list)
 
 
-def run_case_merge(db: Session) -> CaseMergeResult:
-    """Merge every duplicate-ROL group of Case rows into one firm-owned Case.
+def run_case_merge(
+    db: Session,
+    *,
+    group_limit: Optional[int] = None,
+    only_group_keys: Optional[Collection[Identity]] = None,
+) -> CaseMergeResult:
+    """Merge every duplicate-identity group of Case rows into one firm-owned Case.
 
     Steps (per spec's "Data migration invariants" requirement):
-    1. Find duplicate ROL groups (civil cases, >1 Case row per ROL).
+    1. Find duplicate groups (civil cases, >1 Case row per
+       ``(rol, court_id, procedure)``; NULL and '' procedure are equal).
     2. Select the winner per group: richest (most movements+documents+
        litigantes), tie-broken by lowest ``id``.
     3. Backfill ``case_lawyer_source`` for every pre-merge ``lawyer_id`` in
        the group (so the merge doesn't lose the per-lawyer sync signal).
     4. Snapshot the loser->winner mapping into ``case_merge_audit``.
-    5. Re-point all 8 child tables loser_case_id -> winner_case_id.
+    5. Re-point all child tables (``CHILD_TABLES_WITH_CASE_ID``) loser_case_id -> winner_case_id.
     6. Dedupe children per natural key (true duplicates collapse; distinct
        rows from both sides are preserved).
     7. VERIFY invariants — raises ``CaseMergeVerificationError`` and deletes
@@ -91,21 +116,38 @@ def run_case_merge(db: Session) -> CaseMergeResult:
     9. Re-own every surviving Case to the firm ``lawyer_id`` — deliberately
        AFTER delete, not before: a loser can legitimately already be
        firm-owned, and re-owning the winner while that loser still exists
-       would transiently violate ``uq_cases_lawyer_rol``.
+       would transiently violate ``uq_cases_identity``.
 
-    Does not commit. Idempotent: with no duplicate ROLs left, this is a
+    Does not commit. Idempotent: with no duplicate identities left, this is a
     cheap no-op (re-own is scoped to non-firm-owned cases only).
+
+    Batching (for resumable cleanups, one transaction per call):
+    ``only_group_keys`` restricts the run to those identities (unknown keys
+    are ignored, so resuming with an already-merged key is a no-op) and
+    ``group_limit`` then keeps the first N groups in ascending
+    ``(court_id, rol, procedure)`` order. Merged groups stop being
+    duplicates, so the next call over the same ordering returns the NEXT
+    groups. When either argument is given, verification (step 7) and re-own
+    (step 9) are scoped to the groups/winners of this batch; with neither,
+    the behaviour is the full-table one. ``remaining_groups`` counts the
+    groups still duplicated after the batch.
     """
     firm_id = firm_lawyer_id(db)
-    groups = _find_duplicate_rol_groups(db)
+    batched = group_limit is not None or only_group_keys is not None
+    identities = _select_batch_identities(db, group_limit, only_group_keys)
+    groups = _load_groups(db, identities)
 
-    losers_by_rol: Dict[str, List[Case]] = {}
+    losers_by_identity: Dict[Identity, List[Case]] = {}
     audit_rows_created = 0
 
-    for rol, cases in groups.items():
+    winner_ids: Dict[Identity, int] = {}
+
+    for identity, cases in groups.items():
+        rol = identity[0]
         winner = _select_winner(db, cases)
+        winner_ids[identity] = winner.id
         losers = [c for c in cases if c.id != winner.id]
-        losers_by_rol[rol] = losers
+        losers_by_identity[identity] = losers
 
         _backfill_case_lawyer_source(db, winner, cases)
 
@@ -125,16 +167,20 @@ def run_case_merge(db: Session) -> CaseMergeResult:
 
         for loser in losers:
             _merge_children(db, loser.id, winner.id)
+            _repoint_audit_winner(db, loser.id, winner.id)
             db.flush()
 
-    loser_ids = [loser.id for losers in losers_by_rol.values() for loser in losers]
+    loser_ids = [loser.id for losers in losers_by_identity.values() for loser in losers]
 
-    # Verify BEFORE any Case delete (spec invariants 1-3: no dup ROLs among
+    # Verify BEFORE any Case delete (spec invariants 1-3: no dup identities among
     # survivors, no orphaned children, natural-key dedupe integrity).
-    _verify_invariants(db, loser_ids)
+    if batched:
+        _verify_invariants(db, loser_ids, identities=list(groups))
+    else:
+        _verify_invariants(db, loser_ids)
 
     losers_deleted = 0
-    for losers in losers_by_rol.values():
+    for losers in losers_by_identity.values():
         for loser in losers:
             db.delete(loser)
             losers_deleted += 1
@@ -144,11 +190,19 @@ def run_case_merge(db: Session) -> CaseMergeResult:
     # firm-owned (e.g. the firm's own whole-firm scrape loses richness to a
     # lawyer's extension copy for the same ROL). Re-owning the winner to
     # firm_id while that not-yet-deleted loser still holds
-    # (firm_id, rol) would transiently violate uq_cases_lawyer_rol. Deleting
+    # (firm_id, rol, court, procedure) would transiently violate uq_cases_identity. Deleting
     # losers first makes re-own unconditionally safe; invariant 4 ("every
     # surviving Case is owned by the firm lawyer_id") then holds by
     # construction rather than needing a separate pre-delete check.
-    reowned = _reown_surviving_cases(db, firm_id, exclude_ids=[])
+    # In a batch only this batch's winners are re-owned: the rest of the table
+    # still holds groups that were not merged yet, and touching them would
+    # both pre-empt their own batch and pay a table-wide UPDATE every call.
+    reowned = _reown_surviving_cases(
+        db,
+        firm_id,
+        exclude_ids=[],
+        only_ids=[winner_ids[identity] for identity in groups] if batched else None,
+    )
     db.flush()
 
     return CaseMergeResult(
@@ -156,8 +210,25 @@ def run_case_merge(db: Session) -> CaseMergeResult:
         losers_deleted=losers_deleted,
         audit_rows_created=audit_rows_created,
         reowned_case_count=reowned,
-        merged_rols=sorted(groups.keys()),
+        merged_rols=sorted(identity[0] for identity in groups),
+        remaining_groups=count_duplicate_identity_groups(db),
+        group_keys=list(groups),
     )
+
+
+def count_duplicate_identity_groups(db: Session) -> int:
+    """Number of civil identities still held by more than one Case row, in ONE
+    aggregate statement (same GROUP BY ... HAVING shape as
+    ``_find_duplicate_identity_groups``, without loading any case)."""
+    procedure_key = func.coalesce(Case.procedure, "")
+    grouped = (
+        db.query(Case.rol)
+        .filter(Case.competencia == "civil")
+        .group_by(Case.rol, Case.court_id, procedure_key)
+        .having(func.count(Case.id) > 1)
+        .subquery()
+    )
+    return db.query(func.count()).select_from(grouped).scalar() or 0
 
 
 def reverse_case_merge(db: Session) -> int:
@@ -172,24 +243,30 @@ def reverse_case_merge(db: Session) -> int:
     best-effort recovery path and to give ``downgrade()`` something
     meaningful to do.
 
-    Idempotent: skips an audit row if a Case with that (lawyer_id, rol)
-    already exists.
+    Idempotent: skips an audit row if a Case with that (lawyer_id, rol,
+    court_id, procedure) already exists — the winner's court and cuaderno
+    identify the causa, so a different causa with the same ROL is not a skip.
 
     Returns the number of Case rows recreated.
     """
     recreated = 0
     audit_rows = db.query(CaseMergeAudit).all()
     for row in audit_rows:
+        winner = db.query(Case).filter(Case.id == row.winner_case_id).first()
+        if winner is None:
+            continue
+
         existing = (
             db.query(Case)
-            .filter(Case.lawyer_id == row.loser_lawyer_id, Case.rol == row.rol)
+            .filter(
+                Case.lawyer_id == row.loser_lawyer_id,
+                Case.rol == row.rol,
+                Case.court_id == winner.court_id,
+                func.coalesce(Case.procedure, "") == (winner.procedure or ""),
+            )
             .first()
         )
         if existing is not None:
-            continue
-
-        winner = db.query(Case).filter(Case.id == row.winner_case_id).first()
-        if winner is None:
             continue
 
         db.add(
@@ -197,6 +274,7 @@ def reverse_case_merge(db: Session) -> int:
                 lawyer_id=row.loser_lawyer_id,
                 court_id=winner.court_id,
                 rol=row.rol,
+                procedure=winner.procedure,
                 competencia=winner.competencia,
             )
         )
@@ -210,25 +288,66 @@ def reverse_case_merge(db: Session) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _find_duplicate_rol_groups(db: Session) -> Dict[str, List[Case]]:
-    """Civil ROLs with more than one Case row, each group ordered by id."""
-    dupe_rols = (
-        db.query(Case.rol)
+def _find_duplicate_identities(db: Session) -> List[Identity]:
+    """Identities of civil causas with more than one Case row, sorted by
+    ``(court_id, rol, procedure)``. NULL and '' procedure are the same
+    cuaderno. The order depends only on the identities themselves, so it is
+    stable across batches."""
+    procedure_key = func.coalesce(Case.procedure, "")
+    dupes = (
+        db.query(Case.rol, Case.court_id, procedure_key)
         .filter(Case.competencia == "civil")
-        .group_by(Case.rol)
+        .group_by(Case.rol, Case.court_id, procedure_key)
         .having(func.count(Case.id) > 1)
         .all()
     )
-    groups: Dict[str, List[Case]] = {}
-    for (rol,) in dupe_rols:
-        cases = (
+    return sorted(
+        ((rol, court_id, procedure or "") for rol, court_id, procedure in dupes),
+        key=lambda identity: (identity[1], identity[0], identity[2]),
+    )
+
+
+def _select_batch_identities(
+    db: Session,
+    group_limit: Optional[int],
+    only_group_keys: Optional[Collection[Identity]],
+) -> List[Identity]:
+    """Duplicate identities for this run: filtered by ``only_group_keys``
+    (keys that are not duplicated any more are ignored), then cut to the
+    first ``group_limit`` in sorted order."""
+    identities = _find_duplicate_identities(db)
+    if only_group_keys is not None:
+        wanted = {(rol, court_id, procedure or "") for rol, court_id, procedure in only_group_keys}
+        identities = [identity for identity in identities if identity in wanted]
+    if group_limit is not None:
+        identities = identities[: max(group_limit, 0)]
+    return identities
+
+
+def _load_groups(db: Session, identities: List[Identity]) -> Dict[Identity, List[Case]]:
+    """Cases of each identity, ordered by id."""
+    procedure_key = func.coalesce(Case.procedure, "")
+    groups: Dict[Identity, List[Case]] = {}
+    for rol, court_id, procedure in identities:
+        groups[(rol, court_id, procedure)] = (
             db.query(Case)
-            .filter(Case.rol == rol, Case.competencia == "civil")
+            .filter(
+                Case.rol == rol,
+                Case.court_id == court_id,
+                procedure_key == procedure,
+                Case.competencia == "civil",
+            )
             .order_by(Case.id)
             .all()
         )
-        groups[rol] = cases
     return groups
+
+
+def _find_duplicate_identity_groups(db: Session) -> Dict[Identity, List[Case]]:
+    """Civil causas with more than one Case row per identity, each group
+    ordered by id. Identity is ``(rol, court_id, procedure)``, never ROL
+    alone; NULL and '' procedure are the same cuaderno."""
+    return _load_groups(db, _find_duplicate_identities(db))
 
 
 def _richness_score(db: Session, case_id: int) -> int:
@@ -277,8 +396,25 @@ def _backfill_case_lawyer_source(db: Session, winner: Case, cases: List[Case]) -
     db.flush()
 
 
+def _repoint_audit_winner(db: Session, loser_id: int, winner_id: int) -> None:
+    """Keep the audit trail when a former winner loses a later merge.
+
+    ``case_merge_audit.winner_case_id`` is a foreign key to ``cases.id``. An EARLIER merge
+    (migration 024) recorded some cases as winners, and a case like that can lose a new
+    merge: deleting it then violates the foreign key and the whole batch rolls back
+    (measured on QA: 229 old audit rows, 167 still-duplicated cases among them).
+
+    The old rows are not deleted: they are re-pointed to the case that now holds the
+    data, so the chain reads "X went into Y, and Y into Z". ``loser_case_id`` is not a
+    foreign key and needs no change.
+    """
+    db.query(CaseMergeAudit).filter(CaseMergeAudit.winner_case_id == loser_id).update(
+        {CaseMergeAudit.winner_case_id: winner_id}, synchronize_session=False
+    )
+
+
 def _merge_children(db: Session, loser_id: int, winner_id: int) -> None:
-    """Collision-aware loser -> winner merge for all 8 child tables.
+    """Collision-aware loser -> winner merge for every child table.
 
     Replaces the old two-phase "blind repoint (UPDATE case_id=winner for
     every loser row) THEN dedupe" flow. That flow could emit an UPDATE that
@@ -309,6 +445,12 @@ def _merge_children(db: Session, loser_id: int, winner_id: int) -> None:
     _merge_deadlines(db, loser_id, winner_id)
     _merge_documents(db, loser_id, winner_id)
     _merge_alerts(db, loser_id, winner_id)
+    _merge_case_lawyer_sources(db, loser_id, winner_id)
+    _merge_cartera_snapshots(db, loser_id, winner_id)
+    # No per-case constraint: plain repoint.
+    for model in (Hito, LiberacionRequest, GeneratedDocument):
+        for row in db.query(model).filter(model.case_id == loser_id).all():
+            row.case_id = winner_id
 
 
 def _merge_movements(db: Session, loser_id: int, winner_id: int) -> None:
@@ -342,6 +484,8 @@ def _merge_movements(db: Session, loser_id: int, winner_id: int) -> None:
                 deadline.verdict_movement_id = canonical.id
             for alert in db.query(Alert).filter(Alert.movement_id == row.id).all():
                 alert.movement_id = canonical.id
+            for hito in db.query(Hito).filter(Hito.movement_id == row.id).all():
+                hito.movement_id = canonical.id
             to_delete.append(row)
         else:
             row.case_id = winner_id
@@ -466,36 +610,83 @@ def _merge_alerts(db: Session, loser_id: int, winner_id: int) -> None:
             seen.add(key)
 
 
-def _reown_surviving_cases(db: Session, firm_id: int, exclude_ids: List[int]) -> int:
+def _merge_case_lawyer_sources(db: Session, loser_id: int, winner_id: int) -> None:
+    """Unique per (case_id, lawyer_id): the loser's own source rows still
+    reference the loser and would block its delete. ``_backfill_case_lawyer_
+    source`` already gave the winner a row per pre-merge lawyer, so colliding
+    loser rows are dropped and the rest repointed."""
+    seen = {
+        row.lawyer_id
+        for row in db.query(CaseLawyerSource).filter(CaseLawyerSource.case_id == winner_id).all()
+    }
+    for row in db.query(CaseLawyerSource).filter(CaseLawyerSource.case_id == loser_id).order_by(CaseLawyerSource.id).all():
+        if row.lawyer_id in seen:
+            db.delete(row)
+        else:
+            row.case_id = winner_id
+            seen.add(row.lawyer_id)
+
+
+def _merge_cartera_snapshots(db: Session, loser_id: int, winner_id: int) -> None:
+    """Unique per (periodo, case_id): the winner keeps its snapshot for a
+    period both copies froze; periods only the loser has are repointed."""
+    seen = {
+        row.periodo
+        for row in db.query(CarteraSnapshot).filter(CarteraSnapshot.case_id == winner_id).all()
+    }
+    for row in db.query(CarteraSnapshot).filter(CarteraSnapshot.case_id == loser_id).order_by(CarteraSnapshot.id).all():
+        if row.periodo in seen:
+            db.delete(row)
+        else:
+            row.case_id = winner_id
+            seen.add(row.periodo)
+
+
+def _reown_surviving_cases(
+    db: Session,
+    firm_id: int,
+    exclude_ids: List[int],
+    only_ids: Optional[List[int]] = None,
+) -> int:
     """Set lawyer_id = firm_id for every civil Case not about to be deleted.
 
     Scoped to non-firm-owned rows so a no-duplicates re-run reports 0
-    (idempotency signal), not just "no functional change".
+    (idempotency signal), not just "no functional change". ``only_ids``
+    (a batch's winners) restricts it further; an empty list re-owns nothing.
     """
-    rows = (
-        db.query(Case)
-        .filter(Case.lawyer_id != firm_id, ~Case.id.in_(exclude_ids or [0]))
-        .all()
-    )
+    if only_ids is not None and not only_ids:
+        return 0
+    query = db.query(Case).filter(Case.lawyer_id != firm_id, ~Case.id.in_(exclude_ids or [0]))
+    if only_ids is not None:
+        query = query.filter(Case.id.in_(only_ids))
+    rows = query.all()
     for row in rows:
         row.lawyer_id = firm_id
     return len(rows)
 
 
-def _verify_invariants(db: Session, loser_ids: List[int]) -> None:
+def _verify_invariants(
+    db: Session,
+    loser_ids: List[int],
+    identities: Optional[Collection[Identity]] = None,
+) -> None:
     """Verify merge invariants BEFORE any loser Case row is deleted.
 
     Raises ``CaseMergeVerificationError`` (nothing deleted) if any of:
-    1. Zero duplicate ROLs remain among survivors (post-repoint/dedupe).
+    1. Zero duplicate identities (rol, court_id, procedure) remain among
+       survivors (post-repoint/dedupe).
     2. Zero child rows still reference a to-be-deleted loser case_id
        (would become orphaned the instant the loser Case is deleted).
 
     Invariant 4 ("every surviving Case is owned by the firm lawyer_id") is
     NOT checked here: re-owning happens AFTER delete (see ``run_case_merge``
     docstring for why — checking/enforcing it pre-delete would itself
-    transiently violate ``uq_cases_lawyer_rol`` whenever a not-yet-deleted
+    transiently violate ``uq_cases_identity`` whenever a not-yet-deleted
     loser already happens to be firm-owned). It is guaranteed by
     construction once ``_reown_surviving_cases`` runs post-delete.
+
+    ``identities`` scopes check 1 to the groups of a batch (groups outside
+    it legitimately still hold duplicates); ``None`` checks the whole table.
     """
     loser_ids = loser_ids or []
     failures: List[str] = []
@@ -508,16 +699,42 @@ def _verify_invariants(db: Session, loser_ids: List[int]) -> None:
                 "loser case_id — repoint step incomplete"
             )
 
-    dupe_rols = (
-        db.query(Case.rol)
-        .filter(Case.competencia == "civil", ~Case.id.in_(loser_ids or [0]))
-        .group_by(Case.rol)
-        .having(func.count(Case.id) > 1)
-        .all()
+    procedure_key = func.coalesce(Case.procedure, "")
+    stray_audit = (
+        db.query(func.count(CaseMergeAudit.id))
+        .filter(CaseMergeAudit.winner_case_id.in_(loser_ids or [0]))
+        .scalar()
+        or 0
     )
-    if dupe_rols:
+    if stray_audit:
         failures.append(
-            "duplicate ROLs remain among survivors: " + ", ".join(sorted(r[0] for r in dupe_rols))
+            f"case_merge_audit: {stray_audit} row(s) still name a to-be-deleted loser as "
+            "winner_case_id — audit repoint incomplete"
+        )
+
+    dupe_query = (
+        db.query(Case.rol, Case.court_id, procedure_key)
+        .filter(Case.competencia == "civil", ~Case.id.in_(loser_ids or [0]))
+        .group_by(Case.rol, Case.court_id, procedure_key)
+        .having(func.count(Case.id) > 1)
+    )
+    if identities is not None:
+        if not identities:
+            dupe_query = dupe_query.filter(False)
+        else:
+            dupe_query = dupe_query.filter(
+                tuple_(Case.rol, Case.court_id, procedure_key).in_(
+                    [(rol, court_id, procedure or "") for rol, court_id, procedure in identities]
+                )
+            )
+    dupe_identities = dupe_query.all()
+    if dupe_identities:
+        failures.append(
+            "duplicate identities remain among survivors: "
+            + ", ".join(
+                f"{rol} (court {court_id}, procedure {procedure!r})"
+                for rol, court_id, procedure in sorted(dupe_identities, key=str)
+            )
         )
 
     if failures:

@@ -46,6 +46,7 @@ async def sync_one_cu_client(
         ScrapedCase,
         SyncService,
         _select_cases_for_detail_rotation,
+        case_belongs_to_lawyer,
         detect_and_sync_movements,
     )
 
@@ -107,7 +108,7 @@ async def sync_one_cu_client(
         (
             db.query(Case)
             .filter(
-                Case.lawyer_id == lawyer_id,
+                case_belongs_to_lawyer(lawyer_id),
                 Case.rol.in_(touched_rols),
                 Case.client_id.is_(None),
             )

@@ -3,9 +3,12 @@
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict
+import re
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy import case, func, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, get_current_lawyer, require_admin, _resolve_lawyer_id
@@ -13,6 +16,7 @@ from app.core.security import hash_password
 from app.models.case import Case
 from app.models.lawyer import Lawyer
 from app.services.lawyer_roster import firm_roster
+from app.utils.rut import normalize_rut, validate_rut
 
 _STALE_THRESHOLD_DAYS = 7
 
@@ -32,6 +36,71 @@ class AccountUpdateBody(BaseModel):
     email: Optional[str] = None
     role: Optional[str] = None
     new_password: Optional[str] = None
+    # False blocks the person (sign-in and open sessions stop; nothing is deleted); True reactivates.
+    is_active: Optional[bool] = None
+
+
+_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_NIVELES = {"junior", "pleno"}
+
+
+class LawyerCreateBody(BaseModel):
+    """POST /lawyers: add a person to the firm by hand (they used to appear only via the PJUD sync)."""
+    rut: str
+    name: str
+    email: Optional[str] = None
+    nivel: Optional[str] = None
+    # Optional: with a password the person can sign in right away.
+    password: Optional[str] = None
+    role: str = "lawyer"
+
+    @field_validator("password")
+    @classmethod
+    def _password(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and len(v) < 8:
+            raise ValueError("La contraseña debe tener al menos 8 caracteres")
+        return v
+
+    @field_validator("role")
+    @classmethod
+    def _role(cls, v: str) -> str:
+        if v not in {"lawyer", "admin"}:
+            raise ValueError("El rol debe ser 'lawyer' o 'admin'")
+        return v
+
+    @field_validator("rut")
+    @classmethod
+    def _rut(cls, v: str) -> str:
+        if not validate_rut(v):
+            raise ValueError("RUT inválido (revisa el dígito verificador)")
+        return normalize_rut(v)
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("El nombre es obligatorio")
+        if len(v) > 255:
+            raise ValueError("El nombre admite hasta 255 caracteres")
+        return v
+
+    @field_validator("email")
+    @classmethod
+    def _email(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or not v.strip():
+            return None
+        v = v.strip().lower()
+        if not _EMAIL.match(v) or len(v) > 255:
+            raise ValueError("Correo inválido")
+        return v
+
+    @field_validator("nivel")
+    @classmethod
+    def _nivel(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in _NIVELES:
+            raise ValueError("El nivel debe ser 'junior' o 'pleno'")
+        return v
 
 
 class SyncStatusItem(BaseModel):
@@ -108,28 +177,65 @@ def get_sync_status(db: Session = Depends(get_db)):
     ]
 
 
+def _account_json(person: Lawyer) -> dict:
+    """What the admin screen needs about one person. Never the password; a missing flag counts as active."""
+    return {
+        "id": person.id,
+        "rut": person.rut,
+        "name": person.name,
+        "email": person.email,
+        "role": person.role,
+        "nivel": person.nivel,
+        "is_active": person.is_active is not False,
+        "blocked_at": person.blocked_at.isoformat() if person.blocked_at else None,
+        "has_password": person.password_hash is not None,
+        "password_changed_at": person.password_changed_at.isoformat() if person.password_changed_at else None,
+    }
+
+
 @router.get("/accounts", dependencies=[Depends(require_admin)])
 def list_accounts(db: Session = Depends(get_db)):
     """List all lawyer accounts with has_password flag (admin only)."""
     lawyers = db.query(Lawyer).order_by(Lawyer.id).all()
-    return [
-        {
-            "id": l.id,
-            "rut": l.rut,
-            "name": l.name,
-            "email": l.email,
-            "role": l.role,
-            "has_password": l.password_hash is not None,
-        }
-        for l in lawyers
-    ]
+    return [_account_json(person) for person in lawyers]
+
+
+@router.post("", status_code=status.HTTP_201_CREATED)
+def create_lawyer(
+    body: LawyerCreateBody,
+    _admin_rut: str = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Add a person to the firm (admin only). No password, hito link or PJUD credential is
+    created: the admin issues those afterwards with the existing actions."""
+    existing = db.query(Lawyer).filter(Lawyer.rut == body.rut).first()
+    if existing is not None:
+        raise HTTPException(status_code=409, detail=f"Ya existe una persona con ese RUT: {existing.name}")
+    if body.email and db.query(Lawyer).filter(Lawyer.email == body.email).first() is not None:
+        raise HTTPException(status_code=409, detail="Ya existe una persona con ese correo")
+
+    lawyer = Lawyer(
+        rut=body.rut, name=body.name, email=body.email, nivel=body.nivel,
+        role=body.role, is_firm_lawyer=True, is_active=True,
+    )
+    if body.password:
+        lawyer.password_hash = hash_password(body.password)
+        lawyer.password_changed_at = datetime.utcnow()
+    db.add(lawyer)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Ya existe una persona con ese RUT o correo")
+    db.refresh(lawyer)
+    return _account_json(lawyer)
 
 
 @router.put("/{id}/account")
 def update_account(
     id: int,
     body: AccountUpdateBody,
-    _admin_rut: str = Depends(require_admin),
+    admin_rut: str = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
     """Update a lawyer's email, role, and/or password (admin only)."""
@@ -145,21 +251,74 @@ def update_account(
     if body.email is not None:
         lawyer.email = body.email
 
+    if body.is_active is not None:
+        if body.is_active is False:
+            if normalize_rut(lawyer.rut) == normalize_rut(admin_rut):
+                raise HTTPException(status_code=409, detail="No puedes bloquear tu propia cuenta")
+            # The public hito link dies with the access; reactivating issues a new one if needed.
+            lawyer.hito_form_token = None
+        # Stamp the block date only on the actual transition, so saving twice keeps the first date.
+        if body.is_active is False and lawyer.is_active is not False:
+            lawyer.blocked_at = datetime.utcnow()
+        elif body.is_active is True:
+            lawyer.blocked_at = None
+        lawyer.is_active = body.is_active
+
     if body.new_password is not None:
         if len(body.new_password) < 8:
             raise HTTPException(status_code=422, detail="Password must be at least 8 characters")
         lawyer.password_hash = hash_password(body.new_password)
+        lawyer.password_changed_at = datetime.utcnow()
 
     db.commit()
     db.refresh(lawyer)
-    return {
-        "id": lawyer.id,
-        "rut": lawyer.rut,
-        "name": lawyer.name,
-        "email": lawyer.email,
-        "role": lawyer.role,
-        "has_password": lawyer.password_hash is not None,
-    }
+    return _account_json(lawyer)
+
+
+def _has_history(db: Session, lawyer_id: int) -> bool:
+    """True when any row of any table points at this person (cases, hitos, alerts, syncs, bonus...).
+
+    Derived from the schema's own foreign keys, so a table added later is covered without a list
+    to maintain. PostgreSQL would also refuse the delete; this makes the answer explicit and
+    independent of the database's enforcement.
+    """
+    for table in Lawyer.metadata.sorted_tables:
+        for fk in table.foreign_keys:
+            if fk.column.table is Lawyer.__table__ and fk.parent.table is not Lawyer.__table__:
+                if db.query(table).filter(fk.parent == lawyer_id).limit(1).first() is not None:
+                    return True
+    return False
+
+
+@router.delete("/{id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_lawyer(
+    id: int,
+    admin_rut: str = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Delete a person who has no history (admin only), e.g. an account made by mistake.
+
+    Cases, hitos, alerts, syncs and the bonus history all point at a person with plain foreign
+    keys, so the database refuses the delete when any exists. That refusal is the safety net:
+    the answer is a 409 that points at blocking, which keeps everything.
+    """
+    lawyer = db.query(Lawyer).filter(Lawyer.id == id).first()
+    if not lawyer:
+        raise HTTPException(status_code=404, detail="Lawyer not found")
+    if normalize_rut(lawyer.rut) == normalize_rut(admin_rut):
+        raise HTTPException(status_code=409, detail="No puedes eliminar tu propia cuenta")
+    refusal = HTTPException(
+        status_code=409,
+        detail="Esta persona tiene historial (causas, hitos, alertas u otros registros) y no se puede eliminar. Bloquéala: no podrá ingresar y se conserva todo.",
+    )
+    if _has_history(db, lawyer.id):
+        raise refusal
+    try:
+        db.delete(lawyer)
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise refusal
 
 
 @router.get("", response_model=list[LawyerRosterItem])

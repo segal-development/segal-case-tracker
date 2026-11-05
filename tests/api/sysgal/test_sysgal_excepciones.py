@@ -14,6 +14,7 @@ import pytest
 
 from app.models.case import Case
 from app.models.case_deadline import CaseDeadline
+from app.models.case_escrito import CaseEscrito
 from app.models.case_litigante import CaseLitigante
 from app.models.court import Court
 from app.models.lawyer import Lawyer
@@ -80,6 +81,19 @@ def add_movement(env, case, description, *, procedure="Escrito", days_ago=0):
     env["db"].add(mv)
     env["db"].commit()
     return mv
+
+
+def add_escrito(env, case, *, days_ago=0, tipo="Opone excepciones", solicitante="Demandado"):
+    """A scraped escrito: it exists from the day the lawyer FILES, before any movement."""
+    env["n"] += 1
+    row = CaseEscrito(
+        case_id=case.id, tipo_escrito=tipo, solicitante=solicitante,
+        fecha_ingreso=datetime.combine(_today_chile() - timedelta(days=days_ago), datetime.min.time()),
+        natural_key=f"e{env['n']}",
+    )
+    env["db"].add(row)
+    env["db"].commit()
+    return row
 
 
 def add_deadline(env, case, *, due_in, triggered_ago=8, dtype="excepciones_8d",
@@ -296,3 +310,111 @@ def test_filing_just_after_plazo_is_registro_tardio_with_neutral_spanish_reason(
     motivo = row["veredicto"]["motivo"]
     assert "verifica" in motivo.lower()
     assert "verificá" not in motivo.lower()
+
+
+# --------------------------------------------------------------------------- escritos
+# The escrito exists from the day the lawyer files; the Movement only appears when
+# the court provides it. In that window a movements-only audit claims "no escrito".
+
+
+def test_escrito_within_plazo_without_movement_yet_is_cumplido(client, env):
+    """The C-11622-2026 case: filed on time, court has not provided it yet."""
+    case = make_case(env)
+    add_deadline(env, case, due_in=-2, triggered_ago=12)
+    add_movement(env, case, "Se provee demanda", procedure="Resolución", days_ago=12)
+    add_escrito(env, case, days_ago=5)
+    row = _only(_get(client))
+    assert row["excepciones"]["presentadas"] is True
+    assert row["excepciones"]["fecha"] == (_today_chile() - timedelta(days=5)).isoformat()
+    assert row["veredicto"]["valor"] == "cumplido"
+
+
+def test_escrito_after_plazo_is_fuera_de_plazo(client, env):
+    case = make_case(env)
+    add_deadline(env, case, due_in=-6, triggered_ago=16)
+    add_movement(env, case, "Se provee demanda", procedure="Resolución", days_ago=16)
+    add_escrito(env, case, days_ago=1)
+    row = _only(_get(client))
+    assert row["excepciones"]["presentadas"] is True
+    assert row["veredicto"]["valor"] == "fuera_de_plazo"
+
+
+def test_causa_without_movements_but_with_escrito_is_not_sin_determinar(client, env):
+    case = make_case(env)
+    add_deadline(env, case, due_in=3, triggered_ago=5)
+    add_escrito(env, case, days_ago=2)
+    row = _only(_get(client))
+    assert row["excepciones"]["presentadas"] is True
+    assert row["veredicto"]["valor"] == "cumplido"
+
+
+def test_unrelated_escrito_without_movements_still_never_invents_a_miss(client, env):
+    """An escrito that is not the excepciones filing is no evidence either way."""
+    case = make_case(env)
+    add_deadline(env, case, due_in=-2, triggered_ago=12)
+    add_escrito(env, case, days_ago=3, tipo="Téngase presente")
+    row = _only(_get(client))
+    assert row["excepciones"]["presentadas"] is None
+    assert row["veredicto"]["valor"] == "sin_determinar"
+
+
+def test_creditor_side_client_with_escrito_is_still_not_the_ejecutado(client, env):
+    case = make_case(env, participante="DTE.")
+    add_escrito(env, case, days_ago=2)
+    row = _only(_get(client))
+    assert row["excepciones"]["presentadas"] is None
+    assert row["veredicto"]["valor"] == "sin_determinar"
+
+
+def test_movement_and_escrito_best_verdict_wins_without_contradiction(client, env):
+    """Movement says late, escrito says on time: the better one wins, both fields agree."""
+    case = make_case(env)
+    add_deadline(env, case, due_in=-6, triggered_ago=16)
+    add_movement(env, case, "Opone excepciones", days_ago=1)  # registered 5 days past due
+    add_escrito(env, case, days_ago=8)  # filed before due
+    row = _only(_get(client))
+    assert row["veredicto"]["valor"] == "cumplido"
+    assert row["excepciones"]["presentadas"] is True
+    assert row["excepciones"]["fecha"] == (_today_chile() - timedelta(days=8)).isoformat()
+
+
+def test_equal_verdicts_keep_the_movement_as_evidence(client, env):
+    case = make_case(env)
+    add_deadline(env, case, due_in=3)
+    mv = add_movement(env, case, "Opone excepciones", days_ago=2)
+    add_escrito(env, case, days_ago=3)
+    row = _only(_get(client))
+    assert row["veredicto"]["valor"] == "cumplido"
+    assert row["excepciones"]["movimiento_id"] == mv.id
+
+
+def test_causa_without_escrito_is_unchanged(client, env):
+    """No-regression: with no escritos the answer is exactly the movements-only one."""
+    case = make_case(env)
+    add_deadline(env, case, due_in=-2, triggered_ago=12)
+    add_movement(env, case, "Se provee demanda", procedure="Resolución", days_ago=12)
+    row = _only(_get(client))
+    assert row["excepciones"] == {"presentadas": False, "fecha": None, "movimiento_id": None}
+    assert row["veredicto"]["valor"] == "no_cumplido"
+
+
+def test_movimiento_id_is_null_when_the_evidence_is_an_escrito(client, env):
+    """There is no movement to point at: never invent one."""
+    case = make_case(env)
+    add_deadline(env, case, due_in=3, triggered_ago=5)
+    add_movement(env, case, "Se provee demanda", procedure="Resolución", days_ago=5)
+    add_escrito(env, case, days_ago=2)
+    row = _only(_get(client))
+    assert row["excepciones"]["presentadas"] is True
+    assert row["excepciones"]["movimiento_id"] is None
+    assert row["excepciones"]["fecha"] == (_today_chile() - timedelta(days=2)).isoformat()
+
+
+def test_escritos_of_other_causas_do_not_leak(client, env):
+    mine = make_case(env)
+    other = make_case(env)
+    add_deadline(env, mine, due_in=-2, triggered_ago=12)
+    add_movement(env, mine, "Se provee demanda", procedure="Resolución", days_ago=12)
+    add_escrito(env, other, days_ago=5)
+    rows = {c["rol"]: c for c in _get(client)["causas"]}
+    assert rows[mine.rol]["veredicto"]["valor"] == "no_cumplido"

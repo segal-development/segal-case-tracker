@@ -32,6 +32,14 @@ from app.models.generated_document import GeneratedDocument
 from app.models.cliente_sysgal_estado import ClienteSysgalEstado
 from app.services.sysgal_cobertura import COBERTURAS, derive_cobertura
 from app.services.timeline_service import build_case_timeline
+from app.services.case_diagnostico import classify, days_since
+from app.services.deadline_engine import is_medida_prejudicial
+from app.services.poder_deadline import (
+    is_excepciones_filing,
+    parse_extended_from,
+    window_resolutions,
+)
+from app.services.procedural_classifier import MovementClassifier
 from app.utils.rut import clean_rut
 
 logger = logging.getLogger(__name__)
@@ -101,6 +109,11 @@ class CaseResponse(BaseModel):
     assigned_lawyer_id: Optional[int] = None
     assigned_lawyer_nombre: Optional[str] = None
     asignado: bool = False
+    # The lawyer who works this causa (Case.effective_lawyer_id: the override
+    # when set, else the provenance lawyer). Same names as the Plazos panel.
+    # Optional so an unknown lawyer never breaks the payload.
+    abogado_id: Optional[int] = None
+    abogado_nombre: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -118,6 +131,47 @@ class MovementResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class DiagnosticoMovimiento(BaseModel):
+    fecha: datetime
+    descripcion: str
+
+
+class DiagnosticoFila(BaseModel):
+    """One case row of the diagnostic. Carries NO credential material, only booleans."""
+    case_id: int
+    rol: str
+    caratula: str
+    tribunal: Optional[str] = None
+    estado: str
+    abogado_id: Optional[int] = None
+    abogado_nombre: Optional[str] = None
+    abogado_activo: Optional[bool] = None
+    abogado_tiene_credencial: Optional[bool] = None
+    last_detail_checked_at: Optional[datetime] = None
+    dias_desde_revision: Optional[int] = None
+    last_movement_at: Optional[datetime] = None
+    movimientos: int
+    ultimo_movimiento: Optional[DiagnosticoMovimiento] = None
+    veredicto: Literal[
+        "sin_credencial", "abogado_inactivo", "nunca_revisada", "latencia", "al_dia"
+    ]
+    veredicto_detalle: str
+
+
+#: Cap on diagnosed rows. A company RUT (a bank being sued) matches hundreds of
+#: cases -- 512 for one real RUT -- and each row costs a movements query, so an
+#: uncapped answer hangs a screen used with a client on the phone. ``total``
+#: still reports how many matched, so the screen can say it is showing a slice.
+DIAGNOSTICO_MAX_FILAS = 50
+
+
+class DiagnosticoResponse(BaseModel):
+    buscado: str
+    encontrado: bool
+    total: int
+    filas: List[DiagnosticoFila]
 
 
 class CaseListItem(CaseResponse):
@@ -159,10 +213,18 @@ class CaseSummaryResponse(BaseModel):
     sysgal_sin_dato: int = 0
 
 
+class FacetAbogado(BaseModel):
+    rut: str
+    nombre: str
+
+
 class CaseFacetsResponse(BaseModel):
     """Distinct filter values present in the scoped case set."""
     tribunals: List[str]
     materias: List[str]
+    # Active firm lawyers, for the "Abogado" filter. Only a viewer with firm-wide
+    # scope (admin/auditor) gets them: a plain lawyer cannot look at a colleague's caseload.
+    abogados: List[FacetAbogado] = []
 
 
 class LitiganteResponse(BaseModel):
@@ -275,6 +337,17 @@ class CaseTimelineResponse(BaseModel):
     pages: int
 
 
+class WindowResolution(BaseModel):
+    """A court act dictated inside the excepciones window (see window_resolutions)."""
+    date: str
+    description: str
+    requires_action: bool
+    status: str
+    due_date: Optional[str] = None
+    resolved_on: Optional[str] = None
+    resolved_by: Optional[str] = None
+
+
 class CaseDetailResponse(BaseModel):
     """Case with movements and all scraped entity lists."""
     case: CaseResponse
@@ -288,6 +361,10 @@ class CaseDetailResponse(BaseModel):
     escritos_count: int
     exhortos: List[ExhortoResponse]
     exhortos_count: int
+    # Stage value -> ISO date the stage was reached (see MovementClassifier.stage_history).
+    stage_dates: dict[str, str] = {}
+    # Court acts of the excepciones window; [] outside it (see _window_resolutions).
+    window_resolutions: List[WindowResolution] = []
 
 
 # ============================================================================
@@ -722,6 +799,14 @@ async def list_cases(
         else {}
     )
 
+    # Effective-lawyer names for this page (1 query, no N+1).
+    effective_ids = {c.effective_lawyer_id for c in cases} - {None}
+    effective_names = (
+        dict(db.query(Lawyer.id, Lawyer.name).filter(Lawyer.id.in_(effective_ids)).all())
+        if effective_ids
+        else {}
+    )
+
     # Build response with court info
     items = []
     for case in cases:
@@ -761,6 +846,8 @@ async def list_cases(
             assigned_lawyer_id=case.assigned_lawyer_id,
             assigned_lawyer_nombre=assigned_names.get(case.assigned_lawyer_id),
             asignado=case.assigned_lawyer_id is not None,
+            abogado_id=case.effective_lawyer_id,
+            abogado_nombre=effective_names.get(case.effective_lawyer_id),
             **_sysgal_fields(sysgal_info.get(case.id)),
         ))
 
@@ -771,6 +858,128 @@ async def list_cases(
         per_page=per_page,
         pages=pages,
         last_sync=last_sync,
+    )
+
+
+@router.get("/diagnostico", response_model=DiagnosticoResponse)
+async def diagnostico_causa(
+    rol: Optional[str] = Query(None, description="Exact ROL, e.g. C-1234-2024"),
+    rut: Optional[str] = Query(None, description="Defendant RUT"),
+    current_lawyer: dict = Depends(get_current_lawyer),
+    db: Session = Depends(get_db),
+):
+    """Why does the system not show what the client reports? (admin/auditor only).
+
+    Returns EVERY case row sharing the ROL (or defendant RUT), across all
+    lawyers, each with a verdict. READ-ONLY: no PJUD calls, no writes.
+
+    Exposes only WHETHER the assigned lawyer has a credential loaded, never the
+    credential itself (no value, ciphertext, hash or length), same rule as
+    ``/credentials``.
+    """
+    from app.config import settings
+
+    scope = resolve_case_scope(db, current_lawyer)
+    if scope is not ALL_CASES:
+        raise HTTPException(status_code=403, detail="Requiere rol auditor o admin")
+
+    rol_term = (rol or "").strip().upper()
+    rut_term = (rut or "").strip()
+    if bool(rol_term) == bool(rut_term):
+        raise HTTPException(status_code=400, detail="Indica exactamente uno: rol o rut")
+
+    query = apply_case_scope(db.query(Case), scope)
+    if rol_term:
+        query = query.filter(func.upper(Case.rol) == rol_term)
+        buscado = f"ROL {rol_term}"
+    else:
+        # Normalise BOTH sides (dots, hyphen, spaces, case): the user types
+        # "12.345.678-9", case_litigantes stores "12345678-9". A format
+        # mismatch here would read as "never ingested", the worst lie this
+        # screen can tell, so no raw comparison and no substring match.
+        wanted = clean_rut(rut_term).replace("-", "")
+        stored = func.upper(
+            func.replace(func.replace(func.replace(CaseLitigante.rut, ".", ""), "-", ""), " ", "")
+        )
+        query = query.filter(
+            select(1)
+            .where(
+                CaseLitigante.case_id == Case.id,
+                CaseLitigante.participante == "DDO.",
+                stored == wanted,
+            )
+            .exists()
+        )
+        buscado = f"RUT {rut_term}"
+    total = query.count()
+    cases = query.order_by(Case.id).limit(DIAGNOSTICO_MAX_FILAS).all()
+
+    case_ids = [c.id for c in cases]
+    lawyers = {
+        l.id: l
+        for l in db.query(Lawyer).filter(Lawyer.id.in_({c.lawyer_id for c in cases})).all()
+    } if cases else {}
+    courts = {
+        ct.id: ct.name
+        for ct in db.query(Court).filter(Court.id.in_({c.court_id for c in cases})).all()
+    } if cases else {}
+    counts = dict(
+        db.query(Movement.case_id, func.count(Movement.id))
+        .filter(Movement.case_id.in_(case_ids))
+        .group_by(Movement.case_id)
+        .all()
+    ) if cases else {}
+
+    now = datetime.utcnow()
+    filas: List[DiagnosticoFila] = []
+    for c in cases:
+        ab = lawyers.get(c.lawyer_id)
+        # Collapse to a boolean immediately: the secret never leaves this line.
+        tiene_credencial = (
+            None
+            if ab is None
+            else bool(ab.encrypted_pjud_password or ab.encrypted_clave_unica_password)
+        )
+        veredicto, detalle = classify(
+            has_lawyer=ab is not None,
+            lawyer_active=None if ab is None else bool(ab.is_active),
+            lawyer_has_credential=tiene_credencial,
+            last_detail_checked_at=c.last_detail_checked_at,
+            latency_days=settings.DIAGNOSTICO_LATENCIA_DIAS,
+            now=now,
+        )
+        last = (
+            db.query(Movement)
+            .filter(Movement.case_id == c.id)
+            .order_by(Movement.movement_date.desc(), Movement.id.desc())
+            .first()
+        )
+        filas.append(
+            DiagnosticoFila(
+                case_id=c.id,
+                rol=c.rol,
+                caratula=f"{c.plaintiff or ''}/{c.defendant or ''}",
+                tribunal=courts.get(c.court_id),
+                estado=c.status,
+                abogado_id=ab.id if ab else None,
+                abogado_nombre=ab.name if ab else None,
+                abogado_activo=None if ab is None else bool(ab.is_active),
+                abogado_tiene_credencial=tiene_credencial,
+                last_detail_checked_at=c.last_detail_checked_at,
+                dias_desde_revision=days_since(c.last_detail_checked_at, now),
+                last_movement_at=c.last_movement_at,
+                movimientos=counts.get(c.id, 0),
+                ultimo_movimiento=(
+                    DiagnosticoMovimiento(fecha=last.movement_date, descripcion=last.description or "")
+                    if last
+                    else None
+                ),
+                veredicto=veredicto,  # type: ignore[arg-type]
+                veredicto_detalle=detalle,
+            )
+        )
+    return DiagnosticoResponse(
+        buscado=buscado, encontrado=bool(filas), total=total, filas=filas
     )
 
 
@@ -838,7 +1047,7 @@ async def cases_facets(
     scoped set, sorted alphabetically, excluding null/empty. Respects
     competencia/status/abogado_rut, not the quick-filters.
     """
-    base, _lawyer_id, _scope = _scoped_cases_query(
+    base, _lawyer_id, scope = _scoped_cases_query(
         db,
         current_lawyer,
         competencia=competencia,
@@ -857,7 +1066,23 @@ async def cases_facets(
     tribunals = sorted({name for (name,) in tribunal_rows if name and name.strip()})
     materias = sorted({proc for (proc,) in materia_rows if proc and proc.strip()})
 
-    return CaseFacetsResponse(tribunals=tribunals, materias=materias)
+    abogados: List[FacetAbogado] = []
+    if scope is ALL_CASES:
+        firm = (
+            db.query(Lawyer.rut, Lawyer.name)
+            .filter(Lawyer.is_firm_lawyer.is_(True), Lawyer.is_active.is_(True))
+            .order_by(Lawyer.name)
+            .all()
+        )
+        abogados = [FacetAbogado(rut=rut, nombre=name) for rut, name in firm if rut and name]
+
+    return CaseFacetsResponse(tribunals=tribunals, materias=materias, abogados=abogados)
+
+
+def _effective_lawyer_name(case: Case) -> Optional[str]:
+    """Name of ``Case.effective_lawyer_id`` using the already-mapped relationships."""
+    holder = case.assigned_lawyer if case.assigned_lawyer_id is not None else case.lawyer
+    return holder.name if holder else None
 
 
 @router.get("/{case_id}", response_model=CaseDetailResponse)
@@ -941,6 +1166,8 @@ async def get_case(
         assigned_lawyer_id=case.assigned_lawyer_id,
         assigned_lawyer_nombre=case.assigned_lawyer.name if case.assigned_lawyer else None,
         asignado=case.assigned_lawyer_id is not None,
+        abogado_id=case.effective_lawyer_id,
+        abogado_nombre=_effective_lawyer_name(case),
         **_sysgal_fields(sysgal_info),
     )
 
@@ -961,6 +1188,8 @@ async def get_case(
         case=case_response,
         movements=movements_response,
         movements_count=len(movements),
+        stage_dates=_stage_dates(case, movements),
+        window_resolutions=_window_resolutions(case, movements),
         litigantes=[LitiganteResponse.model_validate(r) for r in litigantes],
         litigantes_count=len(litigantes),
         notificaciones=[NotificacionResponse.model_validate(r) for r in notificaciones],
@@ -969,6 +1198,32 @@ async def get_case(
         escritos_count=len(escritos),
         exhortos=[ExhortoResponse.model_validate(r) for r in exhortos],
         exhortos_count=len(exhortos),
+    )
+
+
+def _stage_dates(case: Case, movements: list) -> dict[str, str]:
+    """Stage value -> ISO date reached, from the already-loaded movements.
+
+    A medida prejudicial has no ejecutivo flow, so it gets no dates.
+    """
+    if is_medida_prejudicial(case.procedure):
+        return {}
+    history = MovementClassifier().stage_history(movements, date.today())
+    return {state.value: reached.isoformat() for state, reached in history}
+
+
+def _window_resolutions(case: Case, movements: list) -> list[dict]:
+    """Resolutions of the excepciones window, from the already-loaded movements."""
+    from app.config import settings
+
+    if case.procedural_state not in ("excepciones", "notificado"):
+        return []
+    if is_medida_prejudicial(case.procedure):
+        return []
+    if not any(is_excepciones_filing(m) for m in movements):
+        return []
+    return window_resolutions(
+        movements, date.today(), parse_extended_from(settings.PODER_EXTENDED_FROM)
     )
 
 

@@ -76,7 +76,7 @@ class TestCreation:
         _add(db, case, datetime(2026, 6, 1), PREVIO)  # Monday
         DeadlineEngine.recompute_case(db, case)
         (row,) = _rows(db, case, PODER)
-        assert row.status == "active"
+        assert row.status == "expired"  # created long past: closed once its margin is over
         assert row.triggered_at == date(2026, 6, 1)
         assert row.due_date == date(2026, 6, 4)  # Thursday
         assert row.legal_basis == "art. 7 CPC · art. 7 Ley 20.886 (mod. Ley 21.394)"
@@ -139,7 +139,7 @@ class TestCompliance:
         _add(db, case, datetime(2026, 6, 1), PREVIO)
         DeadlineEngine.recompute_case(db, case)
         (row,) = _rows(db, case, PODER)
-        assert row.status == "active"
+        assert row.status == "expired"  # not cumplido: the act predates the order
 
     def test_compliance_arriving_on_a_later_sync_flips_active_to_cumplido(self, db, case) -> None:
         _add(db, case, datetime(2026, 6, 1), PREVIO)
@@ -176,7 +176,7 @@ class TestCompliance:
         _add(db, case, datetime(2026, 6, 10), PREVIO)
         DeadlineEngine.recompute_case(db, case)
         old, new = _rows(db, case, PODER)
-        assert (old.status, new.status) == ("superseded", "active")
+        assert (old.status, new.status) == ("superseded", "expired")
         assert new.triggered_at == date(2026, 6, 10)
 
 
@@ -227,7 +227,7 @@ class TestNeverAlerts:
 
         transition = DeadlineEngine.recompute_case(db, case)
 
-        assert [r.status for r in _rows(db, case, PODER)] == ["active"]
+        assert [r.status for r in _rows(db, case, PODER)] == ["expired"]
         assert case.procedural_state == "mandamiento"
         assert case.semaforo == "verde"
         assert case.next_deadline_at is None

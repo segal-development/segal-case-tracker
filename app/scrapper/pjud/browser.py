@@ -21,6 +21,7 @@ from typing import Optional, List, Dict, Any
 from playwright.async_api import async_playwright, Browser, Page, BrowserContext, Playwright
 
 from app.config import settings
+from app.scrapper.pjud.dns_resolver import chromium_dns_bypass_args
 
 # Copied here to keep browser.py self-contained (no circular-import risk).
 _PJUD_BASE_URL = "https://oficinajudicialvirtual.pjud.cl"
@@ -174,7 +175,12 @@ class BrowserFactory:
                 "--mute-audio",
             ]
             logger.info("BrowserFactory using system Chrome: %s", chrome_path)
-        
+
+        # Opt-in: map the PJUD host to an address we resolved ourselves, so
+        # Chromium never asks the (measurably broken) macOS system resolver.
+        # Returns [] — today's behaviour — when off or when resolution fails.
+        launch_args += await chromium_dns_bypass_args()
+
         start_time = time.perf_counter()
         logger.info("Starting fresh browser instance")
         

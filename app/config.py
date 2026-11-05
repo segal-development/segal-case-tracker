@@ -85,6 +85,48 @@ class Settings(BaseSettings):
     # its movement_date. 0 disables it. Rationale in app/services/deadline_verdict.py.
     DEADLINE_PODER_NOTIFICATION_ALLOWANCE_DAYS: int = 2
 
+    # acreditar_poder_3d, extended trigger: from this ISO date on (inclusive, by
+    # the resolution's movement_date) a court "Mero tramite" / "Apercibimiento
+    # poder y/o titulo" dictated after our "Opone excepciones" and before the
+    # "Opone excepciones-Traslado" also starts the plazo. Forward-only by the
+    # firm's decision ("solo para resoluciones nuevas desde hoy"). Empty string =
+    # extension OFF (only "Previo a proveer"); an invalid value = OFF + a WARNING.
+    PODER_EXTENDED_FROM: str = "2026-11-04"
+
+    # Semaforo de plazos: who is told in ADDITION to the case's lawyer(s).
+    # Comma-separated lawyer ids (lawyers.id). Amarillo adds the first list;
+    # ROJO sends to the second, which is the full escalation (it repeats the
+    # amarillo people on purpose: each list reads as "who gets this level").
+    # Defaults, verified 2026-10-14: 15 = Melissa Acevedo, 1 = Carla Lavin.
+    # To change a person: edit these in the worker's .env and restart it.
+    SEMAFORO_AMARILLO_EXTRA_LAWYER_IDS: str = "15"
+    SEMAFORO_ROJO_EXTRA_LAWYER_IDS: str = "15,1"
+    # Semaforo cutoff: a plazo whose ``triggered_at`` is more than this many
+    # calendar days before today raises NO alert (no email, no webhook); it stays
+    # visible on the Plazos screen. Exists because the semaforo was switched on
+    # over a base with years of never-closed plazos. 0 or negative = no cutoff
+    # (alert on everything). It must stay above the longest live term: an
+    # 8-business-day plazo reaches ROJO ~9-12 calendar days after it triggers,
+    # so a value below that silences the very escalation the semaforo exists for.
+    SEMAFORO_MAX_TRIGGER_AGE_DAYS: int = 14
+    # Expired-and-unfiled notice: a FATAL plazo whose ``due_date`` passed with
+    # the firm NOT having acted (verdict no_cumplido / fuera_de_plazo) is
+    # announced once, but only while it expired within this many calendar days.
+    # Older ones are history, not something a lawyer can still react to.
+    # 0 or negative = no window (announce every such plazo, however old).
+    SEMAFORO_EXPIRED_WINDOW_DAYS: int = 30
+    # Excepciones term (business days): legally 4 or 8 depending on where the
+    # requerimiento was served, and no source we have says where. 4 or 8 pins
+    # that single term for every excepciones plazo; 0 = unknown, keep BOTH
+    # readings. Anything else is rejected at load. Reversible by env, no deploy.
+    #
+    # Default 8, by the firm's own instruction: drop the 4-day reading and keep
+    # only the 8-day one. It is a DEFAULT and not an env var on purpose -- this
+    # value has to hold wherever the code runs, and setting it only on the
+    # scraping station (its LaunchAgent plist) left the API still on 0, so the
+    # panel kept printing "Plazo no confirmado: 4 días / 8 días" to the lawyers.
+    SEMAFORO_EXCEPCIONES_TERM_DAYS: int = 8
+
     # Email
     SENDGRID_API_KEY: str = ""
     FROM_EMAIL: str = "notificaciones@segal.cl"
@@ -98,6 +140,11 @@ class Settings(BaseSettings):
     SMTP_USE_TLS: bool = True
     SMTP_FROM: str = ""
     SUPERVISOR_EMAIL: str = ""
+
+    # Gate de correo saliente (app/services/email_gate.py). Listas separadas por
+    # coma; vacio = sin restriccion. Se cambian por entorno, sin deploy.
+    EMAIL_ALLOWED_KINDS: str = ""
+    EMAIL_ALLOWED_RECIPIENTS: str = ""
 
     # Alerta operativa de scraping. Casilla propia y NO SUPERVISOR_EMAIL: el
     # aviso de credencial vencida le sirve a quien coordina abogados, mientras
@@ -116,6 +163,11 @@ class Settings(BaseSettings):
     SCRAPING_MAX_FALLAS: int = 5
     #: Espera mínima entre dos avisos del mismo tipo.
     SCRAPING_ALERT_COOLDOWN_HOURS: int = 6
+
+    # Telegram channel for operational alerts. Both empty = channel disabled.
+    # The token is a secret: it must never be logged or returned.
+    TELEGRAM_BOT_TOKEN: str = ""
+    TELEGRAM_CHAT_ID: str = ""
 
     # Sysgal CRM (read-only client-coverage lookup by party RUT).
     # Both empty = integration disabled (sync is a no-op).
@@ -138,6 +190,10 @@ class Settings(BaseSettings):
     # Sysgal for thousands of RUTs that did not change; with it, the first run
     # fetches the backlog and later runs refresh only what went stale.
     SYSGAL_CACHE_TTL_DAYS: int = 7
+
+    # How long a non-firm-wide user's resolved case scope (which case ids they
+    # may see) is reused per process. 0 disables the cache entirely.
+    CASE_SCOPE_CACHE_SECONDS: int = 60
 
     # Firebase (push notifications)
     FIREBASE_CREDENTIALS_PATH: str = ""
@@ -194,6 +250,14 @@ class Settings(BaseSettings):
     PJUD_VIEWPORT_HEIGHT: int = 1080        # Browser viewport height
     PJUD_ALERTS_ENABLED: bool = True        # Enable/disable alert webhooks
     PJUD_SCRAPING_ENABLED: bool = True      # False where the IP can't authenticate against PJUD (cloud VM)
+    # Resolve the PJUD host ourselves (direct UDP query) and pass Chromium
+    # --host-resolver-rules=MAP, so the browser never calls the macOS system
+    # resolver for it. See app/scrapper/pjud/dns_resolver.py for the evidence:
+    # getaddrinfo refuses the host in 2-4 ms while a public resolver answers it.
+    # DEFAULT OFF ON PURPOSE: PJUD sits behind F5 Shape and any new Chromium
+    # flag is a fingerprint risk, so this is enabled by hand on the station and
+    # watched over a live cycle before it ever becomes the default.
+    PJUD_BYPASS_SYSTEM_DNS: bool = False
 
     # Document storage (Slice 2)
     DOC_STORAGE_BACKEND: str = "local"          # "local" or "gcs"
@@ -239,6 +303,15 @@ class Settings(BaseSettings):
     # weeks catches up over several cycles instead of in one burst. Env var,
     # tunable without a deploy.
     ESTADO_DIARIO_MAX_DAYS_PER_CYCLE: int = Field(default=3, ge=1)
+    # Days since the last detail check after which the on-screen case diagnostic
+    # (GET /cases/diagnostico) reports "latencia" instead of "al_dia".
+    DIAGNOSTICO_LATENCIA_DIAS: int = Field(default=7, ge=1)
+    #: Dias de antelacion con que una causa con plazo FATAL por vencer salta
+    #: al frente de la rotacion de detalle. 0 = sin prioridad.
+    #: Incidente 2026-10-20: se alerto "vence hoy" sobre un poder ya acreditado
+    #: el dia anterior, porque la causa no se releia hace 18 horas. Ese dia
+    #: habia 14 plazos fatales venciendo en <=1 dia sin relectura.
+    DETAIL_FATAL_PLAZO_DAYS: int = 2
     DETAIL_MIN_YEAR: int = 2021    # Only detail-scrape cases with ROL year >= this (0 = all)
     DETAIL_PENDING_DOCS_FIRST: bool = False  # when true, detail rotation prioritizes cases with the most pending documents (PDF backfill)
     # Which side of the freshness/backlog cut this station works on. "all" = no cut
@@ -255,6 +328,60 @@ class Settings(BaseSettings):
     # The cap is a number to tune from real data, so it is an env var, not a constant.
     DETAIL_FEED_PRIORITY_ENABLED: bool = False
     DETAIL_FEED_MAX_PER_BATCH: int = Field(default=20, ge=0)
+    # PJUD splits one judicial case into cuadernos: the main one ("Principal")
+    # plus secondary ones (medidas prejudiciales, incidentes, apremios). We keep
+    # ONE ``cases`` row per cuaderno, so the detail rotation treats each cuaderno
+    # as an independent case to visit. Measured 2026-10-20 on QA: 60% of the
+    # 1.082 daily detail reads landed on a cuaderno that is not Principal, and
+    # one lawyer spent 131 of its 156 daily reads re-reading 199 medidas
+    # prejudiciales every 1,5 days.
+    # When ON, a secondary cuaderno that carries NO live deadline is not re-read
+    # more often than every DETAIL_SECONDARY_CUADERNO_MIN_DAYS days: it sinks
+    # below everything else until then, and afterwards rejoins the rotation at
+    # its true age. It is a DEPRIORITIZATION, never a skip -- 13 of 54 live
+    # deadlines measured that day lived on a secondary cuaderno, and a cuaderno
+    # we cannot identify counts as a real case.
+    # Default ON in code on purpose: a value set only in the scraping station's
+    # LaunchAgent plist never reaches the API. Flip it in the environment to
+    # kill it without a deploy.
+    DETAIL_SECONDARY_CUADERNO_DEMOTE: bool = True
+    # Minimum days between two reads of an inert secondary cuaderno. 0 disables
+    # the demotion as well (every row is always "due"). Tunable from real data,
+    # so it is an env var, not a constant.
+    DETAIL_SECONDARY_CUADERNO_MIN_DAYS: int = Field(default=14, ge=0)
+    # Dormancy demotion. A causa that has not moved in years is rotated at the
+    # same frequency as one notified yesterday. Measured 2026-10-21 on the live
+    # QA DB, over the 15.201 rows in rotation (status='active', poda_at NULL):
+    # 2.976 have not moved in over a year, 1.245 in over two, 367 in over
+    # three, and NONE of the 2.976 carries a live deadline today.
+    #
+    # The rotation is the channel for what nobody told us about. A dormant
+    # causa that wakes up is caught by the OJV estado-diario feed
+    # (DETAIL_FEED_PRIORITY_ENABLED), which reads PJUD's daily docket per
+    # lawyer and jumps the matching causas to the front of the queue.
+    #
+    # Default ON in code on purpose: a value set only in the scraping station's
+    # LaunchAgent plist never reaches the API. Flip it in the environment to
+    # kill it without a deploy.
+    DETAIL_DORMANT_DEMOTE: bool = True
+    # Days without a single movement after which a causa counts as dormant.
+    # 0 disables the demotion. 365 measured as the only cut that frees a
+    # material share of the budget: 2.976 rows against 1.245 at 730 days and
+    # 367 at 1.095. A row with NO ``last_movement_at`` is NEVER dormant -- see
+    # the comment in ``_select_cases_for_detail_rotation``.
+    DETAIL_DORMANT_DAYS: int = Field(default=365, ge=0)
+    # Minimum days between two rotation reads of a dormant causa, i.e. the
+    # worst case a dormant causa can go unseen by the rotation. 0 disables the
+    # demotion as well.
+    #
+    # WHY 90 AND NOT LESS: the age rotation already orders by "least recently
+    # read first", so a window SHORTER than the cartera's own lap changes
+    # nothing -- the dormant row loses on age anyway. Measured laps per lawyer
+    # on 2026-10-21 run from 7 to 69 days, so only a window above ~65 days
+    # actually bites across the whole firm. WHY NOT MORE: going from 90 to 365
+    # buys the worst cartera 4,3 more days of lap (67,3 -> 63,0) while
+    # quadrupling the blind window. The curve flattens at 90.
+    DETAIL_DORMANT_MIN_DAYS: int = Field(default=90, ge=0)
 
     # Notifications
     NOTIFY_MAX_PER_SYNC: int = 25           # Max notifications dispatched per sync_movements call
@@ -269,12 +396,23 @@ class Settings(BaseSettings):
     # (e.g. "civil,laboral") without a code change.
     SYNC_COMPETENCIAS: str = "civil"
 
+    # Restrict the sync cycle to these lawyer ids (CSV, e.g. "1,7,16"). Used to
+    # split the caseload across machines or to isolate one lawyer in a test.
+    # Empty (default) = every active lawyer, i.e. unchanged behaviour.
+    SYNC_LAWYER_IDS: str = ""
+
     # Sync commit resilience (Mac -> Cloud SQL Auth Proxy long-write drops).
     # SyncService.sync_cases commits progress every SYNC_COMMIT_CHUNK_SIZE
     # upserted cases instead of one commit for the whole batch, so a dropped
     # connection mid-run only loses the current chunk, not the whole caseload.
     SYNC_COMMIT_CHUNK_SIZE: int = 200       # Cases processed between commits
     SYNC_COMMIT_MAX_RETRIES: int = 2        # Max commit attempts on OperationalError (incl. the first)
+
+    # Session-rejection breaker: stop the cycle after this many CONSECUTIVE
+    # lawyers whose freshly re-authenticated session PJUD rejected, then do
+    # nothing until the cooldown passes (in-memory: a worker restart clears it).
+    SYNC_AUTH_REJECT_TRIP: int = 3
+    SYNC_AUTH_BLOCK_COOLDOWN_MINUTES: int = 90
 
     # Presentación worker (Slice 2a — scaffolding). Master gate defaults OFF:
     # while False the station-side worker only logs queue depth and claims/
@@ -302,6 +440,16 @@ class Settings(BaseSettings):
         return [c.strip() for c in self.SYNC_COMPETENCIAS.split(",") if c.strip()]
 
     @property
+    def sync_lawyer_ids_list(self) -> list[int]:
+        """Split SYNC_LAWYER_IDS on commas, strip whitespace, keep integers only.
+
+        Non-numeric tokens are dropped rather than raised: a typo in an env var
+        must not stop the worker from booting. Callers that must not widen the
+        scope on a typo (the sync cycle) check the raw setting too.
+        """
+        return [int(t) for t in (c.strip() for c in self.SYNC_LAWYER_IDS.split(",")) if t.isdigit()]
+
+    @property
     def effective_debug(self) -> bool:
         """True only when DEBUG is set AND we are in the development environment."""
         return self.DEBUG and self.ENVIRONMENT.lower() == "development"
@@ -314,6 +462,16 @@ class Settings(BaseSettings):
     @classmethod
     def _normalize_rotation_scope(cls, v):
         return v.strip().lower() if isinstance(v, str) else v
+
+    @field_validator("SEMAFORO_EXCEPCIONES_TERM_DAYS")
+    @classmethod
+    def _excepciones_term_is_0_4_or_8(cls, v: int) -> int:
+        if v not in (0, 4, 8):
+            raise ValueError(
+                "SEMAFORO_EXCEPCIONES_TERM_DAYS must be 0 (unknown, keep both "
+                f"readings), 4 or 8; got {v}"
+            )
+        return v
 
     @model_validator(mode="after")
     def validate_production_secrets(self) -> "Settings":

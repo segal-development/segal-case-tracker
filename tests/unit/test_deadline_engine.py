@@ -401,7 +401,9 @@ class TestDemandadoEscritoClosesExcepciones:
         """The most important guard: a really missed plazo keeps warning."""
         case = self._seed(db)
         _recompute(db, case)
-        assert self._row(db, case).status == "active"
+        # Overdue and unanswered: closed as "expired" (a lapsed MANDATORY plazo
+        # reads as ROJO) instead of lingering "active" with a date in the past.
+        assert self._row(db, case).status == "expired"
         assert case.semaforo == "rojo"
 
     @pytest.mark.parametrize(
@@ -417,7 +419,7 @@ class TestDemandadoEscritoClosesExcepciones:
         case = self._seed(db)
         _add_escrito(db, case.id, self.due, tipo=tipo)
         _recompute(db, case)
-        assert self._row(db, case).status == "active"
+        assert self._row(db, case).status == "expired"  # not closed as cumplido
         assert case.semaforo == "rojo"
 
     @pytest.mark.parametrize("solicitante", ["Demandante", "Ejecutante", "Tribunal"])
@@ -425,14 +427,14 @@ class TestDemandadoEscritoClosesExcepciones:
         case = self._seed(db)
         _add_escrito(db, case.id, self.due, solicitante=solicitante)
         _recompute(db, case)
-        assert self._row(db, case).status == "active"
+        assert self._row(db, case).status == "expired"  # not closed as cumplido
         assert case.semaforo == "rojo"
 
     def test_escrito_without_date_does_not_close(self, db) -> None:
         case = self._seed(db)
         _add_escrito(db, case.id, None)
         _recompute(db, case)
-        assert self._row(db, case).status == "active"
+        assert self._row(db, case).status == "expired"  # not closed as cumplido
 
     def test_manual_row_is_never_overwritten(self, db) -> None:
         from app.services.business_days import add_business_days
@@ -743,11 +745,11 @@ class TestApelacion5D:
             .first()
         )
         assert apelacion_row is not None, "APELACION_5D must be active after sentencia"
-        expected_due = add_business_days(sentencia_date, 5)
+        expected_due = add_business_days(sentencia_date, 10)
         assert apelacion_row.due_date == expected_due, (
             f"APELACION_5D due_date: expected {expected_due}, got {apelacion_row.due_date}"
         )
-        assert apelacion_row.legal_basis == "art. 475 CPC"
+        assert apelacion_row.legal_basis == "art. 189 CPC"
         # SENTENCIA_10D from citación must be superseded
         sentencia_10d_row = (
             db.query(CaseDeadline)
@@ -791,7 +793,8 @@ class TestAutoPruebaSubDeadlines:
                 .filter(
                     CaseDeadline.case_id == case.id,
                     CaseDeadline.deadline_type == dtype.value,
-                    CaseDeadline.status == "active",
+                    # The seeded dates are long past: a lapsed plazo is "expired".
+                    CaseDeadline.status.in_(("active", "expired")),
                 )
                 .first()
             )
@@ -873,7 +876,7 @@ class TestCitacionSentenciaRealTexts:
             .filter(
                 CaseDeadline.case_id == case.id,
                 CaseDeadline.deadline_type == DeadlineType.TERMINO_PROBATORIO_10D.value,
-                CaseDeadline.status == "active",
+                CaseDeadline.status.in_(("active", "expired")),
             )
             .first()
         )
@@ -887,7 +890,7 @@ class TestCitacionSentenciaRealTexts:
             .filter(
                 CaseDeadline.case_id == case.id,
                 CaseDeadline.deadline_type == DeadlineType.SENTENCIA_10D.value,
-                CaseDeadline.status == "active",
+                CaseDeadline.status.in_(("active", "expired")),  # seeded dates are past
             )
             .first()
         )
@@ -1235,12 +1238,28 @@ class TestFirmSide:
 class TestAbandonoDisponible:
     """abandono_disponible column set by DeadlineEngine.recompute_case."""
 
-    def test_pre_sentencia_7_months_ago_is_true(self, db) -> None:
-        """Pre-sentencia (notificado) + last movement 7 months ago → abandono_disponible = True."""
+    def test_notificado_without_defense_7_months_ago_is_false(self, db) -> None:
+        """Notified, no excepciones opposed + 7 months ago → abandono_disponible = False.
+
+        Carla Segal (2026-10-23): when no defense was presented the abandono term
+        is 3 years (art. 153), not 6 months. This test used to expect True.
+        """
         case = _make_case(db)
         notif_date = TODAY - relativedelta(months=7)
         _add_movement(db, case.id, notif_date, "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)")
         _recompute(db, case)
+        assert case.procedural_state == "notificado"
+        assert case.abandono_disponible is False
+
+    def test_with_excepciones_opposed_7_months_ago_is_true(self, db) -> None:
+        """Excepciones opposed and no sentencia on them + 7 months idle → 6-month rule applies."""
+        case = _make_case(db)
+        _add_movement(
+            db, case.id, TODAY - relativedelta(months=8), "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)"
+        )
+        _add_movement(db, case.id, TODAY - relativedelta(months=7), "Excepciones", "Opone excepciones")
+        _recompute(db, case)
+        assert case.procedural_state == "excepciones"
         assert case.abandono_disponible is True
 
     def test_pre_sentencia_3_months_ago_is_false(self, db) -> None:

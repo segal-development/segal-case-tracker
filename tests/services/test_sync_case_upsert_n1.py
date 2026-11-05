@@ -61,6 +61,16 @@ def sqlite_db(sqlite_engine):
         session.close()
 
 
+@pytest.fixture(autouse=True)
+def _firm_lawyer(sqlite_db, lawyer):
+    """sync_cases creates cases under the firm lawyer (Approach C).
+
+    Depends on ``lawyer`` so the individual lawyer keeps its id.
+    """
+    sqlite_db.add(Lawyer(rut="16021492-9", name="Firm", is_active=True))
+    sqlite_db.commit()
+
+
 @pytest.fixture()
 def lawyer(sqlite_db):
     db = sqlite_db
@@ -156,6 +166,7 @@ class TestUpsertCaseCorrectnessUnchanged:
             defendant="OLD DEFENDANT",
             status="active",
             competencia="civil",
+            procedure="Principal",  # part of the case identity (rol, court, procedure)
             created_at=datetime.utcnow(),
             updated_at=datetime.utcnow(),
         )
@@ -205,6 +216,7 @@ class TestUpsertCaseCorrectnessUnchanged:
             defendant="B",
             status="active",
             competencia="laboral",
+            procedure="Principal",  # part of the case identity (rol, court, procedure)
             created_at=datetime.utcnow(),
             updated_at=datetime.utcnow(),
         )

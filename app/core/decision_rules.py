@@ -3,7 +3,7 @@
 Chilean juicio ejecutivo. Every rule below is a DEFENSE action taken by the
 ejecutado/deudor, and encodes a CONFIRMED-by-the-firm action (2026-07-09);
 see ``memory/juicio-ejecutivo-defense-rules.md`` for the legal source
-(CPC + Ley 21.394 + CC art. 2515 + DFL 707).
+(CPC + Ley 21.394 + CC art. 2515 + Ley 18.092 + DFL 707).
 
 The firm's side is NOT fixed, despite what this docstring used to claim:
 PJUD's litigante rows show 431 civil cases where a firm lawyer is the
@@ -125,8 +125,8 @@ def _is_excepciones_window(ctx: DecisionContext) -> bool:
 
 
 def _is_apelacion_window(ctx: DecisionContext) -> bool:
-    """Sentencia condenatoria notified, within the 5-día apelación window
-    (art. 475 CPC — ejecutado: solo efecto devolutivo)."""
+    """Sentencia condenatoria notified, within the 10-día apelación window
+    (art. 189 CPC; ejecutado: solo efecto devolutivo, art. 475 CPC)."""
     return (
         ctx.procedural_state == ProceduralState.SENTENCIA.value
         and _has_open_fatal_window(ctx)
@@ -187,15 +187,15 @@ DECISION_RULES: list[DecisionRule] = [
     ),
     DecisionRule(
         code="evaluar_apelacion",
-        action_text="Evaluar apelación (5 días, solo efecto devolutivo)",
-        legal_basis="art. 475 CPC",
+        action_text="Evaluar apelación (10 días, solo efecto devolutivo)",
+        legal_basis="art. 189 / 475 CPC",
         urgency=Urgency.CRITICA,
         predicate=_is_apelacion_window,
     ),
     DecisionRule(
         code="oponer_prescripcion",
         action_text="Oponer prescripción de la acción",
-        legal_basis="art. 98 DFL 707 / 2515 CC",
+        legal_basis="art. 98 Ley 18.092 / 2515 CC",
         urgency=Urgency.ALTA,
         predicate=_is_prescripcion,
     ),
