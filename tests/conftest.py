@@ -103,6 +103,16 @@ def sample_session():
 
 
 @pytest.fixture(autouse=True)
+def clear_case_scope_cache():
+    """Drop cached case scopes so no test sees another test's visibility."""
+    from app.services.lawyer_roster import clear_case_scope_cache as _clear
+
+    _clear()
+    yield
+    _clear()
+
+
+@pytest.fixture(autouse=True)
 def reset_circuit_breaker_registry():
     """Clear the global CB registries before each test to prevent state leakage.
 
