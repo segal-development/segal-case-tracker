@@ -166,6 +166,33 @@ def _is_traslado_resolution(movement: object) -> bool:
     )
 
 
+# Stages that come AFTER the traslado al ejecutante. A Mero tramite dictated in one of them (or
+# once the case already went through one) does not threaten the defense: the window of the
+# excepciones opuestas is over. PJUD's own stage names, matched accent-insensitively on the start.
+_LATER_STAGES = (
+    "contestacion excepciones",
+    "termino probatorio",
+    "sentencia",
+    "impugnacion de sentencia",
+    "apremio",
+)
+
+
+def _in_later_stage(movement: object) -> bool:
+    stage = _fold((getattr(movement, "stage", None) or "").strip()).lower()
+    return bool(stage) and stage.startswith(_LATER_STAGES)
+
+
+def _court_moved_past_window(movements: list, trigger: object) -> bool:
+    """True when the trigger itself, or any movement that precedes it, is in a stage after the
+    traslado. Real case C-12767-2025: a sentencia stage Mero tramite and no literal
+    'Opone excepciones-Traslado' movement, so the traslado check alone missed it."""
+    if _in_later_stage(trigger):
+        return True
+    key = _order_key(trigger)
+    return any(_in_later_stage(m) and _order_key(m) < key for m in movements)
+
+
 def _extended_trigger_applies(
     movements: list, movement: object, extended_from: date | None
 ) -> bool:
@@ -180,6 +207,8 @@ def _extended_trigger_applies(
     if day < extended_from:
         return False
     if not responds_to_excepciones_filing(movements, movement):
+        return False
+    if _court_moved_past_window(movements, movement):
         return False
     return not any(_is_traslado_resolution(m) and _day(m) <= day for m in movements)
 

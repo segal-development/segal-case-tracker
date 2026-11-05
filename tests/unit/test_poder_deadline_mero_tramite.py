@@ -173,3 +173,46 @@ class TestCutoffSetting:
         assert find_poder_obligation([_opone(), _mv("2026-11-05", MERO, id=2)]) is not None
         monkeypatch.setattr(settings, "PODER_EXTENDED_FROM", "")
         assert find_poder_obligation([_opone(), _mv("2026-11-05", MERO, id=2)]) is None
+
+
+def _staged(day: str, description: str, stage: str, procedure: str = "Resolución", id: int = 0) -> FakeMovement:
+    return FakeMovement(
+        stage=stage, procedure=procedure, description=description,
+        movement_date=datetime.strptime(day, "%Y-%m-%d"), id=id,
+    )
+
+
+class TestCourtAlreadyMovedPastTheWindow:
+    """The window is between 'Excepciones opuestas' and 'Traslado al ejecutante'. A Mero tramite
+    dictated once the case is in a later stage (real case C-12767-2025: sentencia stage, with no
+    literal 'Opone excepciones-Traslado' movement) threatens nothing."""
+
+    @pytest.mark.parametrize(
+        "stage",
+        ["Sentencia", "Impugnación de Sentencia", "Término Probatorio", "Contestación Excepciones", "Apremio"],
+    )
+    def test_a_trigger_in_a_later_stage_does_not_open_the_plazo(self, stage) -> None:
+        trigger = _staged("2026-11-05", MERO, stage, id=3)
+        assert find_poder_obligation([_opone(), trigger], extended_from=CUTOFF) is None
+
+    def test_an_earlier_movement_of_a_later_stage_means_the_court_moved_on(self) -> None:
+        # No stage on the trigger itself (PJUD leaves it blank sometimes), but the case already had a sentencia.
+        movements = [
+            _opone("2026-02-01"),
+            _staged("2026-09-25", "Sentencia", "Sentencia", procedure="", id=2),
+            _staged("2026-11-05", MERO, "", id=3),
+        ]
+        assert find_poder_obligation(movements, extended_from=CUTOFF) is None
+
+    @pytest.mark.parametrize("stage", ["Excepciones", "Notificación demanda y su proveído", "Notificación demanda y su pr"])
+    def test_the_window_stages_still_trigger(self, stage) -> None:
+        trigger = _staged("2026-11-05", MERO, stage, id=3)
+        assert find_poder_obligation([_opone(), trigger], extended_from=CUTOFF) is not None
+
+    def test_a_blank_stage_with_nothing_later_before_it_still_triggers(self) -> None:
+        trigger = _staged("2026-11-05", MERO, "", id=3)
+        assert find_poder_obligation([_opone(), trigger], extended_from=CUTOFF) is not None
+
+    def test_previo_a_proveer_is_unchanged_whatever_the_stage(self) -> None:
+        pap = _staged("2026-09-05", "Previo a proveer", "Sentencia", id=3)
+        assert find_poder_obligation([_opone("2026-08-01"), pap], extended_from=CUTOFF) is not None
