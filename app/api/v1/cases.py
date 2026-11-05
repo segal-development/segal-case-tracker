@@ -34,6 +34,11 @@ from app.services.sysgal_cobertura import COBERTURAS, derive_cobertura
 from app.services.timeline_service import build_case_timeline
 from app.services.case_diagnostico import classify, days_since
 from app.services.deadline_engine import is_medida_prejudicial
+from app.services.poder_deadline import (
+    is_excepciones_filing,
+    parse_extended_from,
+    window_resolutions,
+)
 from app.services.procedural_classifier import MovementClassifier
 from app.utils.rut import clean_rut
 
@@ -332,6 +337,17 @@ class CaseTimelineResponse(BaseModel):
     pages: int
 
 
+class WindowResolution(BaseModel):
+    """A court act dictated inside the excepciones window (see window_resolutions)."""
+    date: str
+    description: str
+    requires_action: bool
+    status: str
+    due_date: Optional[str] = None
+    resolved_on: Optional[str] = None
+    resolved_by: Optional[str] = None
+
+
 class CaseDetailResponse(BaseModel):
     """Case with movements and all scraped entity lists."""
     case: CaseResponse
@@ -347,6 +363,8 @@ class CaseDetailResponse(BaseModel):
     exhortos_count: int
     # Stage value -> ISO date the stage was reached (see MovementClassifier.stage_history).
     stage_dates: dict[str, str] = {}
+    # Court acts of the excepciones window; [] outside it (see _window_resolutions).
+    window_resolutions: List[WindowResolution] = []
 
 
 # ============================================================================
@@ -1171,6 +1189,7 @@ async def get_case(
         movements=movements_response,
         movements_count=len(movements),
         stage_dates=_stage_dates(case, movements),
+        window_resolutions=_window_resolutions(case, movements),
         litigantes=[LitiganteResponse.model_validate(r) for r in litigantes],
         litigantes_count=len(litigantes),
         notificaciones=[NotificacionResponse.model_validate(r) for r in notificaciones],
@@ -1191,6 +1210,21 @@ def _stage_dates(case: Case, movements: list) -> dict[str, str]:
         return {}
     history = MovementClassifier().stage_history(movements, date.today())
     return {state.value: reached.isoformat() for state, reached in history}
+
+
+def _window_resolutions(case: Case, movements: list) -> list[dict]:
+    """Resolutions of the excepciones window, from the already-loaded movements."""
+    from app.config import settings
+
+    if case.procedural_state not in ("excepciones", "notificado"):
+        return []
+    if is_medida_prejudicial(case.procedure):
+        return []
+    if not any(is_excepciones_filing(m) for m in movements):
+        return []
+    return window_resolutions(
+        movements, date.today(), parse_extended_from(settings.PODER_EXTENDED_FROM)
+    )
 
 
 @router.get("/{case_id}/movements", response_model=List[MovementResponse])

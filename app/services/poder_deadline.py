@@ -331,3 +331,92 @@ def obligation_is_ours(movements: list, source_movement_id: object, side: str) -
     if trigger is None or not responds_to_excepciones_filing(movements, trigger):
         return False
     return side != "demandante"
+
+
+# ---------------------------------------------------------------------------
+# Display of the court acts dictated inside the excepciones window
+# ---------------------------------------------------------------------------
+_WINDOW_RESOLUTIONS_CAP = 8
+_WINDOW_ACTION_BUSINESS_DAYS = 3
+
+
+def window_resolutions(
+    movements: list, today: date, extended_from: date | None = None
+) -> list[dict]:
+    """Court acts from the first ``Opone excepciones`` up to the first traslado.
+
+    A display of what the court dictated, not the plazo engine: no cutoff, no
+    "no later stage" and no ownership checks. Each ``requires_action`` act is
+    judged against the compliance dated strictly after ITSELF.
+    """
+    ordered = sorted(movements, key=_order_key)
+    first_filing = next((m for m in ordered if is_excepciones_filing(m)), None)
+    if first_filing is None:
+        return []
+    start = _day(first_filing)
+
+    acts: list = []
+    for m in ordered:
+        if _day(m) < start or not _is_court_act(m) or _NULO_RE.search(_description(m)):
+            continue
+        if is_compliance_movement(m) or is_extended_compliance_movement(m):
+            continue
+        acts.append(m)
+        if _is_traslado_resolution(m):
+            break
+
+    return [_window_item(m, ordered, today, extended_from) for m in acts[-_WINDOW_RESOLUTIONS_CAP:]]
+
+
+def _window_item(
+    movement: object, ordered: list, today: date, extended_from: date | None = None
+) -> dict:
+    from app.services.business_days import add_business_days
+
+    day = _day(movement)
+    item = {
+        "date": day.isoformat(),
+        "description": _description(movement).strip(),
+        "requires_action": False,
+        "status": "informativa",
+        "due_date": None,
+        "resolved_on": None,
+        "resolved_by": None,
+    }
+    if not (is_previo_a_proveer(movement) or is_extended_trigger(movement)):
+        return item
+
+    due = add_business_days(day, _WINDOW_ACTION_BUSINESS_DAYS)
+    item["requires_action"] = True
+    item["due_date"] = due.isoformat()
+
+    compliance = next(
+        (
+            m
+            for m in ordered
+            if _day(m) > day
+            and (is_compliance_movement(m) or is_extended_compliance_movement(m))
+        ),
+        None,
+    )
+    moved_on = next((m for m in ordered if _day(m) > day and _is_traslado_resolution(m)), None)
+    if compliance is not None:
+        item["status"] = "cumplida"
+        item["resolved_on"] = _day(compliance).isoformat()
+        item["resolved_by"] = _description(compliance).strip()
+    elif moved_on is not None:
+        item["status"] = "avanzo"
+        item["resolved_on"] = _day(moved_on).isoformat()
+    elif due < today:
+        # Mero tramite / Apercibimiento dictated before the rule's cutoff never opened a plazo, so
+        # an unfulfilled one is only "no record" (the lawyer may have acted by another route).
+        before_cutoff = (
+            extended_from is not None
+            and is_extended_trigger(movement)
+            and not is_previo_a_proveer(movement)
+            and day < extended_from
+        )
+        item["status"] = "sin_registro" if before_cutoff else "vencida"
+    else:
+        item["status"] = "pendiente"
+    return item
