@@ -141,6 +141,11 @@ class Settings(BaseSettings):
     SMTP_FROM: str = ""
     SUPERVISOR_EMAIL: str = ""
 
+    # Gate de correo saliente (app/services/email_gate.py). Listas separadas por
+    # coma; vacio = sin restriccion. Se cambian por entorno, sin deploy.
+    EMAIL_ALLOWED_KINDS: str = ""
+    EMAIL_ALLOWED_RECIPIENTS: str = ""
+
     # Alerta operativa de scraping. Casilla propia y NO SUPERVISOR_EMAIL: el
     # aviso de credencial vencida le sirve a quien coordina abogados, mientras
     # que "el scraping lleva horas sin completar" le sirve a quien opera el
