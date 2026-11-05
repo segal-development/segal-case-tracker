@@ -2,11 +2,15 @@
 
 import calendar
 import re
+import threading
+import time
 from collections import defaultdict, namedtuple
 from datetime import datetime, timedelta
 from typing import Optional
+from sqlalchemy import event, inspect as sa_inspect
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.models.case import Case
 from app.models.case_litigante import CaseLitigante
 from app.models.court import Court
@@ -17,6 +21,89 @@ from app.utils.rut import normalize_rut
 DEMANDANTE_ABOGADO = frozenset({"AB.DTE", "AP.DTE"})
 DEMANDADO_ABOGADO = frozenset({"AB.DDO", "AP.DDO"})
 ALL_ABOGADO = DEMANDANTE_ABOGADO | DEMANDADO_ABOGADO
+
+# Short-lived per-process cache of resolved case scopes (which case ids an
+# account may see). SECURITY: keys MUST carry every input that changes the
+# result (account identity, role, requested abogado) so two accounts never
+# share an entry; values are frozensets so no caller can mutate a cached one.
+_SCOPE_CACHE_MAX_ENTRIES = 512
+_scope_clock = time.monotonic
+_scope_cache: dict = {}  # key -> (expires_at, frozenset); insertion order = age
+_scope_cache_lock = threading.Lock()
+
+
+def _scope_cache_ttl() -> int:
+    return max(0, int(settings.CASE_SCOPE_CACHE_SECONDS))
+
+
+def _scope_cache_get(key):
+    """Return the live cached frozenset for ``key``, or None."""
+    with _scope_cache_lock:
+        entry = _scope_cache.get(key)
+        if entry is None:
+            return None
+        expires_at, value = entry
+        if _scope_clock() >= expires_at:
+            del _scope_cache[key]
+            return None
+        return value
+
+
+def _scope_cache_put(key, value: frozenset) -> None:
+    with _scope_cache_lock:
+        _scope_cache.pop(key, None)
+        _scope_cache[key] = (_scope_clock() + _scope_cache_ttl(), value)
+        while len(_scope_cache) > _SCOPE_CACHE_MAX_ENTRIES:
+            del _scope_cache[next(iter(_scope_cache))]
+
+
+def clear_case_scope_cache() -> None:
+    with _scope_cache_lock:
+        _scope_cache.clear()
+
+
+# Invalidation: scope inputs are Case ownership/assignment, CaseLitigante rows
+# and the Lawyer identity/role. Any flush that changes one of them drops the
+# whole cache (at flush AND again after commit, so a request that recomputes
+# between flush and commit cannot leave a pre-commit value behind). Bulk
+# ``query.update()`` bypasses these events; the TTL bounds that staleness.
+_CASE_SCOPE_COLUMNS = ("lawyer_id", "assigned_lawyer_id", "competencia")
+_LAWYER_SCOPE_COLUMNS = ("rut", "role")
+
+
+def _changes_scope(obj, *, new_or_deleted: bool) -> bool:
+    if isinstance(obj, CaseLitigante):
+        return True
+    if isinstance(obj, (Case, Lawyer)):
+        if new_or_deleted:
+            return True
+        columns = _CASE_SCOPE_COLUMNS if isinstance(obj, Case) else _LAWYER_SCOPE_COLUMNS
+        state = sa_inspect(obj)
+        return any(state.attrs[c].history.has_changes() for c in columns)
+    return False
+
+
+def _scope_cache_on_flush(session, flush_context) -> None:
+    touched = any(_changes_scope(o, new_or_deleted=True) for o in (*session.new, *session.deleted))
+    touched = touched or any(_changes_scope(o, new_or_deleted=False) for o in session.dirty)
+    if touched:
+        session.info["case_scope_dirty"] = True
+        clear_case_scope_cache()
+
+
+def _scope_cache_on_commit(session) -> None:
+    if session.info.pop("case_scope_dirty", False):
+        clear_case_scope_cache()
+
+
+def _scope_cache_on_rollback(session) -> None:
+    session.info.pop("case_scope_dirty", None)
+
+
+event.listen(Session, "after_flush", _scope_cache_on_flush)
+event.listen(Session, "after_commit", _scope_cache_on_commit)
+event.listen(Session, "after_rollback", _scope_cache_on_rollback)
+
 
 _TRAILING_PAREN_RE = re.compile(r"\s*\([^)]*\)\s*$")
 
@@ -788,8 +875,14 @@ def case_ids_for_abogado(db: Session, account_rut: str, abogado_rut: str) -> set
     for its new assignee's RUT here, not the original litigante's.
     """
     abogado_rut_norm = normalize_rut(abogado_rut)
+    use_cache = _scope_cache_ttl() > 0
+    key = ("abogado", normalize_rut(account_rut), abogado_rut_norm)
+    if use_cache:
+        cached = _scope_cache_get(key)
+        if cached is not None:
+            return set(cached)
 
-    return {
+    result = {
         case_id
         for case_id, litigantes in _abogado_litigantes_by_case(db).items()
         if any(
@@ -797,6 +890,9 @@ def case_ids_for_abogado(db: Session, account_rut: str, abogado_rut: str) -> set
             for lit in litigantes
         )
     }
+    if use_cache:
+        _scope_cache_put(key, frozenset(result))
+    return result
 
 
 def acting_lawyer_is_case_abogado(db: Session, case: Case, acting_rut: str) -> bool:

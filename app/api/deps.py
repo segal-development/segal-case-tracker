@@ -348,26 +348,33 @@ def resolve_case_scope(db: Session, current_lawyer: dict):
         raise HTTPException(status_code=401, detail="Invalid token")
 
     from app.models.lawyer import Lawyer
-    from app.services.lawyer_roster import case_ids_for_abogado
+    from app.services import lawyer_roster
 
     if isinstance(sub, int) or (isinstance(sub, str) and sub.isdigit()):
         lawyer = db.query(Lawyer).filter(Lawyer.id == int(sub)).first()
         if lawyer is None:
             return set()
-        if lawyer.role in ("auditor", "admin"):
-            return ALL_CASES
-        return case_ids_for_abogado(db, lawyer.rut, lawyer.rut) | _bootstrap_owned_case_ids(
-            db, lawyer.id
-        )
-
-    lawyer = db.query(Lawyer).filter(Lawyer.rut == sub).first()
-    if not lawyer:
-        raise HTTPException(status_code=404, detail="Lawyer not found")
+    else:
+        lawyer = db.query(Lawyer).filter(Lawyer.rut == sub).first()
+        if not lawyer:
+            raise HTTPException(status_code=404, detail="Lawyer not found")
     if lawyer.role in ("auditor", "admin"):
         return ALL_CASES
-    return case_ids_for_abogado(db, lawyer.rut, lawyer.rut) | _bootstrap_owned_case_ids(
-        db, lawyer.id
-    )
+
+    # Cache key carries id AND rut AND role (the lawyer row is still read per
+    # request, so a role change or deleted account is never served stale).
+    use_cache = lawyer_roster._scope_cache_ttl() > 0
+    key = ("scope", lawyer.id, lawyer.rut, lawyer.role)
+    if use_cache:
+        cached = lawyer_roster._scope_cache_get(key)
+        if cached is not None:
+            return set(cached)
+    scope = lawyer_roster.case_ids_for_abogado(
+        db, lawyer.rut, lawyer.rut
+    ) | _bootstrap_owned_case_ids(db, lawyer.id)
+    if use_cache:
+        lawyer_roster._scope_cache_put(key, frozenset(scope))
+    return scope
 
 
 def apply_case_scope(query, scope):
