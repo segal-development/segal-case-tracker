@@ -66,6 +66,8 @@ from app.services.deadline_verdict import (
     verdict_uses_escritos,
 )
 from app.services.poder_deadline import (
+    _NULO_RE,
+    _is_court_act,
     find_poder_obligation,
     obligation_is_ours,
     parse_extended_from,
@@ -787,7 +789,7 @@ class DeadlineEngine:
 
         # Step 8: write denormalized Case columns.
         case.procedural_state = proc_state.value
-        case.semaforo = cls._apply_semaforo_override(case, semaforo)
+        case.semaforo = cls._apply_semaforo_override(case, semaforo, movements)
         case.abandono_disponible = abandono
         case.prescripcion_cumplida = prescripcion_cumplida
         case.prescripcion_fecha = prescripcion_fecha
@@ -1312,20 +1314,26 @@ class DeadlineEngine:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _apply_semaforo_override(case: Case, computed: str) -> str:
-        """Honor a manual liberación override until a NEWER movement supersedes it.
+    def _apply_semaforo_override(
+        case: Case, computed: str, movements: Optional[Iterable[Movement]] = None
+    ) -> str:
+        """Honor a manual liberación override until the court dictates something NEW.
 
-        A liberación (auditor + dirección dual sign-off) pins the case's semáforo
-        to a chosen range. It holds while no case activity arrived after it; once a
-        newer movement lands (last_movement_at > override_at) the override is
-        cleared and the computed color resumes — "el semáforo se sigue moviendo".
+        The override is cleared only when a court act (not an ``Escrito``, not
+        ``[Nulo]``) is dated on a DAY strictly after the day the override was
+        applied; the firm's own escritos never clear it. Once cleared, the
+        computed color resumes.
         """
         override = getattr(case, "semaforo_override", None)
         if not override:
             return computed
         ov_at = getattr(case, "semaforo_override_at", None)
-        last_mv = getattr(case, "last_movement_at", None)
-        if ov_at is not None and last_mv is not None and last_mv > ov_at:
+        if ov_at is not None and any(
+            _is_court_act(mv)
+            and not _NULO_RE.search(mv.description or "")
+            and mv.movement_date.date() > ov_at.date()
+            for mv in movements or ()
+        ):
             case.semaforo_override = None
             case.semaforo_override_at = None
             case.semaforo_override_by = None
