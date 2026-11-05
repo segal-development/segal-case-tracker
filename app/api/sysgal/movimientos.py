@@ -14,12 +14,14 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
 from app.api.sysgal.deps import require_sysgal_key
+from app.config import settings
 from app.models.case import Case
 from app.models.case_litigante import CaseLitigante
 from app.models.client import Client
 from app.models.document import Document
 from app.models.movement import Movement
 from app.utils.rut import normalize_rut
+from app.services.storage_service import GCSStorageBackend, get_storage_backend
 
 
 router = APIRouter()
@@ -51,6 +53,35 @@ class SysgalMovimientosResponse(BaseModel):
     next_cursor: Optional[str] = None
     has_more: bool
     items: List[SysgalMovimientoItem]
+
+
+class SysgalDocumentoUrlResponse(BaseModel):
+    url: str
+    expira_en_segundos: int
+
+
+@router.get("/documentos/url", response_model=SysgalDocumentoUrlResponse)
+def obtener_url_documento(
+    ruta: str = Query(..., description="Ruta gs:// devuelta en documento_ruta"),
+    db: Session = Depends(get_db),
+    _key=Depends(require_sysgal_key),
+) -> SysgalDocumentoUrlResponse:
+    """Create a temporary browser URL for a registered stored document."""
+    document = db.query(Document).filter(
+        Document.gcs_path == ruta, Document.status == "stored"
+    ).first()
+    if not document:
+        raise HTTPException(status_code=404, detail="Documento no encontrado")
+
+    backend = get_storage_backend(settings)
+    prefix = f"gs://{settings.GCS_BUCKET}/"
+    if not isinstance(backend, GCSStorageBackend) or not ruta.startswith(prefix):
+        raise HTTPException(status_code=400, detail="Ruta de almacenamiento no válida")
+
+    return SysgalDocumentoUrlResponse(
+        url=backend.signed_url(ruta[len(prefix):], settings.GCS_SIGNED_URL_TTL),
+        expira_en_segundos=settings.GCS_SIGNED_URL_TTL,
+    )
 
 
 def _previous_chilean_day_bounds(
