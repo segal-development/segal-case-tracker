@@ -1,9 +1,9 @@
-"""Liberación de causa endpoints — dual sign-off semáforo override.
+"""Liberación de causa endpoints — single sign-off semáforo override.
 
-A lawyer requests moving a case's semáforo (target + motivo). It only applies
-under CROSS-CONTROL: an auditor (role=auditor) AND the dirección (role=admin)
-must both authorize. On apply, a manual override is written on the Case (the
-DeadlineEngine honors it until a newer movement supersedes it).
+A lawyer requests a release (target + required motivo). ONE approval by an
+auditor (role=auditor) or the dirección (role=admin) applies it. On apply, a
+manual override is written on the Case (the DeadlineEngine honors it until the
+court dictates something new).
 """
 import logging
 from datetime import datetime
@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_lawyer, get_db
+from app.api.v1.cases import _effective_lawyer_name
 from app.models.case import Case
 from app.models.lawyer import Lawyer
 from app.models.liberacion import (
@@ -26,13 +27,13 @@ from app.models.liberacion import (
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-_SEMAFORO_VALUES = {"rojo", "amarillo", "verde"}
+_SEMAFORO_VALUES = {"rojo", "amarillo", "verde", "gris"}
 _OVERSIGHT_ROLES = {"auditor", "admin"}
 
 
 class CrearLiberacionBody(BaseModel):
     case_id: int
-    target_semaforo: str  # rojo | amarillo | verde
+    target_semaforo: str  # gris (liberada) | rojo | amarillo | verde
     motivo: Optional[str] = None
 
 
@@ -44,6 +45,8 @@ class LiberacionResponse(BaseModel):
     id: int
     case_id: int
     rol: Optional[str] = None
+    tribunal: Optional[str] = None
+    abogado_nombre: Optional[str] = None
     caratulado: Optional[str] = None
     semaforo_actual: Optional[str] = None
     target_semaforo: str
@@ -72,6 +75,8 @@ def _to_response(db: Session, r: LiberacionRequest) -> LiberacionResponse:
         id=r.id,
         case_id=r.case_id,
         rol=case.rol if case else None,
+        tribunal=case.court.name if case and case.court else None,
+        abogado_nombre=_effective_lawyer_name(case) if case else None,
         caratulado=f"{case.plaintiff or ''}/{case.defendant or ''}" if case else None,
         semaforo_actual=case.semaforo if case else None,
         target_semaforo=r.target_semaforo,
@@ -86,10 +91,8 @@ def _to_response(db: Session, r: LiberacionRequest) -> LiberacionResponse:
     )
 
 
-def _maybe_apply(db: Session, r: LiberacionRequest) -> None:
-    """When both sign-offs are present, apply the override to the case."""
-    if not (r.auditor_ok and r.direccion_ok):
-        return
+def _apply(db: Session, r: LiberacionRequest, approver_name: Optional[str]) -> None:
+    """Write the override on the case and mark the request applied."""
     case = db.query(Case).filter(Case.id == r.case_id).first()
     if case is None:
         return
@@ -98,9 +101,7 @@ def _maybe_apply(db: Session, r: LiberacionRequest) -> None:
     r.aplicado_at = now
     case.semaforo_override = r.target_semaforo
     case.semaforo_override_at = now
-    case.semaforo_override_by = " + ".join(
-        n for n in (r.auditor_aprobado_by_name, r.direccion_aprobado_by_name) if n
-    )
+    case.semaforo_override_by = approver_name
     case.semaforo = r.target_semaforo  # reflect immediately
 
 
@@ -110,12 +111,15 @@ async def crear_liberacion(
     db: Session = Depends(get_db),
     current_lawyer: dict = Depends(get_current_lawyer),
 ):
-    """Request moving a case's semáforo (needs later auditor + dirección sign-off)."""
+    """Request a release (needs one auditor or dirección approval)."""
     actor = _resolve_lawyer(db, current_lawyer)
     if actor is None:
         raise HTTPException(status_code=401, detail="No se pudo resolver el abogado")
     if body.target_semaforo not in _SEMAFORO_VALUES:
-        raise HTTPException(status_code=400, detail="Estado destino inválido (rojo/amarillo/verde)")
+        raise HTTPException(status_code=400, detail="Estado destino inválido (gris/rojo/amarillo/verde)")
+    motivo = (body.motivo or "").strip()
+    if not 1 <= len(motivo) <= 500:
+        raise HTTPException(status_code=400, detail="Indica el motivo de la liberación.")
     case = db.query(Case).filter(Case.id == body.case_id).first()
     if case is None:
         raise HTTPException(status_code=404, detail="Causa no encontrada")
@@ -133,7 +137,7 @@ async def crear_liberacion(
         requested_by_rut=actor.rut,
         requested_by_name=actor.name,
         target_semaforo=body.target_semaforo,
-        motivo=body.motivo,
+        motivo=motivo,
         estado=LIB_PENDIENTE,
     )
     db.add(req)
@@ -177,13 +181,17 @@ async def aprobar_liberacion(
     db: Session = Depends(get_db),
     current_lawyer: dict = Depends(get_current_lawyer),
 ):
-    """Sign off a liberación. The actor's ROLE decides which side of the dual
-    control it fills: role=auditor → auditor sign-off; role=admin → dirección
-    sign-off. Applies the move only once BOTH are present."""
+    """Sign off a liberación. The actor's ROLE decides which slot records it
+    (auditor / dirección); ONE sign-off applies the release immediately."""
     actor = _resolve_lawyer(db, current_lawyer)
     if actor is None or actor.role not in _OVERSIGHT_ROLES:
         raise HTTPException(status_code=403, detail="Solo auditor o dirección pueden autorizar")
-    r = db.query(LiberacionRequest).filter(LiberacionRequest.id == req_id).first()
+    r = (
+        db.query(LiberacionRequest)
+        .filter(LiberacionRequest.id == req_id)
+        .with_for_update()
+        .first()
+    )
     if r is None:
         raise HTTPException(status_code=404, detail="Solicitud no encontrada")
     if r.estado != LIB_PENDIENTE:
@@ -191,19 +199,15 @@ async def aprobar_liberacion(
 
     now = datetime.utcnow()
     if actor.role == "auditor":
-        if r.auditor_ok:
-            raise HTTPException(status_code=409, detail="El auditor ya autorizó")
         r.auditor_aprobado_by_rut = actor.rut
         r.auditor_aprobado_by_name = actor.name
         r.auditor_aprobado_at = now
     else:  # admin = dirección
-        if r.direccion_ok:
-            raise HTTPException(status_code=409, detail="La dirección ya autorizó")
         r.direccion_aprobado_by_rut = actor.rut
         r.direccion_aprobado_by_name = actor.name
         r.direccion_aprobado_at = now
 
-    _maybe_apply(db, r)
+    _apply(db, r, actor.name)
     db.commit()
     db.refresh(r)
     return _to_response(db, r)
@@ -220,7 +224,12 @@ async def rechazar_liberacion(
     actor = _resolve_lawyer(db, current_lawyer)
     if actor is None or actor.role not in _OVERSIGHT_ROLES:
         raise HTTPException(status_code=403, detail="Solo auditor o dirección")
-    r = db.query(LiberacionRequest).filter(LiberacionRequest.id == req_id).first()
+    r = (
+        db.query(LiberacionRequest)
+        .filter(LiberacionRequest.id == req_id)
+        .with_for_update()
+        .first()
+    )
     if r is None:
         raise HTTPException(status_code=404, detail="Solicitud no encontrada")
     if r.estado != LIB_PENDIENTE:

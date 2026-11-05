@@ -26,6 +26,7 @@ from app.models.case_escrito import CaseEscrito
 from app.models.case_exhorto import CaseExhorto
 from app.models.movement import Movement
 from app.models.court import Court
+from app.models.liberacion import LIB_APLICADO, LiberacionRequest
 from app.models.sync_history import SyncHistory
 from app.models.document import Document
 from app.models.generated_document import GeneratedDocument
@@ -348,6 +349,22 @@ class WindowResolution(BaseModel):
     resolved_by: Optional[str] = None
 
 
+class LiberacionSummary(BaseModel):
+    """Most recent liberación request of a case (any estado)."""
+    id: int
+    estado: Literal["pendiente", "aplicado", "rechazado"]
+    target_semaforo: str
+    motivo: Optional[str] = None
+    requested_by_name: Optional[str] = None
+    created_at: datetime
+    approved_by_name: Optional[str] = None
+    aplicado_at: Optional[datetime] = None
+    rechazado_by_name: Optional[str] = None
+    rechazo_motivo: Optional[str] = None
+    # Applied AND the case's override is still set (not yet expired by a new court act).
+    vigente: bool = False
+
+
 class CaseDetailResponse(BaseModel):
     """Case with movements and all scraped entity lists."""
     case: CaseResponse
@@ -365,6 +382,7 @@ class CaseDetailResponse(BaseModel):
     stage_dates: dict[str, str] = {}
     # Court acts of the excepciones window; [] outside it (see _window_resolutions).
     window_resolutions: List[WindowResolution] = []
+    liberacion: Optional[LiberacionSummary] = None
 
 
 # ============================================================================
@@ -1085,6 +1103,30 @@ def _effective_lawyer_name(case: Case) -> Optional[str]:
     return holder.name if holder else None
 
 
+def _liberacion_summary(db: Session, case: Case) -> Optional[LiberacionSummary]:
+    r = (
+        db.query(LiberacionRequest)
+        .filter(LiberacionRequest.case_id == case.id)
+        .order_by(LiberacionRequest.created_at.desc(), LiberacionRequest.id.desc())
+        .first()
+    )
+    if r is None:
+        return None
+    return LiberacionSummary(
+        id=r.id,
+        estado=r.estado,
+        target_semaforo=r.target_semaforo,
+        motivo=r.motivo,
+        requested_by_name=r.requested_by_name,
+        created_at=r.created_at,
+        approved_by_name=r.auditor_aprobado_by_name or r.direccion_aprobado_by_name,
+        aplicado_at=r.aplicado_at,
+        rechazado_by_name=r.rechazado_by_name,
+        rechazo_motivo=r.rechazo_motivo,
+        vigente=r.estado == LIB_APLICADO and bool(case.semaforo_override),
+    )
+
+
 @router.get("/{case_id}", response_model=CaseDetailResponse)
 async def get_case(
     case_id: int,
@@ -1190,6 +1232,7 @@ async def get_case(
         movements_count=len(movements),
         stage_dates=_stage_dates(case, movements),
         window_resolutions=_window_resolutions(case, movements),
+        liberacion=_liberacion_summary(db, case),
         litigantes=[LitiganteResponse.model_validate(r) for r in litigantes],
         litigantes_count=len(litigantes),
         notificaciones=[NotificacionResponse.model_validate(r) for r in notificaciones],
