@@ -333,6 +333,34 @@ def test_create_same_rol_different_tribunal_allowed(client, db, admin, lawyer, t
     assert r3.status_code == 409
 
 
+@pytest.mark.parametrize(
+    "first, second",
+    [
+        ("7° Juzgado Civil de Santiago", "7º Juzgado Civil de Santiago"),  # degree sign vs ordinal
+        ("7º Juzgado Civil de Santiago", "7°  Juzgado  Civil de Santiago"),  # plus doubled spaces
+        ("2ª Sala", "2° Sala"),  # feminine ordinal vs degree sign
+    ],
+)
+def test_create_same_tribunal_written_with_another_ordinal_sign_is_duplicate(
+    client, db, admin, lawyer, tipo, first, second
+):
+    """Real case (Carla, C-13411-2026, October 2026): the same causa entered twice because one
+    tribunal said '7°' (degree sign) and the other '7º' (ordinal indicator)."""
+    common = {"hito_tipo_id": tipo.id, "fecha_hito": "2026-10-13",
+              "rol_causa": "12.575.550-K", "descripcion": "C-13411-2026",
+              "lawyer_id": lawyer.id}
+    assert client.post("/api/v1/hitos", headers=_h(ADMIN_RUT), data={**common, "tribunal": first}).status_code == 201
+    assert client.post("/api/v1/hitos", headers=_h(ADMIN_RUT), data={**common, "tribunal": second}).status_code == 409
+
+
+def test_create_different_tribunal_number_is_still_allowed(client, db, admin, lawyer, tipo):
+    common = {"hito_tipo_id": tipo.id, "fecha_hito": "2026-10-13",
+              "rol_causa": "12.575.550-K", "descripcion": "C-13411-2026",
+              "lawyer_id": lawyer.id}
+    assert client.post("/api/v1/hitos", headers=_h(ADMIN_RUT), data={**common, "tribunal": "7° Juzgado Civil de Santiago"}).status_code == 201
+    assert client.post("/api/v1/hitos", headers=_h(ADMIN_RUT), data={**common, "tribunal": "17º Juzgado Civil de Santiago"}).status_code == 201
+
+
 def test_create_allows_multiple_without_causa(client, db, admin, tipo):
     # Hitos without a causa can't collide → both allowed.
     base = {"hito_tipo_id": tipo.id, "fecha_hito": "2026-07-15"}

@@ -95,6 +95,9 @@ def _causa_key(descripcion: Optional[str]) -> Optional[str]:
     return (m.group(0).upper() if m else text.upper()[:120]) or None
 
 
+_ORDINAL_SIGNS = str.maketrans({"°": "º", "ª": "º", "˚": "º"})
+
+
 def _tribunal_key(tribunal: Optional[str]) -> Optional[str]:
     """Normalized tribunal token used for hito dedup.
 
@@ -105,7 +108,10 @@ def _tribunal_key(tribunal: Optional[str]) -> Optional[str]:
     """
     if not tribunal:
         return None
-    return tribunal.strip().upper()[:255] or None
+    # The degree sign (°) and the ordinal indicators (º, ª) are typed interchangeably ("7°" and
+    # "7º" are the same tribunal: C-13411-2026 was paid twice, October 2026); runs of whitespace too.
+    folded = tribunal.translate(_ORDINAL_SIGNS)
+    return " ".join(folded.split()).upper()[:255] or None
 
 
 def _tribunal_collides(a: Optional[str], b: Optional[str]) -> bool:
