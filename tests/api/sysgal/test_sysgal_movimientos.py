@@ -11,6 +11,7 @@ from app.models.document import Document
 from app.models.lawyer import Lawyer
 from app.models.movement import Movement
 from app.models.sysgal_api_key import SysgalApiKey
+from app.services.storage_service import GCSStorageBackend
 
 
 URL = "/api/sysgal/v1/movimientos"
@@ -217,3 +218,31 @@ def test_invalid_cursor_returns_422(client, db):
     response = client.get(URL, params={"desde": "no-es-un-cursor"}, headers=_auth())
     assert response.status_code == 422
     assert response.json()["detail"] == "Cursor 'desde' inválido"
+
+
+def test_document_url_requires_key_and_signs_only_registered_path(client, db, monkeypatch):
+    _seed_key(db)
+    _seed(db)
+    from app.api.sysgal import movimientos
+
+    monkeypatch.setattr(movimientos.settings, "DOC_STORAGE_BACKEND", "gcs")
+    monkeypatch.setattr(movimientos.settings, "GCS_BUCKET", "bucket")
+    monkeypatch.setattr(movimientos.settings, "GCS_SIGNED_URL_TTL", 300)
+    signed = []
+
+    def sign(_self, key, expires_s):
+        signed.append((key, expires_s))
+        return "https://storage.example/signed"
+
+    monkeypatch.setattr(GCSStorageBackend, "signed_url", sign)
+    url = "/api/sysgal/v1/documentos/url"
+    ruta = "gs://bucket/resolucion.pdf"
+    assert client.get(url, params={"ruta": ruta}).status_code == 401
+    response = client.get(url, params={"ruta": ruta}, headers=_auth())
+    assert response.status_code == 200
+    assert response.json() == {
+        "url": "https://storage.example/signed", "expira_en_segundos": 300
+    }
+    assert signed == [("resolucion.pdf", 300)]
+    assert client.get(url, params={"ruta": "gs://bucket/otro.pdf"}, headers=_auth()).status_code == 404
+    assert len(signed) == 1
