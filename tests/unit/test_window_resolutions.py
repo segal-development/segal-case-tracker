@@ -188,3 +188,36 @@ def test_no_opone_excepciones_returns_empty() -> None:
 def test_description_is_stripped() -> None:
     result = window_resolutions([_opone(), _mv("2026-10-01", "  Resuelvo algo  ", id=2)], TODAY)
     assert result[0]["description"] == "Resuelvo algo"
+
+
+CUTOFF = date(2026, 11, 2)
+
+
+def test_overdue_extended_trigger_before_the_cutoff_is_sin_registro() -> None:
+    movements = [_opone(), _mv("2026-09-24", MERO, id=2)]
+    item = window_resolutions(movements, date(2026, 11, 5), extended_from=CUTOFF)[0]
+    assert item["status"] == "sin_registro"
+    assert item["due_date"] == "2026-09-28"
+    assert item["requires_action"] is True
+
+
+def test_overdue_extended_trigger_on_or_after_the_cutoff_stays_vencida() -> None:
+    movements = [_opone(), _mv("2026-11-02", MERO, id=2)]
+    assert window_resolutions(movements, date(2026, 11, 9), extended_from=CUTOFF)[0]["status"] == "vencida"
+
+
+def test_before_the_cutoff_but_not_overdue_or_fulfilled_keeps_its_status() -> None:
+    pend = [_opone("2026-10-20"), _mv("2026-10-30", MERO, id=2)]
+    assert window_resolutions(pend, date(2026, 10, 31), extended_from=CUTOFF)[0]["status"] == "pendiente"
+    done = [_opone(), _mv("2026-10-01", MERO, id=2), _mv("2026-10-05", "Acredita Poder", "Escrito", id=3)]
+    assert window_resolutions(done, date(2026, 11, 5), extended_from=CUTOFF)[0]["status"] == "cumplida"
+
+
+def test_previo_a_proveer_is_never_sin_registro() -> None:
+    movements = [_opone(), _mv("2026-09-24", "Previo a proveer", id=2)]
+    assert window_resolutions(movements, date(2026, 11, 5), extended_from=CUTOFF)[0]["status"] == "vencida"
+
+
+def test_without_a_cutoff_an_overdue_trigger_is_vencida() -> None:
+    movements = [_opone(), _mv("2026-09-24", MERO, id=2)]
+    assert window_resolutions(movements, date(2026, 11, 5))[0]["status"] == "vencida"

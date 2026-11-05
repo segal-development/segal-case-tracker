@@ -34,7 +34,11 @@ from app.services.sysgal_cobertura import COBERTURAS, derive_cobertura
 from app.services.timeline_service import build_case_timeline
 from app.services.case_diagnostico import classify, days_since
 from app.services.deadline_engine import is_medida_prejudicial
-from app.services.poder_deadline import is_excepciones_filing, window_resolutions
+from app.services.poder_deadline import (
+    is_excepciones_filing,
+    parse_extended_from,
+    window_resolutions,
+)
 from app.services.procedural_classifier import MovementClassifier
 from app.utils.rut import clean_rut
 
@@ -1210,13 +1214,17 @@ def _stage_dates(case: Case, movements: list) -> dict[str, str]:
 
 def _window_resolutions(case: Case, movements: list) -> list[dict]:
     """Resolutions of the excepciones window, from the already-loaded movements."""
+    from app.config import settings
+
     if case.procedural_state not in ("excepciones", "notificado"):
         return []
     if is_medida_prejudicial(case.procedure):
         return []
     if not any(is_excepciones_filing(m) for m in movements):
         return []
-    return window_resolutions(movements, date.today())
+    return window_resolutions(
+        movements, date.today(), parse_extended_from(settings.PODER_EXTENDED_FROM)
+    )
 
 
 @router.get("/{case_id}/movements", response_model=List[MovementResponse])

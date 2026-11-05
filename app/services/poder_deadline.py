@@ -340,7 +340,9 @@ _WINDOW_RESOLUTIONS_CAP = 8
 _WINDOW_ACTION_BUSINESS_DAYS = 3
 
 
-def window_resolutions(movements: list, today: date) -> list[dict]:
+def window_resolutions(
+    movements: list, today: date, extended_from: date | None = None
+) -> list[dict]:
     """Court acts from the first ``Opone excepciones`` up to the first traslado.
 
     A display of what the court dictated, not the plazo engine: no cutoff, no
@@ -363,10 +365,12 @@ def window_resolutions(movements: list, today: date) -> list[dict]:
         if _is_traslado_resolution(m):
             break
 
-    return [_window_item(m, ordered, today) for m in acts[-_WINDOW_RESOLUTIONS_CAP:]]
+    return [_window_item(m, ordered, today, extended_from) for m in acts[-_WINDOW_RESOLUTIONS_CAP:]]
 
 
-def _window_item(movement: object, ordered: list, today: date) -> dict:
+def _window_item(
+    movement: object, ordered: list, today: date, extended_from: date | None = None
+) -> dict:
     from app.services.business_days import add_business_days
 
     day = _day(movement)
@@ -404,7 +408,15 @@ def _window_item(movement: object, ordered: list, today: date) -> dict:
         item["status"] = "avanzo"
         item["resolved_on"] = _day(moved_on).isoformat()
     elif due < today:
-        item["status"] = "vencida"
+        # Mero tramite / Apercibimiento dictated before the rule's cutoff never opened a plazo, so
+        # an unfulfilled one is only "no record" (the lawyer may have acted by another route).
+        before_cutoff = (
+            extended_from is not None
+            and is_extended_trigger(movement)
+            and not is_previo_a_proveer(movement)
+            and day < extended_from
+        )
+        item["status"] = "sin_registro" if before_cutoff else "vencida"
     else:
         item["status"] = "pendiente"
     return item
