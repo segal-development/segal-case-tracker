@@ -85,6 +85,14 @@ class Settings(BaseSettings):
     # its movement_date. 0 disables it. Rationale in app/services/deadline_verdict.py.
     DEADLINE_PODER_NOTIFICATION_ALLOWANCE_DAYS: int = 2
 
+    # acreditar_poder_3d, extended trigger: from this ISO date on (inclusive, by
+    # the resolution's movement_date) a court "Mero tramite" / "Apercibimiento
+    # poder y/o titulo" dictated after our "Opone excepciones" and before the
+    # "Opone excepciones-Traslado" also starts the plazo. Forward-only by the
+    # firm's decision ("solo para resoluciones nuevas desde hoy"). Empty string =
+    # extension OFF (only "Previo a proveer"); an invalid value = OFF + a WARNING.
+    PODER_EXTENDED_FROM: str = "2026-11-04"
+
     # Semaforo de plazos: who is told in ADDITION to the case's lawyer(s).
     # Comma-separated lawyer ids (lawyers.id). Amarillo adds the first list;
     # ROJO sends to the second, which is the full escalation (it repeats the

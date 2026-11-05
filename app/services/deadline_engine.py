@@ -35,6 +35,7 @@ from sqlalchemy.orm import Session
 import re as _re
 import unicodedata
 
+from app.config import settings
 from app.core.deadlines_config import (
     ACTIONABLE_DEADLINE_VALUES,
     FATAL_DEADLINE_VALUES,
@@ -64,7 +65,11 @@ from app.services.deadline_verdict import (
     verdict_rank,
     verdict_uses_escritos,
 )
-from app.services.poder_deadline import find_poder_obligation
+from app.services.poder_deadline import (
+    find_poder_obligation,
+    obligation_is_ours,
+    parse_extended_from,
+)
 from app.services.procedural_classifier import (
     _REQUERIMIENTO_PAGA_RE,
     _REQUERIMIENTO_RE,
@@ -770,6 +775,8 @@ class DeadlineEngine:
             db, case.id, proc_state, today,
             actionable_values=actionable_values,
             mandatory_values=mandatory_values,
+            side=side,
+            movements=movements,
         )
 
         # Step 7b: abandono del procedimiento advisory signal (art. 152/153 CPC).
@@ -1335,6 +1342,8 @@ class DeadlineEngine:
         *,
         actionable_values: frozenset[str] = ACTIONABLE_DEADLINE_VALUES,
         mandatory_values: frozenset[str] = MANDATORY_ACTIONABLE_VALUES,
+        side: Optional[str] = None,
+        movements: Optional[list] = None,
     ) -> str:
         """Derive semáforo color from the FIRM's own (actionable) deadlines only.
 
@@ -1349,9 +1358,17 @@ class DeadlineEngine:
         Deadlines outside the firm's actionable set for the given side and expired
         OPTIONAL_ACTIONABLE (APELACION_5D) NEVER by themselves produce ROJO. The
         appeal window never colours at all (SEMAFORO_EXCLUDED_VALUES), open or not.
+
+        ROJO also when the firm (``side`` demandado) has an open or lapsed,
+        unfulfilled "acreditar poder" obligation that is provably its own and
+        was triggered on/after ``PODER_EXTENDED_FROM`` (see
+        ``_poder_forces_rojo``); that parallel plazo is otherwise not actionable.
         """
         if state in (ProceduralState.INDETERMINATE, ProceduralState.TERMINADA):
             return "gris"
+
+        if side is not None and cls._poder_forces_rojo(db, case_id, side, movements or []):
+            return "rojo"
 
         # Only the firm's actionable deadlines drive the color. Pick the nearest
         # one that still "counts": a past-due OPTIONAL window (apelación) is
@@ -1395,6 +1412,39 @@ class DeadlineEngine:
 
         # Nothing pending for the firm → al día.
         return "verde"
+
+    @staticmethod
+    def _poder_forces_rojo(
+        db: Session, case_id: int, side: str, movements: list
+    ) -> bool:
+        """An automatic, unfulfilled ``acreditar_poder_3d`` row (active or
+        expired) triggered on/after the cutoff whose obligation is the firm's.
+
+        Cutoff OFF (empty/invalid setting) = never. ``cumplido`` / ``superseded``
+        / manual rows never count. Never raises.
+        """
+        try:
+            cutoff = parse_extended_from(settings.PODER_EXTENDED_FROM)
+            if cutoff is None:
+                return False
+            rows = (
+                db.query(CaseDeadline)
+                .filter(
+                    CaseDeadline.case_id == case_id,
+                    CaseDeadline.deadline_type == DeadlineType.ACREDITAR_PODER_3D.value,
+                    CaseDeadline.status.in_(("active", "expired")),
+                    CaseDeadline.is_manual == False,  # noqa: E712
+                    CaseDeadline.triggered_at >= cutoff,
+                )
+                .all()
+            )
+            return any(
+                obligation_is_ours(movements, row.source_movement_id, side)
+                for row in rows
+            )
+        except Exception:  # pragma: no cover - defensive boundary
+            logger.exception("poder rojo check failed for case_id=%s", case_id)
+            return False
 
     # ------------------------------------------------------------------
     # Helpers
