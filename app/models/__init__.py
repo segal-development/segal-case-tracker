@@ -24,6 +24,7 @@ from app.models.case_merge_audit import CaseMergeAudit
 from app.models.generated_document import GeneratedDocument
 from app.models.credential_audit_event import CredentialAuditEvent
 from app.models.hito import Hito, HitoTipo
+from app.models.activity_event import ActivityEvent
 from app.models.hito_form_link import HitoFormLink
 from app.models.liberacion import LiberacionRequest
 from app.models.bono import BonoVariables
@@ -68,6 +69,7 @@ __all__ = [
     "CaseMergeAudit",
     "GeneratedDocument",
     "CredentialAuditEvent",
+    "ActivityEvent",
     "Hito",
     "HitoTipo",
     "HitoFormLink",

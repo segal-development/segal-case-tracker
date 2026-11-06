@@ -103,6 +103,17 @@ def sample_session():
 
 
 @pytest.fixture(autouse=True)
+def activity_audit_off(monkeypatch):
+    """The activity audit is off by default so unrelated tests never write to the
+    test DB through the middleware; tests/api/v1/test_activity*.py switch it on."""
+    from app.services import activity_audit
+
+    monkeypatch.setattr(activity_audit, "ENABLED", False)
+    yield
+    activity_audit.set_session_factory(None)
+
+
+@pytest.fixture(autouse=True)
 def clear_case_scope_cache():
     """Drop cached case scopes so no test sees another test's visibility."""
     from app.services.lawyer_roster import clear_case_scope_cache as _clear

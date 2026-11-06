@@ -280,6 +280,8 @@ def web_login(body: WebLoginRequest, db: Session = Depends(get_db)):
     # A missing flag (None) still means active.
     if lawyer.is_active is False:
         raise HTTPException(status_code=403, detail="Tu cuenta está bloqueada. Contacta al administrador.")
+    lawyer.last_login_at = datetime.utcnow()
+    db.commit()
     token = create_access_token({"sub": lawyer.rut})
     return WebLoginResponse(access_token=token)
 
