@@ -85,6 +85,9 @@ class Case(Base):
     abandono_disponible = Column(Boolean, nullable=False, server_default=text("false"), default=False)
     next_deadline_fatal = Column(Boolean, nullable=False, server_default=text("false"), default=False)
     en_apremio = Column(Boolean, nullable=False, server_default=text("false"), default=False)
+    # Prueba stage: the only thing that would make the case red is a lapsed prueba plazo
+    # and the court has not moved since (computed by DeadlineEngine.recompute_case).
+    esperando_tribunal = Column(Boolean, nullable=False, server_default=text("false"), default=False)
     consulta_reserved = Column(Boolean, nullable=False, server_default=text("false"), default=False)  # True when consulta_by_rol returns None (case not in public consulta)
 
     # Manual semáforo override (liberación de causa — auditor + dirección dual
