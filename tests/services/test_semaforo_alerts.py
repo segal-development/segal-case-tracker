@@ -395,6 +395,49 @@ class TestNeverBreaksTheCycle:
         assert who(db, "plazo_rojo") == ["Ana Pérez", "Melissa Acevedo"]
 
 
+class TestAssignedLawyerReceivesPlazoAlerts:
+    """S2: a reassigned case alerts the assigned lawyer, not the litigante."""
+
+    def _case_with_litigante_and_override(self, db, people, *, active=True):
+        nueva = Lawyer(rut="33333333-3", name="Nueva Abogada", email="nueva@segal.cl", is_active=active)
+        db.add(nueva)
+        db.flush()
+        case = make_case(db, people)
+        db.add(CaseLitigante(
+            case_id=case.id, participante="AB.DDO", rut=FIRM_RUT,
+            persona_type="NATURAL", nombre="Ana", natural_key="k-ana",
+        ))
+        case.assigned_lawyer_id = nueva.id
+        db.commit()
+        return case
+
+    def test_override_replaces_the_litigante_and_escalation_is_kept(self, db, people) -> None:
+        self._case_with_litigante_and_override(db, people)
+        make_deadline(db, db.query(Case).one())
+        with smtp_ok():
+            run_semaforo_alerts(db, today=D[8])
+        assert who(db, "plazo_rojo") == ["Carla Lavín", "Melissa Acevedo", "Nueva Abogada"]
+
+    def test_without_override_the_litigante_still_gets_it(self, db, people) -> None:
+        case = make_case(db, people)
+        db.add(CaseLitigante(
+            case_id=case.id, participante="AB.DDO", rut=FIRM_RUT,
+            persona_type="NATURAL", nombre="Ana", natural_key="k-ana",
+        ))
+        db.commit()
+        make_deadline(db, case)
+        with smtp_ok():
+            run_semaforo_alerts(db, today=D[1])
+        assert who(db, "plazo_verde") == ["Ana Pérez"]
+
+    def test_inactive_override_target_falls_back_to_the_litigante(self, db, people) -> None:
+        case = self._case_with_litigante_and_override(db, people, active=False)
+        make_deadline(db, case)
+        with smtp_ok():
+            run_semaforo_alerts(db, today=D[1])
+        assert who(db, "plazo_verde") == ["Ana Pérez"]
+
+
 class TestRatificacion:
     def _poder_case(self, db, people, *, ours=True):
         case = make_case(db, people)
