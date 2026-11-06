@@ -76,3 +76,24 @@ def actor_fields(lawyer: Optional[Lawyer]) -> dict:
     if lawyer is None:
         return {"lawyer_id": None, "actor_name": None, "actor_role": None}
     return {"lawyer_id": lawyer.id, "actor_name": lawyer.name, "actor_role": lawyer.role}
+
+
+def client_ip(headers: dict, fallback: str | None) -> str | None:
+    """Browser IP for the audit. Requests reach the API through the Vercel proxy, so the ASGI
+    client is Vercel; the browser is the first X-Forwarded-For hop (then X-Real-IP). Only valid
+    IP literals are accepted. The header can be forged by a client that calls the API directly,
+    so this is informative, not evidence."""
+    import ipaddress
+
+    candidates = []
+    xff = headers.get("x-forwarded-for")
+    if xff:
+        candidates.append(xff.split(",")[0].strip())
+    if headers.get("x-real-ip"):
+        candidates.append(headers["x-real-ip"].strip())
+    for value in candidates:
+        try:
+            return str(ipaddress.ip_address(value))
+        except ValueError:
+            continue
+    return fallback

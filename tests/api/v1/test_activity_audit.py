@@ -285,3 +285,44 @@ def test_view_path_with_query_or_fragment_is_rejected(client, db):
         assert r.status_code == 422
     text = _all_text(db)
     assert "token=abc" not in text and "?" not in text and "#" not in text
+
+
+def _run_with_headers_db(db, headers, client=("76.76.21.21", 443)):
+    import asyncio
+
+    from app.middleware.activity_audit import ActivityAuditMiddleware
+
+    async def inner(scope, receive, send):
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    async def noop_receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def noop_send(message):
+        pass
+
+    scope = {"type": "http", "method": "POST", "path": "/api/v1/alerts/read-all",
+             "headers": [(k.encode(), v.encode()) for k, v in headers], "client": client, "query_string": b""}
+    asyncio.run(ActivityAuditMiddleware(inner)(scope, noop_receive, noop_send))
+
+
+def test_ip_comes_from_x_forwarded_for_first_hop(db):
+    """Behind the Vercel proxy the ASGI client is Vercel; the browser IP is the first X-Forwarded-For hop."""
+    _run_with_headers_db(db, [("x-forwarded-for", "201.214.10.5, 76.76.21.21")])
+    assert _events(db)[-1].ip == "201.214.10.5"
+
+
+def test_ip_falls_back_to_x_real_ip_then_client(db):
+    _run_with_headers_db(db, [("x-real-ip", "190.20.30.40")])
+    assert _events(db)[-1].ip == "190.20.30.40"
+    _run_with_headers_db(db, [("x-forwarded-for", "not-an-ip")])
+    assert _events(db)[-1].ip == "76.76.21.21"
+
+
+def test_view_stores_the_browser_ip(client, db):
+    lw = _lawyer(db, "11111111-1", "a@x.cl")
+    r = client.post("/api/v1/activity/views", json={"path": "/causas"},
+                    headers={**_headers(lw.rut), "X-Forwarded-For": "201.214.10.5, 76.76.21.21"})
+    assert r.status_code == 204
+    assert _events(db)[-1].ip == "201.214.10.5"
