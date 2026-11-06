@@ -250,6 +250,9 @@ class Settings(BaseSettings):
     PJUD_VIEWPORT_HEIGHT: int = 1080        # Browser viewport height
     PJUD_ALERTS_ENABLED: bool = True        # Enable/disable alert webhooks
     PJUD_SCRAPING_ENABLED: bool = True      # False where the IP can't authenticate against PJUD (cloud VM)
+    # Comma-separated egress IPs the worker must never scrape PJUD from (the office
+    # IP, blocked by PJUD 28/10-06/11). Empty = guard off. See services/egress_guard.py.
+    FORBIDDEN_EGRESS_IPS: str = "186.10.251.189"
     # Resolve the PJUD host ourselves (direct UDP query) and pass Chromium
     # --host-resolver-rules=MAP, so the browser never calls the macOS system
     # resolver for it. See app/scrapper/pjud/dns_resolver.py for the evidence:

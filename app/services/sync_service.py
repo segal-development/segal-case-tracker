@@ -109,6 +109,7 @@ from app.models.lawyer import Lawyer
 from app.models.sync_history import SyncHistory
 from app.models.webhook import Webhook
 from app.models.case_deadline import CaseDeadline
+from app.services.egress_guard import EGRESS_REASON_PREFIX, egress_allowed_cached
 from app.core.deadlines_config import FATAL_DEADLINE_VALUES
 from app.models.case_litigante import CaseLitigante
 from app.models.case_notificacion import CaseNotificacion
@@ -3085,6 +3086,21 @@ async def detect_and_sync_movements(
     notification_svc = NotificationService(db)
 
     for api_case in cases_for_check:
+        # Egress guard (cached 5 min): checked BEFORE any PJUD request of this
+        # iteration, so nothing is sent once the egress IP is known forbidden.
+        egress_ok, egress_ip, egress_reason = await asyncio.to_thread(
+            egress_allowed_cached
+        )
+        if not egress_ok:
+            logger.warning(
+                "detect_and_sync_movements: egress %s (ip=%s); stopping batch "
+                "before %s (lawyer_id=%s)",
+                egress_reason, egress_ip, api_case.rol, lawyer_id,
+            )
+            errors.append(f"{EGRESS_REASON_PREFIX}: {egress_ip or 'desconocida'}")
+            end_reason = "egress"
+            break
+
         elapsed = DETAIL_BATCH_CLOCK() - batch_started_at
         if elapsed >= DETAIL_BATCH_MAX_SECONDS:
             # Not an error and not the cases' fault: nothing is advanced, the

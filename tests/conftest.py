@@ -113,6 +113,21 @@ def clear_case_scope_cache():
 
 
 @pytest.fixture(autouse=True)
+def egress_guard_off(monkeypatch):
+    """Guard off (empty list) for every test, and no guard state leaks across tests.
+
+    Tests of the guard itself set FORBIDDEN_EGRESS_IPS explicitly.
+    """
+    from app.config import settings
+    from app.services import egress_guard
+
+    monkeypatch.setattr(settings, "FORBIDDEN_EGRESS_IPS", "")
+    egress_guard.reset_state()
+    yield
+    egress_guard.reset_state()
+
+
+@pytest.fixture(autouse=True)
 def reset_circuit_breaker_registry():
     """Clear the global CB registries before each test to prevent state leakage.
 

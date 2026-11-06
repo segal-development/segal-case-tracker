@@ -51,6 +51,7 @@ from app.services.cycle_timing import (
     timed,
     use_timer,
 )
+from app.services.egress_guard import EGRESS_REASON_PREFIX, egress_allowed
 from app.services.estado_diario_probe import run_estado_diario_probe
 from app.services.session_store import get_session_store, SessionStore
 from app.services.pjud_session import PJUDSession
@@ -113,6 +114,28 @@ async def _notify_ip_block_best_effort(rejections: int, cooldown_minutes: int) -
         )
     except Exception:  # includes the timeout; the thread finishes on its own
         logger.warning("IP-block notification did not complete in time (non-fatal)")
+
+
+#: Seconds to wait before re-checking the egress IP after a forbidden/unknown result.
+EGRESS_RECHECK_SECONDS = 5 * 60
+
+
+async def _wait_for_allowed_egress() -> None:
+    """Return only when the egress IP is allowed; never contacts PJUD meanwhile.
+
+    FAIL CLOSED: an unknown IP waits too. Sleeps EGRESS_RECHECK_SECONDS between
+    checks, so it can never spin.
+    """
+    while True:
+        allowed, ip, reason = await asyncio.to_thread(egress_allowed)
+        if allowed:
+            return
+        logger.warning(
+            "Egress guard: not syncing (%s, ip=%s); re-checking in %d s",
+            reason, ip or "desconocida", EGRESS_RECHECK_SECONDS,
+        )
+        with timed("waits"):
+            await asyncio.sleep(EGRESS_RECHECK_SECONDS)
 
 
 def _wall_now() -> datetime:
@@ -384,7 +407,12 @@ def _credential_failure_detail(exc: InvalidCredentialsError) -> str:
 # detect_and_sync_movements appends one of these when it stops the batch early
 # (the proactive rotation reason carries its own marker: it is a planned stop,
 # not a failure, but operators still need it in sync_history.error_message).
-_BATCH_STOP_MARKERS = ("lote detenido", "batch stopped", DETAIL_ROTATION_REASON_MARKER)
+_BATCH_STOP_MARKERS = (
+    "lote detenido",
+    "batch stopped",
+    DETAIL_ROTATION_REASON_MARKER,
+    EGRESS_REASON_PREFIX,
+)
 
 
 def _batch_stop_reason(mov_errors: list[str]) -> Optional[str]:
@@ -1147,6 +1175,9 @@ async def _run_sync_cycle(timer: CycleTimer):
             results["aborted"] += 1
             continue
         for competencia in COMPETENCIAS:
+            # Egress guard: no DB session, no login, nothing recorded while the
+            # egress IP is forbidden/unknown (see _wait_for_allowed_egress).
+            await _wait_for_allowed_egress()
             # Fresh, short-lived session PER (lawyer, competencia) work unit.
             # If the Cloud SQL Auth Proxy drops the connection mid-batch, the
             # poisoned session is confined to this iteration and discarded;
