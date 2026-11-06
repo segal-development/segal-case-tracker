@@ -927,7 +927,18 @@ def resolve_case_alert_recipients(db: Session, case: Case) -> list[Lawyer]:
     Used by ``SyncService.sync_movements`` (movement-alert fan-out) and
     ``deadlines.py`` (deadline_audit/deadline_added fan-out) per ADR-005.
     Callers apply their own empty-recipients fallback (e.g. the firm lawyer).
+
+    Alerts follow the assignment: when the case has an asignación override
+    (``Case.assigned_lawyer_id``) and that lawyer is ACTIVE, the override
+    REPLACES the litigante abogados — the same precedence
+    ``_abogado_litigantes_by_case`` applies. An inactive override target is
+    ignored, so the litigante rule (and the callers' fallback) applies.
     """
+    if case.assigned_lawyer_id is not None:
+        assigned = db.get(Lawyer, case.assigned_lawyer_id)
+        if assigned is not None and assigned.is_active:
+            return [assigned]
+
     litigantes = (
         db.query(CaseLitigante)
         .filter(

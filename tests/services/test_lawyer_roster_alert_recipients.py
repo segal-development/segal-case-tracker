@@ -91,3 +91,73 @@ class TestResolveCaseAlertRecipients:
         recipients = resolve_case_alert_recipients(db, seeded_case)
 
         assert recipients == []
+
+
+class TestAssignedOverrideReplacesLitigantes:
+    """S2: ``cases.assigned_lawyer_id`` (active) REPLACES the litigante abogados."""
+
+    def _two_litigantes(self, db, case):
+        sandy = Lawyer(rut="17111111-1", name="Sandy")
+        marcela = Lawyer(rut="17222222-2", name="Marcela")
+        nueva = Lawyer(rut="17333333-3", name="Nueva", is_active=True)
+        db.add_all([sandy, marcela, nueva])
+        db.commit()
+        _add_litigante(db, case.id, "AB.DDO", sandy.rut, "Sandy")
+        _add_litigante(db, case.id, "AP.DTE", marcela.rut, "Marcela")
+        return sandy, marcela, nueva
+
+    def test_active_override_is_the_only_recipient(self, db, seeded_case):
+        _, _, nueva = self._two_litigantes(db, seeded_case)
+        seeded_case.assigned_lawyer_id = nueva.id
+        db.commit()
+
+        recipients = resolve_case_alert_recipients(db, seeded_case)
+
+        assert [r.id for r in recipients] == [nueva.id]
+
+    def test_override_applies_when_case_has_no_litigantes(self, db, seeded_case):
+        nueva = Lawyer(rut="17333333-3", name="Nueva", is_active=True)
+        db.add(nueva)
+        db.commit()
+        seeded_case.assigned_lawyer_id = nueva.id
+        db.commit()
+
+        assert [r.id for r in resolve_case_alert_recipients(db, seeded_case)] == [nueva.id]
+
+    def test_no_override_keeps_litigante_recipients(self, db, seeded_case):
+        sandy, marcela, _ = self._two_litigantes(db, seeded_case)
+
+        recipients = resolve_case_alert_recipients(db, seeded_case)
+
+        assert {r.id for r in recipients} == {sandy.id, marcela.id}
+
+    def test_inactive_override_falls_back_to_litigantes(self, db, seeded_case):
+        sandy, marcela, nueva = self._two_litigantes(db, seeded_case)
+        nueva.is_active = False
+        seeded_case.assigned_lawyer_id = nueva.id
+        db.commit()
+
+        recipients = resolve_case_alert_recipients(db, seeded_case)
+
+        assert {r.id for r in recipients} == {sandy.id, marcela.id}
+
+    def test_movement_alert_goes_only_to_the_assigned_lawyer(self, db, seeded_case):
+        from unittest.mock import patch
+
+        from app.models.alert import Alert
+        from app.services.sync_service import ScrapedMovement, SyncService
+
+        _, _, nueva = self._two_litigantes(db, seeded_case)
+        seeded_case.assigned_lawyer_id = nueva.id
+        db.commit()
+        mov = ScrapedMovement(
+            folio="1", fecha="15/01/2026", tipo_tramite="Resolucion",
+            descripcion="Se dicta resolucion", etapa="En tramitacion",
+        )
+
+        with patch("app.services.sync_service.NotificationService"):
+            _, alert_count = SyncService(db).sync_movements(seeded_case.id, [mov])
+
+        assert alert_count == 1
+        alerts = db.query(Alert).filter(Alert.case_id == seeded_case.id).all()
+        assert [a.lawyer_id for a in alerts] == [nueva.id]
