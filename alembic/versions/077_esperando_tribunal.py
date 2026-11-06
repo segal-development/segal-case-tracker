@@ -1,7 +1,7 @@
 """cases.esperando_tribunal: prueba plazos lapsed and the court idle
 
-Revision ID: 076
-Revises: 075
+Revision ID: 077
+Revises: 076
 
 A case whose only red cause is a lapsed prueba-stage plazo is "esperando al tribunal".
 The engine computes the flag on every recompute. Additive, defaults to false; existing rows
@@ -13,8 +13,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "076"
-down_revision: Union[str, None] = "075"
+revision: str = "077"
+down_revision: Union[str, None] = "076"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
