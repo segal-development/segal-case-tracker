@@ -5,7 +5,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Depends, Query, Request, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -46,6 +46,7 @@ def _chile_day_bounds(day: date):
 @router.post("/views", status_code=204)
 def record_view(
     body: ViewBody,
+    request: Request,
     payload: dict = Depends(get_current_lawyer),
     db: Session = Depends(get_db),
 ):
@@ -70,6 +71,11 @@ def record_view(
         if recent is None:
             activity_audit.insert_event(
                 db, kind="view", route=body.path, path=body.path, case_id=body.case_id,
+                ip=activity_audit.client_ip(
+                    {k.lower(): v for k, v in request.headers.items()},
+                    request.client.host if request.client else None,
+                ),
+                user_agent=request.headers.get("user-agent"),
                 **activity_audit.actor_fields(lawyer),
             )
     except Exception:  # S3: never fail because of the audit

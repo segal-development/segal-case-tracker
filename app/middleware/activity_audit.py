@@ -114,7 +114,7 @@ class ActivityAuditMiddleware:
         try:
             headers = {k.decode("latin-1").lower(): v.decode("latin-1")
                        for k, v in scope.get("headers", [])
-                       if k in (b"authorization", b"user-agent", b"content-type")}
+                       if k in (b"authorization", b"user-agent", b"content-type", b"x-forwarded-for", b"x-real-ip")}
             client = scope.get("client")
             route_obj = scope.get("route")
             route = getattr(route_obj, "path", None) or path
@@ -123,7 +123,7 @@ class ActivityAuditMiddleware:
             stored_path = _redact_path(path, params)
             await run_in_threadpool(
                 self._write, stored_path, route, scope["method"], status_code, headers,
-                client[0] if client else None, case_id, target, body,
+                audit.client_ip(headers, client[0] if client else None), case_id, target, body,
             )
         except Exception as exc:  # S3: the audit never breaks a request
             logger.warning("activity audit failed: %s", exc)
