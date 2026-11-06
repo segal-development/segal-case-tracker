@@ -17,6 +17,7 @@ from app.api.deps import get_current_lawyer, get_db
 from app.api.v1.cases import _effective_lawyer_name
 from app.models.case import Case
 from app.models.lawyer import Lawyer
+from app.models.alert import Alert
 from app.models.liberacion import (
     LiberacionRequest,
     LIB_APLICADO,
@@ -103,6 +104,26 @@ def _apply(db: Session, r: LiberacionRequest, approver_name: Optional[str]) -> N
     case.semaforo_override_at = now
     case.semaforo_override_by = approver_name
     case.semaforo = r.target_semaforo  # reflect immediately
+
+
+def _notify_requester(db: Session, r: LiberacionRequest, actor: Lawyer, approved: bool) -> None:
+    """In-app notice (bell / Novedades) to the lawyer who asked for the release. No e-mail.
+    Nobody is notified of their own decision on their own request."""
+    if not r.requested_by_rut or r.requested_by_rut == actor.rut:
+        return
+    requester = db.query(Lawyer).filter(Lawyer.rut == r.requested_by_rut).first()
+    case = db.query(Case).filter(Case.id == r.case_id).first()
+    if requester is None or case is None:
+        return
+    rol = case.rol or f"#{case.id}"
+    if approved:
+        kind, title = "liberacion_aprobada", f"Liberación aprobada · {rol}"
+        message = f"{actor.name} aprobó la liberación de la causa {rol}. La causa salió del semáforo."
+    else:
+        kind, title = "liberacion_rechazada", f"Liberación rechazada · {rol}"
+        message = f"{actor.name} rechazó la liberación de la causa {rol}. Motivo: {r.rechazo_motivo}"
+    db.add(Alert(lawyer_id=requester.id, case_id=case.id, type=kind, title=title[:255],
+                 message=message, created_at=datetime.utcnow()))
 
 
 @router.post("", response_model=LiberacionResponse, status_code=status.HTTP_201_CREATED)
@@ -208,6 +229,8 @@ async def aprobar_liberacion(
         r.direccion_aprobado_at = now
 
     _apply(db, r, actor.name)
+    if r.estado == LIB_APLICADO:
+        _notify_requester(db, r, actor, approved=True)
     db.commit()
     db.refresh(r)
     return _to_response(db, r)
@@ -234,10 +257,14 @@ async def rechazar_liberacion(
         raise HTTPException(status_code=404, detail="Solicitud no encontrada")
     if r.estado != LIB_PENDIENTE:
         raise HTTPException(status_code=409, detail=f"La solicitud ya está {r.estado}")
+    motivo = (body.motivo or "").strip()
+    if not 1 <= len(motivo) <= 500:
+        raise HTTPException(status_code=400, detail="Indica el motivo del rechazo.")
     r.estado = LIB_RECHAZADO
     r.rechazado_by_rut = actor.rut
     r.rechazado_by_name = actor.name
-    r.rechazo_motivo = body.motivo
+    r.rechazo_motivo = motivo
+    _notify_requester(db, r, actor, approved=False)
     db.commit()
     db.refresh(r)
     return _to_response(db, r)
