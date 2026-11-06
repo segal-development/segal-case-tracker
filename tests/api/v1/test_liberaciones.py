@@ -185,3 +185,66 @@ def test_override_without_movements_holds():
     case = _ov(AT)
     assert DeadlineEngine._apply_semaforo_override(case, "rojo", []) == "gris"
     assert DeadlineEngine._apply_semaforo_override(case, "rojo") == "gris"
+
+
+# --- motivo obligatorio al rechazar + aviso al solicitante ---------------------------------
+
+from app.models.alert import Alert  # noqa: E402
+
+
+def _alerts_for(db, rut):
+    lw = db.query(Lawyer).filter(Lawyer.rut == rut).first()
+    return db.query(Alert).filter(Alert.lawyer_id == lw.id).order_by(Alert.id).all()
+
+
+@pytest.mark.parametrize("body", [{}, {"motivo": ""}, {"motivo": "   "}, {"motivo": "x" * 501}])
+def test_reject_requires_a_motivo(client, db, actors, case, body):
+    lib_id = _request(client, case.id).json()["id"]
+    r = client.post(f"/api/v1/liberaciones/{lib_id}/rechazar", headers=_h(ADMIN_RUT), json=body)
+    assert r.status_code == 400
+    assert r.json()["detail"] == "Indica el motivo del rechazo."
+    assert db.get(LiberacionRequest, lib_id).estado == "pendiente"
+    assert _alerts_for(db, LAWYER_RUT) == []
+
+
+def test_reject_notifies_the_requester_with_the_motivo(client, db, actors, case):
+    lib_id = _request(client, case.id).json()["id"]
+    r = client.post(f"/api/v1/liberaciones/{lib_id}/rechazar", headers=_h(ADMIN_RUT),
+                    json={"motivo": "  Falta acreditar el poder  "})
+    assert r.status_code == 200
+    assert r.json()["rechazo_motivo"] == "Falta acreditar el poder"
+    (al,) = _alerts_for(db, LAWYER_RUT)
+    assert al.type == "liberacion_rechazada"
+    assert al.case_id == case.id
+    assert al.title == "Liberación rechazada · C-777-2026"
+    assert al.message == "Carla Dir rechazó la liberación de la causa C-777-2026. Motivo: Falta acreditar el poder"
+    assert al.read is False
+
+
+def test_approve_notifies_the_requester(client, db, actors, case):
+    lib_id = _request(client, case.id).json()["id"]
+    assert client.post(f"/api/v1/liberaciones/{lib_id}/aprobar", headers=_h(AUDITOR_RUT)).status_code == 200
+    (al,) = _alerts_for(db, LAWYER_RUT)
+    assert al.type == "liberacion_aprobada"
+    assert al.title == "Liberación aprobada · C-777-2026"
+    assert al.message == "Denisse Aud aprobó la liberación de la causa C-777-2026. La causa salió del semáforo."
+
+
+def test_no_notice_to_yourself(client, db, actors, case):
+    r = client.post("/api/v1/liberaciones", headers=_h(ADMIN_RUT),
+                    json={"case_id": case.id, "target_semaforo": "gris", "motivo": "propia"})
+    lib_id = r.json()["id"]
+    assert client.post(f"/api/v1/liberaciones/{lib_id}/aprobar", headers=_h(ADMIN_RUT)).status_code == 200
+    assert _alerts_for(db, ADMIN_RUT) == []
+
+
+def test_the_notice_is_only_visible_to_the_requester(client, db, actors, case):
+    lib_id = _request(client, case.id).json()["id"]
+    client.post(f"/api/v1/liberaciones/{lib_id}/rechazar", headers=_h(ADMIN_RUT), json={"motivo": "no"})
+    mine = client.get("/api/v1/alerts?category=all", headers=_h(LAWYER_RUT)).json()
+    assert any(a["type"] == "liberacion_rechazada" for a in mine["items"])
+    theirs = client.get("/api/v1/alerts?category=all", headers=_h(AUDITOR_RUT)).json()
+    assert not any(a["type"].startswith("liberacion_") for a in theirs["items"])
+    # Both notices belong in the default "Requiere atención" feed of the requester.
+    default = client.get("/api/v1/alerts", headers=_h(LAWYER_RUT)).json()
+    assert any(a["type"] == "liberacion_rechazada" for a in default["items"])

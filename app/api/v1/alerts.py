@@ -50,6 +50,9 @@ ACTIONABLE_ALERT_TYPES = frozenset(
         "plazo_rojo",
         # Fatal plazo that expired with no filing from the firm (one per plazo).
         "plazo_vencido",
+        # Decision on the lawyer's own liberación request (in-app only, no e-mail).
+        "liberacion_aprobada",
+        "liberacion_rechazada",
     }
 )
 
