@@ -86,6 +86,7 @@ class CaseResponse(BaseModel):
     abandono_disponible: bool = False
     next_deadline_fatal: bool = False
     en_apremio: bool = False
+    esperando_tribunal: bool = False
     # Prescripción advisory
     titulo_tipo: Optional[str] = None
     titulo_fecha: Optional[date] = None
@@ -856,6 +857,7 @@ async def list_cases(
             abandono_disponible=case.abandono_disponible or False,
             next_deadline_fatal=case.next_deadline_fatal or False,
             en_apremio=case.en_apremio or False,
+            esperando_tribunal=case.esperando_tribunal or False,
             prescripcion_cumplida=case.prescripcion_cumplida or False,
             plazo_fatal_incumplido=case.plazo_fatal_incumplido or False,
             matriz=case.matriz,
@@ -1200,6 +1202,7 @@ async def get_case(
         abandono_disponible=case.abandono_disponible or False,
         next_deadline_fatal=case.next_deadline_fatal or False,
         en_apremio=case.en_apremio or False,
+        esperando_tribunal=case.esperando_tribunal or False,
         prescripcion_cumplida=case.prescripcion_cumplida or False,
         plazo_fatal_incumplido=case.plazo_fatal_incumplido or False,
         matriz=case.matriz,

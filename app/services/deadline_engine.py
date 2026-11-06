@@ -86,6 +86,15 @@ _CLASSIFIER = MovementClassifier()
 
 _CHILE_TZ = ZoneInfo("America/Santiago")
 
+# Prueba-stage plazos: once past due they no longer colour the semáforo (the case
+# is "esperando al tribunal"). Kept here, not in deadlines_config, on purpose.
+PRUEBA_STAGE_VALUES: frozenset[str] = frozenset({
+    DeadlineType.TERMINO_PROBATORIO_10D.value,
+    DeadlineType.OBSERVACIONES_PRUEBA_6D.value,
+    DeadlineType.LISTA_TESTIGOS_2D.value,
+    DeadlineType.REPOSICION_AUTO_PRUEBA_3D.value,
+})
+
 
 def _today_chile() -> date:
     """Return today's date in the America/Santiago timezone.
@@ -773,7 +782,7 @@ class DeadlineEngine:
         cls._rejudge_closed_excepciones(db, movements, today, escritos, closed_candidates)
 
         # Step 7a: compute semáforo from nearest active deadline.
-        semaforo = cls._compute_semaforo(
+        semaforo, esperando = cls._compute_semaforo_state(
             db, case.id, proc_state, today,
             actionable_values=actionable_values,
             mandatory_values=mandatory_values,
@@ -790,6 +799,8 @@ class DeadlineEngine:
         # Step 8: write denormalized Case columns.
         case.procedural_state = proc_state.value
         case.semaforo = cls._apply_semaforo_override(case, semaforo, movements)
+        # A liberación override pins the colour, so the "esperando" label does not apply.
+        case.esperando_tribunal = esperando and case.semaforo == semaforo
         case.abandono_disponible = abandono
         case.prescripcion_cumplida = prescripcion_cumplida
         case.prescripcion_fecha = prescripcion_fecha
@@ -1341,13 +1352,41 @@ class DeadlineEngine:
         return override
 
     @classmethod
-    def _compute_semaforo(
+    def _compute_semaforo(cls, db: Session, case_id: int, state: ProceduralState, today: date, **kwargs) -> str:
+        """Semáforo colour only (see ``_compute_semaforo_state``)."""
+        return cls._compute_semaforo_state(db, case_id, state, today, **kwargs)[0]
+
+    @classmethod
+    def _compute_semaforo_state(
+        cls,
+        db: Session,
+        case_id: int,
+        state: ProceduralState,
+        today: date,
+        **kwargs,
+    ) -> tuple[str, bool]:
+        """Return ``(colour, esperando_tribunal)``.
+
+        A prueba-stage plazo (``PRUEBA_STAGE_VALUES``) that is past due no longer
+        colours the case: the firm has nothing left to do and the court is idle.
+        ``esperando_tribunal`` is True when ignoring those plazos is what takes the
+        case out of rojo (i.e. nothing else keeps it red/amarillo).
+        """
+        color = cls._semaforo_color(db, case_id, state, today, ignore_lapsed_prueba=True, **kwargs)
+        if color in ("rojo", "amarillo", "gris"):
+            return color, False
+        with_prueba = cls._semaforo_color(db, case_id, state, today, ignore_lapsed_prueba=False, **kwargs)
+        return color, with_prueba == "rojo"
+
+    @classmethod
+    def _semaforo_color(
         cls,
         db: Session,
         case_id: int,
         state: ProceduralState,
         today: date,
         *,
+        ignore_lapsed_prueba: bool = False,
         actionable_values: frozenset[str] = ACTIONABLE_DEADLINE_VALUES,
         mandatory_values: frozenset[str] = MANDATORY_ACTIONABLE_VALUES,
         side: Optional[str] = None,
@@ -1392,6 +1431,12 @@ class DeadlineEngine:
             .all()
         )
         for row in active_actionable:
+            if (
+                ignore_lapsed_prueba
+                and row.deadline_type in PRUEBA_STAGE_VALUES
+                and row.due_date < today
+            ):
+                continue  # lapsed prueba plazo, court idle → esperando al tribunal
             remaining = count_business_days_remaining(row.due_date, today)
             if row.deadline_type in OPTIONAL_ACTIONABLE_VALUES and remaining < 0:
                 continue  # optional window already closed → not red
@@ -1406,12 +1451,13 @@ class DeadlineEngine:
         # (For demandante: expired traslado_ejecutante = firm missed reply.
         #  For demandado:  expired excepciones = firm missed the defense window.
         #  Expired apelación = closed optional window → not red.)
+        expired_types = mandatory_values - (PRUEBA_STAGE_VALUES if ignore_lapsed_prueba else frozenset())
         has_expired_mandatory = (
             db.query(CaseDeadline)
             .filter(
                 CaseDeadline.case_id == case_id,
                 CaseDeadline.status == "expired",
-                CaseDeadline.deadline_type.in_(mandatory_values),
+                CaseDeadline.deadline_type.in_(expired_types),
             )
             .first()
         )
@@ -1571,6 +1617,7 @@ class DeadlineEngine:
         """Set case to GRIS/INDETERMINATE and flush (safe-fail path)."""
         case.procedural_state = ProceduralState.INDETERMINATE.value
         case.semaforo = "gris"
+        case.esperando_tribunal = False
         case.next_deadline_at = None
         case.abandono_disponible = False
         case.next_deadline_fatal = False
