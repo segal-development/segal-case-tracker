@@ -16,6 +16,7 @@ from app.api.redaccion.buscar import router as redaccion_buscar_router
 from app.api.redaccion.detalle import router as redaccion_detalle_router
 from app.api.presentacion.presentaciones import router as presentacion_router
 from app.config import settings
+from app.middleware.activity_audit import ActivityAuditMiddleware
 
 
 @asynccontextmanager
@@ -51,6 +52,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Activity audit: records mutating /api/v1 calls and logins after the response
+# (best effort; never breaks a request). Added after CORS.
+app.add_middleware(ActivityAuditMiddleware)
 
 # Routes
 app.include_router(api_router, prefix="/api/v1")
