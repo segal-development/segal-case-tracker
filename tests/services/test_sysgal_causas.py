@@ -172,3 +172,14 @@ class TestOwnerByCase:
                            case_id=case.id, sysgal_updated_at=datetime(2026, 11, 2), synced_at=datetime.utcnow()))
         db.commit()
         assert sysgal_owner_by_case(db) == {case.id: other.id}
+
+
+def test_columns_fit_the_real_sysgal_data():
+    """First real sync (2026-11-09) died on a 60-char free-text ROL ('DEMANDA CUIDADO PERSONAL Y
+    MODIFICACION VISITAS ROMERO'). Real maxima over 110,064 causas: rol 60, tribunal 49, rut 9."""
+    from app.models.sysgal_causa import SysgalCausa
+
+    cols = SysgalCausa.__table__.c
+    assert cols.rol.type.length >= 255
+    assert cols.rol_norm.type.length >= 255
+    assert cols.rut_cliente.type.length >= 30
