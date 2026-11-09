@@ -186,6 +186,8 @@ def _account_json(person: Lawyer) -> dict:
         "email": person.email,
         "role": person.role,
         "nivel": person.nivel,
+        # Carries a cartera (the traspaso wizard lists only these).
+        "is_firm_lawyer": bool(person.is_firm_lawyer),
         "is_active": person.is_active is not False,
         "blocked_at": person.blocked_at.isoformat() if person.blocked_at else None,
         "has_password": person.password_hash is not None,
