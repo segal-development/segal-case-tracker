@@ -249,6 +249,26 @@ class TestCasesSummary:
         assert data["apremio"] == 1
         assert data["prescripcion"] == 1
 
+    def test_summary_counts_gris_so_the_chips_add_up(self, authed_client, db, lawyer, court):
+        """Real case (Benjamín, 2026-11-09): 462 of 480 cases were gris (medidas prejudiciales)
+        and no chip showed them, so Críticas+Atención+Al día+Sin seguimiento = 20 of 480."""
+        _make_case(db, lawyer, court, "C-7321-2025", semaforo="rojo")
+        _make_case(db, lawyer, court, "C-7322-2025", semaforo="verde")
+        _make_case(db, lawyer, court, "C-7323-2025", semaforo="gris")
+        _make_case(db, lawyer, court, "C-7324-2025", semaforo="gris")
+        _make_case(db, lawyer, court, "C-7325-2025", semaforo=None)
+        data = authed_client.get("/api/v1/cases/summary").json()
+        assert data["gris"] == 2
+        assert data["rojo"] + data["amarillo"] + data["verde"] + data["gris"] + data["sin_seguimiento"] == data["total"] == 5
+
+    def test_sem_gris_filter_lists_only_gris_cases(self, authed_client, db, lawyer, court):
+        _make_case(db, lawyer, court, "C-7331-2025", semaforo="gris")
+        _make_case(db, lawyer, court, "C-7332-2025", semaforo="verde")
+        _make_case(db, lawyer, court, "C-7333-2025", semaforo=None)
+        r = authed_client.get("/api/v1/cases", params={"sem": "gris"})
+        assert r.status_code == 200
+        assert [c["rol"] for c in r.json()["items"]] == ["C-7331-2025"]
+
     def test_summary_ignores_quick_filters(self, authed_client, db, lawyer, court):
         """summary reports quick-filter TOTALS, so it must ignore q/sem itself."""
         _make_case(db, lawyer, court, "C-7311-2025", semaforo="rojo")
