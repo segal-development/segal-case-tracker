@@ -262,3 +262,36 @@ def _client_recording():
         return httpx.Response(200, json={"success": True, "data": [], "siguiente_desde_id": None})
 
     return _client(handler), calls
+
+
+class TestIntermittentPhpWarning:
+    """Real incident (2026-11-09): page desde_id=57779 came back HTTP 200 with a PHP warning
+    (ci_session fopen) before the JSON. Asking again returned clean JSON."""
+
+    PHP = '\n<div><h4>A PHP Error was encountered</h4><p>Message: fopen(/var/lib/php/sessions/ci_session)</p></div>'
+
+    def test_non_json_200_is_retried_and_then_succeeds(self):
+        calls = []
+
+        def handler(request):
+            calls.append(1)
+            if len(calls) == 1:
+                return httpx.Response(200, text=self.PHP + '{"success": true, "data": []}')
+            return httpx.Response(200, json={"success": True, "data": [_raw(7)], "siguiente_desde_id": None})
+
+        page = _client(handler).causas()
+        assert len(calls) == 2
+        assert [i.sysgal_id for i in page["items"]] == [7]
+
+    def test_persistent_non_json_is_an_error_without_leaking_the_body(self, caplog):
+        with caplog.at_level(logging.DEBUG):
+            with pytest.raises(SysgalError) as exc:
+                _client(lambda r: httpx.Response(200, text=self.PHP)).causas()
+        assert "ci_session" not in str(exc.value) and "ci_session" not in caplog.text
+
+
+def test_page_cap_covers_two_hundred_thousand_causas():
+    """Sysgal ids reached ~57,800 after 55,000 causas: the old cap (100,000) could cut the sync short."""
+    from app.services.sysgal_client import MAX_CAUSAS_PAGES, MAX_CAUSAS_PER_PAGE
+
+    assert MAX_CAUSAS_PAGES * MAX_CAUSAS_PER_PAGE >= 200_000

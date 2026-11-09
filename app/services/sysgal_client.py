@@ -28,8 +28,9 @@ MAX_RUTS_PER_REQUEST = 100
 
 # Hard cap on ``limite`` for GET /api_sync/causas (announced contract).
 MAX_CAUSAS_PER_PAGE = 500
-# Safety net against a cursor that never ends (200 x 500 = 100k causas).
-MAX_CAUSAS_PAGES = 200
+# Safety net against a cursor that never ends (400 x 500 = 200k causas). Sysgal ids reached
+# ~57,800 after 55,000 causas on 2026-11-09, so 100k was too tight.
+MAX_CAUSAS_PAGES = 400
 
 _ESTADO_PATH = "/api_sync/clientes_estado"
 _CAUSAS_PATH = "/api_sync/causas"
@@ -304,8 +305,13 @@ class SysgalClient:
 
             try:
                 return response.json()
-            except ValueError as exc:
-                raise SysgalError(f"Sysgal GET {path} returned a non-JSON body (HTTP 200)") from exc
+            except ValueError:
+                # Seen in production (2026-11-09): an intermittent PHP warning printed before the
+                # JSON. Asking again returned clean JSON, so retry like a 5xx. The body is never
+                # logged (it can carry client data).
+                last_error = "non-JSON body (HTTP 200)"
+                logger.warning("Sysgal GET %s returned %s (attempt %d/2)", path, last_error, attempt)
+                continue
 
         raise SysgalError(f"Sysgal GET {path} unavailable after retry ({last_error})")
 
