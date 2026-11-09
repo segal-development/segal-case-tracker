@@ -46,7 +46,7 @@ class TestCausasPage:
         assert params["desde_id"] == "5"
         assert params["limite"] == "100"
         assert params["actualizado_desde"] == "2026-11-01 10:30:00"
-        assert params["solo_activas"] == "true"
+        assert params["solo_activas"] == "1"  # Sysgal docs: 0 or 1
         assert [c.sysgal_id for c in page["items"]] == [1]
         assert page["siguiente_desde_id"] is None
 
@@ -151,7 +151,7 @@ class TestIterCausas:
         list(_client(handler).iter_causas(actualizado_desde="2026-11-01 00:00:00", solo_activas=True))
 
         assert len(seen) == 2
-        assert all(p["actualizado_desde"] == "2026-11-01 00:00:00" and p["solo_activas"] == "true" for p in seen)
+        assert all(p["actualizado_desde"] == "2026-11-01 00:00:00" and p["solo_activas"] == "1" for p in seen)
 
     def test_page_cap_stops_a_cursor_that_never_ends(self):
         calls = []
@@ -218,3 +218,47 @@ class TestFieldMapping:
         u = map_usuario({"id": 1, "nombre": "Ana", "perfil": "Abogado", "estado": "activo", "correo": "a@x.cl", "zzz": 1})
         assert (u.sysgal_id, u.nombre, u.perfil, u.estado, u.correo) == (1, "Ana", "Abogado", "activo", "a@x.cl")
         assert map_usuario({"id": 2, "nombre": "B"}).correo is None
+
+
+class TestRealSysgalShape:
+    """Shapes from the real endpoints (probed from the QA VM, 2026-11-09)."""
+
+    REAL_CAUSA = {
+        "id_causa": 279, "rol": "C-1234-2025", "tribunal": "7º Juzgado Civil de Santiago",
+        "rut_cliente": "12.345.678-5", "abogado": {"id": 41, "nombre": "BENJAMIN HERVAS"},
+        "abogados": [{"id": 41, "nombre": "BENJAMIN HERVAS"}, {"id": 3, "nombre": "CARLA LAVIN"}],
+        "etapa": None, "tramite": None, "activa": True, "fecha_actualizacion": "2026-11-08 17:05:33",
+    }
+
+    def test_maps_the_abogado_object_and_activa(self):
+        dto = map_causa(self.REAL_CAUSA)
+        assert (dto.sysgal_id, dto.abogado_sysgal_id, dto.abogado_nombre) == (279, 41, "BENJAMIN HERVAS")
+        assert dto.estado == "activa"
+        assert dto.updated_at == datetime(2026, 11, 8, 17, 5, 33)
+        assert dto.etapa is None and dto.tramite is None
+
+    def test_inactive_and_null_abogado(self):
+        dto = map_causa({**self.REAL_CAUSA, "abogado": None, "abogados": [], "activa": False})
+        assert dto.abogado_sysgal_id is None and dto.abogado_nombre is None
+        assert dto.estado == "terminada"
+
+    def test_maps_the_real_usuario(self):
+        u = map_usuario({"id": 41, "nombre": "BENJAMIN HERVAS", "tipo": 3, "tipo_nombre": "Abogado", "activo": True})
+        assert (u.sysgal_id, u.nombre, u.perfil, u.estado, u.correo) == (41, "BENJAMIN HERVAS", "Abogado", "activo", None)
+        assert map_usuario({"id": 7, "nombre": "X", "tipo": 4, "tipo_nombre": "Procurador", "activo": False}).estado == "inactivo"
+
+    def test_solo_activas_is_sent_as_1_or_0(self):
+        client, calls = _client_recording()
+        client.causas(solo_activas=True)
+        client.causas(solo_activas=False)
+        assert [c["solo_activas"] for c in calls] == ["1", "0"]
+
+
+def _client_recording():
+    calls = []
+
+    def handler(request):
+        calls.append(dict(request.url.params))
+        return httpx.Response(200, json={"success": True, "data": [], "siguiente_desde_id": None})
+
+    return _client(handler), calls

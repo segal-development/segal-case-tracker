@@ -104,18 +104,24 @@ def map_causa(raw: dict) -> SysgalCausaDTO:
     sysgal_id = _to_int(raw.get("id_causa"))
     if sysgal_id is None:
         raise SysgalError("Sysgal causa item has no usable 'id_causa'")
+    # Real shape (2026-11-09): abogado = {id, nombre} (the latest assigned; may be null) and
+    # activa = bool. The flat abogado_id / abogado_nombre / estado stay as a fallback.
+    abogado_raw = raw.get("abogado")
+    abogado: dict = abogado_raw if isinstance(abogado_raw, dict) else {}
+    activa = raw.get("activa")
+    estado = ("activa" if activa else "terminada") if isinstance(activa, bool) else _text(raw.get("estado"))
     return SysgalCausaDTO(
         sysgal_id=sysgal_id,
         rol=_text(raw.get("rol")) or "",
         tribunal=_text(raw.get("tribunal")) or "",
         rut_cliente=_text(raw.get("rut_cliente")),
-        abogado_sysgal_id=_to_int(raw.get("abogado_id")),
-        abogado_nombre=_text(raw.get("abogado_nombre")),
+        abogado_sysgal_id=_to_int(abogado.get("id", raw.get("abogado_id"))),
+        abogado_nombre=_text(abogado.get("nombre", raw.get("abogado_nombre"))),
         etapa=_text(raw.get("etapa")),
         tramite=_text(raw.get("tramite")),
         updated_at=_to_datetime(raw.get("fecha_actualizacion")),
         tribunal_codigo=_text(raw.get("tribunal_codigo")),
-        estado=_text(raw.get("estado")),
+        estado=estado,
         competencia=_text(raw.get("competencia")),
         eliminada=bool(raw.get("eliminada")),
         responsable_desde=_to_date(raw.get("responsable_desde")),
@@ -127,11 +133,14 @@ def map_usuario(raw: dict) -> SysgalUsuarioDTO:
     sysgal_id = _to_int(raw.get("id"))
     if sysgal_id is None:
         raise SysgalError("Sysgal usuario item has no usable 'id'")
+    # Real shape (2026-11-09): id, nombre, tipo, tipo_nombre, activo (bool); no personal data.
+    activo = raw.get("activo")
+    estado = ("activo" if activo else "inactivo") if isinstance(activo, bool) else _text(raw.get("estado"))
     return SysgalUsuarioDTO(
         sysgal_id=sysgal_id,
         nombre=_text(raw.get("nombre")) or "",
-        perfil=_text(raw.get("perfil")),
-        estado=_text(raw.get("estado")),
+        perfil=_text(raw.get("tipo_nombre", raw.get("perfil"))),
+        estado=estado,
         correo=_text(raw.get("correo")),
     )
 
@@ -231,7 +240,7 @@ class SysgalClient:
                 else str(actualizado_desde)
             )
         if solo_activas is not None:
-            params["solo_activas"] = "true" if solo_activas else "false"
+            params["solo_activas"] = "1" if solo_activas else "0"  # Sysgal accepts 0 or 1
 
         body = self._get_json(_CAUSAS_PATH, params)
         items = [map_causa(raw) for raw in _extract_items(body) if isinstance(raw, dict)]

@@ -113,3 +113,11 @@ class TestRolPlusRutFallback:
         _case(db, lawyer, _court(db, "A", "Juzgado Uno"), rut="12345678-5")
         _case(db, lawyer, _court(db, "B", "Juzgado Dos"), rut="12345678-5")
         assert match_causa(db, "C-100-2026", "Otro", None, "12345678-5").status == "ambigua"
+
+
+def test_malformed_sysgal_rol_never_matches():
+    """Real data (2026-11-09): some Sysgal ROLs are a bare number ('7'). They must stay unmatched."""
+    from app.services.sysgal_matching import normalize_rol
+
+    assert normalize_rol("7") == "7"
+    assert normalize_rol("1234-2025") == "C-1234-2025"
