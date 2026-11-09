@@ -17,11 +17,11 @@ class SysgalCausa(Base):
     id = Column(Integer, primary_key=True, index=True)
     sysgal_id = Column(Integer, nullable=False, unique=True, index=True)
 
-    rol = Column(String(50), nullable=False)
-    rol_norm = Column(String(50), nullable=False, index=True)
+    rol = Column(String(255), nullable=False)  # Sysgal sends free-text ROLs too (60 chars seen)
+    rol_norm = Column(String(255), nullable=False, index=True)
     tribunal = Column(String(255), nullable=False)
     tribunal_codigo = Column(String(20), nullable=True)
-    rut_cliente = Column(String(20), nullable=True)
+    rut_cliente = Column(String(30), nullable=True)
 
     abogado_sysgal_id = Column(Integer, nullable=True, index=True)
     abogado_nombre = Column(String(255), nullable=True)
