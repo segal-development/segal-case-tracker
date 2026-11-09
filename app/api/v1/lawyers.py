@@ -231,6 +231,16 @@ def create_lawyer(
     return _account_json(lawyer)
 
 
+def block_account(lawyer: Lawyer) -> None:
+    """Block a person: sign-in stops and nothing is deleted. Shared with the traspaso de cartera."""
+    # The public hito link dies with the access; reactivating issues a new one if needed.
+    lawyer.hito_form_token = None
+    # Stamp the block date only on the actual transition, so saving twice keeps the first date.
+    if lawyer.is_active is not False:
+        lawyer.blocked_at = datetime.utcnow()
+    lawyer.is_active = False
+
+
 @router.put("/{id}/account")
 def update_account(
     id: int,
@@ -255,14 +265,10 @@ def update_account(
         if body.is_active is False:
             if normalize_rut(lawyer.rut) == normalize_rut(admin_rut):
                 raise HTTPException(status_code=409, detail="No puedes bloquear tu propia cuenta")
-            # The public hito link dies with the access; reactivating issues a new one if needed.
-            lawyer.hito_form_token = None
-        # Stamp the block date only on the actual transition, so saving twice keeps the first date.
-        if body.is_active is False and lawyer.is_active is not False:
-            lawyer.blocked_at = datetime.utcnow()
+            block_account(lawyer)
         elif body.is_active is True:
             lawyer.blocked_at = None
-        lawyer.is_active = body.is_active
+            lawyer.is_active = True
 
     if body.new_password is not None:
         if len(body.new_password) < 8:
