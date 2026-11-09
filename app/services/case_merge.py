@@ -40,6 +40,7 @@ from app.models.case_litigante import CaseLitigante
 from app.models.case_merge_audit import CaseMergeAudit
 from app.models.case_notificacion import CaseNotificacion
 from app.models.cartera_snapshot import CarteraSnapshot
+from app.models.case_assignment_history import CaseAssignmentHistory
 from app.models.document import Document
 from app.models.generated_document import GeneratedDocument
 from app.models.hito import Hito
@@ -65,6 +66,7 @@ CHILD_TABLES_WITH_CASE_ID = [
     GeneratedDocument,
     CarteraSnapshot,
     CaseLawyerSource,
+    CaseAssignmentHistory,
 ]
 
 # (rol, court_id, procedure) with NULL and '' treated as the same cuaderno.
@@ -448,7 +450,7 @@ def _merge_children(db: Session, loser_id: int, winner_id: int) -> None:
     _merge_case_lawyer_sources(db, loser_id, winner_id)
     _merge_cartera_snapshots(db, loser_id, winner_id)
     # No per-case constraint: plain repoint.
-    for model in (Hito, LiberacionRequest, GeneratedDocument):
+    for model in (Hito, LiberacionRequest, GeneratedDocument, CaseAssignmentHistory):
         for row in db.query(model).filter(model.case_id == loser_id).all():
             row.case_id = winner_id
 

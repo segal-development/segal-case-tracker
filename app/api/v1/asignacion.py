@@ -35,6 +35,7 @@ auditor; mutating endpoints (``reasignar``, the DELETE override) are
 admin-only.
 """
 import logging
+import uuid
 from collections import Counter
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -52,6 +53,15 @@ from app.services.asignacion_engine import (
     asignar_automatico,
 )
 from app.services.lawyer_roster import resolved_owner_by_case
+from app.services.traspaso_cartera import (
+    TraspasoError,
+    apply_traspaso,
+    list_batches,
+    record_history,
+    revert_batch,
+    write_override,
+)
+from app.services.traspaso_plan import PlanError, build_plan
 
 logger = logging.getLogger(__name__)
 
@@ -320,11 +330,16 @@ async def reasignar(
     advertencias: List[str] = []
     now = datetime.utcnow()
     reasignadas = 0
+    batch_id = str(uuid.uuid4())
+    owners = resolved_owner_by_case(db)
     for case in cases:
-        case.assigned_lawyer_id = target.id
-        case.assigned_at = now
-        case.assigned_by_rut = admin_rut
-        case.assigned_motivo = body.motivo
+        previous_owner = owners.get(case.id)
+        record_history(
+            db, case, batch_id=batch_id,
+            from_lawyer_id=previous_owner.id if previous_owner else None,
+            to_lawyer_id=target.id, motivo=body.motivo, actor_rut=admin_rut, now=now,
+        )
+        write_override(case, target.id, admin_rut, body.motivo, now)
         reasignadas += 1
 
         niveles = NIVELES_REQUERIDOS.get(case.matriz)
@@ -338,6 +353,77 @@ async def reasignar(
     db.commit()
 
     return ReasignarResponse(reasignadas=reasignadas, omitidas=omitidas, advertencias=advertencias)
+
+
+class TraspasoPlanRequest(BaseModel):
+    origen_lawyer_id: int
+    destino_lawyer_ids: Optional[List[int]] = None
+    destino_unico_id: Optional[int] = None
+
+
+class TraspasoAsignacion(BaseModel):
+    case_id: int
+    destino_lawyer_id: int
+
+
+class TraspasoAplicarRequest(BaseModel):
+    origen_lawyer_id: int
+    asignaciones: List[TraspasoAsignacion]
+    bloquear_origen: bool = False
+
+
+@router.post("/traspaso/plan")
+async def traspaso_plan(
+    body: TraspasoPlanRequest,
+    _admin_rut: str = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Dry run of a portfolio handover: smart distribution, writes nothing (admin only)."""
+    try:
+        return build_plan(db, body.origen_lawyer_id, body.destino_lawyer_ids, body.destino_unico_id)
+    except PlanError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+
+
+@router.post("/traspaso/aplicar")
+async def traspaso_aplicar(
+    body: TraspasoAplicarRequest,
+    admin_rut: str = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Apply a handover in ONE transaction, with history for the revert (admin only)."""
+    try:
+        return apply_traspaso(
+            db,
+            body.origen_lawyer_id,
+            [(a.case_id, a.destino_lawyer_id) for a in body.asignaciones],
+            actor_rut=admin_rut,
+            bloquear_origen=body.bloquear_origen,
+        )
+    except TraspasoError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail)
+
+
+@router.get("/traspaso")
+async def traspaso_listar(
+    _admin_rut: str = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Assignment batches (traspasos and manual reasignaciones), newest first."""
+    return list_batches(db)
+
+
+@router.post("/traspaso/{batch_id}/revertir")
+async def traspaso_revertir(
+    batch_id: str,
+    _admin_rut: str = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Restore the previous owners of a batch; does NOT unblock the account (admin only)."""
+    try:
+        return revert_batch(db, batch_id)
+    except TraspasoError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail)
 
 
 @router.delete("/{case_id}", status_code=status.HTTP_204_NO_CONTENT)
