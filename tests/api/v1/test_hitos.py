@@ -697,3 +697,41 @@ def test_edit_over_the_column_length_is_422_and_keeps_the_hito(client, db, admin
     assert field in r.json()["detail"] and str(LARGOS[field]) in r.json()["detail"]
     db.expire_all()
     assert db.get(Hito, hid).procedimiento == before
+
+
+def _hito_causa(db, lawyer, tipo, estado):
+    h = Hito(lawyer_id=lawyer.id, hito_tipo_id=tipo.id, valor_bruto=8077, fecha_hito=date(2026, 7, 15),
+             rol_causa="20.419.813-6", descripcion="C-12975-2026", tribunal="8º Juzgado Civil de Santiago",
+             estado=estado)
+    db.add(h)
+    db.commit()
+    db.refresh(h)
+    return h
+
+
+def test_a_rejected_hito_cannot_be_approved_when_its_causa_is_already_paid(client, db, admin, lawyer, tipo):
+    """Once a rejected hito no longer blocks a new filing (Fernanda, C-12975-2026), approving the
+    old rejected one too would pay the same causa twice."""
+    viejo = _hito_causa(db, lawyer, tipo, "rechazado")
+    _hito_causa(db, lawyer, tipo, "aprobado")
+    r = client.post(f"/api/v1/hitos/{viejo.id}/aprobar", headers=_h(ADMIN_RUT))
+    assert r.status_code == 409
+    assert "ya tiene un hito aprobado" in r.json()["detail"]
+    db.refresh(viejo)
+    assert viejo.estado == "rechazado"
+
+
+def test_approving_the_only_hito_of_a_causa_still_works(client, db, admin, lawyer, tipo):
+    _hito_causa(db, lawyer, tipo, "rechazado")
+    nuevo = _hito_causa(db, lawyer, tipo, "pendiente")
+    assert client.post(f"/api/v1/hitos/{nuevo.id}/aprobar", headers=_h(ADMIN_RUT)).status_code == 200
+
+
+def test_bulk_approve_skips_a_second_hito_of_the_same_causa(client, db, admin, lawyer, tipo):
+    a = _hito_causa(db, lawyer, tipo, "aprobado")
+    b = _hito_causa(db, lawyer, tipo, "rechazado")
+    r = client.post("/api/v1/hitos/aprobar-lote", headers=_h(ADMIN_RUT), json={"ids": [b.id]})
+    assert r.status_code == 200
+    assert b.id in r.json()["omitidos_ids"]
+    db.refresh(b)
+    assert b.estado == "rechazado" and a.estado == "aprobado"
