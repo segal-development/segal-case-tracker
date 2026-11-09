@@ -268,3 +268,24 @@ def test_response_shape_is_minimal(client, db, storage, lawyer, tipo):
     r = _verificar(client, TOKEN, rol_causa="C-1-2026", descripcion="C-100-2026",
                    tribunal="1º Juzgado Civil")
     assert set(r.json()) == {"existe", "detalle"}
+
+
+# --------------------------------------------------------------------------- #
+# A rejected hito never blocks a new one (real case: Fernanda, C-12975-2026, a conversión
+# rejected on 07/10/2026 blocked the new one on 09/11/2026).
+# --------------------------------------------------------------------------- #
+def test_rejected_hito_does_not_block_and_can_be_filed_again(client, db, storage, lawyer, tipo):
+    _existente(db, lawyer.id, tipo.id, estado="rechazado")
+    r = _verificar(client, TOKEN, rol_causa="C-1-2026", descripcion="C-100-2026", tribunal="1º Juzgado Civil")
+    assert r.status_code == 200 and r.json()["existe"] is False
+    assert _post_public(client, TOKEN, tipo.id).status_code == 201
+    estados = sorted(h.estado for h in db.query(Hito).filter(Hito.lawyer_id == lawyer.id).all())
+    assert estados == ["pendiente", "rechazado"]  # the rejected one stays as history
+
+
+@pytest.mark.parametrize("estado", ["pendiente", "aprobado"])
+def test_pending_or_approved_hito_still_blocks(client, db, storage, lawyer, tipo, estado):
+    _existente(db, lawyer.id, tipo.id, estado=estado)
+    assert _verificar(client, TOKEN, rol_causa="C-1-2026", descripcion="C-100-2026",
+                      tribunal="1º Juzgado Civil").json()["existe"] is True
+    assert _post_public(client, TOKEN, tipo.id).status_code == 409

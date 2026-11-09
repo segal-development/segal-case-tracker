@@ -134,9 +134,17 @@ def _hito_existente(
     rol_causa: Optional[str],
     descripcion: Optional[str],
     tribunal: Optional[str],
+    *,
+    solo_estado: Optional[str] = None,
+    excluir_id: Optional[int] = None,
 ) -> Optional[tuple]:
     """Return the row of the hito that already covers this causa for
     ``lawyer_id``, or ``None``.
+
+    A REJECTED hito never covers the causa (it was never counted nor paid): the
+    lawyer may file it again (real case: Fernanda, C-12975-2026, 2026-11-09). With
+    ``solo_estado`` only hitos in that estado count (approval uses it to refuse a
+    second approved hito for the causa); ``excluir_id`` ignores the hito itself.
 
     Single source of truth for the dedup rule keyed on ``(lawyer, rol_causa,
     _causa_key(descripcion), _tribunal_collides(tribunal))`` — shared by
@@ -156,11 +164,16 @@ def _hito_existente(
     tribunal_norm = (tribunal or "").strip() or None
     causa = _causa_key(descripcion)
     trib = _tribunal_key(tribunal_norm)
-    prior = (
-        db.query(Hito.descripcion, Hito.tribunal, Hito.fecha_hito, Hito.estado, Hito.created_by_name)
-        .filter(Hito.lawyer_id == lawyer_id, Hito.rol_causa == rol_norm)
-        .all()
+    query = db.query(Hito.descripcion, Hito.tribunal, Hito.fecha_hito, Hito.estado, Hito.created_by_name).filter(
+        Hito.lawyer_id == lawyer_id, Hito.rol_causa == rol_norm
     )
+    if solo_estado is not None:
+        query = query.filter(Hito.estado == solo_estado)
+    else:
+        query = query.filter(Hito.estado != HITO_RECHAZADO)
+    if excluir_id is not None:
+        query = query.filter(Hito.id != excluir_id)
+    prior = query.all()
     return next(
         (
             row
@@ -308,6 +321,17 @@ class HitoVerificarResponse(BaseModel):
 
 
 _SIN_EVIDENCIA_DETAIL = "El hito no tiene evidencia adjunta; no se puede aprobar sin evidencia."
+_YA_APROBADO_DETAIL = "Esta causa ya tiene un hito aprobado de este abogado; no se puede aprobar otro."
+
+
+def _otro_aprobado(db: Session, hito: "Hito") -> bool:
+    """True when another APPROVED hito already covers this hito's causa (same rule as the
+    duplicate check). A rejected hito may be filed again, so this keeps the old rejected one
+    from being approved later and the causa paid twice."""
+    return _hito_existente(
+        db, hito.lawyer_id, hito.rol_causa, hito.descripcion, hito.tribunal,
+        solo_estado=HITO_APROBADO, excluir_id=hito.id,
+    ) is not None
 _EVIDENCIA_ESTADO_DETAIL = "Solo se puede adjuntar evidencia a un hito pendiente, sugerido o rechazado."
 _EVIDENCIA_OBLIGATORIA_DETAIL = "La evidencia es obligatoria"
 _LINK_INVALIDO_DETAIL = "Link inválido o vencido"
@@ -1159,6 +1183,8 @@ async def aprobar_hito(
         raise HTTPException(status_code=409, detail="El período de ese hito está cerrado")
     if _falta_evidencia_para_aprobar(hito):
         raise HTTPException(status_code=409, detail=_SIN_EVIDENCIA_DETAIL)
+    if _otro_aprobado(db, hito):
+        raise HTTPException(status_code=409, detail=_YA_APROBADO_DETAIL)
 
     admin = db.query(Lawyer).filter(Lawyer.rut == admin_rut).first()
     hito.estado = HITO_APROBADO
@@ -1215,10 +1241,11 @@ async def aprobar_hitos_lote(
     for hito in hitos:
         if cierre_svc.is_cerrado(db, cierre_svc.periodo_de_fecha(hito.fecha_hito)):
             raise HTTPException(status_code=409, detail="El período de ese hito está cerrado")
-        if _falta_evidencia_para_aprobar(hito):
+        if _falta_evidencia_para_aprobar(hito) or _otro_aprobado(db, hito):
             omitidos.append(hito.id)
             continue
         hito.estado = HITO_APROBADO
+        db.flush()  # a later id of the same causa in this batch must see this approval
         hito.aprobado_by_rut = admin_rut
         hito.aprobado_by_name = admin.name if admin else None
         hito.aprobado_at = now
