@@ -20,6 +20,7 @@ from app.models.case import Case
 from app.models.case_assignment_history import CaseAssignmentHistory
 from app.models.lawyer import Lawyer
 from app.services.traspaso_plan import is_eligible_destination, owned_cases
+from app.utils.rut import normalize_rut
 
 
 class TraspasoError(Exception):
@@ -84,6 +85,10 @@ def apply_traspaso(
     origen = db.get(Lawyer, origen_id)
     if origen is None:
         raise TraspasoError(422, "El abogado de origen no existe")
+    # Same rule as PUT /lawyers/{id}/account: an admin handing over her own cartera must not
+    # lock herself out. Checked before any write.
+    if bloquear_origen and normalize_rut(origen.rut) == normalize_rut(actor_rut):
+        raise TraspasoError(409, "No puedes bloquear tu propia cuenta")
 
     case_ids = [cid for cid, _ in pairs]
     if len(set(case_ids)) != len(case_ids):

@@ -119,6 +119,30 @@ def test_apply_bloquear_origen(client, db, admin, origen, dest_a, court):
     assert fresh.is_active is False and fresh.blocked_at is not None and fresh.hito_form_token is None
 
 
+def test_apply_refuses_to_block_the_admin_herself_and_writes_nothing(client, db, admin, dest_a, court):
+    """An admin who hands over her own cartera must not lock herself out (same rule as the
+    account endpoint: 'No puedes bloquear tu propia cuenta'). Verifier finding."""
+    admin.is_firm_lawyer = True
+    admin.nivel = "pleno"
+    db.commit()
+    c = _case(db, dest_a, court, "C-1-2026", assigned=admin)
+    r = _apply(client, admin, [(c.id, dest_a.id)], bloquear=True)
+    assert r.status_code == 409
+    assert r.json()["detail"] == "No puedes bloquear tu propia cuenta"
+    db.expire_all()
+    assert db.get(Lawyer, admin.id).is_active is not False
+    assert db.get(Case, c.id).assigned_lawyer_id == admin.id
+    assert db.query(CaseAssignmentHistory).count() == 0
+
+
+def test_apply_own_cartera_without_blocking_is_allowed(client, db, admin, dest_a, court):
+    admin.is_firm_lawyer = True
+    admin.nivel = "pleno"
+    db.commit()
+    c = _case(db, dest_a, court, "C-1-2026", assigned=admin)
+    assert _apply(client, admin, [(c.id, dest_a.id)]).status_code == 200
+
+
 def test_apply_without_bloquear_keeps_account(client, db, admin, origen, dest_a, court):
     c = _case(db, dest_a, court, "C-1-2026", assigned=origen)
     _apply(client, origen, [(c.id, dest_a.id)])
