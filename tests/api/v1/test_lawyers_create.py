@@ -153,9 +153,10 @@ def test_accounts_list_says_who_is_a_firm_lawyer(client, db, admin):
     or procuradores): the accounts list must expose is_firm_lawyer."""
     _lawyer(db, "11111111-1", "Abogada Firma", is_firm_lawyer=True)
     _lawyer(db, "22222222-2", "Auditor Externo", role="auditor", is_firm_lawyer=False)
-    _lawyer(db, "33333333-3", "Sin Marca")
+    _lawyer(db, "33333333-3", "Admin Sin Cartera", role="admin", is_firm_lawyer=False)
     _login_as(admin)
     by_name = {a["name"]: a for a in client.get("/api/v1/lawyers/accounts").json()}
     assert by_name["Abogada Firma"]["is_firm_lawyer"] is True
     assert by_name["Auditor Externo"]["is_firm_lawyer"] is False
-    assert by_name["Sin Marca"]["is_firm_lawyer"] is False
+    assert by_name["Admin Sin Cartera"]["is_firm_lawyer"] is False
+    assert by_name["Carla Admin"]["is_firm_lawyer"] is True  # column default: a person is a firm lawyer
