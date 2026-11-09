@@ -205,6 +205,9 @@ class CaseSummaryResponse(BaseModel):
     amarillo: int
     verde: int
     sin_seguimiento: int
+    # Out of the semáforo (medidas prejudiciales, non-civil, liberadas): without it the chips
+    # never added up to the total.
+    gris: int = 0
     abandono: int
     apremio: int
     prescripcion: int
@@ -640,7 +643,7 @@ async def list_cases(
     sem: Optional[str] = Query(
         None,
         description=(
-            "Semáforo/category quick-filter: rojo|amarillo|verde|sin-seguimiento|"
+            "Semáforo/category quick-filter: rojo|amarillo|verde|gris|sin-seguimiento|"
             "abandono|apremio|prescripcion. 'todas'/unknown are ignored."
         ),
     ),
@@ -720,6 +723,8 @@ async def list_cases(
         query = query.filter(Case.semaforo == "amarillo")
     elif sem == "verde":
         query = query.filter(Case.semaforo == "verde")
+    elif sem == "gris":
+        query = query.filter(Case.semaforo == "gris")
     elif sem == "sin-seguimiento":
         query = query.filter(Case.semaforo.is_(None))
     elif sem == "abandono":
@@ -1045,6 +1050,7 @@ async def cases_summary(
         amarillo=sem_counts.get("amarillo", 0),
         verde=sem_counts.get("verde", 0),
         sin_seguimiento=sem_counts.get(None, 0),
+        gris=sem_counts.get("gris", 0),
         abandono=abandono,
         apremio=apremio,
         prescripcion=prescripcion,
