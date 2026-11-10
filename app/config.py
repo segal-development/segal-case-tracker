@@ -190,6 +190,9 @@ class Settings(BaseSettings):
     # Sysgal for thousands of RUTs that did not change; with it, the first run
     # fetches the backlog and later runs refresh only what went stale.
     SYSGAL_CACHE_TTL_DAYS: int = 7
+    # Daily Sysgal causas sync + incorporation queue. Only the QA VM egress IP is whitelisted
+    # by Sysgal (the station gets 403), so enable it ONLY there.
+    SYSGAL_CAUSAS_SYNC_ENABLED: bool = False
 
     # How long a non-firm-wide user's resolved case scope (which case ids they
     # may see) is reused per process. 0 disables the cache entirely.

@@ -36,6 +36,7 @@ from app.models.presentacion_api_key import PresentacionApiKey
 from app.models.presentacion import Presentacion
 from app.models.cliente_sysgal_estado import ClienteSysgalEstado
 from app.models.sysgal_causa import SysgalCausa
+from app.models.sysgal_incorporacion import SysgalIncorporacion
 from app.models.sysgal_usuario import SysgalUsuario
 from app.models.evaluacion import (
     EvaluacionCriterio,
@@ -87,6 +88,7 @@ __all__ = [
     "ClienteSysgalEstado",
     "SysgalCausa",
     "SysgalUsuario",
+    "SysgalIncorporacion",
     "EvaluacionCriterio",
     "EvaluacionEvaluable",
     "Evaluacion",

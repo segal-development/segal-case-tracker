@@ -13,7 +13,8 @@ Usage:
 
 import asyncio
 import logging
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 from typing import Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -242,6 +243,46 @@ def _log_cycle_summary(timer: CycleTimer, now: datetime) -> None:
 
 # How often to run sync (in hours)
 SYNC_INTERVAL_HOURS = settings.SYNC_INTERVAL_HOURS
+
+# Calendar day (Chile) of the last successful Sysgal causas sync; process-local, so a
+# worker restart may repeat one cheap incremental sync.
+_last_sysgal_causas_day: Optional[date] = None
+
+
+def _chile_now() -> datetime:
+    return datetime.now(ZoneInfo("America/Santiago"))
+
+
+def _maybe_sync_sysgal_causas(db: Session) -> None:
+    """Run the incremental Sysgal causas sync + queue refresh at most once per Chile day.
+
+    Gated by ``SYSGAL_CAUSAS_SYNC_ENABLED`` (only the VM can reach Sysgal). SAFE-FAIL: an
+    exception is logged and never breaks the cycle; the day is marked done only on success.
+    """
+    global _last_sysgal_causas_day
+    if not settings.SYSGAL_CAUSAS_SYNC_ENABLED:
+        return
+    today = _chile_now().date()
+    if _last_sysgal_causas_day == today:
+        return
+    try:
+        from app.services.sysgal_causas import sync_sysgal_causas
+        from app.services.sysgal_client import SysgalClient
+        from app.services.sysgal_incorporacion import encolar_incorporaciones
+
+        client = SysgalClient(settings.SYSGAL_BASE_URL, settings.SYSGAL_API_KEY)
+        if not client.is_configured:
+            logger.warning("Sysgal causas sync enabled but SYSGAL_BASE_URL/SYSGAL_API_KEY are empty")
+            return
+        stats = sync_sysgal_causas(db, client)
+        logger.info("Sysgal causas sync: %s", stats)
+        queue_stats = encolar_incorporaciones(db)
+        db.commit()
+        logger.info("Sysgal incorporacion queue: %s", queue_stats)
+        _last_sysgal_causas_day = today
+    except Exception:
+        db.rollback()
+        logger.exception("Sysgal causas sync failed (non-fatal)")
 
 # Max age before considering data stale (in hours)
 MAX_DATA_AGE_HOURS = settings.MAX_DATA_AGE_HOURS
@@ -1070,6 +1111,9 @@ async def _run_sync_cycle(timer: CycleTimer):
             logger.info("Sysgal cobertura sync: %s", sysgal_summary)
         except Exception:
             logger.exception("Sysgal cobertura sync failed (non-fatal)")
+
+        # Daily Sysgal causas sync + incorporation queue (VM only; see the setting).
+        _maybe_sync_sysgal_causas(setup_db)
 
         # Salud del scraping: mirar sync_history y avisar si viene fallando.
         # Va al FINAL del ciclo, cuando las corridas de esta vuelta ya quedaron
