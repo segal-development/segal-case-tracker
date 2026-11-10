@@ -336,21 +336,84 @@ class _FirmConsulta:
                 logger.warning("Sysgal incorporacion: browser close failed (non-fatal)")
 
 
-def _open_firm_consulta(db: Session) -> Optional[_FirmConsulta]:
-    """Firm CU credentials: CU_RUT/CU_PASSWORD env (as the scripts) or the firm lawyer's stored CU."""
+class _LawyerSessionConsulta:
+    """``consulta_by_rol`` inside the firm lawyer's OWN PJUD session (segunda clave or Clave Única).
+
+    The session is obtained exactly as her sync cycle does: the stored one first, else
+    ``_reauth`` (which persists it, audits it and alerts the supervisor on bad credentials), so
+    the incorporation never opens a second parallel session for her. The session is left in the
+    store on close; only the incorporation's own browser is stopped.
+    """
+
+    def __init__(self, lawyer, store: SessionStore, db: Session):
+        self._lawyer = lawyer
+        self._store = store
+        self._db = db
+        self._scraper = None
+        self._session = None
+
+    def _rejected(self, reason: Optional[str]) -> LoginPageError:
+        return LoginPageError(f"firm session unavailable: {reason or 'unknown'}")
+
+    async def _ensure_session(self) -> PJUDSession:
+        if self._session is not None:
+            return self._session
+        session = await self._store.get_session_by_lawyer(int(self._lawyer.id))
+        if session is None:
+            session, reason = await _reauth_with_network_retry(self._lawyer, self._store)
+            self._db.commit()  # persist credential_alert_sent_at changes, as sync_lawyer_cases
+            if session is None:
+                raise self._rejected(reason)
+        self._session = session
+        return session
+
+    async def _ensure_scraper(self):
+        if self._scraper is None:
+            from app.scrapper.pjud.civil import CivilScraper
+
+            self._scraper = CivilScraper(headless=True)
+            self._scraper.reuse_context = True
+        if not self._scraper._browser:
+            await self._scraper.start()
+        return self._scraper
+
+    async def fetch(self, rol: str, corte: int):
+        from app.scrapper.pjud.exceptions import ConsultaSessionExpired
+
+        session = await self._ensure_session()
+        scraper = await self._ensure_scraper()
+        try:
+            return await scraper.consulta_by_rol(session, rol, str(corte))
+        except ConsultaSessionExpired:
+            fresh, reason = await _reauth(self._lawyer, self._store)  # one re-login
+            self._db.commit()
+            if fresh is None:
+                raise self._rejected(reason) from None
+            self._session = fresh
+            return await scraper.consulta_by_rol(fresh, rol, str(corte))
+
+    async def aclose(self) -> None:
+        if self._scraper is not None:
+            try:
+                await self._scraper.stop()
+            except Exception:
+                logger.warning("Sysgal incorporacion: browser close failed (non-fatal)")
+
+
+def _open_firm_consulta(db: Session):
+    """Explicit CU_RUT/CU_PASSWORD env override (as the scripts), else the firm lawyer's own session."""
     import os
 
     rut, password = os.environ.get("CU_RUT", ""), os.environ.get("CU_PASSWORD", "")
-    if not (rut and password):
-        from app.api.deps import firm_lawyer_id
+    if rut and password:
+        return _FirmConsulta((rut, password))
+    from app.api.deps import firm_lawyer_id
 
-        firm = db.get(Lawyer, firm_lawyer_id(db))
-        if firm is None or not firm.encrypted_clave_unica_password:
-            logger.warning("Sysgal incorporacion: no firm Clave Unica credentials available")
-            return None
-        rut = str(firm.clave_unica_rut or firm.rut)
-        password = decrypt_pjud_password(str(firm.encrypted_clave_unica_password))
-    return _FirmConsulta((rut, password))
+    firm = db.get(Lawyer, firm_lawyer_id(db))
+    if firm is None:
+        logger.warning("Sysgal incorporacion: no firm lawyer configured")
+        return None
+    return _LawyerSessionConsulta(firm, get_session_store(), db)
 
 
 async def _maybe_run_sysgal_incorporacion(db: Session) -> None:
