@@ -15,9 +15,11 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_db, require_admin
 from app.models.lawyer import Lawyer
 from app.models.sysgal_causa import SysgalCausa
+from app.models.sysgal_incorporacion import SysgalIncorporacion
 from app.models.sysgal_usuario import SysgalUsuario
 from app.services.lawyer_roster import resolved_owner_by_case
 from app.services.sysgal_causas import sysgal_owner_by_case
+from app.services.sysgal_incorporacion import rol_year
 
 router = APIRouter()
 
@@ -140,3 +142,45 @@ async def set_sysgal_usuario_mapping(
     usuario.mapped_by = admin_rut if body.lawyer_id is not None else None
     db.commit()
     return {"sysgal_id": usuario.sysgal_id, "lawyer_id": usuario.lawyer_id, "mapped_by": usuario.mapped_by}
+
+
+@router.get("/incorporaciones/resumen")
+async def sysgal_incorporaciones_resumen(
+    _admin: str = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Read-only summary of the incorporation queue: counts and the next pending causas."""
+    rows = (
+        db.query(SysgalIncorporacion, SysgalCausa, SysgalUsuario)
+        .join(SysgalCausa, SysgalCausa.id == SysgalIncorporacion.sysgal_causa_id)
+        .outerjoin(SysgalUsuario, SysgalUsuario.sysgal_id == SysgalCausa.abogado_sysgal_id)
+        .all()
+    )
+    lawyer_names = {lw.id: lw.name for lw in db.query(Lawyer).all()}
+
+    def lawyer_of(causa: SysgalCausa, usuario: Optional[SysgalUsuario]) -> Optional[str]:
+        if usuario is not None and usuario.lawyer_id in lawyer_names:
+            return lawyer_names[usuario.lawyer_id]
+        return causa.abogado_nombre
+
+    def year_of(causa: SysgalCausa) -> Optional[int]:
+        try:
+            return rol_year(causa.rol_norm)
+        except (IndexError, ValueError):
+            return None
+
+    por_estado = Counter(q.estado for q, _c, _u in rows)
+    por_anio = Counter(str(year_of(c)) for _q, c, _u in rows if year_of(c) is not None)
+    por_abogado = Counter(lawyer_of(c, u) or "(sin abogado)" for _q, c, u in rows)
+
+    pendientes = sorted((r for r in rows if r[0].estado == "pendiente"), key=lambda r: (r[0].prioridad, r[0].id))
+    primeras = [
+        {"rol": c.rol_norm, "tribunal": c.tribunal, "abogado": lawyer_of(c, u), "anio": year_of(c)}
+        for _q, c, u in pendientes[:EXAMPLES_LIMIT]
+    ]
+    return {
+        "por_estado": dict(por_estado),
+        "por_anio": dict(por_anio),
+        "por_abogado": dict(por_abogado),
+        "primeras_pendientes": primeras,
+    }
