@@ -8,6 +8,16 @@ from app.services import email_gate
 from app.services.email_gate import email_allowed
 
 
+@pytest.fixture(autouse=True)
+def switch_off():
+    """Env-rule tests run with the DB switch known to be off (no DB read)."""
+    import time
+
+    email_gate._switch_cache.update(value=False, at=time.monotonic())
+    yield
+    email_gate._switch_cache.clear()
+
+
 @pytest.fixture
 def gate():
     """Set the two gate settings for the duration of a test."""
@@ -83,3 +93,49 @@ def test_suppression_logs_info_without_addresses(gate, caplog):
     text = " ".join(r.getMessage() for r in records)
     assert "movimientos" in text and "2" in text
     assert "secreto@x.cl" not in text
+
+
+# --- Server-side kill switch stored in the DB (goals: correos_apagados) ---------------------
+
+
+@pytest.fixture(autouse=False)
+def fresh_switch():
+    email_gate._switch_cache.clear()
+    yield
+    email_gate._switch_cache.clear()
+
+
+def test_db_switch_on_blocks_every_kind_even_with_empty_env(gate, fresh_switch):
+    with gate(), patch.object(email_gate, "_read_db_switch", return_value=True):
+        assert email_allowed(email_gate.MOVIMIENTOS, "a@x.cl") is False
+        assert email_allowed(email_gate.PLAZOS_FATALES_ESTUDIO, "a@x.cl") is False
+
+
+def test_db_switch_off_leaves_the_env_rules(gate, fresh_switch):
+    with gate(kinds="plazos_fatales_estudio"), patch.object(email_gate, "_read_db_switch", return_value=False):
+        assert email_allowed(email_gate.PLAZOS_FATALES_ESTUDIO, "a@x.cl") is True
+        assert email_allowed(email_gate.MOVIMIENTOS, "a@x.cl") is False
+
+
+def test_db_switch_is_cached_between_calls(gate, fresh_switch):
+    reader = patch.object(email_gate, "_read_db_switch", return_value=True)
+    with gate(), reader as read:
+        email_allowed(email_gate.MOVIMIENTOS, "a@x.cl")
+        email_allowed(email_gate.AGENDA, "a@x.cl")
+    assert read.call_count == 1
+
+
+def test_db_read_failure_keeps_the_last_known_value(gate, fresh_switch):
+    with gate(), patch.object(email_gate, "_read_db_switch", return_value=True):
+        assert email_allowed(email_gate.MOVIMIENTOS, "a@x.cl") is False
+    email_gate._switch_cache["at"] = 0.0  # expire the cache
+    with gate(), patch.object(email_gate, "_read_db_switch", side_effect=RuntimeError("db down")):
+        assert email_allowed(email_gate.MOVIMIENTOS, "a@x.cl") is False
+
+
+def test_read_db_switch_uses_the_goals_row(db):
+    from app.services import app_settings
+
+    assert email_gate._read_db_switch(db) is False
+    app_settings.set_int(db, app_settings.KEY_CORREOS_APAGADOS, 1)
+    assert email_gate._read_db_switch(db) is True
