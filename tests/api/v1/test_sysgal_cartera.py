@@ -53,9 +53,9 @@ def _case(db, owner, rol, court=None, litigante_rut=None):
     return case
 
 
-def _causa(db, sid, abogado, case=None, method=None, rol="C-1-2026", eliminada=False):
+def _causa(db, sid, abogado, case=None, method=None, rol="C-1-2026", eliminada=False, estado="activa"):
     db.add(SysgalCausa(sysgal_id=sid, rol=rol, rol_norm=rol, tribunal="T", abogado_sysgal_id=abogado,
-                       case_id=case.id if case else None, match_method=method, eliminada=eliminada,
+                       case_id=case.id if case else None, match_method=method, eliminada=eliminada, estado=estado,
                        synced_at=datetime.utcnow()))
 
 
@@ -74,7 +74,8 @@ class TestReporte:
     def test_empty(self, client, admin):
         body = client.get("/api/v1/sysgal/cartera/reporte", headers=admin).json()
         assert body["usuarios"] == [] and body["por_abogado"] == [] and body["ejemplos_sin_calce"] == []
-        assert body["calce"] == {"total": 0, "calzadas": 0, "sin_calce": 0, "ambiguas": 0}
+        zero = {"total": 0, "calzadas": 0, "sin_calce": 0, "ambiguas": 0}
+        assert body["calce"] == {**zero, "por_estado": {"activa": zero, "terminada": zero, "otros": zero}}
 
     def test_calce_counts_and_examples(self, client, admin, db):
         owner = _lawyer(db, "44444444-4", "Owner")
@@ -86,9 +87,41 @@ class TestReporte:
 
         body = client.get("/api/v1/sysgal/cartera/reporte", headers=admin).json()
 
-        assert body["calce"] == {"total": 3, "calzadas": 1, "sin_calce": 1, "ambiguas": 1}
+        assert {k: v for k, v in body["calce"].items() if k != "por_estado"} == {
+            "total": 3, "calzadas": 1, "sin_calce": 1, "ambiguas": 1}
         assert [e["sysgal_id"] for e in body["ejemplos_sin_calce"]] == [2]
         assert body["ejemplos_sin_calce"][0]["rol"] == "C-2-2026"
+
+    def test_calce_split_by_estado(self, client, admin, db):
+        owner = _lawyer(db, "44444444-4", "Owner")
+        c1, c2 = _case(db, owner, "C-1-2026"), _case(db, owner, "C-2-2026")
+        _causa(db, 1, 9, case=c1, method="rol+tribunal")
+        _causa(db, 2, 9, case=c2, method="rol+tribunal", estado="terminada")
+        _causa(db, 3, 9, method="ambigua", estado="terminada")
+        _causa(db, 4, 9, estado="terminada")
+        _causa(db, 5, 9, estado=None)
+        db.commit()
+
+        calce = client.get("/api/v1/sysgal/cartera/reporte", headers=admin).json()["calce"]
+
+        assert calce["total"] == 5
+        assert calce["por_estado"] == {
+            "activa": {"total": 1, "calzadas": 1, "sin_calce": 0, "ambiguas": 0},
+            "terminada": {"total": 3, "calzadas": 1, "sin_calce": 1, "ambiguas": 1},
+            "otros": {"total": 1, "calzadas": 0, "sin_calce": 1, "ambiguas": 0},
+        }
+
+    def test_con_sysgal_counts_only_active_causas(self, client, admin, db):
+        ana = _lawyer(db, "55555555-5", "Ana")
+        c1, c2 = _case(db, ana, "C-1-2026"), _case(db, ana, "C-2-2026")
+        db.add(SysgalUsuario(sysgal_id=9, nombre="Ana S", lawyer_id=ana.id))
+        _causa(db, 1, 9, case=c1, method="rol+tribunal")
+        _causa(db, 2, 9, case=c2, method="rol+tribunal", estado="terminada")
+        db.commit()
+
+        rows = {r["lawyer_id"]: r for r in client.get("/api/v1/sysgal/cartera/reporte", headers=admin).json()["por_abogado"]}
+
+        assert rows[ana.id]["con_sysgal"] == 1
 
     def test_examples_capped_at_20(self, client, admin, db):
         for i in range(25):

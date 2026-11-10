@@ -115,6 +115,78 @@ class TestRolPlusRutFallback:
         assert match_causa(db, "C-100-2026", "Otro", None, "12345678-5").status == "ambigua"
 
 
+class TestPrincipalCuaderno:
+    """One causa stored as several cuadernos (rows) in the same tribunal: the Principal wins."""
+
+    def test_principal_plus_incidente_same_court_matches_principal(self, db, lawyer):
+        court = _court(db, "A", "Juzgado Uno")
+        _case(db, lawyer, court, procedure="Administración Concursal")
+        principal = _case(db, lawyer, court, procedure="Principal")
+
+        r = match_causa(db, "C-100-2026", "Juzgado Uno", None, None)
+
+        assert (r.status, r.case_id, r.method) == ("calzada", principal.id, "rol+tribunal")
+
+    def test_principal_comparison_is_case_insensitive_and_trimmed(self, db, lawyer):
+        court = _court(db, "A", "Juzgado Uno")
+        _case(db, lawyer, court, procedure="Incidente Abandono del Proc.")
+        principal = _case(db, lawyer, court, procedure="  principal ")
+
+        r = match_causa(db, "C-100-2026", "Juzgado Uno", None, None)
+
+        assert (r.status, r.case_id) == ("calzada", principal.id)
+
+    def test_two_principal_stay_ambiguous(self, db, lawyer):
+        court = _court(db, "A", "Juzgado Uno")
+        other = Lawyer(rut="22222222-2", name="Other")
+        db.add(other)
+        db.flush()
+        _case(db, lawyer, court, procedure="Principal")
+        _case(db, other, court, procedure="Principal")
+        _case(db, lawyer, court, procedure="Apremio")
+
+        r = match_causa(db, "C-100-2026", "Juzgado Uno", None, None)
+
+        assert (r.status, r.case_id, r.method) == ("ambigua", None, None)
+
+    def test_no_principal_stays_ambiguous(self, db, lawyer):
+        court = _court(db, "A", "Juzgado Uno")
+        _case(db, lawyer, court, procedure="Ejecutivo")
+        _case(db, lawyer, court, procedure=None)
+
+        assert match_causa(db, "C-100-2026", "Juzgado Uno", None, None).status == "ambigua"
+
+    def test_different_courts_unchanged_even_with_a_principal(self, db, lawyer):
+        _case(db, lawyer, _court(db, "A", "Juzgado Uno"), procedure="Principal", rut="12345678-5")
+        _case(db, lawyer, _court(db, "B", "Juzgado Dos"), procedure="Apremio", rut="12345678-5")
+
+        r = match_causa(db, "C-100-2026", "Otro", None, "12345678-5")
+
+        assert (r.status, r.case_id) == ("ambigua", None)
+
+    def test_rut_decided_tie_in_same_court_matches_principal_by_rut(self, db, lawyer):
+        court = _court(db, "A", "Juzgado Uno")
+        _case(db, lawyer, court, procedure="Apremio", rut="12345678-5")
+        principal = _case(db, lawyer, court, procedure="Principal", rut="12345678-5")
+        other = Lawyer(rut="22222222-2", name="Other")
+        db.add(other)
+        db.flush()
+        _case(db, other, court, procedure="Principal", rut="99999999-9")
+
+        r = match_causa(db, "C-100-2026", "Juzgado Uno", None, "12345678-5")
+
+        assert (r.status, r.case_id, r.method) == ("calzada", principal.id, "rol+rut")
+
+    def test_rut_fallback_without_tribunal_hit_matches_principal_in_single_court(self, db, lawyer):
+        court = _court(db, "A", "Juzgado Uno")
+        _case(db, lawyer, court, procedure="Apremio", rut="12345678-5")
+        principal = _case(db, lawyer, court, procedure="Principal", rut="12345678-5")
+
+        r = match_causa(db, "C-100-2026", "Nombre Distinto", None, "12345678-5")
+
+        assert (r.status, r.case_id, r.method) == ("calzada", principal.id, "rol+rut")
+
+
 def test_malformed_sysgal_rol_never_matches():
     """Real data (2026-11-09): some Sysgal ROLs are a bare number ('7'). They must stay unmatched."""
     from app.services.sysgal_matching import normalize_rol
