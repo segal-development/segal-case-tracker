@@ -15,6 +15,9 @@ KEY_POR_HORA = "sysgal_incorporacion_por_hora"
 #: yyyymmdd (Chile) of the day the incorporation was braked; 0/absent = not braked.
 KEY_FRENO_DIA = "sysgal_incorporacion_freno_dia"
 
+#: 1 = no e-mail leaves, from ANY process (VM or station); read by app/services/email_gate.py.
+KEY_CORREOS_APAGADOS = "correos_apagados"
+
 DEFAULT_POR_DIA = 0  # 0 = OFF
 DEFAULT_POR_HORA = 10
 
