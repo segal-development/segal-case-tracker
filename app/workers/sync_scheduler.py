@@ -284,6 +284,41 @@ def _maybe_sync_sysgal_causas(db: Session) -> None:
         db.rollback()
         logger.exception("Sysgal causas sync failed (non-fatal)")
 
+
+# Chile day on which the previous month's avance-de-cartera snapshot was settled (taken, or
+# already there / closed); process-local, a restart only repeats a cheap existence check.
+_last_avance_snapshot_day: Optional[date] = None
+
+
+def _maybe_take_avance_snapshot(db: Session) -> None:
+    """On day 1 (Chile) after 01:00 freeze the previous month's Sysgal cartera stats, once.
+
+    Same gate as the causas sync (only the VM can reach Sysgal). Idempotent: the service skips
+    a month that already has a snapshot or whose liquidación is closed. SAFE-FAIL: a failure is
+    logged and retried on the next run; it never breaks the cycle.
+    """
+    global _last_avance_snapshot_day
+    if not settings.SYSGAL_CAUSAS_SYNC_ENABLED:
+        return
+    now = _chile_now()
+    today = now.date()
+    if today.day != 1 or now.hour < 1 or _last_avance_snapshot_day == today:
+        return
+    try:
+        from app.services.avance_cartera import take_previous_month_if_missing
+        from app.services.sysgal_client import SysgalClient
+
+        client = SysgalClient(settings.SYSGAL_BASE_URL, settings.SYSGAL_API_KEY)
+        if not client.is_configured:
+            logger.warning("Avance cartera snapshot enabled but SYSGAL_BASE_URL/SYSGAL_API_KEY are empty")
+            return
+        result = take_previous_month_if_missing(db, client, today)
+        logger.info("Avance cartera snapshot: %s", result)
+        _last_avance_snapshot_day = today
+    except Exception:
+        db.rollback()
+        logger.exception("Avance cartera snapshot failed (non-fatal)")
+
 class _FirmConsulta:
     """Lazy firm Clave Única session + ``consulta_by_rol`` for the Sysgal incorporation.
 
@@ -1276,6 +1311,7 @@ async def _run_sync_cycle(timer: CycleTimer):
 
         # Daily Sysgal causas sync + incorporation queue (VM only; see the setting).
         _maybe_sync_sysgal_causas(setup_db)
+        _maybe_take_avance_snapshot(setup_db)
 
         # Salud del scraping: mirar sync_history y avisar si viene fallando.
         # Va al FINAL del ciclo, cuando las corridas de esta vuelta ya quedaron

@@ -35,6 +35,11 @@ MAX_CAUSAS_PAGES = 400
 _ESTADO_PATH = "/api_sync/clientes_estado"
 _CAUSAS_PATH = "/api_sync/causas"
 _USUARIOS_PATH = "/api_sync/usuarios"
+_ESTADISTICAS_CARTERA_PATH = "/api_sync/estadisticas_cartera"
+_SIN_GESTION_PATH = "/api_sync/causas_sin_gestion"
+
+# Hard cap on ``limite`` for GET /api_sync/causas_sin_gestion.
+MAX_SIN_GESTION_PER_PAGE = 500
 
 
 class SysgalError(Exception):
@@ -276,6 +281,39 @@ class SysgalClient:
         """``GET /api_sync/usuarios`` mapped to DTOs."""
         body = self._get_json(_USUARIOS_PATH, {})
         return [map_usuario(raw) for raw in _extract_items(body) if isinstance(raw, dict)]
+
+    def estadisticas_cartera(self, desde: date, hasta: date) -> dict:
+        """``GET /api_sync/estadisticas_cartera``: Sysgal's cartera/effectiveness stats as received.
+
+        Never recomputed here; the dict is returned (and snapshotted) exactly as Sysgal sent it.
+        """
+        body = self._get_json(
+            _ESTADISTICAS_CARTERA_PATH, {"desde": desde.isoformat(), "hasta": hasta.isoformat()}
+        )
+        if not isinstance(body, dict) or not isinstance(body.get("por_abogado"), list):
+            raise SysgalError("Sysgal estadisticas_cartera body has no 'por_abogado' list (HTTP 200)")
+        return body
+
+    def causas_sin_gestion(
+        self,
+        desde: date,
+        hasta: date,
+        abogado_id: Optional[int] = None,
+        desde_id: Optional[int] = None,
+        limite: int = MAX_SIN_GESTION_PER_PAGE,
+    ) -> dict:
+        """One page of ``GET /api_sync/causas_sin_gestion``, as received (``data`` + ``siguiente_desde_id``)."""
+        if not 1 <= limite <= MAX_SIN_GESTION_PER_PAGE:
+            raise ValueError(f"limite must be between 1 and {MAX_SIN_GESTION_PER_PAGE}, got {limite}")
+        params: dict = {"desde": desde.isoformat(), "hasta": hasta.isoformat(), "limite": limite}
+        if abogado_id is not None:
+            params["abogado_id"] = abogado_id
+        if desde_id is not None:
+            params["desde_id"] = desde_id
+        body = self._get_json(_SIN_GESTION_PATH, params)
+        if not isinstance(body, dict) or not isinstance(body.get("data"), list):
+            raise SysgalError("Sysgal causas_sin_gestion body has no 'data' list (HTTP 200)")
+        return body
 
     def _get_json(self, path: str, params: dict) -> Any:
         """GET with the same retry-once / error policy as ``estado_por_ruts``.

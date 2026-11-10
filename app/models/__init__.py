@@ -38,6 +38,7 @@ from app.models.cliente_sysgal_estado import ClienteSysgalEstado
 from app.models.sysgal_causa import SysgalCausa
 from app.models.sysgal_incorporacion import SysgalIncorporacion
 from app.models.sysgal_usuario import SysgalUsuario
+from app.models.avance_cartera import AvanceCarteraSnapshot
 from app.models.evaluacion import (
     EvaluacionCriterio,
     EvaluacionEvaluable,
