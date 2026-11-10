@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 PENDIENTE = "pendiente"
 INCORPORADA = "incorporada"
 SIN_CORTE = "sin_corte"
+DESCARTADA = "descartada"
 
 _VALID_ROL = re.compile(r"^[A-Z]-\d+-\d{4}$")
 
@@ -31,29 +32,93 @@ def rol_year(rol_norm: str) -> int:
     return int(rol_norm.rsplit("-", 1)[1])
 
 
+_ORDINAL_WORDS = {
+    "primer": 1, "primero": 1, "segundo": 2, "tercer": 3, "tercero": 3, "cuarto": 4,
+    "quinto": 5, "sexto": 6, "séptimo": 7, "septimo": 7, "octavo": 8, "noveno": 9, "décimo": 10, "decimo": 10,
+}
+_ORDINAL_TOKEN = re.compile(r"^(\d{1,2})(er|ero|ro|do|to|vo|no|mo|ndo|nvo)$", re.IGNORECASE)
+# Pure criminal courts only: "Juzgado de Letras y Garantía" is mixed and takes civil causas.
+_GARANTIA = re.compile(r"juzgado\s+de\s+garant[ií]a", re.IGNORECASE)
+TRIBUNAL_PENAL = "tribunal penal"
+
+
+def _fold_ordinals(text: str) -> str:
+    """Rewrite written Spanish ordinals ("1er", "2do", "Primer"…) as "Nº" tokens (whole token only)."""
+    out = []
+    for token in text.split():
+        m = _ORDINAL_TOKEN.match(token)
+        if m and 1 <= int(m.group(1)) <= 30:
+            out.append(f"{int(m.group(1))}º")
+        elif token.lower() in _ORDINAL_WORDS:
+            out.append(f"{_ORDINAL_WORDS[token.lower()]}º")
+        else:
+            out.append(token)
+    return " ".join(out)
+
+
+def _queue_key(tribunal: Optional[str]) -> Optional[str]:
+    key = _tribunal_key(tribunal)
+    return _tribunal_key(_fold_ordinals(key)) if key else None
+
+
+def _city_of(name: str) -> str:
+    parts = re.split(r"\s+de\s+", name.strip(), flags=re.IGNORECASE)
+    return " ".join(parts[-1].split()).upper() if len(parts) > 1 else ""
+
+
+def _is_penal(*names: Optional[str]) -> bool:
+    return any(n and _GARANTIA.search(n) for n in names)
+
+
 def _court_resolver(db: Session):
-    """Return ``resolve(tribunal, codigo) -> Court | None`` using the matcher's tribunal key."""
-    courts = db.query(Court).all()
+    """Return ``resolve(tribunal, codigo) -> (Court | None, corte | None, penal)``.
+
+    The corte is ``Court.pjud_corte`` or, when the court lacks it, the one value every other
+    court of the same city agrees on (never written back to ``courts``).
+    """
+    courts = sorted(db.query(Court).all(), key=lambda c: c.id)
     by_code = {c.code: c for c in courts}
     by_key: dict[str, list[Court]] = {}
+    cortes_by_city: dict[str, set[int]] = {}
     for c in courts:
-        key = _tribunal_key(c.name)
+        key = _queue_key(c.name)
         if key:
             by_key.setdefault(key, []).append(c)
+        city = _city_of(c.name or "")
+        if city and c.pjud_corte is not None:
+            cortes_by_city.setdefault(city, set()).add(c.pjud_corte)
 
-    def resolve(tribunal: Optional[str], codigo: Optional[str]) -> Optional[Court]:
-        if codigo and codigo in by_code:
-            return by_code[codigo]
-        hits = by_key.get(_tribunal_key(tribunal) or "", [])
-        return hits[0] if len(hits) == 1 else None
+    def pick(hits: list[Court]) -> Optional[Court]:
+        if len(hits) == 1:
+            return hits[0]
+        # Same tribunal modulo case/spaces/ordinal sign (the key) -> prefer the one with a corte.
+        return next((c for c in hits if c.pjud_corte is not None), hits[0]) if hits else None
+
+    def resolve(tribunal: Optional[str], codigo: Optional[str]):
+        court = by_code.get(codigo) if codigo else None
+        if court is None:
+            court = pick(by_key.get(_queue_key(tribunal) or "", []))
+        if _is_penal(tribunal, court.name if court else None):
+            return court, None, True
+        if court is None:
+            return None, None, False
+        corte = court.pjud_corte
+        if corte is None:
+            siblings = cortes_by_city.get(_city_of(court.name or ""), set())
+            corte = next(iter(siblings)) if len(siblings) == 1 else None
+        return court, corte, False
 
     return resolve
 
 
-def _apply_court(row: SysgalIncorporacion, court: Optional[Court]) -> None:
+def _apply_court(row: SysgalIncorporacion, resolved) -> None:
+    court, corte, penal = resolved
     row.court_id = court.id if court else None
-    row.corte = court.pjud_corte if court else None
-    row.estado = PENDIENTE if court is not None and court.pjud_corte is not None else SIN_CORTE
+    row.corte = corte
+    if penal:
+        row.estado, row.ultimo_error = DESCARTADA, TRIBUNAL_PENAL
+        return
+    row.estado = PENDIENTE if court is not None and corte is not None else SIN_CORTE
 
 
 def _rank(row: SysgalCausa):
