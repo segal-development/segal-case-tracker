@@ -10,6 +10,9 @@ Rules (never guess — ambiguity leaves ``case_id`` NULL):
    decides, over the tribunal hits when there are some, else over every case with that ROL.
    Exactly one hit -> ``rol+rut``.
 4. More than one hit at the deciding step -> ``ambigua``; no candidate -> ``sin_calce``.
+   Exception: when those hits are cuadernos of one causa (same court; our system stores one row
+   per cuaderno) and EXACTLY ONE has ``procedure == 'Principal'``, that one wins (same method as
+   the deciding step). Zero or several Principal -> still ``ambigua``.
 """
 
 from dataclasses import dataclass
@@ -51,7 +54,7 @@ def match_causa(
         return MatchResult(SIN_CALCE)
 
     rows = (
-        db.query(Case.id, Court.code, Court.name)
+        db.query(Case.id, Court.code, Court.name, Case.court_id, Case.procedure)
         .join(Court, Court.id == Case.court_id)
         .filter(Case.rol == rol_norm)
         .order_by(Case.id)
@@ -68,20 +71,34 @@ def match_causa(
     hits = _rut_hits(db, pool, rut_cliente)
     if len(hits) == 1:
         return MatchResult(CALZADA, hits[0], "rol+rut")
-    if len(hits) > 1 or len(by_tribunal) > 1:
-        return MatchResult(AMBIGUA)
+    if len(hits) > 1:
+        principal = _sole_principal(rows, hits)
+        return MatchResult(CALZADA, principal, "rol+rut") if principal else MatchResult(AMBIGUA)
+    if len(by_tribunal) > 1:
+        principal = _sole_principal(rows, by_tribunal)
+        return MatchResult(CALZADA, principal, "rol+tribunal") if principal else MatchResult(AMBIGUA)
     return MatchResult(SIN_CALCE)
+
+
+def _sole_principal(rows, case_ids: list[int]) -> Optional[int]:
+    """The only 'Principal' cuaderno among ``case_ids`` when they all sit in one court, else None."""
+    wanted = set(case_ids)
+    candidates = [r for r in rows if r[0] in wanted]
+    if len({r[3] for r in candidates}) != 1:
+        return None
+    principals = [r[0] for r in candidates if (r[4] or "").strip().lower() == "principal"]
+    return principals[0] if len(principals) == 1 else None
 
 
 def _tribunal_hits(rows, tribunal: Optional[str], tribunal_codigo: Optional[str]) -> list[int]:
     if tribunal_codigo:
-        hits = [cid for cid, code, _ in rows if code == tribunal_codigo]
+        hits = [r[0] for r in rows if r[1] == tribunal_codigo]
         if hits:
             return hits
     key = _tribunal_key(tribunal)
     if not key:
         return []
-    return [cid for cid, _, name in rows if _tribunal_key(name) == key]
+    return [r[0] for r in rows if _tribunal_key(r[2]) == key]
 
 
 def _rut_hits(db: Session, case_ids: list[int], rut_cliente: Optional[str]) -> list[int]:

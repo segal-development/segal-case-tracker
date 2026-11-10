@@ -52,6 +52,22 @@ def _proposals(lawyers: list[Lawyer]):
     return propose
 
 
+def _estado_bucket(estado: Optional[str]) -> str:
+    key = (estado or "").strip().lower()
+    return key if key in ("activa", "terminada") else "otros"
+
+
+def _calce_counts(causas: list[tuple[Optional[int], Optional[str]]]) -> dict:
+    calzadas = sum(1 for case_id, _m in causas if case_id is not None)
+    ambiguas = sum(1 for case_id, m in causas if case_id is None and m == "ambigua")
+    return {
+        "total": len(causas),
+        "calzadas": calzadas,
+        "sin_calce": len(causas) - calzadas - ambiguas,
+        "ambiguas": ambiguas,
+    }
+
+
 @router.get("/cartera/reporte")
 async def sysgal_cartera_reporte(
     _admin: str = Depends(require_admin),
@@ -74,14 +90,13 @@ async def sysgal_cartera_reporte(
         for u in db.query(SysgalUsuario).order_by(SysgalUsuario.sysgal_id).all()
     ]
 
-    causas = db.query(SysgalCausa.sysgal_id, SysgalCausa.case_id, SysgalCausa.match_method).all()
-    calzadas = sum(1 for _, case_id, _m in causas if case_id is not None)
-    ambiguas = sum(1 for _, case_id, m in causas if case_id is None and m == "ambigua")
+    causas = db.query(SysgalCausa.case_id, SysgalCausa.match_method, SysgalCausa.estado).all()
     calce = {
-        "total": len(causas),
-        "calzadas": calzadas,
-        "sin_calce": len(causas) - calzadas - ambiguas,
-        "ambiguas": ambiguas,
+        **_calce_counts([(c, m) for c, m, _e in causas]),
+        "por_estado": {
+            bucket: _calce_counts([(c, m) for c, m, e in causas if _estado_bucket(e) == bucket])
+            for bucket in ("activa", "terminada", "otros")
+        },
     }
 
     hoy = Counter(lw.id for lw in resolved_owner_by_case(db).values())
