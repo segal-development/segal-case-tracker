@@ -22,7 +22,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session, selectinload
 
-from app.api.deps import get_current_lawyer, get_db, require_admin
+from app.api.deps import get_current_lawyer, get_db, require_admin, require_auditor
 from app.models.hito import (
     Hito, HitoTipo, HITO_APROBADO, HITO_PENDIENTE, HITO_RECHAZADO, HITO_SUGERIDO,
     ORIGEN_FORMULARIO, ORIGEN_MANUAL,
@@ -376,6 +376,10 @@ def _resolve_lawyer(db: Session, current_lawyer: dict) -> Optional[Lawyer]:
 
 def _is_admin(lawyer: Optional[Lawyer]) -> bool:
     return bool(lawyer and lawyer.role == "admin")
+
+
+def _is_auditor(lawyer: Optional[Lawyer]) -> bool:
+    return bool(lawyer and lawyer.role == "auditor")
 
 
 def _es_abogado_comun(lawyer: Optional[Lawyer]) -> bool:
@@ -749,6 +753,8 @@ async def create_hito(
     actor = _resolve_lawyer(db, current_lawyer)
     if actor is None:
         raise HTTPException(status_code=401, detail="No se pudo resolver el abogado")
+    if _is_auditor(actor):
+        raise HTTPException(status_code=403, detail="El auditor solo tiene acceso de lectura")
 
     # A lawyer registers hitos for themselves; only an admin may set another lawyer.
     target_lawyer_id = actor.id
@@ -788,7 +794,7 @@ async def list_hitos(
     db: Session = Depends(get_db),
     current_lawyer: dict = Depends(get_current_lawyer),
 ):
-    """List hitos. Admins see all; a lawyer sees only their own.
+    """List hitos. Admins and auditors (read-only) see all; a lawyer sees only their own.
 
     Bounded server-side pagination: the response is a ``{items, total, page,
     per_page, pages}`` envelope. The screen still consumes the full list — the
@@ -801,8 +807,8 @@ async def list_hitos(
     q = db.query(Hito).options(
         selectinload(Hito.lawyer), selectinload(Hito.tipo)
     )
-    if not _is_admin(actor):
-        q = q.filter(Hito.lawyer_id == actor.id)  # non-admins: own hitos only
+    if not (_is_admin(actor) or _is_auditor(actor)):
+        q = q.filter(Hito.lawyer_id == actor.id)  # lawyers: own hitos only
     elif lawyer_id is not None:
         q = q.filter(Hito.lawyer_id == lawyer_id)
     if estado:
@@ -1305,7 +1311,7 @@ async def eliminar_hitos_lote(
 async def resumen_hitos(
     periodo: Optional[str] = Query(None, description="Mes YYYY-MM (default: mes actual)"),
     db: Session = Depends(get_db),
-    _admin_rut: str = Depends(require_admin),
+    _auditor_rut: str = Depends(require_auditor),  # admin or auditor (read-only)
 ):
     """Per-lawyer totals for a period: approved count + gross sum + pending count."""
     if periodo:
@@ -1370,7 +1376,7 @@ async def stats_mensual_hitos(
     desde: Optional[str] = Query(None, description="Mes inicial YYYY-MM (default: 11 meses atrás)"),
     hasta: Optional[str] = Query(None, description="Mes final YYYY-MM (default: mes actual)"),
     db: Session = Depends(get_db),
-    _admin_rut: str = Depends(require_admin),
+    _auditor_rut: str = Depends(require_auditor),  # admin or auditor (read-only)
 ):
     """Hitos INGRESADOS por mes, por abogado + total general (proyección).
 
