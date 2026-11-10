@@ -47,6 +47,7 @@ from app.models.hito import Hito
 from app.models.liberacion import LiberacionRequest
 from app.models.movement import Movement
 from app.models.sysgal_causa import SysgalCausa
+from app.models.sysgal_incorporacion import SysgalIncorporacion
 
 # Every table with a ``case_id`` FK to ``cases.id`` (case_merge_audit's
 # ``winner_case_id`` is excluded: it points at the WINNER, not a child). Each
@@ -69,6 +70,7 @@ CHILD_TABLES_WITH_CASE_ID = [
     CaseLawyerSource,
     CaseAssignmentHistory,
     SysgalCausa,
+    SysgalIncorporacion,
 ]
 
 # (rol, court_id, procedure) with NULL and '' treated as the same cuaderno.
