@@ -157,3 +157,138 @@ def test_sin_corte_row_becomes_pendiente_once_court_resolves(db):
 
     assert _queue(db)[c.id].estado == "pendiente"
     assert _queue(db)[c.id].corte == 90
+
+
+def _court(db, code, name, corte=None):
+    c = Court(code=code, name=name, region="RM", type="civil", pjud_corte=corte)
+    db.add(c)
+    db.flush()
+    return c
+
+
+@pytest.mark.parametrize(
+    "sysgal_name,our_name",
+    [
+        ("1er Juzgado de Letras de Buin", "1º Juzgado de Letras de Buin"),
+        ("2do Juzgado de Letras de Buin", "2º Juzgado de Letras de Buin"),
+        ("1er Juzgado de Letras de Melipilla", "1° Juzgado de Letras de Melipilla"),
+        ("2DO Juzgado de Letras de Coronel", "2º Juzgado de Letras de Coronel"),
+        ("Primer Juzgado de Letras de Talca", "1º Juzgado de Letras de Talca"),
+        ("Tercer Juzgado Civil de Arica", "3º Juzgado Civil de Arica"),
+        ("12vo Juzgado Civil de Santiago", "12º Juzgado Civil de Santiago"),
+    ],
+)
+def test_written_ordinals_match_our_ordinal_sign(db, sysgal_name, our_name):
+    court = _court(db, "K1", our_name, corte=11)
+    c = _causa(db, 1, tribunal=sysgal_name)
+
+    encolar_incorporaciones(db)
+
+    q = _queue(db)[c.id]
+    assert (q.estado, q.court_id, q.corte) == ("pendiente", court.id, 11)
+
+
+def test_duplicate_courts_by_case_pick_the_one_with_corte(db):
+    _court(db, "A", "1º Juzgado de Letras de La Serena")
+    with_corte = _court(db, "B", "1º Juzgado de Letras de la Serena", corte=25)
+    c = _causa(db, 1, tribunal="1° Juzgado de Letras de La Serena")
+
+    encolar_incorporaciones(db)
+
+    q = _queue(db)[c.id]
+    assert (q.estado, q.court_id, q.corte) == ("pendiente", with_corte.id, 25)
+
+
+def test_duplicates_without_corte_use_lowest_id_and_sibling_inference(db):
+    first = _court(db, "A", "1º Juzgado de Letras de La Serena")
+    _court(db, "B", "1º Juzgado de Letras de la Serena")
+    _court(db, "C", "2º Juzgado de Letras de La Serena", corte=25)
+    c = _causa(db, 1, tribunal="1º Juzgado de Letras de La Serena")
+
+    encolar_incorporaciones(db)
+
+    q = _queue(db)[c.id]
+    assert (q.estado, q.court_id, q.corte) == ("pendiente", first.id, 25)
+    assert first.pjud_corte is None  # the courts table is never written
+
+
+def test_corte_inferred_from_same_city_sibling(db):
+    court = _court(db, "A", "1º Juzgado de Letras de Buin")
+    _court(db, "B", "2º Juzgado de Letras de buin", corte=15)
+    _court(db, "C", "1º Juzgado de Letras de Melipilla", corte=99)
+    c = _causa(db, 1, tribunal="1º Juzgado de Letras de Buin")
+
+    encolar_incorporaciones(db)
+
+    q = _queue(db)[c.id]
+    assert (q.estado, q.court_id, q.corte) == ("pendiente", court.id, 15)
+    assert court.pjud_corte is None
+
+
+def test_disagreeing_siblings_stay_sin_corte(db):
+    _court(db, "A", "1º Juzgado de Letras de Buin")
+    _court(db, "B", "2º Juzgado de Letras de Buin", corte=15)
+    _court(db, "C", "3º Juzgado de Letras de Buin", corte=16)
+    c = _causa(db, 1, tribunal="1º Juzgado de Letras de Buin")
+
+    encolar_incorporaciones(db)
+
+    assert _queue(db)[c.id].estado == "sin_corte"
+    assert _queue(db)[c.id].corte is None
+
+
+def test_garantia_is_descartada_with_reason(db):
+    _court(db, "G", "Juzgado de Garantía de Buin", corte=15)
+    c1 = _causa(db, 1, tribunal="Juzgado De Garantía de Buin")
+    c2 = _causa(db, 2, rol="C-101-2026", tribunal="Juzgado de Garantia de Nunoa")
+
+    stats = encolar_incorporaciones(db)
+
+    for c in (c1, c2):
+        q = _queue(db)[c.id]
+        assert (q.estado, q.ultimo_error) == ("descartada", "tribunal penal")
+    assert stats["sin_corte"] == 0
+
+
+def test_juzgado_de_letras_y_garantia_is_civil_and_queued(db):
+    # Mixed courts (civil + criminal) take civil causas: never discard them as penal.
+    _court(db, "LV", "Juzgado de Letras y Garantía de Los Vilos", corte=25)
+    c = _causa(db, 1, tribunal="Juzgado de Letras y Garantía de los Vilos")
+
+    encolar_incorporaciones(db)
+
+    q = _queue(db)[c.id]
+    assert (q.estado, q.corte, q.ultimo_error) == ("pendiente", 25, None)
+
+
+@pytest.mark.parametrize("name", ["Cualquier Tribunal", "Otros tribunales"])
+def test_cualquier_tribunal_stays_sin_corte(db, court, name):
+    c = _causa(db, 1, tribunal=name)
+
+    encolar_incorporaciones(db)
+
+    assert _queue(db)[c.id].estado == "sin_corte"
+
+
+def test_previously_sin_corte_row_is_re_resolved_on_rerun(db):
+    c = _causa(db, 1, tribunal="1er Juzgado de Letras de Buin")
+    encolar_incorporaciones(db)
+    assert _queue(db)[c.id].estado == "sin_corte"
+    _court(db, "A", "1º Juzgado de Letras de Buin", corte=15)
+
+    stats = encolar_incorporaciones(db)
+
+    assert (_queue(db)[c.id].estado, _queue(db)[c.id].corte) == ("pendiente", 15)
+    assert stats["reevaluadas"] == 1
+
+
+def test_sin_corte_garantia_row_is_discarded_on_rerun(db):
+    c = _causa(db, 1, tribunal="Juzgado de Garantía de Buin")
+    row = SysgalIncorporacion(sysgal_causa_id=c.id, estado="sin_corte",
+                              created_at=datetime.utcnow(), updated_at=datetime.utcnow())
+    db.add(row)
+    db.flush()
+
+    encolar_incorporaciones(db)
+
+    assert (_queue(db)[c.id].estado, _queue(db)[c.id].ultimo_error) == ("descartada", "tribunal penal")
