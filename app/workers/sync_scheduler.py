@@ -284,6 +284,105 @@ def _maybe_sync_sysgal_causas(db: Session) -> None:
         db.rollback()
         logger.exception("Sysgal causas sync failed (non-fatal)")
 
+class _FirmConsulta:
+    """Lazy firm Clave Única session + ``consulta_by_rol`` for the Sysgal incorporation.
+
+    Same acquisition as scripts/consulta_sync.py (firm credentials, no captcha, never a lawyer's
+    Mis-causas session). Nothing is opened until the first ``fetch``; the session is not stored.
+    """
+
+    def __init__(self, credentials):
+        self._credentials = credentials  # (rut, password)
+        self._scraper = None
+        self._session = None
+
+    async def _login(self):
+        from app.scrapper.pjud.civil import CivilScraper
+        from app.scrapper.pjud.clave_unica import ClaveUnicaAuth, ClaveUnicaCredentials
+
+        if self._scraper is None:
+            self._scraper = CivilScraper(headless=True)
+            self._scraper.reuse_context = True
+        sc = self._scraper
+        if not sc._browser:
+            await sc.start()
+        ctx = await sc._browser.new_context(viewport={"width": 1280, "height": 800})
+        try:
+            page = await ctx.new_page()
+            rut, password = self._credentials
+            self._session = await ClaveUnicaAuth().login(
+                page, ClaveUnicaCredentials(rut=rut, password=password), 0
+            )
+        finally:
+            await ctx.close()
+        sc._page = None
+
+    async def fetch(self, rol: str, corte: int):
+        from app.scrapper.pjud.exceptions import ConsultaSessionExpired
+
+        if self._session is None:
+            await self._login()
+        try:
+            return await self._scraper.consulta_by_rol(self._session, rol, str(corte))
+        except ConsultaSessionExpired:
+            await self._login()  # one re-login, as sync_via_consulta does
+            return await self._scraper.consulta_by_rol(self._session, rol, str(corte))
+
+    async def aclose(self) -> None:
+        if self._scraper is not None:
+            try:
+                await self._scraper.stop()
+            except Exception:
+                logger.warning("Sysgal incorporacion: browser close failed (non-fatal)")
+
+
+def _open_firm_consulta(db: Session) -> Optional[_FirmConsulta]:
+    """Firm CU credentials: CU_RUT/CU_PASSWORD env (as the scripts) or the firm lawyer's stored CU."""
+    import os
+
+    rut, password = os.environ.get("CU_RUT", ""), os.environ.get("CU_PASSWORD", "")
+    if not (rut and password):
+        from app.api.deps import firm_lawyer_id
+
+        firm = db.get(Lawyer, firm_lawyer_id(db))
+        if firm is None or not firm.encrypted_clave_unica_password:
+            logger.warning("Sysgal incorporacion: no firm Clave Unica credentials available")
+            return None
+        rut = str(firm.clave_unica_rut or firm.rut)
+        password = decrypt_pjud_password(str(firm.encrypted_clave_unica_password))
+    return _FirmConsulta((rut, password))
+
+
+async def _maybe_run_sysgal_incorporacion(db: Session) -> None:
+    """Consume the Sysgal incorporation queue between lawyer units (SAFE-FAIL, egress-guarded).
+
+    OFF unless ``sysgal_incorporacion_por_dia`` > 0 in the DB; the run itself checks pace and the
+    brake before any PJUD request, and opens the firm session lazily on the first one.
+    """
+    firm = None
+    try:
+        from app.services import app_settings
+
+        if app_settings.get_ritmo(db)["por_dia"] <= 0:
+            return  # OFF (default): no egress lookup, no PJUD, nothing
+        allowed, ip, reason = await asyncio.to_thread(egress_allowed)
+        if not allowed:
+            logger.warning("Sysgal incorporacion skipped: egress %s (ip=%s)", reason, ip or "desconocida")
+            return
+        from app.services.sysgal_incorporacion_pjud import run_incorporacion
+
+        firm = _open_firm_consulta(db)
+        if firm is None:
+            return
+        await run_incorporacion(db, firm.fetch)
+    except Exception:
+        db.rollback()
+        logger.exception("Sysgal incorporacion failed (non-fatal)")
+    finally:
+        if firm is not None:
+            await firm.aclose()
+
+
 # Max age before considering data stale (in hours)
 MAX_DATA_AGE_HOURS = settings.MAX_DATA_AGE_HOURS
 
@@ -1268,6 +1367,8 @@ async def _run_sync_cycle(timer: CycleTimer):
                 )
                 results["failed"] += 1
             finally:
+                # Sysgal incorporation: after the unit's batch ended, never inside it.
+                await _maybe_run_sysgal_incorporacion(work_db)
                 work_db.close()
 
             if len(consecutive_rejections) >= reject_trip:

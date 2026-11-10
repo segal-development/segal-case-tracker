@@ -9,7 +9,7 @@ from collections import Counter, defaultdict
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, require_admin
@@ -17,13 +17,20 @@ from app.models.lawyer import Lawyer
 from app.models.sysgal_causa import SysgalCausa
 from app.models.sysgal_incorporacion import SysgalIncorporacion
 from app.models.sysgal_usuario import SysgalUsuario
+from app.services import app_settings
 from app.services.lawyer_roster import resolved_owner_by_case
 from app.services.sysgal_causas import sysgal_owner_by_case
 from app.services.sysgal_incorporacion import rol_year
+from app.services.sysgal_incorporacion_pjud import CHILE, _day_code
 
 router = APIRouter()
 
 EXAMPLES_LIMIT = 20
+
+
+class RitmoRequest(BaseModel):
+    por_dia: Optional[int] = Field(default=None, ge=0)
+    por_hora: Optional[int] = Field(default=None, ge=0)
 
 
 class UsuarioMappingRequest(BaseModel):
@@ -199,3 +206,30 @@ async def sysgal_incorporaciones_resumen(
         "por_abogado": dict(por_abogado),
         "primeras_pendientes": primeras,
     }
+
+
+def _ritmo_payload(db: Session) -> dict:
+    from datetime import datetime
+
+    braked = app_settings.get_int(db, app_settings.KEY_FRENO_DIA, 0) == _day_code(datetime.now(CHILE))
+    return {**app_settings.get_ritmo(db), "frenada_hoy": braked}
+
+
+@router.get("/incorporaciones/ritmo")
+async def get_incorporaciones_ritmo(
+    _admin: str = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Pace of the Sysgal incorporation (por_dia = 0 means OFF) and whether it is braked today."""
+    return _ritmo_payload(db)
+
+
+@router.put("/incorporaciones/ritmo")
+async def set_incorporaciones_ritmo(
+    body: RitmoRequest,
+    _admin: str = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    app_settings.set_ritmo(db, por_dia=body.por_dia, por_hora=body.por_hora)
+    db.commit()
+    return _ritmo_payload(db)
