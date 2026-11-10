@@ -11,15 +11,18 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy import and_, func
+from sqlalchemy.orm import Session, aliased
 
+from app.models.case import Case
 from app.models.sysgal_causa import SysgalCausa
 from app.models.sysgal_usuario import SysgalUsuario
 from app.services.sysgal_client import SysgalClient
 from app.services.sysgal_matching import AMBIGUA, CALZADA, match_causa, normalize_rol
 
 logger = logging.getLogger(__name__)
+
+ACTIVA = "activa"  # SysgalCausa.estado that may decide an owner (compared lowercase/trimmed)
 
 _CAUSA_FIELDS = (
     "rol", "tribunal", "tribunal_codigo", "rut_cliente", "abogado_sysgal_id", "abogado_nombre",
@@ -86,20 +89,29 @@ def sync_sysgal_causas(db: Session, client: SysgalClient, full: bool = False) ->
 
 
 def sysgal_owner_by_case(db: Session) -> dict[int, int]:
-    """``{case_id: lawyer_id}`` for matched, non-eliminada causas whose responsible is mapped.
+    """``{case_id: lawyer_id}`` for matched, active, non-eliminada causas whose responsible is mapped.
 
+    Only causas with ``estado = 'activa'`` count: a terminated Sysgal causa never decides an owner.
+    The lawyer also applies to the SIBLING cuadernos of a matched case (our cases with the same
+    ``rol`` and ``court_id``), unless a sibling has its own matched causa, which keeps its own owner.
     If several causas point at one case, the most recently updated wins (ties: highest
-    ``sysgal_id``), so the result is deterministic. Pure read; nothing consumes it yet.
+    ``sysgal_id``), so the result is deterministic. Pure read; one query.
     """
+    matched, sibling = aliased(Case), aliased(Case)
     rows = (
-        db.query(SysgalCausa.case_id, SysgalUsuario.lawyer_id)
+        db.query(SysgalCausa.case_id, sibling.id, SysgalUsuario.lawyer_id)
         .join(SysgalUsuario, SysgalUsuario.sysgal_id == SysgalCausa.abogado_sysgal_id)
+        .join(matched, matched.id == SysgalCausa.case_id)
+        .join(sibling, and_(sibling.rol == matched.rol, sibling.court_id == matched.court_id))
         .filter(
             SysgalCausa.case_id.isnot(None),
             SysgalCausa.eliminada.is_(False),
+            func.lower(func.trim(SysgalCausa.estado)) == ACTIVA,
             SysgalUsuario.lawyer_id.isnot(None),
         )
         .order_by(func.coalesce(SysgalCausa.sysgal_updated_at, datetime.min), SysgalCausa.sysgal_id)
         .all()
     )
-    return {case_id: lawyer_id for case_id, lawyer_id in rows}  # later rows overwrite earlier
+    direct = {case_id: lawyer_id for case_id, _sibling_id, lawyer_id in rows}  # later rows overwrite earlier
+    inherited = {sibling_id: lawyer_id for _case_id, sibling_id, lawyer_id in rows}
+    return {**inherited, **direct}

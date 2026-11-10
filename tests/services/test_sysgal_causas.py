@@ -139,7 +139,8 @@ class TestOwnerByCase:
         case = _case(db, lawyer, court)
         db.add(SysgalUsuario(sysgal_id=1, nombre="Ana", lawyer_id=lawyer.id if mapped else None))
         db.add(SysgalCausa(sysgal_id=10, rol="C-100-2026", rol_norm="C-100-2026", tribunal="T",
-                           abogado_sysgal_id=1, eliminada=eliminada, case_id=case.id, synced_at=datetime.utcnow()))
+                           abogado_sysgal_id=1, eliminada=eliminada, estado="activa", case_id=case.id,
+                           synced_at=datetime.utcnow()))
         db.commit()
         return case
 
@@ -169,9 +170,76 @@ class TestOwnerByCase:
         db.add(SysgalUsuario(sysgal_id=2, nombre="Beto", lawyer_id=other.id))
         db.query(SysgalCausa).update({"sysgal_updated_at": datetime(2026, 11, 1)})
         db.add(SysgalCausa(sysgal_id=11, rol="C-100-2026", rol_norm="C-100-2026", tribunal="T", abogado_sysgal_id=2,
-                           case_id=case.id, sysgal_updated_at=datetime(2026, 11, 2), synced_at=datetime.utcnow()))
+                           estado="activa", case_id=case.id, sysgal_updated_at=datetime(2026, 11, 2), synced_at=datetime.utcnow()))
         db.commit()
         assert sysgal_owner_by_case(db) == {case.id: other.id}
+
+    def test_terminated_causa_gives_no_owner(self, db, lawyer, court):
+        self._setup(db, lawyer, court)
+        db.query(SysgalCausa).update({"estado": "terminada"})
+        db.commit()
+        assert sysgal_owner_by_case(db) == {}
+
+    def test_terminated_causa_does_not_override_an_active_one(self, db, lawyer, court):
+        case = self._setup(db, lawyer, court)
+        other = Lawyer(rut="22222222-2", name="Other")
+        db.add(other)
+        db.flush()
+        db.add(SysgalUsuario(sysgal_id=2, nombre="Beto", lawyer_id=other.id))
+        db.query(SysgalCausa).update({"sysgal_updated_at": datetime(2026, 11, 1)})
+        db.add(SysgalCausa(sysgal_id=11, rol="C-100-2026", rol_norm="C-100-2026", tribunal="T", abogado_sysgal_id=2,
+                           estado="terminada", case_id=case.id, sysgal_updated_at=datetime(2026, 11, 2),
+                           synced_at=datetime.utcnow()))
+        db.commit()
+        assert sysgal_owner_by_case(db) == {case.id: lawyer.id}
+
+    def test_owner_propagates_to_sibling_cuadernos_of_the_same_rol_and_court(self, db, lawyer, court):
+        case = self._setup(db, lawyer, court)
+        sibling = _case(db, lawyer, court, procedure="Administración Concursal")
+        other_court = Court(code="B", name="Juzgado Dos", region="RM", type="civil")
+        other_rol_court = Court(code="C", name="Juzgado Tres", region="RM", type="civil")
+        db.add_all([other_court, other_rol_court])
+        db.flush()
+        elsewhere = _case(db, lawyer, other_court)
+        other_rol = _case(db, lawyer, court, rol="C-999-2026")
+        db.commit()
+
+        owners = sysgal_owner_by_case(db)
+
+        assert owners == {case.id: lawyer.id, sibling.id: lawyer.id}
+        assert elsewhere.id not in owners and other_rol.id not in owners
+
+    def test_sibling_with_its_own_sysgal_match_keeps_its_own_owner(self, db, lawyer, court):
+        case = self._setup(db, lawyer, court)
+        sibling = _case(db, lawyer, court, procedure="Administración Concursal")
+        other = Lawyer(rut="22222222-2", name="Other")
+        db.add(other)
+        db.flush()
+        db.add(SysgalUsuario(sysgal_id=2, nombre="Beto", lawyer_id=other.id))
+        db.add(SysgalCausa(sysgal_id=11, rol="C-100-2026", rol_norm="C-100-2026", tribunal="T", abogado_sysgal_id=2,
+                           estado="activa", case_id=sibling.id, synced_at=datetime.utcnow()))
+        db.commit()
+
+        assert sysgal_owner_by_case(db) == {case.id: lawyer.id, sibling.id: other.id}
+
+    def test_sibling_propagation_does_not_scale_with_cases(self, db, lawyer, court):
+        from sqlalchemy import event
+
+        case = self._setup(db, lawyer, court)
+        for i in range(5):
+            _case(db, lawyer, court, procedure=f"Inc {i}")
+        db.commit()
+        count = []
+        engine = db.get_bind()
+        listener = lambda *a, **k: count.append(1)  # noqa: E731
+        event.listen(engine, "before_cursor_execute", listener)
+        try:
+            owners = sysgal_owner_by_case(db)
+        finally:
+            event.remove(engine, "before_cursor_execute", listener)
+
+        assert len(owners) == 6 and case.id in owners
+        assert len(count) <= 2
 
 
 def test_columns_fit_the_real_sysgal_data():
