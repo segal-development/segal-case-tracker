@@ -11,7 +11,7 @@ from sqlalchemy import event, inspect as sa_inspect
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.models.case import Case
+from app.models.case import EFFECTIVE_LAWYER_ID, Case
 from app.models.case_litigante import CaseLitigante
 from app.models.court import Court
 from app.models.lawyer import Lawyer
@@ -890,6 +890,15 @@ def case_ids_for_abogado(db: Session, account_rut: str, abogado_rut: str) -> set
             for lit in litigantes
         )
     }
+    # Cases incorporated from Sysgal while the patrocinio is not accredited in PJUD have no firm
+    # abogado litigante; their only link to the lawyer is the (effective) owner.
+    result |= {
+        case_id
+        for (case_id,) in db.query(Case.id)
+        .join(Lawyer, Lawyer.id == EFFECTIVE_LAWYER_ID)
+        .filter(Case.patrocinio_pendiente.is_(True), Lawyer.rut == abogado_rut)
+        .all()
+    }
     if use_cache:
         _scope_cache_put(key, frozenset(result))
     return result
@@ -947,21 +956,21 @@ def resolve_case_alert_recipients(db: Session, case: Case) -> list[Lawyer]:
         )
         .all()
     )
-    if not litigantes:
-        return []
-
     ruts = {normalize_rut(lit.rut) for lit in litigantes if lit.rut}
-    if not ruts:
-        return []
 
-    lawyers = db.query(Lawyer).filter(Lawyer.rut.in_(ruts)).all()
     seen: set = set()
     result: list[Lawyer] = []
-    for lawyer in lawyers:
+    for lawyer in db.query(Lawyer).filter(Lawyer.rut.in_(ruts)).all() if ruts else []:
         if lawyer.id in seen:
             continue
         seen.add(lawyer.id)
         result.append(lawyer)
+    if not result and case.patrocinio_pendiente:
+        # Incorporated from Sysgal, patrocinio not accredited yet: no firm abogado litigante
+        # exists, so the alert goes to the lawyer the case was incorporated under.
+        owner = db.get(Lawyer, case.lawyer_id)
+        if owner is not None and owner.is_active:
+            return [owner]
     return result
 
 

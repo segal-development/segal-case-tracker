@@ -1169,8 +1169,14 @@ class SyncService:
         *,
         budget: Optional[NotifyBudget] = None,
         notification_svc: Optional[NotificationService] = None,
+        silent: bool = False,
     ) -> Tuple[int, int]:
         """Sync movements for a case, detecting new ones.
+
+        ``silent=True`` stores the movements but creates no Alert and sends no
+        notification: used for the INITIAL load of a case whose historic
+        movements must not alert (Sysgal incorporation). Later syncs use the
+        default and alert as usual.
 
         Args:
             case_id: Database case ID.
@@ -1212,8 +1218,8 @@ class SyncService:
         # round-trips).
         from app.services.lawyer_roster import resolve_case_alert_recipients
 
-        recipients = resolve_case_alert_recipients(self.db, case)
-        if not recipients:
+        recipients = [] if silent else resolve_case_alert_recipients(self.db, case)
+        if not recipients and not silent:
             # Business-purpose fallback (who gets notified), so it follows the
             # asignación-por-nivel override — unlike existing_by_rol above,
             # which must stay on lawyer_id.

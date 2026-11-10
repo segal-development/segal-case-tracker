@@ -23,6 +23,8 @@ class SysgalIncorporacion(Base):
     intentos = Column(Integer, nullable=False, default=0, server_default=text("0"))
     ultimo_error = Column(String(255), nullable=True)
     proximo_intento_at = Column(DateTime, nullable=True)
+    # UTC time of the last PJUD attempt; the pace quota is counted from it (no in-memory counters).
+    ultimo_intento_at = Column(DateTime, nullable=True, index=True)
     corte = Column(Integer, nullable=True)
     court_id = Column(Integer, ForeignKey("courts.id"), nullable=True)
     case_id = Column(Integer, ForeignKey("cases.id", ondelete="SET NULL"), nullable=True, index=True)
