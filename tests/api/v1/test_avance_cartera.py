@@ -186,7 +186,10 @@ class TestSnapshots:
         assert body["taken_by"] == admin_row.id
         assert body["payload"]["cobertura"] == 41.66
         assert fake.stats_calls == [(date(2026, 10, 1), date(2026, 10, 31))]
-        assert client.get(f"{BASE}/snapshots/2026-10", headers=admin).json() == body
+        got = client.get(f"{BASE}/snapshots/2026-10", headers=admin).json()
+        for row in got["payload"]["por_abogado"]:
+            row.pop("en_cartera"), row.pop("lawyer_id")
+        assert got == body
 
     def test_post_current_month_refused(self, client, admin, db, fake):
         today = date.today()
@@ -210,3 +213,78 @@ class TestSnapshots:
             app.dependency_overrides.pop(api.get_sysgal_client, None)
         assert r.status_code == 502 and r.json()["detail"] == DOWN
         assert db.query(AvanceCarteraSnapshot).count() == 0
+
+
+class TestEnCartera:
+    """en_cartera = mapped lawyer AND is_active AND role != admin (any nivel or none)."""
+
+    ROWS = [
+        {"abogado_id": 901, "nombre": "Sin abogado", "total": 1, "gestionadas": 0, "cobertura": 0},
+        {"abogado_id": 902, "nombre": "Junior", "total": 1, "gestionadas": 1, "cobertura": 100},
+        {"abogado_id": 903, "nombre": "Pleno", "total": 1, "gestionadas": 1, "cobertura": 100},
+        {"abogado_id": 904, "nombre": "Inactivo", "total": 1, "gestionadas": 1, "cobertura": 100},
+        {"abogado_id": 905, "nombre": "Admin", "total": 1, "gestionadas": 1, "cobertura": 100},
+        {"abogado_id": 906, "nombre": "Senior", "total": 1, "gestionadas": 1, "cobertura": 100},
+        {"abogado_id": 907, "nombre": "Sin nivel", "total": 1, "gestionadas": 1, "cobertura": 100},
+        {"abogado_id": 908, "nombre": "Inactivo con nivel", "total": 1, "gestionadas": 1, "cobertura": 100},
+    ]
+    EXPECTED = {901: False, 902: True, 903: True, 904: False, 905: False, 906: True, 907: True, 908: False}
+
+    @pytest.fixture
+    def mapped(self, db, people):
+        specs = [
+            (902, "90000001-1", "junior", True, "lawyer"),
+            (903, "90000002-2", "pleno", True, "lawyer"),
+            (904, "90000003-3", None, False, "lawyer"),
+            (905, "90000004-4", None, True, "admin"),
+            (906, "90000005-5", "senior", True, "lawyer"),
+            (907, "90000006-6", None, True, "lawyer"),
+            (908, "90000007-7", "junior", False, "lawyer"),
+        ]
+        for sid, rut, nivel, active, role in specs:
+            lw = Lawyer(rut=rut, name=f"L{sid}", role=role, nivel=nivel, is_active=active)
+            db.add(lw)
+            db.flush()
+            db.add(SysgalUsuario(sysgal_id=sid, nombre=f"L{sid}", lawyer_id=lw.id, synced_at=datetime.utcnow()))
+        db.commit()
+
+    @staticmethod
+    def _stats(rows):
+        return {"desde": "2026-11-01", "hasta": "2026-11-10", "cobertura": 1.0, "por_matriz": [],
+                "por_abogado": [dict(r) for r in rows]}
+
+    def test_estadisticas_en_cartera_per_case(self, client, admin, mapped):
+        fc = FakeClient(stats=self._stats(self.ROWS))
+        app.dependency_overrides[api.get_sysgal_client] = lambda: fc
+        try:
+            r = client.get(f"{BASE}/estadisticas?desde=2026-11-01&hasta=2026-11-10", headers=admin)
+        finally:
+            app.dependency_overrides.pop(api.get_sysgal_client, None)
+        assert r.status_code == 200
+        rows = r.json()["por_abogado"]
+        assert {a["abogado_id"]: a["en_cartera"] for a in rows} == self.EXPECTED
+        assert all(isinstance(a["en_cartera"], bool) and "en_bono" not in a for a in rows)
+
+    def test_cartera_lawyer_ids_one_query(self, db, mapped):
+        from sqlalchemy import event
+        from app.services import avance_cartera as svc
+
+        stmts = []
+        event.listen(db.get_bind(), "before_cursor_execute", lambda *a: stmts.append(a[2]))
+        ids = svc.cartera_lawyer_ids(db)
+        assert len(stmts) == 1
+        names = {x.name for x in db.query(Lawyer).filter(Lawyer.id.in_(ids))}
+        assert names == {"Lawyer", "L902", "L903", "L906", "L907"}  # "Lawyer" = mapped fixture user
+
+    def test_snapshot_get_enriched_stored_payload_verbatim(self, client, admin, mapped, db):
+        payload = self._stats(self.ROWS)
+        db.add(AvanceCarteraSnapshot(periodo="2026-10", desde=date(2026, 10, 1), hasta=date(2026, 10, 31),
+                                     taken_at=datetime.utcnow(), payload=payload))
+        db.commit()
+        r = client.get(f"{BASE}/snapshots/2026-10", headers=admin)
+        assert r.status_code == 200
+        assert {a["abogado_id"]: a["en_cartera"] for a in r.json()["payload"]["por_abogado"]} == self.EXPECTED
+        db.expire_all()
+        stored = db.query(AvanceCarteraSnapshot).filter_by(periodo="2026-10").one().payload
+        assert stored == self._stats(self.ROWS)
+        assert all("en_cartera" not in a for a in stored["por_abogado"])
