@@ -285,11 +285,14 @@ class SysgalClient:
     def estadisticas_cartera(self, desde: date, hasta: date) -> dict:
         """``GET /api_sync/estadisticas_cartera``: Sysgal's cartera/effectiveness stats as received.
 
-        Never recomputed here; the dict is returned (and snapshotted) exactly as Sysgal sent it.
+        Never recomputed here; the stats dict is returned (and snapshotted) exactly as Sysgal sent
+        it. Production wraps it as ``{"success": true, "data": {...}}``; the bare form is accepted too.
         """
         body = self._get_json(
             _ESTADISTICAS_CARTERA_PATH, {"desde": desde.isoformat(), "hasta": hasta.isoformat()}
         )
+        if isinstance(body, dict) and isinstance(body.get("data"), dict):
+            body = body["data"]
         if not isinstance(body, dict) or not isinstance(body.get("por_abogado"), list):
             raise SysgalError("Sysgal estadisticas_cartera body has no 'por_abogado' list (HTTP 200)")
         return body

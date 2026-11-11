@@ -29,6 +29,12 @@ def _client(handler) -> SysgalClient:
 
 
 class TestEstadisticasCartera:
+    def test_real_envelope_success_data_is_unwrapped(self):
+        # Production (2026-11-11) answers {"success": true, "data": {...stats...}}.
+        handler = lambda r: httpx.Response(200, json={"success": True, "data": STATS})  # noqa: E731
+
+        assert _client(handler).estadisticas_cartera(date(2026, 11, 1), date(2026, 11, 10)) == STATS
+
     def test_sends_path_key_and_dates_and_returns_payload_as_received(self):
         seen = {}
 
