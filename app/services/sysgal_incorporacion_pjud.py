@@ -19,6 +19,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models.case import Case
+from app.models.case_litigante import CaseLitigante
 from app.models.sysgal_causa import SysgalCausa
 from app.models.sysgal_incorporacion import SysgalIncorporacion
 from app.models.sysgal_usuario import SysgalUsuario
@@ -133,7 +134,7 @@ def _persist_found(db: Session, q: SysgalIncorporacion, causa: SysgalCausa, lawy
     in the same transaction as the movements; a failure before that point rolls everything back.
     """
     svc = SyncService(db)
-    plaintiff, defendant = svc._parse_caratulado(detail.case.caratulado)
+    plaintiff, defendant = _parties(svc, detail.case.caratulado, detail.litigantes)
     now = datetime.utcnow()
     case = Case(
         lawyer_id=lawyer_id,
@@ -334,4 +335,48 @@ async def run_incorporacion(
             stats["fallos"] += 1
 
     logger.info("Sysgal incorporacion run: %s", stats)
+    return stats
+
+
+def _first_by_role(litigantes, role: str) -> Optional[str]:
+    """Name of the first litigante whose role code (``DTE.``/``DDO.``) matches, if any."""
+    for lit in litigantes:
+        if (lit.participante or "").strip().upper().rstrip(".") == role and (lit.nombre or "").strip():
+            return lit.nombre.strip()
+    return None
+
+
+def _parties(svc: SyncService, caratulado: str, litigantes) -> tuple[str, str]:
+    """Plaintiff/defendant from the litigantes (complete names); the caratulado split only fills a
+    side the litigantes do not provide (consulta-by-ROL caratulados can come truncated)."""
+    plaintiff, defendant = svc._parse_caratulado(caratulado)
+    return _first_by_role(litigantes, "DTE") or plaintiff, _first_by_role(litigantes, "DDO") or defendant
+
+
+def _is_strict_prefix(short: Optional[str], full: Optional[str]) -> bool:
+    short, full = (short or "").strip().casefold(), (full or "").strip().casefold()
+    return bool(short) and len(short) < len(full) and full.startswith(short)
+
+
+def reparar_caratulas(db: Session) -> dict:
+    """Idempotent repair of incorporated cases (patrocinio_pendiente) with an empty defendant or a
+    plaintiff that is a strict prefix of the stored DTE litigante. Uses only litigantes already in
+    our DB (no PJUD request); cases without something better are left untouched."""
+    stats = {"revisadas": 0, "reparadas": 0, "sin_cambio": 0}
+    cases = db.query(Case).filter(Case.patrocinio_pendiente == True).all()  # noqa: E712
+    for case in cases:
+        stats["revisadas"] += 1
+        lits = db.query(CaseLitigante).filter(CaseLitigante.case_id == case.id).order_by(CaseLitigante.id).all()
+        changed = False
+        dte = _first_by_role(lits, "DTE")
+        ddo = _first_by_role(lits, "DDO")
+        if dte and _is_strict_prefix(case.plaintiff, dte):
+            case.plaintiff, changed = dte, True
+        if ddo and not (case.defendant or "").strip():
+            case.defendant, changed = ddo, True
+        if changed:
+            stats["reparadas"] += 1
+        else:
+            stats["sin_cambio"] += 1
+    db.commit()
     return stats
