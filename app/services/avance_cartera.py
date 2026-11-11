@@ -9,6 +9,7 @@ import logging
 from datetime import date, datetime
 from typing import Optional
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models.avance_cartera import AvanceCarteraSnapshot
@@ -61,14 +62,27 @@ def take_snapshot(
 
     payload = client.estadisticas_cartera(desde, hasta)
 
+    taken_at = datetime.utcnow()
     snap = get_snapshot(db, periodo)
     if snap is None:
-        snap = AvanceCarteraSnapshot(periodo=periodo, desde=desde, hasta=hasta)
-        db.add(snap)
-    snap.payload = payload
-    snap.taken_at = datetime.utcnow()
-    snap.taken_by = taken_by
-    db.commit()
+        db.add(
+            AvanceCarteraSnapshot(
+                periodo=periodo, desde=desde, hasta=hasta, payload=payload, taken_at=taken_at, taken_by=taken_by
+            )
+        )
+        try:
+            db.commit()
+        except IntegrityError:
+            # Raced the scheduler (or another POST): the row exists now, so update it instead.
+            db.rollback()
+            snap = get_snapshot(db, periodo)
+            if snap is None:
+                raise
+    if snap is not None:
+        snap.desde, snap.hasta = desde, hasta
+        snap.payload, snap.taken_at, snap.taken_by = payload, taken_at, taken_by
+        db.commit()
+    snap = get_snapshot(db, periodo)
     db.refresh(snap)
     return snap
 
@@ -98,9 +112,24 @@ def cobertura_by_lawyer(db: Session, periodo: str) -> Optional[dict[int, float]]
         .filter(SysgalUsuario.lawyer_id.isnot(None))
         .all()
     }
-    out: dict[int, float] = {}
+    rows_by_lawyer: dict[int, list[dict]] = {}
+    seen_abogados: set = set()
     for row in (snap.payload or {}).get("por_abogado", []):
-        lid = lawyer_by_sysgal.get(row.get("abogado_id"))
+        abogado_id = row.get("abogado_id")
+        if abogado_id in seen_abogados:
+            continue  # a repeated abogado_id row counts once
+        seen_abogados.add(abogado_id)
+        lid = lawyer_by_sysgal.get(abogado_id)
         if lid is not None:
-            out[lid] = float(row.get("cobertura") or 0)
+            rows_by_lawyer.setdefault(lid, []).append(row)
+
+    out: dict[int, float] = {}
+    for lid, rows in rows_by_lawyer.items():
+        if len(rows) == 1:
+            out[lid] = float(rows[0].get("cobertura") or 0)
+            continue
+        # Several Sysgal users mapped to one lawyer: combine from the counts, deterministically.
+        total = sum(int(r.get("total") or 0) for r in rows)
+        gestionadas = sum(int(r.get("gestionadas") or 0) for r in rows)
+        out[lid] = round(100 * gestionadas / total, 2) if total > 0 else 0.0
     return out

@@ -44,15 +44,32 @@ def test_before_01h_does_nothing():
     take.assert_not_called()
 
 
-def test_other_days_do_nothing():
-    take, _ = _run(datetime(2026, 11, 2, 3, 0))
+@pytest.mark.parametrize("day,hour", [(2, 0), (3, 3), (5, 23)])
+def test_days_2_to_5_catch_up_a_missed_day_one(day, hour):
+    take, _ = _run(datetime(2026, 11, day, hour, 0))
+    take.assert_called_once()
+    assert take.call_args.args[2].isoformat() == f"2026-11-0{day}"
+
+
+@pytest.mark.parametrize("day", [6, 15, 30])
+def test_after_day_5_does_nothing(day):
+    take, _ = _run(datetime(2026, 11, day, 3, 0))
     take.assert_not_called()
+
+
+def test_catch_up_runs_once_per_day_but_again_next_day_if_failed():
+    boom = MagicMock(side_effect=RuntimeError("down"))
+    _run(datetime(2026, 11, 2, 3, 0), boom)
+    take, _ = _run(datetime(2026, 11, 3, 3, 0))
+    take.assert_called_once()
 
 
 def test_disabled_flag_does_nothing(monkeypatch):
     monkeypatch.setattr(settings, "SYSGAL_CAUSAS_SYNC_ENABLED", False, raising=False)
-    take, _ = _run(datetime(2026, 11, 1, 3, 0))
+    with patch("app.services.sysgal_client.SysgalClient") as client_cls:
+        take, _ = _run(datetime(2026, 11, 1, 3, 0))
     take.assert_not_called()
+    client_cls.assert_not_called()
 
 
 def test_unconfigured_skips(monkeypatch):

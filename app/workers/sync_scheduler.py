@@ -291,7 +291,10 @@ _last_avance_snapshot_day: Optional[date] = None
 
 
 def _maybe_take_avance_snapshot(db: Session) -> None:
-    """On day 1 (Chile) after 01:00 freeze the previous month's Sysgal cartera stats, once.
+    """On day 1 (Chile, after 01:00) to day 5 freeze the previous month's Sysgal cartera stats.
+
+    Days 2-5 only catch up a missed day 1 (the service skips a month that is already there);
+    later days are left to the admin POST. At most one attempt per Chile day.
 
     Same gate as the causas sync (only the VM can reach Sysgal). Idempotent: the service skips
     a month that already has a snapshot or whose liquidación is closed. SAFE-FAIL: a failure is
@@ -302,7 +305,7 @@ def _maybe_take_avance_snapshot(db: Session) -> None:
         return
     now = _chile_now()
     today = now.date()
-    if today.day != 1 or now.hour < 1 or _last_avance_snapshot_day == today:
+    if not 1 <= today.day <= 5 or (today.day == 1 and now.hour < 1) or _last_avance_snapshot_day == today:
         return
     try:
         from app.services.avance_cartera import take_previous_month_if_missing

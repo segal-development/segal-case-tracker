@@ -107,3 +107,22 @@ def test_upsert_variables_row_uses_snapshot_too(client, db, setup):
     )
     assert r.status_code == 200
     assert r.json()["fuente_v3"] == "sysgal" and r.json()["v3_tramo_bruto"] == 80000
+
+
+def test_periodo_without_snapshot_equals_hand_computed_manual_path(client, db, setup):
+    """Pre-feature liquidación, by hand: junior fijo + V1 + V3 (weeks) - V4, no Sysgal involved."""
+    a, _b, _c = setup
+    var = db.query(BonoVariables).filter_by(lawyer_id=a.id, periodo="2026-09").one()
+    var.clientes_m2, var.clientes_activos = 100, 80  # 80% → $8.000 por cliente
+    var.cumpl_sem1, var.cumpl_sem2, var.cumpl_sem3 = 40.0, 30.0, 20.0  # 90% → tramo 100.000
+    var.reclamos_leve = 1  # -5% sobre V3
+    db.commit()
+    _snapshot(db, [(1, 0.0)])  # snapshot of ANOTHER month must not matter
+
+    ana = _rows(client, "2026-09")["Ana Junior"]
+
+    assert ana["fuente_v3"] == "manual"
+    v1 = 80 * 8000
+    v3 = round(100000 * 0.95)
+    assert (ana["v1_bruto"], ana["v3_tramo_bruto"], ana["v3_neta"]) == (v1, 100000, v3)
+    assert ana["total_bruto"] == 1_105_354 + v1 + v3

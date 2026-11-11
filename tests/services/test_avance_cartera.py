@@ -138,3 +138,75 @@ class TestCoberturaByLawyer:
         db.commit()
         svc.take_snapshot(db, FakeClient(_stats(abogados=((238, 91.5), (999, 10.0)))), "2026-10", today=TODAY)
         assert svc.cobertura_by_lawyer(db, "2026-10") == {lw.id: 91.5}
+
+
+class TestCoberturaDuplicates:
+    def _lawyer(self, db, *sysgal_ids):
+        lw = Lawyer(rut="1-9", name="L", role="lawyer", nivel="junior")
+        db.add(lw)
+        db.commit()
+        for sid in sysgal_ids:
+            db.add(SysgalUsuario(sysgal_id=sid, nombre=f"U{sid}", lawyer_id=lw.id, synced_at=datetime.utcnow()))
+        db.commit()
+        return lw
+
+    def _snap(self, db, rows):
+        db.add(AvanceCarteraSnapshot(
+            periodo="2026-10", desde=date(2026, 10, 1), hasta=date(2026, 10, 31),
+            payload={"por_abogado": rows},
+        ))
+        db.commit()
+
+    def test_two_sysgal_users_one_lawyer_combine_by_totals(self, db):
+        lw = self._lawyer(db, 1, 2)
+        self._snap(db, [
+            {"abogado_id": 1, "total": 10, "gestionadas": 10, "cobertura": 100},
+            {"abogado_id": 2, "total": 30, "gestionadas": 0, "cobertura": 0},
+        ])
+        assert svc.cobertura_by_lawyer(db, "2026-10") == {lw.id: 25.0}
+
+    def test_combined_is_rounded_to_two_decimals(self, db):
+        lw = self._lawyer(db, 1, 2)
+        self._snap(db, [
+            {"abogado_id": 1, "total": 1, "gestionadas": 1, "cobertura": 100},
+            {"abogado_id": 2, "total": 2, "gestionadas": 0, "cobertura": 0},
+        ])
+        assert svc.cobertura_by_lawyer(db, "2026-10") == {lw.id: 33.33}
+
+    def test_repeated_identical_abogado_row_counts_once(self, db):
+        lw = self._lawyer(db, 1)
+        row = {"abogado_id": 1, "total": 10, "gestionadas": 4, "cobertura": 40.0}
+        self._snap(db, [row, dict(row)])
+        assert svc.cobertura_by_lawyer(db, "2026-10") == {lw.id: 40.0}
+
+    def test_combined_zero_total_is_zero(self, db):
+        lw = self._lawyer(db, 1, 2)
+        self._snap(db, [
+            {"abogado_id": 1, "total": 0, "gestionadas": 0, "cobertura": 0},
+            {"abogado_id": 2, "total": 0, "gestionadas": 0, "cobertura": 0},
+        ])
+        assert svc.cobertura_by_lawyer(db, "2026-10") == {lw.id: 0.0}
+
+    def test_single_row_keeps_sysgal_cobertura_as_received(self, db):
+        lw = self._lawyer(db, 1)
+        self._snap(db, [{"abogado_id": 1, "total": 3, "gestionadas": 1, "cobertura": 33.3333}])
+        assert svc.cobertura_by_lawyer(db, "2026-10") == {lw.id: 33.3333}
+
+
+class TestRace:
+    def test_insert_race_updates_the_row_that_won(self, db, monkeypatch):
+        """The row appears between our lookup and our insert (the scheduler won): no error."""
+        svc.take_snapshot(db, FakeClient(_stats(abogados=((238, 10.0),))), "2026-10", today=TODAY)
+        real_get = svc.get_snapshot
+        calls = {"n": 0}
+
+        def stale_get(session, periodo):
+            calls["n"] += 1
+            return None if calls["n"] == 1 else real_get(session, periodo)
+
+        monkeypatch.setattr(svc, "get_snapshot", stale_get)
+        snap = svc.take_snapshot(db, FakeClient(_stats(abogados=((238, 77.0),))), "2026-10", today=TODAY)
+
+        assert db.query(AvanceCarteraSnapshot).count() == 1
+        assert snap.payload["por_abogado"][0]["cobertura"] == 77.0
+        assert real_get(db, "2026-10").payload["por_abogado"][0]["cobertura"] == 77.0
