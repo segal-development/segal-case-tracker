@@ -54,6 +54,12 @@ def _periodo_or_400(periodo: str) -> None:
         raise HTTPException(status_code=400, detail="periodo inválido (usa AAAA-MM)") from None
 
 
+def _with_en_cartera(db: Session, por_abogado: list) -> list:
+    """Copy of the rows with ``en_cartera`` added: mapped, active, non-admin lawyer."""
+    ids = svc.cartera_lawyer_ids(db)
+    return [{**row, "en_cartera": row.get("lawyer_id") in ids} for row in por_abogado]
+
+
 def _snapshot_out(snap) -> dict:
     return {
         "periodo": snap.periodo,
@@ -79,9 +85,9 @@ async def estadisticas(
     except SysgalError:
         raise _sysgal_down() from None
     lawyers = _lawyer_by_sysgal(db)
-    body["por_abogado"] = [
-        {**row, "lawyer_id": lawyers.get(row.get("abogado_id"))} for row in body["por_abogado"]
-    ]
+    body["por_abogado"] = _with_en_cartera(
+        db, [{**row, "lawyer_id": lawyers.get(row.get("abogado_id"))} for row in body["por_abogado"]]
+    )
     return body
 
 
@@ -128,7 +134,16 @@ async def get_snapshot(
     snap = svc.get_snapshot(db, periodo)
     if snap is None:
         raise HTTPException(status_code=404, detail="No hay foto de ese mes.")
-    return _snapshot_out(snap)
+    out = _snapshot_out(snap)
+    payload = out["payload"]
+    if isinstance(payload, dict) and isinstance(payload.get("por_abogado"), list):
+        lawyers = _lawyer_by_sysgal(db)
+        rows = [
+            {**row, "lawyer_id": row.get("lawyer_id", lawyers.get(row.get("abogado_id")))}
+            for row in payload["por_abogado"]
+        ]
+        out["payload"] = {**payload, "por_abogado": _with_en_cartera(db, rows)}
+    return out
 
 
 @router.post("/snapshots/{periodo}")

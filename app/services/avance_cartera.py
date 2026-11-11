@@ -13,6 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models.avance_cartera import AvanceCarteraSnapshot
+from app.models.lawyer import Lawyer
 from app.models.sysgal_usuario import SysgalUsuario
 from app.services import bono_cierre_service as cierre_svc
 
@@ -25,6 +26,20 @@ class PeriodoNoTerminado(Exception):
 
 class PeriodoCerrado(Exception):
     """The bono liquidación of that período is closed."""
+
+
+def cartera_lawyer_ids(db: Session) -> set[int]:
+    """Ids of the active, non-admin lawyers mapped to a Sysgal user (one query).
+
+    Criterion of ``en_cartera`` on the Avance de cartera screen; independent of the bono niveles.
+    """
+    rows = (
+        db.query(Lawyer.id)
+        .join(SysgalUsuario, SysgalUsuario.lawyer_id == Lawyer.id)
+        .filter(Lawyer.is_active.is_(True), Lawyer.role != "admin")
+        .all()
+    )
+    return {lid for (lid,) in rows}
 
 
 def periodo_bounds(periodo: str) -> tuple[date, date]:
