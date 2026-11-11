@@ -15,16 +15,19 @@ Every causa the firm takes in Sysgal must end up followed by our system automati
 - S13 (stage 2). The incorporated case must be VISIBLE to its lawyer and alert him: verify (with tests) that `resolve_case_scope`/`case_ids_for_abogado` include a case whose only link to the lawyer is `Case.lawyer_id` (no firm litigante in PJUD), and that `resolve_case_alert_recipients` falls back to that lawyer; if not, make the minimal change so they do, without changing behaviour for cases that have firm litigantes.
 - S14 (stage 2). Brake: if within one run there are 3 consecutive PJUD failures of the same kind (session expired/redirect to login, empty detail modal, HTTP error) or any login rejection, stop the incorporation for the rest of the Chile day, record why, and send ONE Telegram alert through the existing notifier ("Incorporación desde Sysgal detenida: <motivo>. Se reintenta mañana."). Never log credentials or page bodies.
 - S15 (stage 2). Strict TDD, tests first, RED seen; PJUD fully mocked (fake consulta_by_rol returning a parsed detail / None / raising). Cover: quota per day/hour from DB (0 = nothing), priority order, egress guard respected, found → case created with lawyer_id + patrocinio_pendiente + queue/link updated, existing rol+court → linked not duplicated, unmapped lawyer → error without case, not found → no_visible, retries/backoff/error after 3, brake after 3 consecutive failures + single Telegram, scope and alerts include the incorporated case, admin-only ritmo endpoints. Migration for `cases.patrocinio_pendiente` (+ settings table if needed): single head.
+- S16 (stage 2 fix). An incorporated case must carry the full plaintiff and defendant. Observed in prod 2026-11-11 (first 5 incorporations): C-4950-2026 and C-6219-2026 got plaintiff "BANCO DE CRÉDITO E INVERSI" and an EMPTY defendant, because the consulta-by-ROL caratulado comes truncated and `_persist_found` only splits `detail.case.caratulado`. Fix: take plaintiff/defendant from the detail's litigantes (DTE./DDO. or the equivalent roles the parser already exposes) when available, falling back to the caratulado split only when there are none; never store a truncated name when a complete one is available. Repair the already-incorporated cases with an empty defendant or a plaintiff that is a prefix of the litigante name, using data already stored in our DB (case litigantes) when present — no new PJUD request; if our DB has nothing better, leave them. Tests first (RED seen) with a fixture reproducing the truncated caratulado.
 - S8. Stage 2 (later PR): the station worker consumes the queue with the S2 pace and brake via `consulta_by_rol`, creates the Case (+ movements/documents through the existing ingest path), owner = Sysgal lawyer, flag `patrocinio_pendiente`. Stage 3: dedup/merge when the causa appears in Mis causas, clear the flag; UI badge. Not in stage 1.
 - S9. Out of scope for stage 1: any PJUD request, ownership switch, UI, e-mail.
 
 ## Tasks
 - T1 stage 1 (S4-S7) route: worker, branch feat/sysgal-incorporacion-cola. Commit: after parent review.
+- T4 S16 caratula from litigantes, route: worker, branch fix/incorporacion-caratula.
 - T2 stage 2 (S10-S15) route: worker, branch feat/sysgal-incorporacion-pjud.
 - T3 stage 3 (S8 dedup + UI) route: pending.
 
 ## Log
 L1. Marcelo, 2026-11-10: see S1.
 L2. Marcelo, 2026-11-10: "Que me recomendas?" → recommendation S2; "dale".
+L5. Marcelo, 2026-11-11: "Si dale" to keep the pace at 5/day and fix the truncated caratula before 100/day.
 L4. Marcelo, 2026-11-10: "SI dale" to stage 2 (start with the 428 causas of 2026, 100/day, automatic brake).
 L3. Eduardo Venegas via Marcelo, 2026-11-10: "le aparece en Sysgal como causa de el, en el PJUD le aparece pero al parecer hay que acreditar partocinio y poder".
