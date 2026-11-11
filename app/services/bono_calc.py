@@ -108,6 +108,7 @@ def compute(
     causas_asignadas: int = 0,
     causas_cumplidas: int = 0,
     cumpl_semanas: "list[float] | None" = None,
+    pct_cumpl_override: "float | None" = None,
     reclamos_leve: int = 0,
     reclamos_medio: int = 0,
     reclamos_grave: int = 0,
@@ -119,6 +120,8 @@ def compute(
     ``cumpl_semanas``: avance de cartera por semana en PUNTOS de % (ej. [7.5, 13, 20]);
     el % de cumplimiento del mes es su suma (65 → 0.65). Si no hay semanas cargadas,
     se cae al cociente legacy causas_cumplidas/causas_asignadas.
+    ``pct_cumpl_override`` (fracción, 0.915 = 91,5%): cuando viene (cobertura del snapshot de
+    Sysgal) reemplaza por completo a lo anterior, incluso si es 0. Tramos y montos no cambian.
     """
     nivel = PLENO if nivel == PLENO else JUNIOR  # anything not "pleno" is junior
 
@@ -129,7 +132,9 @@ def compute(
 
     # V3 — cumplimiento (suma de semanas si hay; si no, cociente legacy), minus V4.
     semanas_total = sum(cumpl_semanas) if cumpl_semanas else 0.0
-    if semanas_total > 0:
+    if pct_cumpl_override is not None:
+        pct_cumpl = pct_cumpl_override
+    elif semanas_total > 0:
         pct_cumpl = semanas_total / 100.0
     else:
         pct_cumpl = (causas_cumplidas / causas_asignadas) if causas_asignadas > 0 else 0.0

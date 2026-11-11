@@ -26,6 +26,7 @@ from app.models.hito import (
     Hito,
 )
 from app.models.lawyer import Lawyer
+from app.services import avance_cartera as avance_svc
 from app.services import bono_calc
 from app.services import bono_cierre_service as cierre_svc
 
@@ -117,6 +118,10 @@ class BonoRow(BaseModel):
     cumpl_sem5: float = 0.0
     cumpl_total: float = 0.0  # suma de semanas (= % cumplimiento del mes)
     meta_cumplimiento: float = 0.0  # meta del mes (referencia; no altera V3)
+    # V3 source: "sysgal" when the período has an avance-de-cartera snapshot, else "manual".
+    fuente_v3: str = "manual"
+    cobertura_v3: Optional[float] = None  # puntos de % used (sysgal only)
+    nota_v3: Optional[str] = None
     reclamos_leve: int
     reclamos_medio: int
     reclamos_grave: int
@@ -228,6 +233,7 @@ def _hitos_aprobados_map(db: Session, start: date, end: date) -> dict[int, int]:
 def _build_row(
     lawyer: Lawyer, var: Optional[BonoVariables], hitos_aprobados: int,
     renovaciones_auto: Optional[int] = None,
+    cobertura_map: Optional[dict[int, float]] = None,
 ) -> BonoRow:
     nivel = (var.nivel if var else None) or lawyer.nivel or bono_calc.JUNIOR
     # V2: renovaciones se cuentan automáticamente del módulo (renovaciones_auto);
@@ -247,8 +253,18 @@ def _build_row(
         float(getattr(var, f"cumpl_sem{i}", 0) or 0) if var else 0.0 for i in range(1, 6)
     ]
     cumpl_total = round(sum(semanas), 4)
+    # V3: with a Sysgal snapshot for the período, the lawyer's cobertura replaces the manual
+    # weeks (absent → 0 + note); without one, the manual sum stays as before.
+    fuente_v3, cobertura_v3, nota_v3, pct_override = "manual", None, None, None
+    if cobertura_map is not None:
+        fuente_v3 = "sysgal"
+        cobertura_v3 = cobertura_map.get(lawyer.id, 0.0)
+        pct_override = cobertura_v3 / 100.0
+        if lawyer.id not in cobertura_map:
+            nota_v3 = "Sin datos en Sysgal"
     b = bono_calc.compute(
-        nivel, hitos_aprobados=hitos_aprobados, cumpl_semanas=semanas, **inputs
+        nivel, hitos_aprobados=hitos_aprobados, cumpl_semanas=semanas,
+        pct_cumpl_override=pct_override, **inputs
     )
     return BonoRow(
         lawyer_id=lawyer.id,
@@ -264,6 +280,9 @@ def _build_row(
         cumpl_sem5=semanas[4],
         cumpl_total=cumpl_total,
         meta_cumplimiento=float(getattr(var, "meta_cumplimiento", 0) or 0) if var else 0.0,
+        fuente_v3=fuente_v3,
+        cobertura_v3=cobertura_v3,
+        nota_v3=nota_v3,
         fijo=b["fijo"],
         v1_pct_activacion=b["v1_pct_activacion"],
         v1_valor_cliente=b["v1_valor_cliente"],
@@ -702,8 +721,9 @@ def _liquidacion_data(db: Session, periodo: Optional[str]) -> LiquidacionRespons
         for v in db.query(BonoVariables).filter(BonoVariables.periodo == periodo).all()
     }
 
+    cobertura_map = avance_svc.cobertura_by_lawyer(db, periodo)
     rows = [
-        _build_row(lw, vars_map.get(lw.id), hitos_map.get(lw.id, 0), renov_map.get(lw.id, 0))
+        _build_row(lw, vars_map.get(lw.id), hitos_map.get(lw.id, 0), renov_map.get(lw.id, 0), cobertura_map)
         for lw in lawyers
     ]
     totales = BonoTotales(
@@ -846,7 +866,7 @@ async def upsert_variables(
     _p, start, end = _period_bounds(periodo)
     hitos = _hitos_aprobados_map(db, start, end).get(lawyer_id, 0)
     renov = _renovaciones_map(db, start, end).get(lawyer_id, 0)
-    return _build_row(lawyer, var, hitos, renov)
+    return _build_row(lawyer, var, hitos, renov, avance_svc.cobertura_by_lawyer(db, periodo))
 
 
 class ImportedRow(BaseModel):
