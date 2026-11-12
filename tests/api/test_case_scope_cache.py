@@ -266,6 +266,16 @@ def test_unrelated_case_update_keeps_cache(db, sandy, carla, court, clock, spy):
     assert spy["n"] == 1
 
 
+def test_patrocinio_pendiente_change_invalidates_cached_scope(db, sandy, carla, court, clock, spy):
+    # The flag puts an incorporated case in its owner's scope; clearing it must not be served stale.
+    case = _case(db, carla, court, "C-5015-2025", SANDY_RUT)
+    resolve_case_scope(db, {"sub": SANDY_RUT})
+    case.patrocinio_pendiente = True
+    db.commit()
+    resolve_case_scope(db, {"sub": SANDY_RUT})
+    assert spy["n"] == 2
+
+
 def test_rolled_back_change_is_not_served(db, sandy, carla, court, clock):
     case = _case(db, sandy, court, "C-5015-2025")
     assert resolve_case_scope(db, {"sub": SANDY_RUT}) == {case.id}

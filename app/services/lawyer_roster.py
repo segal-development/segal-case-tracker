@@ -67,7 +67,7 @@ def clear_case_scope_cache() -> None:
 # whole cache (at flush AND again after commit, so a request that recomputes
 # between flush and commit cannot leave a pre-commit value behind). Bulk
 # ``query.update()`` bypasses these events; the TTL bounds that staleness.
-_CASE_SCOPE_COLUMNS = ("lawyer_id", "assigned_lawyer_id", "competencia")
+_CASE_SCOPE_COLUMNS = ("lawyer_id", "assigned_lawyer_id", "competencia", "patrocinio_pendiente")
 _LAWYER_SCOPE_COLUMNS = ("rut", "role")
 
 

@@ -106,6 +106,7 @@ from app.models.movement import Movement
 from app.models.court import Court
 from app.models.alert import Alert
 from app.models.lawyer import Lawyer
+from app.utils.rut import normalize_rut
 from app.models.sync_history import SyncHistory
 from app.models.webhook import Webhook
 from app.models.case_deadline import CaseDeadline
@@ -840,6 +841,55 @@ def sync_case_detail(db: Session, case_id: int, detail: Any) -> dict:
     }
 
 
+def clear_patrocinio_if_firm_litigante(db: Session, case: Case) -> bool:
+    """Clear ``patrocinio_pendiente`` once a firm abogado litigante shows up (S17).
+
+    True when the flag was cleared. Flush-only; the caller owns the commit. A firm abogado is an
+    AB./AP. litigante whose RUT is an active internal ``Lawyer`` (same rule as the alert fan-out).
+    """
+    if not case.patrocinio_pendiente:
+        return False
+    from app.services.lawyer_roster import ALL_ABOGADO
+
+    ruts = {
+        normalize_rut(r)
+        for (r,) in db.query(CaseLitigante.rut)
+        .filter(CaseLitigante.case_id == case.id, CaseLitigante.participante.in_(list(ALL_ABOGADO)))
+        .all()
+        if r
+    }
+    if not ruts:
+        return False
+    firm = {normalize_rut(r) for (r,) in db.query(Lawyer.rut).filter(Lawyer.is_active.is_(True)).all() if r}
+    if not (ruts & firm):
+        return False
+    case.patrocinio_pendiente = False
+    db.flush()
+    return True
+
+
+def contar_duplicados_incorporadas(db: Session) -> list:
+    """Read-only prod check: ``[(pending_case_id, other_case_id)]`` pairs sharing one identity
+    (rol, court, Principal/empty cuaderno) where one side is ``patrocinio_pendiente``."""
+    principal = ("", "principal")
+    ident = func.lower(func.coalesce(Case.procedure, ""))
+    pending = (
+        db.query(Case.id, Case.rol, Case.court_id)
+        .filter(Case.patrocinio_pendiente.is_(True), ident.in_(principal))
+        .all()
+    )
+    pairs = []
+    for pid, rol, court_id in pending:
+        others = (
+            db.query(Case.id)
+            .filter(Case.rol == rol, Case.court_id == court_id, Case.id != pid, ident.in_(principal))
+            .order_by(Case.id)
+            .all()
+        )
+        pairs.extend((pid, oid) for (oid,) in others)
+    return sorted(pairs)
+
+
 class SyncService:
     """
     Synchronize scraped PJUD data with local database.
@@ -1392,7 +1442,16 @@ class SyncService:
                 by_identity.setdefault(
                     self._identity_key(c.rol, c.court_id, c.procedure), c
                 )
+                if c.patrocinio_pendiente and (c.procedure or "").lower() == "principal":
+                    # Incorporated from Sysgal ("Principal"); a listing row with an
+                    # empty cuaderno is the same causa (migration 072 treats NULL/''
+                    # as Principal in ``_existing_case``), never a second row.
+                    by_identity.setdefault(self._pending_alias_key(c.rol, c.court_id), c)
         return by_identity
+
+    @staticmethod
+    def _pending_alias_key(rol: str, court_id: int) -> tuple:
+        return ("__patrocinio_pendiente__", rol, court_id)
 
     def _identity_exists(self, scraped: ScrapedCase, existing_by_identity: dict) -> bool:
         """True when ``scraped`` already has a Case. Creates no court.
@@ -1447,6 +1506,8 @@ class SyncService:
         # Find existing case by identity (from the pre-loaded map).
         identity = self._identity_key(normalized_rol, court.id, scraped.cuaderno)
         existing = existing_by_identity.get(identity)
+        if existing is None and (scraped.cuaderno or "").strip().lower() in ("", "principal"):
+            existing = existing_by_identity.get(self._pending_alias_key(normalized_rol, court.id))
 
         # Parse caratulado into plaintiff/defendant
         plaintiff, defendant = self._parse_caratulado(scraped.caratulado)
@@ -1459,7 +1520,14 @@ class SyncService:
             row.plaintiff = plaintiff
             row.defendant = defendant
             row.status = self._map_status(scraped.estado_cuaderno)
-            row.procedure = scraped.cuaderno
+            if row.patrocinio_pendiente:
+                # The causa is now in the lawyer's Mis causas: the patrocinio is accredited
+                # (S17). Keep the stored identity (Principal) and follow the normal rules.
+                row.patrocinio_pendiente = False
+                if (scraped.cuaderno or "").strip().lower() not in ("", "principal"):
+                    row.procedure = scraped.cuaderno
+            else:
+                row.procedure = scraped.cuaderno
             row.competencia = competencia
             if filed_at:
                 row.filed_at = filed_at
@@ -3258,6 +3326,8 @@ async def detect_and_sync_movements(
                     notification_svc=notification_svc,
                     budget=shared_budget,
                 )
+                if spec is SPEC_LITIGANTE:
+                    clear_patrocinio_if_firm_litigante(db, db_case)
                 if spec is SPEC_ESCRITO:
                     escrito_rows = synced
 
@@ -3869,6 +3939,8 @@ async def sync_via_consulta(
                         case=case, lawyer=lawyer, webhooks=webhooks,
                         notification_svc=notification_svc, budget=shared_budget,
                     )
+                    if spec is SPEC_LITIGANTE:
+                        clear_patrocinio_if_firm_litigante(db, case)
                     if spec is SPEC_ESCRITO:
                         escrito_rows = synced
 
