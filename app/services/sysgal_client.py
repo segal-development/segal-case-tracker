@@ -37,9 +37,12 @@ _CAUSAS_PATH = "/api_sync/causas"
 _USUARIOS_PATH = "/api_sync/usuarios"
 _ESTADISTICAS_CARTERA_PATH = "/api_sync/estadisticas_cartera"
 _SIN_GESTION_PATH = "/api_sync/causas_sin_gestion"
+_ESCRITOS_ESTADISTICAS_PATH = "/api_sync/escritos_estadisticas"
+_ESCRITOS_PATH = "/api_sync/escritos"
 
 # Hard cap on ``limite`` for GET /api_sync/causas_sin_gestion.
 MAX_SIN_GESTION_PER_PAGE = 500
+MAX_ESCRITOS_PER_PAGE = 500
 
 
 class SysgalError(Exception):
@@ -316,6 +319,48 @@ class SysgalClient:
         body = self._get_json(_SIN_GESTION_PATH, params)
         if not isinstance(body, dict) or not isinstance(body.get("data"), list):
             raise SysgalError("Sysgal causas_sin_gestion body has no 'data' list (HTTP 200)")
+        return body
+
+    def escritos_estadisticas(self, desde: date, hasta: date) -> dict:
+        """``GET /api_sync/escritos_estadisticas``: escritos generated in GEDOC, as received.
+
+        Production wraps it as ``{"success": true, "data": {...}}``; the bare form is accepted too.
+        """
+        body = self._get_json(
+            _ESCRITOS_ESTADISTICAS_PATH, {"desde": desde.isoformat(), "hasta": hasta.isoformat()}
+        )
+        if isinstance(body, dict) and isinstance(body.get("data"), dict):
+            body = body["data"]
+        if (
+            not isinstance(body, dict)
+            or not isinstance(body.get("por_abogado"), list)
+            or not isinstance(body.get("por_tipo"), list)
+        ):
+            raise SysgalError("Sysgal escritos_estadisticas body has no 'por_abogado'/'por_tipo' lists (HTTP 200)")
+        return body
+
+    def escritos(
+        self,
+        desde: date,
+        hasta: date,
+        abogado_id: Optional[int] = None,
+        tipo_id: Optional[str] = None,
+        desde_id: Optional[int] = None,
+        limite: int = MAX_ESCRITOS_PER_PAGE,
+    ) -> dict:
+        """One page of ``GET /api_sync/escritos``, as received (``data`` + ``siguiente_desde_id``)."""
+        if not 1 <= limite <= MAX_ESCRITOS_PER_PAGE:
+            raise ValueError(f"limite must be between 1 and {MAX_ESCRITOS_PER_PAGE}, got {limite}")
+        params: dict = {"desde": desde.isoformat(), "hasta": hasta.isoformat(), "limite": limite}
+        if abogado_id is not None:
+            params["abogado_id"] = abogado_id
+        if tipo_id is not None:
+            params["tipo_id"] = tipo_id
+        if desde_id is not None:
+            params["desde_id"] = desde_id
+        body = self._get_json(_ESCRITOS_PATH, params)
+        if not isinstance(body, dict) or not isinstance(body.get("data"), list):
+            raise SysgalError("Sysgal escritos body has no 'data' list (HTTP 200)")
         return body
 
     def _get_json(self, path: str, params: dict) -> Any:
