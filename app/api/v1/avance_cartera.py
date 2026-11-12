@@ -157,6 +157,8 @@ async def take_snapshot(
     admin = db.query(Lawyer).filter(Lawyer.rut == admin_rut).first()
     try:
         snap = svc.take_snapshot(db, client, periodo, taken_by=admin.id if admin else None)
+    except svc.PeriodoSinFoto:
+        raise HTTPException(status_code=400, detail="Las fotos de Sysgal se toman desde noviembre de 2026.") from None
     except svc.PeriodoNoTerminado:
         raise HTTPException(status_code=400, detail="El mes aún no termina.") from None
     except svc.PeriodoCerrado:

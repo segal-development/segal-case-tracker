@@ -91,3 +91,34 @@ def test_failure_is_isolated_and_retried_next_run():
     db.rollback.assert_called()
     take, _ = _run(datetime(2026, 11, 1, 4, 0))
     take.assert_called_once()
+
+
+@pytest.mark.parametrize("now", [datetime(2026, 11, 1, 3, 0), datetime(2026, 11, 5, 3, 0), datetime(2026, 1, 2, 3, 0)])
+def test_never_takes_a_photo_of_a_month_before_2026_11(now):
+    """S11: days 1-5 of November 2026 would photograph October; the real service refuses it."""
+    client = MagicMock()
+    client.is_configured = True
+    db = MagicMock()
+    with patch("app.services.sysgal_client.SysgalClient", return_value=client), patch.object(
+        ss, "_chile_now", return_value=now
+    ), patch("app.services.avance_cartera.get_snapshot", return_value=None), patch(
+        "app.services.avance_cartera.cierre_svc.is_cerrado", return_value=False
+    ), patch("app.services.avance_cartera.take_snapshot") as take_snapshot:
+        ss._maybe_take_avance_snapshot(db)
+    client.estadisticas_cartera.assert_not_called()
+    take_snapshot.assert_not_called()
+    db.add.assert_not_called()
+    db.commit.assert_not_called()
+
+
+def test_takes_the_first_allowed_month_on_december_first():
+    client = MagicMock()
+    client.is_configured = True
+    with patch("app.services.sysgal_client.SysgalClient", return_value=client), patch.object(
+        ss, "_chile_now", return_value=datetime(2026, 12, 1, 3, 0)
+    ), patch("app.services.avance_cartera.get_snapshot", return_value=None), patch(
+        "app.services.avance_cartera.cierre_svc.is_cerrado", return_value=False
+    ), patch("app.services.avance_cartera.take_snapshot") as take_snapshot:
+        ss._maybe_take_avance_snapshot(MagicMock())
+    take_snapshot.assert_called_once()
+    assert take_snapshot.call_args.args[2] == "2026-11"

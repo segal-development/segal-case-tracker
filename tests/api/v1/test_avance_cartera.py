@@ -12,6 +12,7 @@ from app.models.bono_cierre import CIERRE_CERRADO, BonoCierre
 from app.models.lawyer import Lawyer
 from app.models.sysgal_causa import SysgalCausa
 from app.models.sysgal_usuario import SysgalUsuario
+from app.services import avance_cartera as svc
 from app.services.sysgal_client import SysgalError
 
 ADMIN_RUT, AUDITOR_RUT, LAWYER_RUT = "11111111-1", "33333333-3", "22222222-2"
@@ -169,6 +170,18 @@ class TestSinGestion:
         assert r.status_code == 502 and r.json()["detail"] == DOWN
 
 
+@pytest.fixture
+def after_nov(monkeypatch):
+    """Freeze the service clock after November 2026 ended (the real clock moves)."""
+
+    class _Date(date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 12, 10)
+
+    monkeypatch.setattr(svc, "date", _Date)
+
+
 class TestSnapshots:
     def test_get_404_when_missing(self, client, admin, fake):
         assert client.get(f"{BASE}/snapshots/2026-10", headers=admin).status_code == 404
@@ -176,17 +189,17 @@ class TestSnapshots:
     def test_get_invalid_periodo_400(self, client, admin, fake):
         assert client.get(f"{BASE}/snapshots/2026-13", headers=admin).status_code == 400
 
-    def test_post_then_get(self, client, admin, people, db, fake):
-        r = client.post(f"{BASE}/snapshots/2026-10", headers=admin)
+    def test_post_then_get(self, client, admin, people, db, fake, after_nov):
+        r = client.post(f"{BASE}/snapshots/2026-11", headers=admin)
         assert r.status_code == 200
         body = r.json()
         assert set(body) == {"periodo", "desde", "hasta", "taken_at", "taken_by", "payload"}
-        assert body["periodo"] == "2026-10" and body["desde"] == "2026-10-01" and body["hasta"] == "2026-10-31"
+        assert body["periodo"] == "2026-11" and body["desde"] == "2026-11-01" and body["hasta"] == "2026-11-30"
         admin_row = db.query(Lawyer).filter(Lawyer.rut == ADMIN_RUT).one()
         assert body["taken_by"] == admin_row.id
         assert body["payload"]["cobertura"] == 41.66
-        assert fake.stats_calls == [(date(2026, 10, 1), date(2026, 10, 31))]
-        got = client.get(f"{BASE}/snapshots/2026-10", headers=admin).json()
+        assert fake.stats_calls == [(date(2026, 11, 1), date(2026, 11, 30))]
+        got = client.get(f"{BASE}/snapshots/2026-11", headers=admin).json()
         for row in got["payload"]["por_abogado"]:
             row.pop("en_cartera"), row.pop("lawyer_id")
         assert got == body
@@ -197,22 +210,40 @@ class TestSnapshots:
         assert r.status_code == 400 and r.json()["detail"] == "El mes aún no termina."
         assert db.query(AvanceCarteraSnapshot).count() == 0
 
-    def test_post_closed_is_409(self, client, admin, db, fake):
-        db.add(BonoCierre(periodo="2026-10", estado=CIERRE_CERRADO))
+    def test_post_closed_is_409(self, client, admin, db, fake, after_nov):
+        db.add(BonoCierre(periodo="2026-11", estado=CIERRE_CERRADO))
         db.commit()
-        r = client.post(f"{BASE}/snapshots/2026-10", headers=admin)
+        r = client.post(f"{BASE}/snapshots/2026-11", headers=admin)
         assert r.status_code == 409 and r.json()["detail"] == "La liquidación de ese mes ya está cerrada."
         assert db.query(AvanceCarteraSnapshot).count() == 0
 
-    def test_post_sysgal_down_is_502(self, client, admin, db):
+    def test_post_sysgal_down_is_502(self, client, admin, db, after_nov):
         fc = FakeClient(error=SysgalError("HTTP 503"))
         app.dependency_overrides[api.get_sysgal_client] = lambda: fc
         try:
-            r = client.post(f"{BASE}/snapshots/2026-10", headers=admin)
+            r = client.post(f"{BASE}/snapshots/2026-11", headers=admin)
         finally:
             app.dependency_overrides.pop(api.get_sysgal_client, None)
         assert r.status_code == 502 and r.json()["detail"] == DOWN
         assert db.query(AvanceCarteraSnapshot).count() == 0
+
+
+class TestFotoDesde:
+    """S11: photos start with November 2026."""
+
+    MSG = "Las fotos de Sysgal se toman desde noviembre de 2026."
+
+    def test_post_before_november_is_400_nothing_stored_sysgal_not_called(self, client, admin, db, fake, after_nov):
+        r = client.post(f"{BASE}/snapshots/2026-10", headers=admin)
+        assert r.status_code == 400 and r.json()["detail"] == self.MSG
+        assert db.query(AvanceCarteraSnapshot).count() == 0
+        assert fake.stats_calls == []
+
+    def test_post_november_once_ended_is_allowed(self, client, admin, db, fake, after_nov):
+        r = client.post(f"{BASE}/snapshots/2026-11", headers=admin)
+        assert r.status_code == 200 and r.json()["periodo"] == "2026-11"
+        assert fake.stats_calls == [(date(2026, 11, 1), date(2026, 11, 30))]
+        assert db.query(AvanceCarteraSnapshot).count() == 1
 
 
 class TestEnCartera:
