@@ -19,9 +19,16 @@ from app.services import bono_cierre_service as cierre_svc
 
 logger = logging.getLogger(__name__)
 
+# First período with a Sysgal photo. Earlier months always use the manual weeks for the bono V3.
+FOTO_DESDE = "2026-11"
+
 
 class PeriodoNoTerminado(Exception):
     """The month has not ended yet."""
+
+
+class PeriodoSinFoto(Exception):
+    """The período is before ``FOTO_DESDE``: no Sysgal photo exists for it."""
 
 
 class PeriodoCerrado(Exception):
@@ -68,8 +75,10 @@ def take_snapshot(
     db: Session, client, periodo: str, *, today: Optional[date] = None, taken_by: Optional[int] = None
 ) -> AvanceCarteraSnapshot:
     """(Re)take the snapshot of a whole, already ended month. Raises ``ValueError``,
-    ``PeriodoNoTerminado``, ``PeriodoCerrado`` or ``SysgalError`` (nothing is written then)."""
+    ``PeriodoSinFoto``, ``PeriodoNoTerminado``, ``PeriodoCerrado`` or ``SysgalError`` (nothing is written then)."""
     desde, hasta = periodo_bounds(periodo)
+    if periodo < FOTO_DESDE:
+        raise PeriodoSinFoto(periodo)
     if (today or date.today()) <= hasta:
         raise PeriodoNoTerminado(periodo)
     if cierre_svc.is_cerrado(db, periodo):
@@ -103,8 +112,10 @@ def take_snapshot(
 
 
 def take_previous_month_if_missing(db: Session, client, today: date) -> str:
-    """Scheduler entry: snapshot of the previous month once. Returns ``taken|exists|closed``."""
+    """Scheduler entry: snapshot of the previous month once. Returns ``taken|exists|closed|before_start``."""
     periodo = previous_periodo(today)
+    if periodo < FOTO_DESDE:
+        return "before_start"
     if get_snapshot(db, periodo) is not None:
         return "exists"
     if cierre_svc.is_cerrado(db, periodo):
@@ -118,6 +129,8 @@ def cobertura_by_lawyer(db: Session, periodo: str) -> Optional[dict[int, float]]
 
     Only Sysgal abogados mapped to a lawyer appear; lawyers absent from it are the caller's 0.
     """
+    if periodo < FOTO_DESDE:
+        return None  # defense in depth: those months always use the manual weeks
     snap = get_snapshot(db, periodo)
     if snap is None:
         return None
