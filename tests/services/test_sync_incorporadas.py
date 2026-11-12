@@ -1,5 +1,8 @@
 """S17: a Mis-causas ingest of an incorporated causa updates the SAME case and clears the flag."""
 
+from datetime import datetime
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 
 from app.models.case import Case
@@ -7,6 +10,10 @@ from app.models.case_litigante import CaseLitigante
 from app.models.court import Court
 from app.models.lawyer import Lawyer
 from app.models.movement import Movement
+from app.models.sysgal_causa import SysgalCausa
+from app.models.sysgal_incorporacion import SysgalIncorporacion
+from app.api.deps import resolve_case_scope
+from app.services.lawyer_roster import case_ids_for_abogado
 from app.services.sync_service import (
     ScrapedCase,
     ScrapedMovement,
@@ -49,7 +56,7 @@ def _mov(folio="1"):
                            descripcion="Se provee", etapa="Ingreso")
 
 
-def test_mis_causas_ingest_updates_same_row_and_clears_flag(db, world):
+def test_mis_causas_ingest_updates_same_row_and_keeps_the_flag(db, world):
     _, eduardo, court = world
     case = _incorporada(db, eduardo, court)
     svc = SyncService(db)
@@ -62,7 +69,7 @@ def test_mis_causas_ingest_updates_same_row_and_clears_flag(db, world):
     assert [r.id for r in rows] == [case.id]
     assert (result.cases_new, result.cases_updated) == (0, 1)
     db.refresh(case)
-    assert case.patrocinio_pendiente is False
+    assert case.patrocinio_pendiente is True
     assert case.lawyer_id == eduardo.id
     assert db.query(Movement).filter_by(case_id=case.id).count() == 1
 
@@ -76,7 +83,7 @@ def test_mis_causas_ingest_matches_empty_cuaderno_variant_without_duplicate(db, 
     assert [r.id for r in db.query(Case).all()] == [case.id]
     assert (result.cases_new, result.cases_updated) == (0, 1)
     db.refresh(case)
-    assert case.patrocinio_pendiente is False
+    assert case.patrocinio_pendiente is True
     assert case.procedure == "Principal"
 
 
@@ -157,3 +164,97 @@ def test_contar_duplicados_incorporadas(db, world):
     assert pairs == [(pending.id, twin.id)]
     assert ok.id not in {i for p in pairs for i in p}
     assert db.query(Case).count() == before
+
+
+def _mark_incorporada(db, case, n=1):
+    causa = SysgalCausa(sysgal_id=n, rol=case.rol, rol_norm=case.rol, tribunal=COURT, case_id=case.id,
+                        synced_at=datetime.utcnow())
+    db.add(causa)
+    db.flush()
+    db.add(SysgalIncorporacion(sysgal_causa_id=causa.id, estado="incorporada", case_id=case.id))
+    db.commit()
+
+
+def test_two_empty_cuaderno_syncs_after_incorporation_keep_one_case(db, world):
+    _, eduardo, court = world
+    case = _incorporada(db, eduardo, court)
+    _mark_incorporada(db, case)
+
+    first = SyncService(db).sync_cases(eduardo.id, [_scraped(cuaderno="")], competencia="civil")
+    second = SyncService(db).sync_cases(eduardo.id, [_scraped(cuaderno="")], competencia="civil")
+
+    assert [r.id for r in db.query(Case).all()] == [case.id]
+    assert (first.cases_new, first.cases_updated) == (0, 1)
+    assert (second.cases_new, second.cases_updated) == (0, 1)
+    db.refresh(case)
+    assert (case.patrocinio_pendiente, case.procedure) == (True, "Principal")
+
+
+def test_never_incorporated_principal_with_empty_listing_row_is_unchanged_from_main(db, world):
+    firm, eduardo, court = world
+    regular = _incorporada(db, eduardo, court, pendiente=False)
+
+    result = SyncService(db).sync_cases(eduardo.id, [_scraped(cuaderno="")], competencia="civil")
+
+    # Main keeps '' and 'Principal' as two identities: a second row is created under the firm owner.
+    assert (result.cases_new, result.cases_updated) == (1, 0)
+    assert db.query(Case).count() == 2
+    db.refresh(regular)
+    assert (regular.procedure, regular.patrocinio_pendiente) == ("Principal", False)
+
+
+def test_year_floor_check_sees_incorporated_case_through_the_alias(db, world, monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "DETAIL_MIN_YEAR", 2026)
+    _, eduardo, court = world
+    case = _incorporada(db, eduardo, court, rol="C-1-2020")
+    _mark_incorporada(db, case)
+
+    result = SyncService(db).sync_cases(eduardo.id, [_scraped(rol="C-1-2020", cuaderno="")], competencia="civil")
+
+    assert result.cases_year_skipped == 0
+    assert (result.cases_new, result.cases_updated) == (0, 1)
+    assert db.query(Case).count() == 1
+
+
+@pytest.mark.asyncio
+async def test_detail_sync_with_firm_abogado_clears_flag_and_keeps_owner(db, world, monkeypatch):
+    import app.services.sync_service as mod
+    from app.scrapper.pjud.base import PJUDLitigante
+
+    _, eduardo, court = world
+    case = _incorporada(db, eduardo, court)
+    monkeypatch.setattr(mod, "egress_allowed_cached", lambda: (True, "1.2.3.4", "allowed"))
+    detail = MagicMock()
+    detail.case_documents, detail.movements = [], []
+    detail.notificaciones, detail.escritos, detail.exhortos = [], [], []
+    detail.litigantes = [PJUDLitigante(participante="AB.DTE", rut=ABOGADO_RUT, persona_type="NATURAL",
+                                       nombre="EDUARDO")]
+    detail.case = MagicMock()
+    scraper = MagicMock()
+    scraper.get_case_detail = AsyncMock(return_value=detail)
+    api_case = MagicMock()
+    api_case.rol, api_case.case_token = case.rol, "t"
+
+    await mod.detect_and_sync_movements(
+        db=db, scraper=scraper, pjud_session=MagicMock(), lawyer_id=eduardo.id,
+        api_cases=[api_case], selected_cases=[api_case], reauth_callback=AsyncMock(),
+    )
+
+    db.refresh(case)
+    assert case.patrocinio_pendiente is False
+    assert case.lawyer_id == eduardo.id
+    assert case.id in case_ids_for_abogado(db, ABOGADO_RUT, ABOGADO_RUT)
+
+
+def test_case_stays_in_owner_scope_after_mis_causas_match_with_no_litigantes_stored(db, world):
+    _, eduardo, court = world
+    case = _incorporada(db, eduardo, court)
+
+    SyncService(db).sync_cases(eduardo.id, [_scraped()], competencia="civil")
+    db.expire_all()
+
+    assert case.patrocinio_pendiente is True
+    assert case.id in case_ids_for_abogado(db, ABOGADO_RUT, ABOGADO_RUT)
+    assert case.id in resolve_case_scope(db, {"sub": ABOGADO_RUT})

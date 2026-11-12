@@ -1429,23 +1429,41 @@ class SyncService:
         One SELECT per 500 ROLs. Legacy duplicates of one identity (T5 merges
         them) resolve to the lowest id, deterministically.
         """
+        from app.models.sysgal_incorporacion import SysgalIncorporacion
+
         rol_list = sorted(set(rols))
         by_identity: dict = {}
         for start in range(0, len(rol_list), 500):
             batch = rol_list[start : start + 500]
-            for c in (
+            cases = (
                 self.db.query(Case)
                 .filter(Case.rol.in_(batch))
                 .order_by(Case.id)
                 .all()
-            ):
+            )
+            # Principal cases incorporated from Sysgal (still pending or already cleared): one
+            # query per batch, restricted to this batch's Principal case ids (no N+1).
+            principal_ids = [c.id for c in cases if (c.procedure or "").lower() == "principal"]
+            incorporated_ids = (
+                {
+                    cid
+                    for (cid,) in self.db.query(SysgalIncorporacion.case_id)
+                    .filter(SysgalIncorporacion.case_id.in_(principal_ids))
+                    .all()
+                }
+                if principal_ids
+                else set()
+            )
+            for c in cases:
                 by_identity.setdefault(
                     self._identity_key(c.rol, c.court_id, c.procedure), c
                 )
-                if c.patrocinio_pendiente and (c.procedure or "").lower() == "principal":
-                    # Incorporated from Sysgal ("Principal"); a listing row with an
-                    # empty cuaderno is the same causa (migration 072 treats NULL/''
-                    # as Principal in ``_existing_case``), never a second row.
+                if (c.procedure or "").lower() == "principal" and (
+                    c.patrocinio_pendiente or c.id in incorporated_ids
+                ):
+                    # Incorporated from Sysgal ("Principal"); a listing row with an empty
+                    # cuaderno is the same causa (migration 072 treats NULL/'' as Principal in
+                    # ``_existing_case``), never a second row, before or after the flag clears.
                     by_identity.setdefault(self._pending_alias_key(c.rol, c.court_id), c)
         return by_identity
 
@@ -1466,8 +1484,13 @@ class SyncService:
             if court is None:
                 return False
             self._court_cache[name] = court
-        key = self._identity_key(scraped.rol.strip().upper(), court.id, scraped.cuaderno)
-        return key in existing_by_identity
+        rol = scraped.rol.strip().upper()
+        key = self._identity_key(rol, court.id, scraped.cuaderno)
+        if key in existing_by_identity:
+            return True
+        return (scraped.cuaderno or "").strip().lower() in ("", "principal") and (
+            self._pending_alias_key(rol, court.id) in existing_by_identity
+        )
 
     def _upsert_case(
         self,
@@ -1506,8 +1529,10 @@ class SyncService:
         # Find existing case by identity (from the pre-loaded map).
         identity = self._identity_key(normalized_rol, court.id, scraped.cuaderno)
         existing = existing_by_identity.get(identity)
+        via_alias = False
         if existing is None and (scraped.cuaderno or "").strip().lower() in ("", "principal"):
             existing = existing_by_identity.get(self._pending_alias_key(normalized_rol, court.id))
+            via_alias = existing is not None
 
         # Parse caratulado into plaintiff/defendant
         plaintiff, defendant = self._parse_caratulado(scraped.caratulado)
@@ -1520,13 +1545,11 @@ class SyncService:
             row.plaintiff = plaintiff
             row.defendant = defendant
             row.status = self._map_status(scraped.estado_cuaderno)
-            if row.patrocinio_pendiente:
-                # The causa is now in the lawyer's Mis causas: the patrocinio is accredited
-                # (S17). Keep the stored identity (Principal) and follow the normal rules.
-                row.patrocinio_pendiente = False
-                if (scraped.cuaderno or "").strip().lower() not in ("", "principal"):
-                    row.procedure = scraped.cuaderno
-            else:
+            # ``patrocinio_pendiente`` is NOT touched here (S17/L7): it is cleared only when a
+            # firm abogado litigante is stored (``clear_patrocinio_if_firm_litigante``), so the
+            # case never leaves its owner's scope in between. An alias match keeps the stored
+            # identity (Principal) instead of renaming it to the listing's empty cuaderno.
+            if not via_alias:
                 row.procedure = scraped.cuaderno
             row.competencia = competencia
             if filed_at:
