@@ -20,12 +20,14 @@ Every causa the firm takes in Sysgal must end up followed by our system automati
 - S18 (stage 3). API: `patrocinio_pendiente: bool` in the case list items and the case detail of `/api/v1/cases`; list filter `patrocinio_pendiente=true|false`; and its count in the existing Causas summary/counters response used for the filter chips (follow how other chip counts are returned), respecting the caller's case scope.
 - S19 (stage 3). Front (segal-deudores-web): a badge "Patrocinio pendiente" in the Causas list row and in the case detail header, with tooltip "Incorporada desde Sysgal: el patrocinio aún no está acreditado en el PJUD."; a filter chip "Patrocinio pendiente (N)" in Causas next to the existing chips, wired to `?patrocinio_pendiente=true` (URL param like the other chips) and to the count of S18; the CSV export gets a "Patrocinio pendiente" column (Sí/No). Visible to every role that sees the case.
 - S20 (stage 3). Strict TDD both repos (RED seen). Backend: Mis-causas ingest of an incorporated causa updates the same case and clears the flag (no new Case, movements not duplicated); firm litigante appearing clears it; non-incorporated cases unchanged; filter and count respect scope; duplicates check function. Front: badge in row and detail, chip count and URL param, CSV column; `tsc -b`, lint, vitest; Chrome visual check.
+- S21 (stage 2 diagnostics). When a PJUD fetch failure is not one of the classified kinds, store `ultimo_error` as "error inesperado: <ExceptionClassName>" (class name only, e.g. "error inesperado: TimeoutError"; NEVER the exception message, page text, URL or credentials; truncated to the column length), and the brake Telegram includes the kind of the failures that triggered it, e.g. "Incorporación desde Sysgal detenida: 3 fallas seguidas (error inesperado: TimeoutError). Se reintenta mañana.". Consecutive-failure counting for the brake treats all unexpected failures as the same kind (unchanged behaviour: 3 consecutive → brake), retries/backoff unchanged. Observed 2026-11-13 05:11 (Chile): C-12668-2026, C-3799-2026, C-9035-2026 failed with plain "error inesperado" and braked the day; the cause was only in the station log. Tests: class name stored, message never stored (an exception whose message contains a fake secret/page text), brake after 3 unexpected failures of different classes still triggers once, Telegram text includes the kind, classified kinds unchanged.
 - S8. Stage 2 (later PR): the station worker consumes the queue with the S2 pace and brake via `consulta_by_rol`, creates the Case (+ movements/documents through the existing ingest path), owner = Sysgal lawyer, flag `patrocinio_pendiente`. Stage 3: dedup/merge when the causa appears in Mis causas, clear the flag; UI badge. Not in stage 1.
 - S9. Out of scope for stage 1: any PJUD request, ownership switch, UI, e-mail.
 
 ## Tasks
 - T1 stage 1 (S4-S7) route: worker, branch feat/sysgal-incorporacion-cola. Commit: after parent review.
 - T4 S16 caratula from litigantes, route: worker, branch fix/incorporacion-caratula.
+- T6 S21 error class in ultimo_error and brake Telegram, route: worker, branch fix/incorporacion-tipo-error.
 - T2 stage 2 (S10-S15) route: worker, branch feat/sysgal-incorporacion-pjud.
 - T3 stage 3 backend (S17, S18, S20) route: worker, branch feat/incorporacion-etapa3.
 - T5 stage 3 frontend (S19, S20) route: worker, front branch feat/incorporacion-etapa3.
@@ -33,6 +35,7 @@ Every causa the firm takes in Sysgal must end up followed by our system automati
 ## Log
 L1. Marcelo, 2026-11-10: see S1.
 L2. Marcelo, 2026-11-10: "Que me recomendas?" → recommendation S2; "dale".
+L8. Marcelo, 2026-11-13: "Si dale con todo" to storing the error class (S21) after the 05:11 brake.
 L7. Parent decision, 2026-11-12 (after the independent verifier): the Mis-causas match keeps the case linked (no duplicate) but does NOT clear `patrocinio_pendiente`; the flag is cleared only when a firm abogado litigante is stored, so the case never drops out of its owner's scope in between (S17 amended).
 L6. Marcelo, 2026-11-12: "Si vamos con la etapa 3 de la incorporación".
 L5. Marcelo, 2026-11-11: "Si dale" to keep the pace at 5/day and fix the truncated caratula before 100/day.

@@ -101,6 +101,12 @@ def _classify(exc: Exception) -> str:
     return KIND_OTHER
 
 
+def _stored_error(exc: Exception, kind: str) -> str:
+    """Text kept in ``ultimo_error``: the kind, plus only the class name when unexpected (never the message)."""
+    text = f"{KIND_OTHER}: {type(exc).__name__}" if kind == KIND_OTHER else kind
+    return text[:255]
+
+
 def _mapped_lawyer_id(db: Session, causa: SysgalCausa) -> Optional[int]:
     if causa.abogado_sysgal_id is None:
         return None
@@ -208,6 +214,11 @@ def _record_failure(db: Session, q_id: int, kind: str, now: datetime) -> None:
     db.commit()
 
 
+def _brake_reason(kind: str, detail: str) -> str:
+    """Brake motive: classified kinds keep their plain text; unexpected ones name the class."""
+    return f"{BRAKE_STREAK} fallas seguidas ({detail})" if kind == KIND_OTHER else kind
+
+
 async def _brake(db: Session, motivo: str, now: datetime, notify: Callable[[str], bool]) -> None:
     app_settings.set_int(db, app_settings.KEY_FRENO_DIA, _day_code(now))
     db.commit()
@@ -290,19 +301,20 @@ async def run_incorporacion(
             detail = await fetch(rol, corte)
         except Exception as exc:  # noqa: BLE001 — classified; the message is never stored
             kind = _classify(exc)
-            logger.warning("Sysgal incorporacion: PJUD failure (%s) for %s", kind, rol)
+            logger.warning("Sysgal incorporacion: PJUD failure (%s) for %s", _stored_error(exc, kind), rol)
             db.rollback()
             if kind == KIND_LOGIN:
                 stats["frenada"] = True
                 await _brake(db, kind, now, notify)
                 break
-            _record_failure(db, q_id, kind, now)
+            stored = _stored_error(exc, kind)
+            _record_failure(db, q_id, stored, now)
             stats["fallos"] += 1
             streak = streak + 1 if kind == streak_kind else 1
             streak_kind = kind
             if streak >= BRAKE_STREAK:
                 stats["frenada"] = True
-                await _brake(db, kind, now, notify)
+                await _brake(db, _brake_reason(kind, stored), now, notify)
                 break
             continue
 
