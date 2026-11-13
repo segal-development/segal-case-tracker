@@ -18,12 +18,16 @@ Backend: /Users/marcelo/Projects/segal-case-tracker.
 - S11. Front: badge "Terminada en Sysgal" (neutral/grey tone) in the Causas row/card and the case detail header, tooltip "En Sysgal esta causa figura terminada; en el PJUD sigue activa. No se cuenta en las cifras por matriz."; chip "Terminada en Sysgal (N)" next to "Patrocinio pendiente" wired to `?terminada_sysgal=true` (URL param) and the summary count; CSV column "Terminada en Sysgal" (Sí/No); Cartera shows a one-line note under the matriz distribution: "No incluye N causas terminadas en Sysgal." when N > 0 (N from the distribucion response field `terminadas_sysgal`).
 - S12. Strict TDD both repos (RED seen): flag true/false cases (own active, inherited active, only terminated, no Sysgal), counts/filters exclusion and equality chip=list, distribucion/por-abogado exclusion + `terminadas_sysgal` count, recompute and daily reclassification update the flag, cases without Sysgal unchanged; front badge/chip/URL/CSV/Cartera note.
 
+- S13. Matriz chip = list (bug, 2026-11-13): in Causas the "M1 Alta" chip showed 739 while `GET /cases?matriz=M1 Alta` (same scope, same params the screen sends) returned 657. The chips take their counts from `/matriz/distribucion`, which counts a different base than the `/cases` list. Fix: `GET /cases/summary` returns `por_matriz: {"M1 Baja": n, "M1 Alta": n, "M2": n, "M3": n}` computed on EXACTLY the same scoped base query the `/cases` list uses for `?matriz=` (same competencia/status/scope filters and the terminada_en_sysgal exclusion), and the Causas matriz chips use it. `/matriz/distribucion` (Cartera) stays as it is. Tests: for each matriz, summary count == list total for the same scope (plain lawyer, admin firm-wide), including terminada cases excluded and cases outside the list base (e.g. non-civil or other status if the list excludes them).
+
 ## Tasks
 - T1 S2, S3, S5, S6 backend — route: worker, branch feat/matriz-desde-sysgal.
 - T2 S4 label — route: parent inline, front.
 - T4 S7, S8 re-match + sibling inheritance — route: worker, branch feat/sysgal-reenlazar.
 - T5 S9, S10, S12 backend — route: worker, branch feat/terminada-en-sysgal.
 - T6 S11, S12 frontend — route: worker, front branch feat/terminada-en-sysgal.
+- T7 S13 backend summary por_matriz — route: worker, branch fix/matriz-chip-igual-lista.
+- T8 S13 frontend chips from summary — route: worker, front branch fix/matriz-chip-igual-lista.
 - T3 prod recompute (backup, dry run, apply, verify distribution) — route: parent.
 
 ## Log
@@ -31,3 +35,4 @@ Backend: /Users/marcelo/Projects/segal-case-tracker.
 - L2. Marcelo chose "Las dos cosas (recomendado)": classify now with Sysgal's etapa (PJUD only when the case is not in Sysgal) and ask ITDS for the exact per-causa matriz, used directly when it arrives.
 - L3. Marcelo (2026-11-13) "Si dale" to fixing link coverage (daily re-match of unlinked cases + secondary cuadernos inherit the Principal's Sysgal etapa); the 6,141 cases terminated in Sysgal wait for Carla.
 - L4. Marcelo (2026-11-13) asked for a recommendation and accepted it ("si"): option B now — show the 6,141 cases terminated in Sysgal with a "Terminada en Sysgal" badge and filter, excluded from matriz counts, nothing hidden; tell Carla; ownership of those cases still waits for her.
+- L5. Marcelo (2026-11-13): the M1 Alta filter showed no rows at 12:59 (during the deploy/recompute); after reloading it works ("si ahora se ven"). Separately the chip said 739 and the list 657 → S13.

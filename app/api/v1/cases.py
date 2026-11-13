@@ -224,6 +224,8 @@ class CaseSummaryResponse(BaseModel):
     patrocinio_pendiente: int = 0
     # Cases Sysgal considers ended (scoped count).
     terminada_sysgal: int = 0
+    # Per-matriz counts on the exact base `/cases?matriz=X` lists (Causas chips).
+    por_matriz: dict[str, int] = {}
 
 
 class FacetAbogado(BaseModel):
@@ -640,6 +642,32 @@ def _scoped_cases_query(
     return query, lawyer_id, scope
 
 
+MATRICES = ("M1 Baja", "M1 Alta", "M2", "M3")
+
+
+def _matriz_scope_filters(terminada_sysgal: Optional[bool] = None) -> list:
+    """Extra list conditions that accompany `?matriz=`: terminadas en Sysgal are excluded
+    unless ?terminada_sysgal was given explicitly. Shared with /summary `por_matriz`."""
+    return [Case.terminada_en_sysgal.is_(False)] if terminada_sysgal is None else []
+
+
+def _apply_matriz_filter(query, matriz: str, terminada_sysgal: Optional[bool] = None):
+    """The `?matriz=` list filter."""
+    return query.filter(Case.matriz == matriz, *_matriz_scope_filters(terminada_sysgal))
+
+
+def _por_matriz_counts(base) -> dict[str, int]:
+    """Counts per matriz in ONE grouped query over the list's scoped base."""
+    rows = (
+        base.filter(Case.matriz.in_(MATRICES), *_matriz_scope_filters())
+        .with_entities(Case.matriz, func.count(Case.id))
+        .group_by(Case.matriz)
+        .all()
+    )
+    counts = dict(rows)
+    return {m: counts.get(m, 0) for m in MATRICES}
+
+
 @router.get("", response_model=CaseListResponse)
 async def list_cases(
     page: int = Query(1, ge=1),
@@ -777,9 +805,7 @@ async def list_cases(
     # Terminadas en Sysgal are excluded so the list equals its matriz chip (Sysgal's screen);
     # asking explicitly for ?terminada_sysgal=true overrides that.
     if matriz:
-        query = query.filter(Case.matriz == matriz)
-        if terminada_sysgal is None:
-            query = query.filter(Case.terminada_en_sysgal.is_(False))
+        query = _apply_matriz_filter(query, matriz, terminada_sysgal)
 
     # Asignación por nivel filter.
     if asignado is True:
@@ -1102,6 +1128,7 @@ async def cases_summary(
         sysgal_sin_dato=sysgal["sin_dato"],
         patrocinio_pendiente=patrocinio_pendiente,
         terminada_sysgal=terminada_sysgal,
+        por_matriz=_por_matriz_counts(base),
     )
 
 
