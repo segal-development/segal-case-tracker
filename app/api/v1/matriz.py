@@ -65,6 +65,8 @@ class MatrizDistribucionResponse(BaseModel):
     por_origen: List[OrigenCountItem]
     sin_mapear: List[SinMapearItem]
     computed_at: Optional[datetime] = None
+    # Cases Sysgal considers ended: left out of every figure above (same scope).
+    terminadas_sysgal: int = 0
 
 
 class PorAbogadoItem(BaseModel):
@@ -124,7 +126,9 @@ async def get_distribucion(
 ):
     """Matriz distribution over the caller's scope (firm-wide for admin/auditor)."""
     scope = resolve_case_scope(db, current_lawyer)
-    query = apply_case_scope(db.query(Case), scope)
+    scoped = apply_case_scope(db.query(Case), scope)
+    terminadas_sysgal = scoped.filter(Case.terminada_en_sysgal.is_(True)).count()
+    query = scoped.filter(Case.terminada_en_sysgal.is_(False))
 
     total = query.count()
 
@@ -161,6 +165,7 @@ async def get_distribucion(
         por_origen=por_origen,
         sin_mapear=sin_mapear,
         computed_at=computed_at,
+        terminadas_sysgal=terminadas_sysgal,
     )
 
 
@@ -190,7 +195,9 @@ async def get_por_abogado(
 
     all_case_ids = list(by_case.keys())
     matriz_by_case = dict(
-        db.query(Case.id, Case.matriz).filter(Case.id.in_(all_case_ids)).all()
+        db.query(Case.id, Case.matriz)
+        .filter(Case.id.in_(all_case_ids), Case.terminada_en_sysgal.is_(False))
+        .all()
         if all_case_ids
         else []
     )
@@ -204,7 +211,8 @@ async def get_por_abogado(
 
     items = []
     for lawyer in firm_lawyers:
-        case_ids = list(case_ids_by_rut.get(normalize_rut(lawyer.rut), set()))
+        # Terminadas en Sysgal are absent from matriz_by_case: not counted.
+        case_ids = [cid for cid in case_ids_by_rut.get(normalize_rut(lawyer.rut), set()) if cid in matriz_by_case]
         counts = Counter(matriz_by_case.get(cid) for cid in case_ids)
         por_matriz = [
             MatrizCountItem(matriz=item["key"], causas=item["causas"], pct=item["pct"])

@@ -95,7 +95,7 @@ from app.models.matriz_pjud_mapeo import (
 )
 from app.models.matriz_tramite_override import MatrizTramiteOverride
 from app.models.movement import Movement
-from app.services.matriz_sysgal import MATRICES, SysgalInput, load_sysgal_inputs
+from app.services.matriz_sysgal import MATRICES, SysgalInput, load_sysgal_state
 
 logger = logging.getLogger(__name__)
 
@@ -185,6 +185,8 @@ class MatrizMappingCache:
     #: Sysgal data of the causa that decides each linked case (see
     #: ``matriz_sysgal.load_sysgal_inputs``). Empty = no case is linked to Sysgal.
     sysgal_inputs: dict[int, SysgalInput] = field(default_factory=dict)
+    #: Cases linked to Sysgal with no active input (own or inherited): ``terminada_en_sysgal``.
+    sysgal_terminadas: set[int] = field(default_factory=set)
 
     @classmethod
     def load(cls, db: Session) -> "MatrizMappingCache":
@@ -217,12 +219,14 @@ class MatrizMappingCache:
             (row.proc_antiguo, row.etapa, row.nombre_tramite): row.matriz
             for row in db.query(MatrizTramiteOverride).all()
         }
+        sysgal_inputs, sysgal_terminadas = load_sysgal_state(db)
         return cls(
             pjud_mapeo=pjud_mapeo,
             descripcion_rules=descripcion_rules,
             clasificacion=clasificacion,
             tramite_overrides=tramite_overrides,
-            sysgal_inputs=load_sysgal_inputs(db),
+            sysgal_inputs=sysgal_inputs,
+            sysgal_terminadas=sysgal_terminadas,
         )
 
     def resolve_etapa(self, proc_simple: str, etapa: Optional[str]) -> Optional[str]:

@@ -333,3 +333,39 @@ class TestCasesMatrizFilter:
         case = resp.json()["case"]
         assert case["matriz"] == "M3"
         assert case["matriz_origen"] == "pjud_procedimiento"
+
+
+class TestTerminadasSysgal:
+    @pytest.fixture
+    def terminada(self, db, lawyer_a, court, dataset):
+        case = _make_case(db, lawyer_a, court, "C-9-2026", matriz="M2", matriz_origen="pjud_etapa",
+                          terminada_en_sysgal=True)
+        _seed_abogado_litigante(db, case, LAWYER_A_RUT, "Lawyer A")
+        return case
+
+    def test_distribucion_excludes_terminadas_and_reports_them(self, client, admin_headers, terminada):
+        data = client.get("/api/v1/matriz/distribucion", headers=admin_headers).json()
+
+        assert data["total"] == 4
+        assert sum(i["causas"] for i in data["por_matriz"]) == 4
+        assert {i["matriz"]: i["causas"] for i in data["por_matriz"]}["M2"] == 1
+        assert data["terminadas_sysgal"] == 1
+
+    def test_distribucion_terminadas_is_zero_without_any(self, client, admin_headers, dataset):
+        assert client.get("/api/v1/matriz/distribucion", headers=admin_headers).json()["terminadas_sysgal"] == 0
+
+    def test_distribucion_terminadas_respects_scope(self, db, client, lawyer_a_headers, lawyer_b, court, terminada):
+        _make_case(db, lawyer_b, court, "C-10-2026", matriz="M3", matriz_origen="pjud_etapa",
+                   terminada_en_sysgal=True)
+
+        data = client.get("/api/v1/matriz/distribucion", headers=lawyer_a_headers).json()
+
+        assert data["terminadas_sysgal"] == 1
+        assert data["total"] == 2
+
+    def test_por_abogado_excludes_terminadas(self, client, admin_headers, lawyer_a, terminada):
+        resp = client.get("/api/v1/matriz/por-abogado", headers=admin_headers)
+        items = {i["lawyer_id"]: i for i in resp.json()["items"]}
+
+        assert items[lawyer_a.id]["total"] == 2
+        assert {m["matriz"]: m["causas"] for m in items[lawyer_a.id]["por_matriz"]} == {"M1 Baja": 1, "M2": 1}
