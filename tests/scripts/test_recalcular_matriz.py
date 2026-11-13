@@ -130,3 +130,45 @@ class TestSysgalDistribution:
         _print_distribution(Counter({"M2": 1}), Counter({"sysgal_etapa": 1}), 1, Counter({"M1 Baja": 1}))
         out = capsys.readouterr().out
         assert "antes" in out and "después" in out and "sysgal_etapa" in out
+
+
+class TestTerminadaEnSysgal:
+    def _terminada(self, db, case, sid=1, estado="terminada"):
+        from app.models.sysgal_causa import SysgalCausa
+        db.add(SysgalCausa(sysgal_id=sid, rol="C-1-2026", rol_norm="C-1-2026", tribunal="x",
+                           etapa="X", estado=estado, case_id=case.id))
+        db.commit()
+
+    def test_apply_sets_flag_and_reports_count(self, db, one_mapped_case):
+        self._terminada(db, one_mapped_case)
+
+        result = compute_distribution(db, dry_run=False)
+
+        db.expire_all()
+        assert db.get(Case, one_mapped_case.id).terminada_en_sysgal is True
+        assert result["terminadas_sysgal"] == 1 and result["before_terminadas_sysgal"] == 0
+
+    def test_dry_run_reports_count_without_writing(self, db, one_mapped_case):
+        self._terminada(db, one_mapped_case)
+
+        result = compute_distribution(db, dry_run=True)
+
+        db.expire_all()
+        assert db.get(Case, one_mapped_case.id).terminada_en_sysgal is False
+        assert result["terminadas_sysgal"] == 1
+
+    def test_apply_clears_a_stale_flag_and_case_without_sysgal_is_false(self, db, one_mapped_case):
+        one_mapped_case.terminada_en_sysgal = True
+        db.commit()
+
+        result = compute_distribution(db, dry_run=False)
+
+        db.expire_all()
+        assert db.get(Case, one_mapped_case.id).terminada_en_sysgal is False
+        assert result["terminadas_sysgal"] == 0 and result["before_terminadas_sysgal"] == 1
+
+    def test_print_distribution_shows_terminadas(self, capsys):
+        from collections import Counter
+        from scripts.recalcular_matriz import _print_distribution
+        _print_distribution(Counter({"M2": 1}), Counter({"x": 1}), 1, terminadas=(0, 7))
+        assert "Terminada en Sysgal" in capsys.readouterr().out

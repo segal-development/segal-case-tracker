@@ -456,3 +456,35 @@ class TestSiblingMatrizAfterSync:
         db.refresh(secondary)
         db.refresh(principal)
         assert (secondary.matriz, principal.matriz) == ("M3", "M3")
+
+
+class TestTerminadaFlagAfterSync:
+    def test_flag_follows_the_sysgal_state_and_unlinked_cases_are_untouched(self, db, lawyer, court):
+        case = _case(db, lawyer, court)
+        other = _case(db, lawyer, court, rol="C-7-2026")
+        db.commit()
+
+        sync_sysgal_causas(db, FakeClient(causas=[_causa(10, estado="terminada")]))
+        db.expire_all()
+        assert case.terminada_en_sysgal is True
+        assert other.terminada_en_sysgal is False and other.matriz_computed_at is None
+
+        sync_sysgal_causas(db, FakeClient(causas=[_causa(10, estado="activa", updated=datetime(2026, 11, 5))]))
+        db.expire_all()
+        assert case.terminada_en_sysgal is False
+
+        sync_sysgal_causas(db, FakeClient(causas=[_causa(10, estado="terminada", updated=datetime(2026, 11, 6))]))
+        db.expire_all()
+        assert case.terminada_en_sysgal is True
+
+    def test_unchanged_terminated_case_is_not_rewritten(self, db, lawyer, court):
+        case = _case(db, lawyer, court)
+        db.commit()
+        sync_sysgal_causas(db, FakeClient(causas=[_causa(10, estado="terminada")]))
+        db.expire_all()
+        stamp = case.matriz_computed_at
+
+        sync_sysgal_causas(db, FakeClient(causas=[_causa(10, estado="terminada", updated=datetime(2026, 11, 5))]))
+
+        db.expire_all()
+        assert case.terminada_en_sysgal is True and case.matriz_computed_at == stamp

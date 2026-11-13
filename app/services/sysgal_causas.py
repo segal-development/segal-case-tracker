@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session, aliased
 from app.models.case import Case
 from app.models.sysgal_causa import SysgalCausa
 from app.models.sysgal_usuario import SysgalUsuario
-from app.services.matriz_sysgal import ACTIVA, load_sysgal_inputs, reclassify_cases
+from app.services.matriz_sysgal import ACTIVA, load_sysgal_state, reclassify_cases
 from app.services.sysgal_client import SysgalClient
 from app.services.sysgal_matching import AMBIGUA, CALZADA, match_causa, match_causas, normalize_rol
 
@@ -37,7 +37,7 @@ def sync_sysgal_causas(db: Session, client: SysgalClient, full: bool = False) ->
     The human ``lawyer_id`` mapping of a usuario is never touched.
     """
     now = datetime.utcnow()
-    inputs_before = load_sysgal_inputs(db)  # what decided each case's matriz before this sync
+    inputs_before, terminadas_before = load_sysgal_state(db)  # state before this sync
     stats = {"usuarios": 0, "causas": 0, "nuevas": 0, "actualizadas": 0,
              "calzadas": 0, "sin_calce": 0, "ambiguas": 0, "reenlazadas": 0}
 
@@ -86,7 +86,7 @@ def sync_sysgal_causas(db: Session, client: SysgalClient, full: bool = False) ->
     db.commit()
     stats["reenlazadas"] = _rematch_safely(db)
     logger.info("Sysgal causas sync done: %s", stats)
-    _reclassify_changed(db, inputs_before)
+    _reclassify_changed(db, inputs_before, terminadas_before)
     return stats
 
 
@@ -140,8 +140,8 @@ def rematch_unlinked(db: Session, dry_run: bool = False) -> dict:
     return report
 
 
-def _reclassify_changed(db: Session, inputs_before: dict) -> None:
-    """Recompute the matriz of the cases whose Sysgal etapa/tramite/matriz (or link) changed.
+def _reclassify_changed(db: Session, inputs_before: dict, terminadas_before: Optional[set] = None) -> None:
+    """Recompute the matriz and ``terminada_en_sysgal`` of the cases whose Sysgal etapa/tramite/matriz (or link/terminada state) changed.
 
     Compares the effective Sysgal input per case before/after the sync, so a newly linked,
     unlinked, terminated or edited causa is all covered; unchanged and unlinked cases are
@@ -149,8 +149,10 @@ def _reclassify_changed(db: Session, inputs_before: dict) -> None:
     logged (the next full recompute fixes it).
     """
     try:
-        after = load_sysgal_inputs(db)
+        after, terminadas_after = load_sysgal_state(db)
         changed = {cid for cid in inputs_before.keys() | after.keys() if inputs_before.get(cid) != after.get(cid)}
+        if terminadas_before is not None:  # also cases whose "terminada en Sysgal" flag flips
+            changed |= terminadas_before ^ terminadas_after
         n = reclassify_cases(db, changed)
         logger.info("Sysgal causas sync: matriz reclassified for %d case(s)", n)
     except Exception:

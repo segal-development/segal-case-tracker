@@ -404,3 +404,83 @@ class TestSiblingInheritance:
 
         db.refresh(row)
         assert row.case_id == principal.id
+
+
+class TestTerminadaEnSysgal:
+    """S9: linked to Sysgal but with NO active, non-eliminada input (own or inherited)."""
+
+    def _flag(self, db, case):
+        reclassify_cases(db, {case.id})
+        db.refresh(case)
+        return case.terminada_en_sysgal
+
+    def test_own_active_link_is_not_terminada(self, db, lawyer, court, taxonomy):
+        case = _case(db, lawyer, court)
+        _sysgal(db, case, etapa="EXHIBICIÓN DOCUMENTOS")
+
+        assert self._flag(db, case) is False
+
+    def test_only_terminated_link_is_terminada_and_matriz_is_still_computed(self, db, lawyer, court, taxonomy):
+        case = _case(db, lawyer, court)
+        _mov(db, case)
+        _sysgal(db, case, etapa="EXHIBICIÓN DOCUMENTOS", estado="terminada")
+
+        assert self._flag(db, case) is True
+        assert (case.matriz, case.matriz_origen) == ("M1 Baja", "pjud_etapa")
+
+    def test_only_eliminated_link_is_terminada(self, db, lawyer, court, taxonomy):
+        case = _case(db, lawyer, court)
+        _sysgal(db, case, etapa="EXHIBICIÓN DOCUMENTOS", eliminada=True)
+
+        assert self._flag(db, case) is True
+
+    def test_inherited_active_input_from_sibling_is_not_terminada(self, db, lawyer, court, taxonomy):
+        principal = _case(db, lawyer, court, procedure="Principal")
+        secondary = _case(db, lawyer, court, procedure="Incidente")
+        _sysgal(db, principal, etapa="EXHIBICIÓN DOCUMENTOS")
+        _sysgal(db, secondary, etapa="APREMIO", estado="terminada")  # own terminated link, sibling active
+
+        assert self._flag(db, secondary) is False
+
+    def test_sibling_of_a_terminated_principal_without_own_link_is_not_flagged(self, db, lawyer, court, taxonomy):
+        principal = _case(db, lawyer, court, procedure="Principal")
+        secondary = _case(db, lawyer, court, procedure="Incidente")
+        _sysgal(db, principal, etapa="EXHIBICIÓN DOCUMENTOS", estado="terminada")
+
+        assert self._flag(db, principal) is True
+        assert self._flag(db, secondary) is False  # no row linked to it
+
+    def test_case_without_sysgal_is_not_terminada(self, db, lawyer, court, taxonomy):
+        case = _case(db, lawyer, court)
+
+        assert self._flag(db, case) is False
+
+    def test_flag_goes_back_to_false_when_the_causa_is_active_again(self, db, lawyer, court, taxonomy):
+        case = _case(db, lawyer, court)
+        row = _sysgal(db, case, etapa="EXHIBICIÓN DOCUMENTOS", estado="terminada")
+        assert self._flag(db, case) is True
+
+        row.estado = "activa"
+        db.commit()
+
+        assert self._flag(db, case) is False
+
+    def test_bulk_load_is_part_of_the_cache_without_extra_sysgal_queries(self, db, lawyer, court, taxonomy):
+        from sqlalchemy import event
+
+        for i in range(3):
+            _sysgal(db, _case(db, lawyer, court, rol=f"C-{i}-2025"), estado="terminada")
+        statements = []
+        engine = db.get_bind()
+
+        def on_exec(conn, cursor, statement, *a):
+            statements.append(statement)
+
+        event.listen(engine, "before_cursor_execute", on_exec)
+        try:
+            cache = MatrizMappingCache.load(db)
+        finally:
+            event.remove(engine, "before_cursor_execute", on_exec)
+
+        assert sum("sysgal_causas" in s for s in statements) <= 2
+        assert len(cache.sysgal_terminadas) == 3

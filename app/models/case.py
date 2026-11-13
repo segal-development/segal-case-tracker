@@ -125,6 +125,11 @@ class Case(Base):
     # "Juicio Ejecutivo Completo" map while it is NULL.
     matriz_proc_simple = Column(String(80), nullable=True)
     matriz_computed_at = Column(DateTime, nullable=True)
+    # True when a Sysgal causa is linked to this case but NO active, non-eliminada Sysgal input
+    # (own or inherited from the Principal sibling) exists: Sysgal considers it ended. Kept current
+    # with the matriz (recalcular_matriz + the daily Sysgal-sync reclassification). Excluded from
+    # the matriz counts; the case itself is untouched.
+    terminada_en_sysgal = Column(Boolean, nullable=False, server_default=text("false"), default=False)
 
     # Asignación por nivel — override of WHO works this causa internally,
     # independent of ``lawyer_id`` (sync provenance, never touched here) and

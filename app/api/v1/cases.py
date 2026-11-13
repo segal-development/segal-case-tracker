@@ -95,6 +95,8 @@ class CaseResponse(BaseModel):
     plazo_fatal_incumplido: bool = False
     # Incorporated from Sysgal while the patrocinio is not accredited in PJUD yet.
     patrocinio_pendiente: bool = False
+    # Sysgal knows the causa and considers it ended (not counted in the matriz figures).
+    terminada_en_sysgal: bool = False
     prescripcion_fecha: Optional[date] = None
     # Sysgal cobertura (derived from the demandado's cached commercial state).
     # Populated ONLY for cases in abandono/apremio/prescripción that have a
@@ -220,6 +222,8 @@ class CaseSummaryResponse(BaseModel):
     sysgal_sin_dato: int = 0
     # Causas incorporated from Sysgal with the patrocinio still pending (scoped count).
     patrocinio_pendiente: int = 0
+    # Cases Sysgal considers ended (scoped count).
+    terminada_sysgal: int = 0
 
 
 class FacetAbogado(BaseModel):
@@ -685,6 +689,13 @@ async def list_cases(
             "accredited in PJUD yet; false = the rest."
         ),
     ),
+    terminada_sysgal: Optional[bool] = Query(
+        None,
+        description=(
+            "Filter by terminada_en_sysgal: true = Sysgal knows the causa and considers it ended; "
+            "false = the rest."
+        ),
+    ),
     sort_by: Optional[Literal["criticidad", "ultima_actuacion", "updated_at"]] = Query(
         None,
         description=(
@@ -763,8 +774,12 @@ async def list_cases(
         query = query.filter(Case.id.in_(matching_ids))
 
     # Matriz de clasificación filter.
+    # Terminadas en Sysgal are excluded so the list equals its matriz chip (Sysgal's screen);
+    # asking explicitly for ?terminada_sysgal=true overrides that.
     if matriz:
         query = query.filter(Case.matriz == matriz)
+        if terminada_sysgal is None:
+            query = query.filter(Case.terminada_en_sysgal.is_(False))
 
     # Asignación por nivel filter.
     if asignado is True:
@@ -784,6 +799,12 @@ async def list_cases(
         query = query.filter(Case.patrocinio_pendiente.is_(True))
     elif patrocinio_pendiente is False:
         query = query.filter(Case.patrocinio_pendiente.is_(False))
+
+    # Terminada en Sysgal filter.
+    if terminada_sysgal is True:
+        query = query.filter(Case.terminada_en_sysgal.is_(True))
+    elif terminada_sysgal is False:
+        query = query.filter(Case.terminada_en_sysgal.is_(False))
 
     # Get total count
     total = query.count()
@@ -883,6 +904,7 @@ async def list_cases(
             prescripcion_cumplida=case.prescripcion_cumplida or False,
             plazo_fatal_incumplido=case.plazo_fatal_incumplido or False,
             patrocinio_pendiente=case.patrocinio_pendiente or False,
+            terminada_en_sysgal=case.terminada_en_sysgal or False,
             matriz=case.matriz,
             matriz_etapa=case.matriz_etapa,
             matriz_origen=case.matriz_origen,
@@ -1059,6 +1081,7 @@ async def cases_summary(
     apremio = base.filter(Case.en_apremio.is_(True)).count()
     prescripcion = base.filter(Case.prescripcion_cumplida.is_(True)).count()
     patrocinio_pendiente = base.filter(Case.patrocinio_pendiente.is_(True)).count()
+    terminada_sysgal = base.filter(Case.terminada_en_sysgal.is_(True)).count()
 
     # Sysgal cobertura chips over the 3-state subset (derived in Python).
     sysgal = _sysgal_summary_counts(db, base)
@@ -1078,6 +1101,7 @@ async def cases_summary(
         sysgal_caducado=sysgal["caducado"],
         sysgal_sin_dato=sysgal["sin_dato"],
         patrocinio_pendiente=patrocinio_pendiente,
+        terminada_sysgal=terminada_sysgal,
     )
 
 
@@ -1232,6 +1256,7 @@ async def get_case(
         prescripcion_cumplida=case.prescripcion_cumplida or False,
         plazo_fatal_incumplido=case.plazo_fatal_incumplido or False,
         patrocinio_pendiente=case.patrocinio_pendiente or False,
+        terminada_en_sysgal=case.terminada_en_sysgal or False,
         matriz=case.matriz,
         matriz_etapa=case.matriz_etapa,
         matriz_origen=case.matriz_origen,

@@ -31,31 +31,43 @@ class SysgalInput(NamedTuple):
     tramite: Optional[str]
 
 
-def load_sysgal_inputs(db: Session) -> dict[int, SysgalInput]:
-    """``{case_id: SysgalInput}`` for cases decided by an active, non-eliminada Sysgal causa.
+def load_sysgal_state(db: Session) -> tuple[dict[int, SysgalInput], set[int]]:
+    """``(inputs, terminadas)`` from ONE query over the Sysgal causas linked to a case.
 
+    ``inputs`` is ``{case_id: SysgalInput}`` for cases decided by an active, non-eliminada causa.
     A case's OWN active link wins. A case without one inherits the inputs of the active causa
     linked to another case with the same ``rol`` + ``court_id`` (its Principal sibling), for
     matriz classification only (``sysgal_causas.case_id`` is never touched).
     Several rows for one case: the most recently updated wins (ties: highest ``id``).
-    One query, no per-case round-trips.
+
+    ``terminadas`` are the cases with a linked causa (any state) but NO input, own or inherited:
+    Sysgal knows them and considers them ended (``cases.terminada_en_sysgal``).
     """
     matched, sibling = aliased(Case), aliased(Case)
+    active = and_(SysgalCausa.eliminada.is_(False), func.lower(func.trim(SysgalCausa.estado)) == ACTIVA)
     rows = (
-        db.query(SysgalCausa.case_id, sibling.id, SysgalCausa.matriz, SysgalCausa.etapa, SysgalCausa.tramite)
+        db.query(SysgalCausa.case_id, sibling.id, SysgalCausa.matriz, SysgalCausa.etapa, SysgalCausa.tramite, active)
         .join(matched, matched.id == SysgalCausa.case_id)
-        .join(sibling, and_(sibling.rol == matched.rol, sibling.court_id == matched.court_id))
-        .filter(
-            SysgalCausa.case_id.isnot(None),
-            SysgalCausa.eliminada.is_(False),
-            func.lower(func.trim(SysgalCausa.estado)) == ACTIVA,
-        )
+        .outerjoin(sibling, and_(active, sibling.rol == matched.rol, sibling.court_id == matched.court_id))
+        .filter(SysgalCausa.case_id.isnot(None))
         .order_by(func.coalesce(SysgalCausa.sysgal_updated_at, datetime.min), SysgalCausa.id)
         .all()
     )
-    direct = {cid: SysgalInput(m, e, t) for cid, target, m, e, t in rows if cid == target}
-    inherited = {target: SysgalInput(m, e, t) for cid, target, m, e, t in rows if cid != target}
-    return {**inherited, **direct}  # later rows overwrite earlier ones
+    direct = {cid: SysgalInput(m, e, t) for cid, target, m, e, t, act in rows if act and cid == target}
+    inherited = {target: SysgalInput(m, e, t) for cid, target, m, e, t, act in rows if act and cid != target}
+    inputs = {**inherited, **direct}  # later rows overwrite earlier ones
+    terminadas = {cid for cid, *_ in rows} - inputs.keys()
+    return inputs, terminadas
+
+
+def load_sysgal_inputs(db: Session) -> dict[int, SysgalInput]:
+    """``{case_id: SysgalInput}`` of the active Sysgal input per case (see ``load_sysgal_state``)."""
+    return load_sysgal_state(db)[0]
+
+
+def load_terminada_ids(db: Session) -> set[int]:
+    """Case ids with ``terminada_en_sysgal`` (see ``load_sysgal_state``)."""
+    return load_sysgal_state(db)[1]
 
 
 def reclassify_cases(db: Session, case_ids: Iterable[int]) -> int:
@@ -83,6 +95,7 @@ def reclassify_cases(db: Session, case_ids: Iterable[int]) -> int:
             case.matriz_etapa = result.matriz_etapa
             case.matriz_origen = result.origen
             case.matriz_computed_at = datetime.utcnow()
+            case.terminada_en_sysgal = case.id in cache.sysgal_terminadas
             done += 1
     db.commit()
     return done

@@ -36,7 +36,9 @@ def compute_distribution(db, *, dry_run: bool) -> dict:
     """Classify every civil ``Case``, persisting unless *dry_run*.
 
     Returns ``{"total", "done", "by_matriz", "before_by_matriz", "by_origen",
-    "no_mapeada_ids"}`` (``before_by_matriz`` = the matriz stored before this run).
+    "no_mapeada_ids", "terminadas_sysgal", "before_terminadas_sysgal"}``
+    (``before_*`` = what was stored before this run; ``terminadas_sysgal`` = cases
+    flagged ``terminada_en_sysgal`` after it).
     Never calls ``db.commit()`` and never mutates a ``Case`` attribute when
     ``dry_run=True`` — safe to run read-only against a live database.
     """
@@ -57,6 +59,9 @@ def compute_distribution(db, *, dry_run: bool) -> dict:
     by_origen: Counter = Counter()
     no_mapeada_ids: list[int] = []
 
+    before_terminadas = sum(1 for case in cases if case.terminada_en_sysgal)
+    terminadas = sum(1 for case in cases if case.id in mapping_cache.sysgal_terminadas)
+
     done = 0
     for case in cases:
         result = classify_case(db, case, mapping_cache=mapping_cache)
@@ -70,6 +75,7 @@ def compute_distribution(db, *, dry_run: bool) -> dict:
             case.matriz_etapa = result.matriz_etapa
             case.matriz_origen = result.origen
             case.matriz_computed_at = datetime.utcnow()
+            case.terminada_en_sysgal = case.id in mapping_cache.sysgal_terminadas
 
         done += 1
         if not dry_run and done % BATCH_SIZE == 0:
@@ -89,11 +95,17 @@ def compute_distribution(db, *, dry_run: bool) -> dict:
         "before_by_matriz": before_by_matriz,
         "by_origen": by_origen,
         "no_mapeada_ids": no_mapeada_ids,
+        "terminadas_sysgal": terminadas,
+        "before_terminadas_sysgal": before_terminadas,
     }
 
 
 def _print_distribution(
-    by_matriz: Counter, by_origen: Counter, total: int, before_by_matriz: Counter = None
+    by_matriz: Counter,
+    by_origen: Counter,
+    total: int,
+    before_by_matriz: Counter = None,
+    terminadas: tuple = None,
 ) -> None:
     if before_by_matriz is not None:
         print("\ndistribución por matriz (antes -> después):")
@@ -113,6 +125,9 @@ def _print_distribution(
     for k, v in sorted(by_origen.items(), key=lambda kv: (-kv[1], str(kv[0] or ""))):
         pct = (v / total * 100) if total else 0
         print(f"  {k!r:>20}: {v:>6} ({pct:.1f}%)")
+    if terminadas is not None:
+        before, after = terminadas
+        print(f"\nTerminada en Sysgal: antes {before} -> después {after} ({after - before:+d})")
 
 
 def _print_top_unmapped(db, no_mapeada_ids: list[int], total: int) -> None:
@@ -153,7 +168,8 @@ def main() -> None:
 
         print(f"\n{'simulado' if args.dry_run else 'listo'}: {result['done']}/{result['total']} causas.")
         _print_distribution(
-            result["by_matriz"], result["by_origen"], result["total"], result["before_by_matriz"]
+            result["by_matriz"], result["by_origen"], result["total"], result["before_by_matriz"],
+            terminadas=(result["before_terminadas_sysgal"], result["terminadas_sysgal"]),
         )
         _print_top_unmapped(db, result["no_mapeada_ids"], result["total"])
     finally:
