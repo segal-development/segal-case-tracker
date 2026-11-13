@@ -418,3 +418,84 @@ def test_normal_sync_movements_path_still_alerts_by_default(db, court, lawyer):
 
     assert (new, alerts) == (1, 1)
     assert [a.lawyer_id for a in _alerts(db)] == [lawyer.id]
+
+
+class _Secretive(Exception):
+    pass
+
+
+@pytest.mark.asyncio
+async def test_unexpected_failure_stores_only_the_exception_class_name(db, court, lawyer, caplog):
+    _ritmo(db, dia=100, hora=100)
+    _, row = _item(db, court, 1)
+    db.commit()
+    fetch = Fake(_Secretive("super-secret <html>page body</html>"))
+
+    with caplog.at_level("DEBUG"):
+        _, notify = await _run(db, fetch)
+
+    db.refresh(row)
+    assert row.ultimo_error == "error inesperado: _Secretive"
+    assert "super-secret" not in caplog.text and "<html>" not in caplog.text
+    for call in notify.call_args_list:
+        assert "super-secret" not in call[0][0] and "<html>" not in call[0][0]
+
+
+@pytest.mark.asyncio
+async def test_unexpected_failure_class_name_is_truncated_to_the_column_length(db, court, lawyer):
+    _ritmo(db, dia=100, hora=100)
+    _, row = _item(db, court, 1)
+    db.commit()
+    long_exc = type("E" * 400, (Exception,), {})
+
+    await _run(db, Fake(long_exc("super-secret")))
+
+    db.refresh(row)
+    assert len(row.ultimo_error) == 255
+    assert row.ultimo_error.startswith("error inesperado: EEE")
+    assert "super-secret" not in row.ultimo_error
+
+
+@pytest.mark.asyncio
+async def test_three_unexpected_failures_of_different_classes_brake_once_with_the_kind(db, court, lawyer):
+    _ritmo(db, dia=100, hora=100)
+    for n in range(1, 6):
+        _item(db, court, n)
+    db.commit()
+    fetch = Fake(TimeoutError("super-secret"), KeyError("super-secret"), ValueError("<html>x</html>"))
+
+    stats, notify = await _run(db, fetch)
+
+    assert len(fetch.calls) == 3
+    assert stats["frenada"] is True
+    notify.assert_called_once()
+    text = notify.call_args[0][0]
+    assert text.startswith("Incorporación desde Sysgal detenida: 3 fallas seguidas (error inesperado")
+    assert text.endswith("). Se reintenta mañana.")
+    assert "super-secret" not in text and "<html>" not in text
+
+
+@pytest.mark.asyncio
+async def test_brake_telegram_names_the_class_of_the_unexpected_failures(db, court, lawyer):
+    _ritmo(db, dia=100, hora=100)
+    for n in range(1, 5):
+        _item(db, court, n)
+    db.commit()
+
+    _, notify = await _run(db, Fake(TimeoutError("x")))
+
+    notify.assert_called_once_with(
+        "Incorporación desde Sysgal detenida: 3 fallas seguidas (error inesperado: TimeoutError). "
+        "Se reintenta mañana.")
+
+
+@pytest.mark.asyncio
+async def test_classified_kinds_keep_their_stored_text(db, court, lawyer):
+    _ritmo(db, dia=100, hora=100)
+    _, row = _item(db, court, 1)
+    db.commit()
+
+    await _run(db, Fake(ConsultaSessionExpired("x")))
+
+    db.refresh(row)
+    assert row.ultimo_error == "sesión de PJUD expirada"
