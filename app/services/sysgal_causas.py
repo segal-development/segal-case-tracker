@@ -19,7 +19,7 @@ from app.models.sysgal_causa import SysgalCausa
 from app.models.sysgal_usuario import SysgalUsuario
 from app.services.matriz_sysgal import ACTIVA, load_sysgal_inputs, reclassify_cases
 from app.services.sysgal_client import SysgalClient
-from app.services.sysgal_matching import AMBIGUA, CALZADA, match_causa, normalize_rol
+from app.services.sysgal_matching import AMBIGUA, CALZADA, match_causa, match_causas, normalize_rol
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +39,7 @@ def sync_sysgal_causas(db: Session, client: SysgalClient, full: bool = False) ->
     now = datetime.utcnow()
     inputs_before = load_sysgal_inputs(db)  # what decided each case's matriz before this sync
     stats = {"usuarios": 0, "causas": 0, "nuevas": 0, "actualizadas": 0,
-             "calzadas": 0, "sin_calce": 0, "ambiguas": 0}
+             "calzadas": 0, "sin_calce": 0, "ambiguas": 0, "reenlazadas": 0}
 
     existing_users = {u.sysgal_id: u for u in db.query(SysgalUsuario).all()}
     for dto in client.usuarios():
@@ -84,9 +84,60 @@ def sync_sysgal_causas(db: Session, client: SysgalClient, full: bool = False) ->
         db.flush()
 
     db.commit()
+    stats["reenlazadas"] = _rematch_safely(db)
     logger.info("Sysgal causas sync done: %s", stats)
     _reclassify_changed(db, inputs_before)
     return stats
+
+
+def _rematch_safely(db: Session) -> int:
+    """Link active causas that are still unlinked (cases created after their first match).
+
+    SAFE-FAIL: the causas data is already committed; a failure is logged and the next sync retries.
+    """
+    try:
+        report = rematch_unlinked(db)
+        db.commit()
+        return report["reenlazadas"]
+    except Exception:
+        db.rollback()
+        logger.exception("Sysgal causas sync: re-match of unlinked causas failed (non-fatal)")
+        return 0
+
+
+def rematch_unlinked(db: Session, dry_run: bool = False) -> dict:
+    """Run the matcher over every ACTIVE, non-eliminada causa with ``case_id IS NULL`` (bulk).
+
+    Rows that already have a ``case_id`` are never read nor re-pointed. Writes (flush only, the
+    caller commits) ``case_id``/``match_method`` of the rows that now match; ``dry_run`` writes nothing.
+    Returns counts only: ``candidatas``, ``reenlazadas``, ``ambiguas``, ``sin_calce``.
+    """
+    rows = (
+        db.query(SysgalCausa)
+        .filter(
+            SysgalCausa.case_id.is_(None),
+            SysgalCausa.eliminada.is_(False),
+            func.lower(func.trim(SysgalCausa.estado)) == ACTIVA,
+        )
+        .order_by(SysgalCausa.id)
+        .all()
+    )
+    results = match_causas(db, [(r.rol_norm, r.tribunal, r.tribunal_codigo, r.rut_cliente) for r in rows])
+    report = {"candidatas": len(rows), "reenlazadas": 0, "ambiguas": 0, "sin_calce": 0}
+    for row, result in zip(rows, results):
+        if result.status == CALZADA:
+            report["reenlazadas"] += 1
+            if not dry_run:
+                row.case_id, row.match_method = result.case_id, result.method
+        elif result.status == AMBIGUA:
+            report["ambiguas"] += 1
+            if not dry_run:
+                row.match_method = AMBIGUA
+        else:
+            report["sin_calce"] += 1
+    if not dry_run:
+        db.flush()
+    return report
 
 
 def _reclassify_changed(db: Session, inputs_before: dict) -> None:

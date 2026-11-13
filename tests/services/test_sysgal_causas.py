@@ -75,7 +75,7 @@ class TestSync:
         stats = sync_sysgal_causas(db, client)
 
         assert stats == {"usuarios": 0, "causas": 2, "nuevas": 2, "actualizadas": 0,
-                         "calzadas": 1, "sin_calce": 1, "ambiguas": 0}
+                         "calzadas": 1, "sin_calce": 1, "ambiguas": 0, "reenlazadas": 0}
         row = db.query(SysgalCausa).filter_by(sysgal_id=10).one()
         assert (row.case_id, row.match_method, row.rol_norm) == (case.id, "rol+tribunal", "C-100-2026")
         assert db.query(SysgalCausa).filter_by(sysgal_id=11).one().case_id is None
@@ -313,3 +313,146 @@ class TestMatrizReclassification:
 
         assert stats["causas"] == 1
         assert db.query(SysgalCausa).count() == 1
+
+
+class TestRematchUnlinked:
+    """S7a: after each sync, ACTIVE unlinked causas are matched again (cases created later get linked)."""
+
+    def _seed_unlinked(self, db, **kw):
+        row = SysgalCausa(sysgal_id=kw.pop("sysgal_id", 50), rol="C-100-2026", rol_norm="C-100-2026",
+                          tribunal="Juzgado Uno", estado=kw.pop("estado", "activa"),
+                          eliminada=kw.pop("eliminada", False), sysgal_updated_at=datetime(2026, 11, 1),
+                          etapa=kw.pop("etapa", None), **kw)
+        db.add(row)
+        db.commit()
+        return row
+
+    def test_links_a_case_created_after_the_first_sync(self, db, lawyer, court):
+        sync_sysgal_causas(db, FakeClient(causas=[_causa(10, estado="activa")]))
+        assert db.query(SysgalCausa).one().case_id is None
+        case = _case(db, lawyer, court)
+        db.commit()
+
+        stats = sync_sysgal_causas(db, FakeClient())  # incremental, nothing changed in Sysgal
+
+        row = db.query(SysgalCausa).one()
+        assert (row.case_id, row.match_method) == (case.id, "rol+tribunal")
+        assert stats["reenlazadas"] == 1
+
+    def test_newly_linked_case_is_reclassified(self, db, lawyer, court):
+        from app.models.matriz_clasificacion import MatrizClasificacion
+
+        db.add(MatrizClasificacion(proc_simple="Juicio Ejecutivo Completo", proc_antiguo="JUICIO EJECUTIVO",
+                                   etapa="EXHIBICIÓN DOCUMENTOS", matriz="M2"))
+        db.commit()
+        sync_sysgal_causas(db, FakeClient(causas=[_causa(10, estado="activa", etapa="EXHIBICIÓN DOCUMENTOS")]))
+        case = _case(db, lawyer, court)
+        db.commit()
+
+        sync_sysgal_causas(db, FakeClient())
+
+        db.refresh(case)
+        assert (case.matriz, case.matriz_origen) == ("M2", "sysgal_etapa")
+
+    def test_already_linked_rows_are_never_repointed(self, db, lawyer, court):
+        first = _case(db, lawyer, court)
+        row = self._seed_unlinked(db)
+        row.case_id, row.match_method = first.id, "manual"
+        db.commit()
+        _case(db, lawyer, court, procedure="Principal")  # would now be ambiguous/other candidate
+        db.commit()
+
+        stats = sync_sysgal_causas(db, FakeClient())
+
+        db.refresh(row)
+        assert (row.case_id, row.match_method) == (first.id, "manual")
+        assert stats["reenlazadas"] == 0
+
+    @pytest.mark.parametrize("kw", [{"estado": "terminada"}, {"eliminada": True}])
+    def test_terminated_or_eliminated_rows_are_not_linked(self, db, lawyer, court, kw):
+        _case(db, lawyer, court)
+        row = self._seed_unlinked(db, **kw)
+
+        stats = sync_sysgal_causas(db, FakeClient())
+
+        db.refresh(row)
+        assert row.case_id is None
+        assert stats["reenlazadas"] == 0
+
+    def test_ambiguous_rows_stay_unlinked(self, db, lawyer, court):
+        _case(db, lawyer, court, procedure="A")
+        _case(db, lawyer, court, procedure="B")
+        row = self._seed_unlinked(db)
+
+        sync_sysgal_causas(db, FakeClient())
+
+        db.refresh(row)
+        assert (row.case_id, row.match_method) == (None, "ambigua")
+
+    def test_rematch_failure_is_not_fatal(self, db, lawyer, court, monkeypatch):
+        import app.services.sysgal_causas as mod
+
+        monkeypatch.setattr(mod, "rematch_unlinked", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
+
+        stats = sync_sysgal_causas(db, FakeClient(causas=[_causa(10)]))
+
+        assert stats["causas"] == 1 and stats["reenlazadas"] == 0
+
+    def test_query_count_is_flat_in_the_number_of_unlinked_rows(self, db, lawyer, court):
+        from sqlalchemy import event
+
+        from app.services.sysgal_causas import rematch_unlinked
+
+        def run(n):
+            for i in range(n):
+                db.add(SysgalCausa(sysgal_id=1000 + i + 100 * n, rol=f"C-{i}-2026", rol_norm=f"C-{i}-2026",
+                                   tribunal="Juzgado Uno", estado="activa", eliminada=False))
+            db.commit()
+            seen = []
+            hook = lambda conn, cur, stmt, *a: seen.append(stmt)  # noqa: E731
+            engine = db.get_bind()
+            event.listen(engine, "before_cursor_execute", hook)
+            try:
+                rematch_unlinked(db, dry_run=True)
+            finally:
+                event.remove(engine, "before_cursor_execute", hook)
+            return len(seen)
+
+        small = run(3)
+        large = run(40)
+
+        assert large <= small + 2
+
+    def test_dry_run_reports_and_writes_nothing(self, db, lawyer, court):
+        from app.services.sysgal_causas import rematch_unlinked
+
+        _case(db, lawyer, court)
+        row = self._seed_unlinked(db)
+
+        report = rematch_unlinked(db, dry_run=True)
+
+        db.refresh(row)
+        assert row.case_id is None
+        assert (report["candidatas"], report["reenlazadas"], report["ambiguas"], report["sin_calce"]) == (1, 1, 0, 0)
+
+
+class TestSiblingMatrizAfterSync:
+    def test_sibling_is_reclassified_when_the_principal_etapa_changes(self, db, lawyer, court):
+        from app.models.matriz_clasificacion import MatrizClasificacion
+
+        for etapa, matriz in [("PRUEBA", "M2"), ("APREMIO", "M3")]:
+            db.add(MatrizClasificacion(proc_simple="Juicio Ejecutivo Completo", proc_antiguo="JUICIO EJECUTIVO",
+                                       etapa=etapa, matriz=matriz))
+        principal = _case(db, lawyer, court, procedure="Principal")
+        secondary = _case(db, lawyer, court, procedure="Incidente nulidad")
+        db.commit()
+        sync_sysgal_causas(db, FakeClient(causas=[_causa(10, estado="activa", etapa="PRUEBA")]))
+        db.refresh(secondary)
+        assert (secondary.matriz, secondary.matriz_origen) == ("M2", "sysgal_etapa")
+
+        sync_sysgal_causas(db, FakeClient(causas=[_causa(10, estado="activa", etapa="APREMIO",
+                                                         updated=datetime(2026, 11, 5))]))
+
+        db.refresh(secondary)
+        db.refresh(principal)
+        assert (secondary.matriz, principal.matriz) == ("M3", "M3")

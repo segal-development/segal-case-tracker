@@ -16,7 +16,7 @@ Rules (never guess — ambiguity leaves ``case_id`` NULL):
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 
 from sqlalchemy.orm import Session
 
@@ -29,6 +29,8 @@ from app.utils.rut import clean_rut
 CALZADA = "calzada"
 SIN_CALCE = "sin_calce"
 AMBIGUA = "ambigua"
+
+_CHUNK = 5000
 
 
 @dataclass
@@ -52,14 +54,53 @@ def match_causa(
 ) -> MatchResult:
     if not rol_norm:
         return MatchResult(SIN_CALCE)
+    rows = _case_rows(db, [rol_norm]).get(rol_norm, [])
+    return _decide(rows, tribunal, tribunal_codigo, rut_cliente, lambda ids: _ruts_by_case(db, ids))
 
-    rows = (
-        db.query(Case.id, Court.code, Court.name, Case.court_id, Case.procedure)
-        .join(Court, Court.id == Case.court_id)
-        .filter(Case.rol == rol_norm)
-        .order_by(Case.id)
-        .all()
-    )
+
+def match_causas(db: Session, items: Sequence[tuple]) -> list[MatchResult]:
+    """Bulk twin of ``match_causa``: same decisions for many ``(rol_norm, tribunal, tribunal_codigo,
+    rut_cliente)`` items, with a constant number of queries (cases by ROL, then litigantes of the
+    candidate cases that need the RUT step), chunked for very large inputs."""
+    if not items:
+        return []
+    by_rol = _case_rows(db, sorted({item[0] for item in items if item[0]}))
+    ruts: dict[int, list[str]] = {}
+    fetched: set[int] = set()
+
+    def ruts_for(ids: list[int]) -> dict[int, list[str]]:
+        missing = [i for i in ids if i not in fetched]
+        if missing:
+            ruts.update(_ruts_by_case(db, missing))
+            fetched.update(missing)
+        return {i: ruts.get(i, []) for i in ids}
+
+    results = []
+    for rol_norm, tribunal, codigo, rut in items:
+        if not rol_norm:
+            results.append(MatchResult(SIN_CALCE))
+            continue
+        results.append(_decide(by_rol.get(rol_norm, []), tribunal, codigo, rut, ruts_for))
+    return results
+
+
+def _case_rows(db: Session, rols: list[str]) -> dict[str, list]:
+    """``{rol: [(case_id, court_code, court_name, court_id, procedure), ...]}`` ordered by case id."""
+    out: dict[str, list] = {}
+    for start in range(0, len(rols), _CHUNK):
+        rows = (
+            db.query(Case.id, Court.code, Court.name, Case.court_id, Case.procedure, Case.rol)
+            .join(Court, Court.id == Case.court_id)
+            .filter(Case.rol.in_(rols[start : start + _CHUNK]))
+            .order_by(Case.id)
+            .all()
+        )
+        for row in rows:
+            out.setdefault(row[5], []).append(row[:5])
+    return out
+
+
+def _decide(rows, tribunal, tribunal_codigo, rut_cliente, ruts_for) -> MatchResult:
     if not rows:
         return MatchResult(SIN_CALCE)
 
@@ -68,7 +109,7 @@ def match_causa(
         return MatchResult(CALZADA, by_tribunal[0], "rol+tribunal")
 
     pool = by_tribunal or [r[0] for r in rows]
-    hits = _rut_hits(db, pool, rut_cliente)
+    hits = _rut_hits(ruts_for, pool, rut_cliente)
     if len(hits) == 1:
         return MatchResult(CALZADA, hits[0], "rol+rut")
     if len(hits) > 1:
@@ -101,9 +142,22 @@ def _tribunal_hits(rows, tribunal: Optional[str], tribunal_codigo: Optional[str]
     return [r[0] for r in rows if _tribunal_key(r[2]) == key]
 
 
-def _rut_hits(db: Session, case_ids: list[int], rut_cliente: Optional[str]) -> list[int]:
+def _ruts_by_case(db: Session, case_ids: list[int]) -> dict[int, list[str]]:
+    out: dict[int, list[str]] = {}
+    for start in range(0, len(case_ids), _CHUNK):
+        rows = (
+            db.query(CaseLitigante.case_id, CaseLitigante.rut)
+            .filter(CaseLitigante.case_id.in_(case_ids[start : start + _CHUNK]))
+            .all()
+        )
+        for cid, rut in rows:
+            out.setdefault(cid, []).append(rut)
+    return out
+
+
+def _rut_hits(ruts_for, case_ids: list[int], rut_cliente: Optional[str]) -> list[int]:
     if not rut_cliente:
         return []
     wanted = clean_rut(rut_cliente)
-    ruts = db.query(CaseLitigante.case_id, CaseLitigante.rut).filter(CaseLitigante.case_id.in_(case_ids)).all()
-    return sorted({cid for cid, rut in ruts if rut and clean_rut(rut) == wanted})
+    by_case = ruts_for(case_ids)
+    return sorted({cid for cid in case_ids for rut in by_case.get(cid, []) if rut and clean_rut(rut) == wanted})

@@ -9,8 +9,8 @@ import logging
 from datetime import datetime
 from typing import Iterable, NamedTuple, Optional
 
-from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy import and_, func
+from sqlalchemy.orm import Session, aliased
 
 from app.models.case import Case
 from app.models.sysgal_causa import SysgalCausa
@@ -32,13 +32,19 @@ class SysgalInput(NamedTuple):
 
 
 def load_sysgal_inputs(db: Session) -> dict[int, SysgalInput]:
-    """``{case_id: SysgalInput}`` for cases linked to an active, non-eliminada Sysgal causa.
+    """``{case_id: SysgalInput}`` for cases decided by an active, non-eliminada Sysgal causa.
 
+    A case's OWN active link wins. A case without one inherits the inputs of the active causa
+    linked to another case with the same ``rol`` + ``court_id`` (its Principal sibling), for
+    matriz classification only (``sysgal_causas.case_id`` is never touched).
     Several rows for one case: the most recently updated wins (ties: highest ``id``).
     One query, no per-case round-trips.
     """
+    matched, sibling = aliased(Case), aliased(Case)
     rows = (
-        db.query(SysgalCausa.case_id, SysgalCausa.matriz, SysgalCausa.etapa, SysgalCausa.tramite)
+        db.query(SysgalCausa.case_id, sibling.id, SysgalCausa.matriz, SysgalCausa.etapa, SysgalCausa.tramite)
+        .join(matched, matched.id == SysgalCausa.case_id)
+        .join(sibling, and_(sibling.rol == matched.rol, sibling.court_id == matched.court_id))
         .filter(
             SysgalCausa.case_id.isnot(None),
             SysgalCausa.eliminada.is_(False),
@@ -47,7 +53,9 @@ def load_sysgal_inputs(db: Session) -> dict[int, SysgalInput]:
         .order_by(func.coalesce(SysgalCausa.sysgal_updated_at, datetime.min), SysgalCausa.id)
         .all()
     )
-    return {case_id: SysgalInput(matriz, etapa, tramite) for case_id, matriz, etapa, tramite in rows}
+    direct = {cid: SysgalInput(m, e, t) for cid, target, m, e, t in rows if cid == target}
+    inherited = {target: SysgalInput(m, e, t) for cid, target, m, e, t in rows if cid != target}
+    return {**inherited, **direct}  # later rows overwrite earlier ones
 
 
 def reclassify_cases(db: Session, case_ids: Iterable[int]) -> int:
