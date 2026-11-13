@@ -294,3 +294,113 @@ class TestReclassifyCases:
 
         assert reclassify_cases(db, {c.id, 999999}) == 0
         assert reclassify_cases(db, set()) == 0
+
+
+class TestSiblingInheritance:
+    """S7b: a case without its own active Sysgal link inherits the Principal sibling's inputs."""
+
+    def test_secondary_cuaderno_classifies_from_principal_sysgal_etapa(self, db, lawyer, court, taxonomy):
+        principal = _case(db, lawyer, court, procedure="Principal")
+        secondary = _case(db, lawyer, court, procedure="Incidente nulidad")
+        _mov(db, secondary)  # PJUD alone would say M1 Baja
+        _sysgal(db, principal, etapa="EXHIBICIÓN DOCUMENTOS")
+
+        r = _classify(db, secondary)
+
+        assert (r.matriz, r.origen) == ("M2", "sysgal_etapa")
+
+    def test_inherits_sysgal_matriz_with_origen_sysgal(self, db, lawyer, court, taxonomy):
+        principal = _case(db, lawyer, court, procedure="Principal")
+        secondary = _case(db, lawyer, court, procedure="Incidente")
+        _sysgal(db, principal, etapa="EXHIBICIÓN DOCUMENTOS", matriz="M1 Alta")
+
+        r = _classify(db, secondary)
+
+        assert (r.matriz, r.origen) == ("M1 Alta", "sysgal")
+
+    def test_own_active_link_wins_over_sibling(self, db, lawyer, court, taxonomy):
+        principal = _case(db, lawyer, court, procedure="Principal")
+        own = _case(db, lawyer, court, procedure="Incidente")
+        _sysgal(db, principal, etapa="EXHIBICIÓN DOCUMENTOS")
+        _sysgal(db, own, etapa="APREMIO")
+
+        assert _classify(db, own).matriz == "M3"
+        assert _classify(db, principal).matriz == "M2"
+
+    def test_own_terminated_link_does_not_block_inheritance(self, db, lawyer, court, taxonomy):
+        principal = _case(db, lawyer, court, procedure="Principal")
+        secondary = _case(db, lawyer, court, procedure="Incidente")
+        _sysgal(db, principal, etapa="EXHIBICIÓN DOCUMENTOS")
+        _sysgal(db, secondary, etapa="APREMIO", estado="terminada")
+
+        assert _classify(db, secondary).matriz == "M2"
+
+    def test_different_court_never_inherits(self, db, lawyer, court, taxonomy):
+        other = Court(code="T2-MSG", name="Otro Juzgado", region="RM", type="civil")
+        db.add(other)
+        db.commit()
+        principal = _case(db, lawyer, court, procedure="Principal")
+        stranger = _case(db, lawyer, other)
+        _mov(db, stranger)
+        _sysgal(db, principal, etapa="EXHIBICIÓN DOCUMENTOS")
+
+        r = _classify(db, stranger)
+
+        assert (r.matriz, r.origen) == ("M1 Baja", "pjud_etapa")
+
+    @pytest.mark.parametrize("kw", [{"estado": "terminada"}, {"eliminada": True}])
+    def test_terminated_or_eliminated_principal_link_is_not_inherited(self, db, lawyer, court, taxonomy, kw):
+        principal = _case(db, lawyer, court, procedure="Principal")
+        secondary = _case(db, lawyer, court, procedure="Incidente")
+        _mov(db, secondary)
+        _sysgal(db, principal, etapa="EXHIBICIÓN DOCUMENTOS", **kw)
+
+        assert _classify(db, secondary).origen == "pjud_etapa"
+
+    def test_unresolved_inherited_etapa_falls_through_to_pjud(self, db, lawyer, court, taxonomy):
+        principal = _case(db, lawyer, court, procedure="Principal")
+        secondary = _case(db, lawyer, court, procedure="Incidente")
+        _mov(db, secondary)
+        _sysgal(db, principal, etapa="JUDICIAL")
+
+        assert _classify(db, secondary).origen == "pjud_etapa"
+
+    def test_case_with_no_sysgal_anywhere_is_unchanged(self, db, lawyer, court, taxonomy):
+        plain = _case(db, lawyer, court, rol="C-7-2025")
+        _case(db, lawyer, court, rol="C-8-2025", procedure="Principal")
+        _mov(db, plain)
+
+        r = _classify(db, plain)
+
+        assert (r.matriz, r.matriz_etapa, r.origen) == ("M1 Baja", "ASIGNACIÓN", "pjud_etapa")
+
+    def test_inherited_inputs_come_from_the_same_single_query(self, db, lawyer, court, taxonomy):
+        for i in range(4):
+            p = _case(db, lawyer, court, rol=f"C-{i}-2025", procedure="Principal")
+            _case(db, lawyer, court, rol=f"C-{i}-2025", procedure="Incidente")
+            _sysgal(db, p, etapa="EXHIBICIÓN DOCUMENTOS")
+        statements = []
+        from sqlalchemy import event
+        engine = db.get_bind()
+
+        def on_exec(conn, cursor, statement, *a):
+            statements.append(statement)
+
+        event.listen(engine, "before_cursor_execute", on_exec)
+        try:
+            cache = MatrizMappingCache.load(db)
+        finally:
+            event.remove(engine, "before_cursor_execute", on_exec)
+
+        assert sum("sysgal_causas" in s for s in statements) == 1
+        assert len(cache.sysgal_inputs) == 8
+
+    def test_sysgal_owner_and_case_id_untouched_by_inheritance(self, db, lawyer, court, taxonomy):
+        principal = _case(db, lawyer, court, procedure="Principal")
+        secondary = _case(db, lawyer, court, procedure="Incidente")
+        row = _sysgal(db, principal, etapa="EXHIBICIÓN DOCUMENTOS")
+
+        _classify(db, secondary)
+
+        db.refresh(row)
+        assert row.case_id == principal.id

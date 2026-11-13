@@ -193,3 +193,58 @@ def test_malformed_sysgal_rol_never_matches():
 
     assert normalize_rol("7") == "7"
     assert normalize_rol("1234-2025") == "C-1234-2025"
+
+
+class TestMatchCausasBulk:
+    """``match_causas`` is the bulk twin of ``match_causa``: same decisions, constant queries."""
+
+    def _scenario(self, db, lawyer):
+        uno, dos = _court(db, "A", "Juzgado Uno"), _court(db, "B", "Juzgado Dos")
+        _case(db, lawyer, uno, rol="C-1-2026")
+        _case(db, lawyer, uno, rol="C-2-2026", procedure="Principal")
+        _case(db, lawyer, uno, rol="C-2-2026", procedure="Incidente")
+        _case(db, lawyer, uno, rol="C-3-2026", procedure="A", rut="11111111-1")
+        _case(db, lawyer, dos, rol="C-3-2026", procedure="B", rut="22222222-2")
+        _case(db, lawyer, uno, rol="C-4-2026", procedure="A")
+        _case(db, lawyer, uno, rol="C-4-2026", procedure="B")
+        return [
+            ("C-1-2026", "Juzgado Uno", None, None),
+            ("C-2-2026", "Juzgado Uno", None, None),
+            ("C-3-2026", "Juzgado Tres", None, "11.111.111-1"),
+            ("C-3-2026", "Juzgado Tres", None, "9-9"),
+            ("C-4-2026", "Juzgado Uno", None, None),
+            ("C-9-2026", "Juzgado Uno", None, None),
+            ("", "Juzgado Uno", None, None),
+        ]
+
+    def test_same_results_as_match_causa(self, db, lawyer):
+        from app.services.sysgal_matching import match_causas
+
+        items = self._scenario(db, lawyer)
+
+        assert match_causas(db, items) == [match_causa(db, *item) for item in items]
+
+    def test_empty_input(self, db):
+        from app.services.sysgal_matching import match_causas
+
+        assert match_causas(db, []) == []
+
+    def test_query_count_does_not_grow_with_items(self, db, lawyer):
+        from sqlalchemy import event
+
+        from app.services.sysgal_matching import match_causas
+
+        items = self._scenario(db, lawyer)
+        counts = []
+        engine = db.get_bind()
+        for batch in (items[:2], items * 5):
+            seen = []
+            hook = lambda conn, cur, stmt, *a: seen.append(stmt)  # noqa: E731
+            event.listen(engine, "before_cursor_execute", hook)
+            try:
+                match_causas(db, batch)
+            finally:
+                event.remove(engine, "before_cursor_execute", hook)
+            counts.append(len(seen))
+
+        assert counts[1] <= counts[0] + 1
