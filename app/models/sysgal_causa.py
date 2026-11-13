@@ -26,6 +26,7 @@ class SysgalCausa(Base):
     abogado_sysgal_id = Column(Integer, nullable=True, index=True)
     abogado_nombre = Column(String(255), nullable=True)
     etapa = Column(String(255), nullable=True)
+    matriz = Column(String(20), nullable=True)  # Sysgal's own matriz (M1 Baja/M1 Alta/M2/M3), when it sends one
     tramite = Column(String(255), nullable=True)
     estado = Column(String(50), nullable=True)
     competencia = Column(String(50), nullable=True)

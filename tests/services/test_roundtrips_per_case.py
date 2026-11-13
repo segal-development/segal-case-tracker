@@ -352,8 +352,12 @@ async def test_roundtrips_five_new_movements(db, seeded, capsys):
 # (a download needs the live token). No SELECT was added: persist_from_detail
 # reuses the case_escritos rows _sync_entities already loaded
 # (``SELECT case_escritos`` stays at 1; see test_escrito_documents_add_no_select).
-NO_NEW_BUDGET = 60
-FIVE_NEW_BUDGET = 77
+#
+# Both budgets went up by 1 when the matriz started coming from Sysgal: the
+# MatrizMappingCache load adds ONE ``SELECT sysgal_causas`` preloading every
+# linked case's etapa/tramite/matriz (a single query, not per case).
+NO_NEW_BUDGET = 61
+FIVE_NEW_BUDGET = 78
 
 
 @pytest.mark.asyncio

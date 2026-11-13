@@ -98,3 +98,35 @@ class TestDryRun:
         db.expire_all()
         refreshed = db.query(Case).filter(Case.id == case.id).first()
         assert refreshed.matriz_origen is None  # untouched by dry-run
+
+
+class TestSysgalDistribution:
+    def _linked(self, db, lawyer, court, one_mapped_case):
+        from app.models.sysgal_causa import SysgalCausa
+        db.add(MatrizClasificacion(
+            proc_simple="Juicio Ejecutivo Completo", proc_antiguo="JUICIO EJECUTIVO",
+            etapa="EXHIBICIÓN DOCUMENTOS", matriz="M2",
+        ))
+        db.add(SysgalCausa(sysgal_id=1, rol="C-1-2026", rol_norm="C-1-2026", tribunal="x",
+                           etapa="EXHIBICIÓN DOCUMENTOS", estado="activa", case_id=one_mapped_case.id))
+        db.commit()
+
+    def test_dry_run_reports_before_after_and_origen_without_writing(self, db, lawyer, court, one_mapped_case):
+        self._linked(db, lawyer, court, one_mapped_case)
+        one_mapped_case.matriz = "M1 Baja"
+        db.commit()
+
+        result = compute_distribution(db, dry_run=True)
+
+        assert result["before_by_matriz"]["M1 Baja"] == 1
+        assert result["by_matriz"]["M2"] == 1
+        assert result["by_origen"]["sysgal_etapa"] == 1
+        db.expire_all()
+        assert db.get(Case, one_mapped_case.id).matriz == "M1 Baja"
+
+    def test_print_distribution_shows_before_and_after(self, capsys):
+        from collections import Counter
+        from scripts.recalcular_matriz import _print_distribution
+        _print_distribution(Counter({"M2": 1}), Counter({"sysgal_etapa": 1}), 1, Counter({"M1 Baja": 1}))
+        out = capsys.readouterr().out
+        assert "antes" in out and "después" in out and "sysgal_etapa" in out

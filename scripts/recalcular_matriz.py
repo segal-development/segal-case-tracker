@@ -35,7 +35,8 @@ TOP_UNMAPPED_LIMIT = 20
 def compute_distribution(db, *, dry_run: bool) -> dict:
     """Classify every civil ``Case``, persisting unless *dry_run*.
 
-    Returns ``{"total", "done", "by_matriz", "by_origen", "no_mapeada_ids"}``.
+    Returns ``{"total", "done", "by_matriz", "before_by_matriz", "by_origen",
+    "no_mapeada_ids"}`` (``before_by_matriz`` = the matriz stored before this run).
     Never calls ``db.commit()`` and never mutates a ``Case`` attribute when
     ``dry_run=True`` — safe to run read-only against a live database.
     """
@@ -52,6 +53,7 @@ def compute_distribution(db, *, dry_run: bool) -> dict:
     mapping_cache.preload_latest_movements(db, [case.id for case in cases])
 
     by_matriz: Counter = Counter()
+    before_by_matriz: Counter = Counter(case.matriz for case in cases)
     by_origen: Counter = Counter()
     no_mapeada_ids: list[int] = []
 
@@ -84,16 +86,29 @@ def compute_distribution(db, *, dry_run: bool) -> dict:
         "total": total,
         "done": done,
         "by_matriz": by_matriz,
+        "before_by_matriz": before_by_matriz,
         "by_origen": by_origen,
         "no_mapeada_ids": no_mapeada_ids,
     }
 
 
-def _print_distribution(by_matriz: Counter, by_origen: Counter, total: int) -> None:
-    print("\ndistribución por matriz:")
-    for k, v in sorted(by_matriz.items(), key=lambda kv: (-kv[1], str(kv[0] or ""))):
-        pct = (v / total * 100) if total else 0
-        print(f"  {k!r:>12}: {v:>6} ({pct:.1f}%)")
+def _print_distribution(
+    by_matriz: Counter, by_origen: Counter, total: int, before_by_matriz: Counter = None
+) -> None:
+    if before_by_matriz is not None:
+        print("\ndistribución por matriz (antes -> después):")
+        keys = sorted(
+            set(by_matriz) | set(before_by_matriz),
+            key=lambda k: (-by_matriz.get(k, 0), str(k or "")),
+        )
+        for k in keys:
+            b, a = before_by_matriz.get(k, 0), by_matriz.get(k, 0)
+            print(f"  {k!r:>12}: antes {b:>6} -> después {a:>6} ({a - b:+d})")
+    else:
+        print("\ndistribución por matriz:")
+        for k, v in sorted(by_matriz.items(), key=lambda kv: (-kv[1], str(kv[0] or ""))):
+            pct = (v / total * 100) if total else 0
+            print(f"  {k!r:>12}: {v:>6} ({pct:.1f}%)")
     print("\ndistribución por origen:")
     for k, v in sorted(by_origen.items(), key=lambda kv: (-kv[1], str(kv[0] or ""))):
         pct = (v / total * 100) if total else 0
@@ -137,7 +152,9 @@ def main() -> None:
         result = compute_distribution(db, dry_run=args.dry_run)
 
         print(f"\n{'simulado' if args.dry_run else 'listo'}: {result['done']}/{result['total']} causas.")
-        _print_distribution(result["by_matriz"], result["by_origen"], result["total"])
+        _print_distribution(
+            result["by_matriz"], result["by_origen"], result["total"], result["before_by_matriz"]
+        )
         _print_top_unmapped(db, result["no_mapeada_ids"], result["total"])
     finally:
         db.close()

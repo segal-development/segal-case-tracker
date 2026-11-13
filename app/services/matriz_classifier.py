@@ -11,6 +11,12 @@ origen="error"``) so a bad row or a scraping gap can never break a sync.
 
 Precedence (first match wins)
 ------------------------------
+0. Sysgal (cases linked to an active, non-eliminada ``sysgal_causas`` row; data
+   preloaded in ``MatrizMappingCache.sysgal_inputs``): (a) the matriz Sysgal sends
+   for the causa -> origen ``sysgal``; (b) Sysgal's etapa resolved in
+   ``matriz_clasificacion`` (+ trámite override with Sysgal's trámite) -> origen
+   ``sysgal_etapa``. An etapa that does not resolve falls through to the PJUD path
+   below, which is unchanged and is the only path for cases not linked to Sysgal.
 1. ``cases.procedure`` signals M3: if it contains "Apremio" or "Tercer"
    (tercerías), the apremio cuaderno is the live one even when the last
    scraped movement's stage is older — the case is ``M3`` / etapa
@@ -89,6 +95,7 @@ from app.models.matriz_pjud_mapeo import (
 )
 from app.models.matriz_tramite_override import MatrizTramiteOverride
 from app.models.movement import Movement
+from app.services.matriz_sysgal import MATRICES, SysgalInput, load_sysgal_inputs
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +104,8 @@ _PRELOAD_CHUNK = 5000
 
 DEFAULT_PROC_SIMPLE = "Juicio Ejecutivo Completo"
 
+ORIGEN_SYSGAL = "sysgal"
+ORIGEN_SYSGAL_ETAPA = "sysgal_etapa"
 ORIGEN_PROCEDIMIENTO = "pjud_procedimiento"
 ORIGEN_ETAPA = "pjud_etapa"
 ORIGEN_DESCRIPCION = "pjud_descripcion"
@@ -120,6 +129,10 @@ def _normalize_text(value: Optional[str]) -> str:
     decomposed = unicodedata.normalize("NFKD", value)
     without_accents = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
     return without_accents.lower()
+
+
+def _normalize_etapa(value: str) -> str:
+    return " ".join(_normalize_text(value).split())
 
 
 class MatrizResult(NamedTuple):
@@ -169,6 +182,9 @@ class MatrizMappingCache:
     #: case genuinely has no movements (not that it was never loaded).
     latest_movement: dict[int, _LatestMovement] = field(default_factory=dict)
     preloaded_case_ids: set[int] = field(default_factory=set)
+    #: Sysgal data of the causa that decides each linked case (see
+    #: ``matriz_sysgal.load_sysgal_inputs``). Empty = no case is linked to Sysgal.
+    sysgal_inputs: dict[int, SysgalInput] = field(default_factory=dict)
 
     @classmethod
     def load(cls, db: Session) -> "MatrizMappingCache":
@@ -206,7 +222,21 @@ class MatrizMappingCache:
             descripcion_rules=descripcion_rules,
             clasificacion=clasificacion,
             tramite_overrides=tramite_overrides,
+            sysgal_inputs=load_sysgal_inputs(db),
         )
+
+    def resolve_etapa(self, proc_simple: str, etapa: Optional[str]) -> Optional[str]:
+        """The ``matriz_clasificacion`` etapa name matching *etapa* for *proc_simple*:
+        exact first, then accent-/case-/whitespace-insensitive. ``None`` if none."""
+        if not etapa or not etapa.strip():
+            return None
+        if (proc_simple, etapa) in self.clasificacion:
+            return etapa
+        wanted = _normalize_etapa(etapa)
+        for ps, known in self.clasificacion:
+            if ps == proc_simple and _normalize_etapa(known) == wanted:
+                return known
+        return None
 
     def preload_latest_movements(
         self, db: Session, case_ids: Optional[list[int]] = None
@@ -303,6 +333,33 @@ def _latest_of(movements: Sequence[Movement]) -> Optional[Movement]:
     return max(movements, key=lambda m: (m.movement_date, m.id))
 
 
+def _classify_from_sysgal(
+    case: Case, sysgal: SysgalInput, mapping_cache: MatrizMappingCache
+) -> Optional[MatrizResult]:
+    """Steps 1-2 of the precedence: Sysgal's own matriz, then Sysgal's etapa (with the
+    trámite override). ``None`` -> nothing usable, fall through to the PJUD path."""
+    proc_simple = case.matriz_proc_simple or DEFAULT_PROC_SIMPLE
+    etapa = mapping_cache.resolve_etapa(proc_simple, sysgal.etapa)
+
+    if sysgal.matriz in MATRICES:
+        return MatrizResult(
+            matriz=sysgal.matriz,
+            matriz_etapa=etapa or ((sysgal.etapa or "").strip() or None),
+            origen=ORIGEN_SYSGAL,
+        )
+
+    if etapa is None:
+        return None
+    entry = mapping_cache.clasificacion[(proc_simple, etapa)]
+    if entry.matriz is None:
+        return None
+    matriz = entry.matriz
+    override = mapping_cache.tramite_overrides.get((entry.proc_antiguo, etapa, sysgal.tramite or ""))
+    if override:
+        matriz = override
+    return MatrizResult(matriz=matriz, matriz_etapa=etapa, origen=ORIGEN_SYSGAL_ETAPA)
+
+
 def _classify_case(
     db: Session,
     case: Case,
@@ -310,6 +367,12 @@ def _classify_case(
     mapping_cache: MatrizMappingCache,
     movements: Optional[Sequence[Movement]] = None,
 ) -> MatrizResult:
+    sysgal = mapping_cache.sysgal_inputs.get(case.id)
+    if sysgal is not None:
+        from_sysgal = _classify_from_sysgal(case, sysgal, mapping_cache)
+        if from_sysgal is not None:
+            return from_sysgal
+
     procedure = (case.procedure or "").lower()
     if any(signal in procedure for signal in _APREMIO_PROCEDURE_SIGNALS):
         return MatrizResult(matriz="M3", matriz_etapa="APREMIO", origen=ORIGEN_PROCEDIMIENTO)
