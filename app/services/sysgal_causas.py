@@ -17,16 +17,15 @@ from sqlalchemy.orm import Session, aliased
 from app.models.case import Case
 from app.models.sysgal_causa import SysgalCausa
 from app.models.sysgal_usuario import SysgalUsuario
+from app.services.matriz_sysgal import ACTIVA, load_sysgal_inputs, reclassify_cases
 from app.services.sysgal_client import SysgalClient
 from app.services.sysgal_matching import AMBIGUA, CALZADA, match_causa, normalize_rol
 
 logger = logging.getLogger(__name__)
 
-ACTIVA = "activa"  # SysgalCausa.estado that may decide an owner (compared lowercase/trimmed)
-
 _CAUSA_FIELDS = (
     "rol", "tribunal", "tribunal_codigo", "rut_cliente", "abogado_sysgal_id", "abogado_nombre",
-    "etapa", "tramite", "estado", "competencia", "responsable_desde",
+    "etapa", "tramite", "matriz", "estado", "competencia", "responsable_desde",
 )
 
 
@@ -38,6 +37,7 @@ def sync_sysgal_causas(db: Session, client: SysgalClient, full: bool = False) ->
     The human ``lawyer_id`` mapping of a usuario is never touched.
     """
     now = datetime.utcnow()
+    inputs_before = load_sysgal_inputs(db)  # what decided each case's matriz before this sync
     stats = {"usuarios": 0, "causas": 0, "nuevas": 0, "actualizadas": 0,
              "calzadas": 0, "sin_calce": 0, "ambiguas": 0}
 
@@ -85,7 +85,26 @@ def sync_sysgal_causas(db: Session, client: SysgalClient, full: bool = False) ->
 
     db.commit()
     logger.info("Sysgal causas sync done: %s", stats)
+    _reclassify_changed(db, inputs_before)
     return stats
+
+
+def _reclassify_changed(db: Session, inputs_before: dict) -> None:
+    """Recompute the matriz of the cases whose Sysgal etapa/tramite/matriz (or link) changed.
+
+    Compares the effective Sysgal input per case before/after the sync, so a newly linked,
+    unlinked, terminated or edited causa is all covered; unchanged and unlinked cases are
+    never touched. SAFE-FAIL: the causas data is already committed, so a failure here is only
+    logged (the next full recompute fixes it).
+    """
+    try:
+        after = load_sysgal_inputs(db)
+        changed = {cid for cid in inputs_before.keys() | after.keys() if inputs_before.get(cid) != after.get(cid)}
+        n = reclassify_cases(db, changed)
+        logger.info("Sysgal causas sync: matriz reclassified for %d case(s)", n)
+    except Exception:
+        db.rollback()
+        logger.exception("Sysgal causas sync: matriz reclassification failed (non-fatal)")
 
 
 def sysgal_owner_by_case(db: Session) -> dict[int, int]:

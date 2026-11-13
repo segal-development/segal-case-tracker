@@ -251,3 +251,65 @@ def test_columns_fit_the_real_sysgal_data():
     assert cols.rol.type.length >= 255
     assert cols.rol_norm.type.length >= 255
     assert cols.rut_cliente.type.length >= 30
+
+
+class TestMatrizReclassification:
+    @pytest.fixture
+    def taxonomy(self, db):
+        from app.models.matriz_clasificacion import MatrizClasificacion
+        for etapa, m in [("PRUEBA", "M2"), ("SENTENCIA", "M3")]:
+            db.add(MatrizClasificacion(proc_simple="Juicio Ejecutivo Completo",
+                                       proc_antiguo="JUICIO EJECUTIVO", etapa=etapa, matriz=m))
+        db.commit()
+
+    def test_new_link_classifies_only_the_linked_case(self, db, lawyer, court, taxonomy):
+        linked = _case(db, lawyer, court)
+        other = _case(db, lawyer, court, rol="C-7-2026")
+
+        sync_sysgal_causas(db, FakeClient(causas=[_causa(10, etapa="PRUEBA", estado="activa")]))
+
+        db.expire_all()
+        assert (linked.matriz, linked.matriz_origen) == ("M2", "sysgal_etapa")
+        assert other.matriz_computed_at is None
+
+    def test_etapa_change_reclassifies_and_unchanged_is_untouched(self, db, lawyer, court, taxonomy):
+        a = _case(db, lawyer, court)
+        b = _case(db, lawyer, court, rol="C-7-2026")
+        sync_sysgal_causas(db, FakeClient(causas=[_causa(10, etapa="PRUEBA", estado="activa"),
+                                                  _causa(11, rol="C-7-2026", etapa="PRUEBA", estado="activa")]))
+        db.expire_all()
+        stamp_b = b.matriz_computed_at
+
+        sync_sysgal_causas(db, FakeClient(causas=[_causa(10, etapa="SENTENCIA", estado="activa")]))
+
+        db.expire_all()
+        assert a.matriz == "M3"
+        assert b.matriz_computed_at == stamp_b
+
+    def test_sysgal_matriz_field_is_stored_and_used(self, db, lawyer, court, taxonomy):
+        case = _case(db, lawyer, court)
+
+        sync_sysgal_causas(db, FakeClient(causas=[_causa(10, etapa="PRUEBA", matriz="M1 Alta", estado="activa")]))
+
+        db.expire_all()
+        assert db.query(SysgalCausa).one().matriz == "M1 Alta"
+        assert (case.matriz, case.matriz_origen) == ("M1 Alta", "sysgal")
+
+    def test_causa_becoming_inactive_falls_back_to_pjud(self, db, lawyer, court, taxonomy):
+        case = _case(db, lawyer, court)
+        sync_sysgal_causas(db, FakeClient(causas=[_causa(10, etapa="PRUEBA", estado="activa")]))
+
+        sync_sysgal_causas(db, FakeClient(causas=[_causa(10, etapa="PRUEBA", estado="terminada")]))
+
+        db.expire_all()
+        assert case.matriz_origen == "sin_detalle"
+
+    def test_reclassification_failure_does_not_break_the_sync(self, db, lawyer, court, taxonomy, monkeypatch):
+        _case(db, lawyer, court)
+        monkeypatch.setattr("app.services.sysgal_causas.reclassify_cases",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+
+        stats = sync_sysgal_causas(db, FakeClient(causas=[_causa(10, etapa="PRUEBA", estado="activa")]))
+
+        assert stats["causas"] == 1
+        assert db.query(SysgalCausa).count() == 1

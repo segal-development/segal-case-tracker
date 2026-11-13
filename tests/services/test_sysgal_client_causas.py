@@ -295,3 +295,21 @@ def test_page_cap_covers_two_hundred_thousand_causas():
     from app.services.sysgal_client import MAX_CAUSAS_PAGES, MAX_CAUSAS_PER_PAGE
 
     assert MAX_CAUSAS_PAGES * MAX_CAUSAS_PER_PAGE >= 200_000
+
+
+class TestMapCausaMatriz:
+    @pytest.mark.parametrize("raw,expected", [
+        ("M1 Baja", "M1 Baja"), ("M1 Alta", "M1 Alta"), ("M2", "M2"), ("M3", "M3"),
+        ("  m1   alta ", "M1 Alta"), (None, None), ("", None),
+    ])
+    def test_known_values(self, raw, expected):
+        assert map_causa(_raw(1, matriz=raw)).matriz == expected
+
+    def test_absent_is_none(self):
+        assert map_causa(_raw(1)).matriz is None
+
+    def test_unknown_value_is_ignored_and_logged_once(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert map_causa(_raw(1, matriz="M9-zz")).matriz is None
+            assert map_causa(_raw(2, matriz="M9-zz")).matriz is None
+        assert sum("M9-zz" in r.getMessage() for r in caplog.records) == 1

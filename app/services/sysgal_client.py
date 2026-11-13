@@ -21,6 +21,8 @@ from typing import Any, Iterator, Optional
 
 import httpx
 
+from app.services.matriz_sysgal import MATRICES
+
 logger = logging.getLogger(__name__)
 
 # Hard cap enforced by Sysgal (HTTP 400 beyond it).
@@ -68,6 +70,8 @@ class SysgalCausaDTO:
     competencia: Optional[str] = None
     eliminada: bool = False
     responsable_desde: Optional[date] = None
+    # Sysgal's own matriz for the causa ("M1 Baja" | "M1 Alta" | "M2" | "M3"); None when absent/invalid.
+    matriz: Optional[str] = None
 
 
 @dataclass
@@ -108,6 +112,22 @@ def _to_date(value: Any) -> Optional[date]:
     return parsed.date() if parsed else None
 
 
+_MATRIZ_BY_KEY = {" ".join(m.lower().split()): m for m in MATRICES}
+_unknown_matriz_logged: set[str] = set()
+
+
+def _matriz(value: Any) -> Optional[str]:
+    """Canonical matriz from Sysgal's value; anything outside the four is ignored (logged once)."""
+    text = _text(value)
+    if text is None:
+        return None
+    canonical = _MATRIZ_BY_KEY.get(" ".join(text.lower().split()))
+    if canonical is None and text not in _unknown_matriz_logged:
+        _unknown_matriz_logged.add(text)
+        logger.warning("Sysgal sent an unknown matriz value %r; ignoring it", text[:40])
+    return canonical
+
+
 def map_causa(raw: dict) -> SysgalCausaDTO:
     """JSON item -> ``SysgalCausaDTO``. THE place to edit when Sysgal fixes field names."""
     sysgal_id = _to_int(raw.get("id_causa"))
@@ -134,6 +154,7 @@ def map_causa(raw: dict) -> SysgalCausaDTO:
         competencia=_text(raw.get("competencia")),
         eliminada=bool(raw.get("eliminada")),
         responsable_desde=_to_date(raw.get("responsable_desde")),
+        matriz=_matriz(raw.get("matriz")),
     )
 
 
