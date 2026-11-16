@@ -24,6 +24,7 @@ from app.services.lawyer_roster import (
     firm_risk_board,
     admin_dashboard_stats,
     lawyer_dashboard_stats,
+    procurador_dashboard_stats,
 )
 
 router = APIRouter()
@@ -138,7 +139,14 @@ async def get_my_stats(
     if not lawyer:
         raise HTTPException(status_code=404, detail="Lawyer not found")
 
-    stats = lawyer_dashboard_stats(db, lawyer.rut)
+    if lawyer.role == "procurador":
+        from app.services import procurador as procurador_svc
+
+        abogados = procurador_svc.linked_abogados(db, lawyer.id)
+        stats = procurador_dashboard_stats(db, lawyer.rut, [a.rut for a in abogados])
+        stats["nombre"] = lawyer.name
+    else:
+        stats = lawyer_dashboard_stats(db, lawyer.rut)
 
     # Meta: Goal row with key "monthly_productivity"
     goal = db.query(Goal).filter(Goal.key == "monthly_productivity").first()

@@ -3,7 +3,7 @@
 import hashlib
 from datetime import datetime
 from typing import Generator, Optional
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 
@@ -369,9 +369,20 @@ def resolve_case_scope(db: Session, current_lawyer: dict):
         cached = lawyer_roster._scope_cache_get(key)
         if cached is not None:
             return set(cached)
-    scope = lawyer_roster.case_ids_for_abogado(
-        db, lawyer.rut, lawyer.rut
-    ) | _bootstrap_owned_case_ids(db, lawyer.id)
+    if lawyer.role == "procurador":
+        # Union of the scopes of the ACTIVE firm lawyers he supports, each computed exactly as
+        # that lawyer's own scope. No links -> empty.
+        from app.services import procurador as procurador_svc
+
+        scope = set()
+        for abogado in procurador_svc.linked_abogados(db, lawyer.id):
+            scope |= lawyer_roster.case_ids_for_abogado(
+                db, abogado.rut, abogado.rut
+            ) | _bootstrap_owned_case_ids(db, abogado.id)
+    else:
+        scope = lawyer_roster.case_ids_for_abogado(
+            db, lawyer.rut, lawyer.rut
+        ) | _bootstrap_owned_case_ids(db, lawyer.id)
     if use_cache:
         lawyer_roster._scope_cache_put(key, frozenset(scope))
     return scope
@@ -390,3 +401,85 @@ def apply_case_scope(query, scope):
     from app.models.case import Case
 
     return query.filter(Case.id.in_(scope))
+
+
+# ---------------------------------------------------------------------------
+# Procurador default-deny gate
+# ---------------------------------------------------------------------------
+# A procurador (role 'procurador') may only reach the (method, route template) pairs below;
+# every other authenticated request is a 403, so a newly added endpoint is closed to him by
+# default. Templates are relative to the API prefix. Unauthenticated/public routes and tokens
+# that do not resolve to a procurador are untouched (their own guards answer).
+PROCURADOR_ALLOWED = frozenset(
+    {
+        # session
+        ("GET", "/auth/me"),
+        ("GET", "/auth/session-status"),
+        ("PUT", "/auth/password"),
+        ("POST", "/auth/change-password"),
+        ("POST", "/auth/web-login"),
+        ("POST", "/auth/logout"),
+        # semáforo, agenda, cartera of his lawyers
+        ("GET", "/stats/me"),
+        ("GET", "/stats/data-freshness"),
+        ("GET", "/cases/deadlines/semaforo"),
+        ("GET", "/cases/{case_id}/deadlines"),
+        ("GET", "/calendar"),
+        # causas
+        ("GET", "/cases"),
+        ("GET", "/cases/summary"),
+        ("GET", "/cases/facets"),
+        ("GET", "/cases/{case_id}"),
+        ("GET", "/cases/{case_id}/movements"),
+        ("GET", "/cases/{case_id}/detail-entities"),
+        ("GET", "/cases/{case_id}/documents"),
+        ("GET", "/cases/{case_id}/timeline"),
+        ("GET", "/documents/{document_id}"),
+        ("GET", "/documents/{document_id}/download"),
+        # hitos (writes are further limited inside the endpoints)
+        ("GET", "/hitos"),
+        ("POST", "/hitos"),
+        ("GET", "/hitos/tipos"),
+        ("GET", "/hitos/abogados"),
+        ("PUT", "/hitos/{hito_id}"),
+        ("DELETE", "/hitos/{hito_id}"),
+        ("GET", "/hitos/{hito_id}/evidencia"),
+        ("PUT", "/hitos/{hito_id}/evidencia"),
+        # own page-view audit trail (no data returned)
+        ("POST", "/activity/views"),
+    }
+)
+PROCURADOR_FORBIDDEN_DETAIL = "Tu perfil de procurador no tiene acceso a esta sección."
+
+
+async def procurador_gate(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+    db: Session = Depends(get_db),
+) -> None:
+    if not credentials:
+        return
+    payload = decode_access_token(credentials.credentials)
+    if not payload:
+        return
+    sub = payload.get("sub") or payload.get("lawyer_id")
+    if sub is None:
+        return
+    from app.models.lawyer import Lawyer
+
+    try:
+        lawyer = db.query(Lawyer).filter(Lawyer.id == int(sub)).first()
+    except (TypeError, ValueError):
+        lawyer = db.query(Lawyer).filter(Lawyer.rut == str(sub)).first()
+    if lawyer is None or lawyer.role != "procurador":
+        return
+    route = request.scope.get("route")
+    template = getattr(route, "path", None)
+    if template is None:
+        return  # no route matched: the 404 is not ours to rewrite
+    prefix = request.scope.get("root_path", "") + "/api/v1"
+    if template.startswith(prefix):
+        template = template[len(prefix):] or "/"
+    if (request.method.upper(), template) in PROCURADOR_ALLOWED:
+        return
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=PROCURADOR_FORBIDDEN_DETAIL)
