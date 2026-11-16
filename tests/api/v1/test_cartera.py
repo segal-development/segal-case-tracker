@@ -287,5 +287,18 @@ def test_get_frescura_shape_and_advertencia(client, db, admin_headers, auditor_h
     assert client.get("/api/v1/cartera/frescura", headers=admin_headers).status_code == 200
 
 
+def test_get_frescura_por_abogado_carries_the_lawyer_nivel(client, db, auditor_headers, plain_lawyer, court):
+    # Audit finding #16: Cartera showed "Sin nivel" for everyone because the
+    # per-lawyer freshness rows never carried the nivel.
+    plain_lawyer.nivel = "junior"
+    db.commit()
+    case = _make_case(db, plain_lawyer, court, "C-111-2026", last_detail_checked_at=datetime.utcnow())
+    _seed_litigante(db, case, plain_lawyer)
+
+    body = client.get("/api/v1/cartera/frescura", headers=auditor_headers).json()
+    rows = [r for r in body["por_abogado"] if r["lawyer_id"] == plain_lawyer.id]
+    assert rows and rows[0]["nivel"] == "junior"
+
+
 def test_get_frescura_rejects_plain_lawyer(client, lawyer_headers):
     assert client.get("/api/v1/cartera/frescura", headers=lawyer_headers).status_code == 403
