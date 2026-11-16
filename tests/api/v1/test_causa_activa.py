@@ -123,3 +123,43 @@ def test_list_items_carry_the_stored_state(client, world):
 def test_bogus_contrato_is_422(client, world):
     assert client.get("/api/v1/cases?contrato=bogus", headers=headers(world["admin"].rut)).status_code == 422
 
+
+
+def _auditor(db):
+    return make_lawyer(db, "44444444-4", "Auditor", role="auditor")
+
+
+def test_every_total_screen_agrees_on_one_dataset(client, db, world):
+    """Cases list, summary, matriz, and both /stats/firm variants (admin, auditor) show the same total."""
+    auditor = _auditor(db)
+    for who in (world["admin"], auditor):
+        h = headers(who.rut)
+        totals = {
+            "cases": client.get("/api/v1/cases", headers=h).json()["total"],
+            "summary": client.get("/api/v1/cases/summary", headers=h).json()["total"],
+            "matriz": client.get("/api/v1/matriz/distribucion", headers=h).json()["total"],
+            "firm": client.get("/api/v1/stats/firm", headers=h).json()["totals"]["cases"],
+        }
+        assert totals == {"cases": 3, "summary": 3, "matriz": 3, "firm": 3}, who.role
+
+
+def test_q_by_rol_finds_terminada_and_caducado_causas(client, world):
+    h = headers(world["admin"].rut)
+    for key in ("terminada", "caducado"):
+        rol = world["cases"][key].rol
+        body = client.get("/api/v1/cases", params={"q": rol}, headers=h).json()
+        assert [i["id"] for i in body["items"]] == [world["cases"][key].id]
+
+
+def test_cobertura_filter_counts_within_the_activas_like_its_chip(client, db, world):
+    # Cobertura applies to the abandono/apremio/prescripcion subset; terminada+activo stays out, like the chip.
+    for case in world["cases"].values():
+        case.en_apremio = True
+    db.commit()
+    h = headers(world["admin"].rut)
+
+    body = client.get("/api/v1/cases", params={"cobertura": "activo"}, headers=h).json()
+    chips = client.get("/api/v1/cases/summary", headers=h).json()
+
+    assert [i["id"] for i in body["items"]] == [world["cases"]["activo"].id]
+    assert body["total"] == 1 == chips["sysgal_activo"]

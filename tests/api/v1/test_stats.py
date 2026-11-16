@@ -374,6 +374,62 @@ class TestFirmDashboardStatsAll:
 
 
 class TestAdminDashboardStats:
+    def test_total_cases_counts_activas_and_reports_the_excluded(self, db, lawyer, court):
+        activa = _make_case(db, lawyer, court, "C-6101-2025")
+        terminada = _make_case(db, lawyer, court, "C-6102-2025")
+        caducada = _make_case(db, lawyer, court, "C-6103-2025")
+        terminada.terminada_en_sysgal = True
+        caducada.contrato_estado = "caducado"
+        db.commit()
+        for c in (activa, terminada, caducada):
+            _seed_litigantes(db, c)
+
+        out = admin_dashboard_stats(db, ACCOUNT_RUT)
+
+        assert out["quality"]["total_cases"] == 1
+        assert out["activas_definicion"] == "no terminada en Sysgal; contrato vigente, moroso o sin dato"
+        assert out["excluidas"] == {"terminada_sysgal": 1, "contrato_caducado": 1}
+
+    def test_sync_and_documents_metrics_span_every_civil_case_while_causa_totals_count_activas(
+        self, db, lawyer, court
+    ):
+        now = datetime.utcnow()
+        activa = _make_case(db, lawyer, court, "C-6201-2025", semaforo="rojo")
+        terminada = _make_case(db, lawyer, court, "C-6202-2025", semaforo="verde")
+        caducada = _make_case(db, lawyer, court, "C-6203-2025", semaforo="verde")
+        terminada.terminada_en_sysgal = True
+        caducada.contrato_estado = "caducado"
+        activa.last_detail_checked_at = now
+        caducada.last_detail_checked_at = now  # terminada stays pending: the station still scrapes it
+        db.commit()
+        for c in (activa, terminada, caducada):
+            _seed_litigantes(db, c)
+            db.add(Movement(case_id=c.id, description="Resolución", movement_date=now))
+        db.add_all([
+            Document(case_id=activa.id, status="stored"),
+            Document(case_id=terminada.id, status="pending"),
+            Document(case_id=caducada.id, status="failed"),
+        ])
+        db.commit()
+
+        out = admin_dashboard_stats(db, ACCOUNT_RUT)
+
+        # Scrape freshness and the document pipeline: every civil case, as on main.
+        assert out["sync"]["checked_1h"] == 2
+        assert out["sync"]["checked_24h"] == 2
+        assert out["sync"]["pending_detail"] == 1
+        assert out["sync"]["movements_1h"] == 3
+        assert out["sync"]["stale_30d"] == 2  # checked, no movement date: stale, excluded or not
+        assert out["sync"]["last_checked_at"] is not None
+        assert out["documents"] == {"stored": 1, "pending": 1, "failed": 1, "unavailable": 0}
+        # "How many causas" figures: activas only.
+        quality = out["quality"]
+        assert quality["total_cases"] == 1
+        assert quality["with_semaforo"] == 1
+        assert quality["with_movements"] == 1
+        assert quality["with_litigantes"] == 1
+        assert out["excluidas"] == {"terminada_sysgal": 1, "contrato_caducado": 1}
+
     def test_pending_detail_vs_checked(self, db, lawyer, court):
         checked = _make_case(db, lawyer, court, "C-6001-2025")
         unchecked = _make_case(db, lawyer, court, "C-6002-2025")

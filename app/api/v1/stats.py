@@ -209,6 +209,8 @@ class AdminDashboardStats(BaseModel):
     sync: AdminSync
     documents: AdminDocuments
     quality: AdminQuality
+    activas_definicion: str | None = None
+    excluidas: Excluidas | None = None
 
     model_config = ConfigDict(from_attributes=True)
 

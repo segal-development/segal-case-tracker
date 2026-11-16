@@ -19,6 +19,7 @@ import logging
 from datetime import date, datetime, timedelta
 from typing import Optional
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -115,7 +116,12 @@ def parte_ruts_in_scope(
     # The client of every active Sysgal causa (``rut_cliente``) is the first source of the contract state.
     cliente_rows = (
         db.query(SysgalCausa.rut_cliente)
-        .filter(SysgalCausa.eliminada.is_(False), SysgalCausa.rut_cliente.isnot(None), SysgalCausa.rut_cliente != "")
+        .filter(
+            SysgalCausa.eliminada.is_(False),
+            func.lower(func.trim(SysgalCausa.estado)) == "activa",
+            SysgalCausa.rut_cliente.isnot(None),
+            SysgalCausa.rut_cliente != "",
+        )
         .distinct()
         .all()
     )
@@ -176,12 +182,15 @@ def sync_sysgal_estados(
         client = SysgalClient(settings.SYSGAL_BASE_URL, settings.SYSGAL_API_KEY)
     if not client.is_configured:
         logger.warning("Sysgal integration not configured (SYSGAL_BASE_URL/SYSGAL_API_KEY) — skipping sync")
+        # The contract state also ages by date (stale ACTIVO -> caducado): recompute is local, no Sysgal call.
+        recompute_safely(db)
         return _empty_summary(skipped=True)
 
     summary = _empty_summary(skipped=False)
     ruts = parte_ruts_in_scope(db, force=force)
     summary["consultados"] = len(ruts)
     if not ruts:
+        recompute_safely(db)
         return summary
 
     for start in range(0, len(ruts), MAX_RUTS_PER_REQUEST):

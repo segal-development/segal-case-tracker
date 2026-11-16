@@ -430,3 +430,69 @@ class TestWireFormat:
         assert set(rows) == {valid, invalid}        # cache keyed canonically, never dotted
         assert rows[valid].encontrado and rows[valid].estado_codigo == "ACTIVO"
         assert rows[invalid].encontrado and rows[invalid].estado_codigo == "TERMINADO"
+
+
+class TestContratoRecompute:
+    @staticmethod
+    def _stale_activo_case(db, lawyer, court, synced_at):
+        from app.models.sysgal_causa import SysgalCausa
+
+        case = _make_case(db, lawyer, court, "C-900-2026", contrato_estado="activo")
+        assert case.es_activa is True
+        db.add(SysgalCausa(sysgal_id=900, rol="C-900-2026", rol_norm="C-900-2026", tribunal="t",
+                           rut_cliente="12345678-5", estado="activa", eliminada=False, case_id=case.id))
+        db.add(ClienteSysgalEstado(rut="12345678-5", encontrado=True, estado_codigo="ACTIVO",
+                                   vigencia_hasta=date(2020, 1, 1), synced_at=synced_at))
+        db.commit()
+        return case
+
+    def test_recompute_runs_when_no_rut_is_stale(self, db, lawyer, court):
+        case = self._stale_activo_case(db, lawyer, court, datetime.utcnow())
+        client = FakeClient()
+
+        result = sync_sysgal_estados(db, client=client)
+
+        assert result["consultados"] == 0 and client.batches == []
+        db.refresh(case)
+        assert (case.contrato_estado, case.es_activa) == ("caducado", False)
+
+    def test_recompute_runs_when_sysgal_is_unconfigured(self, db, lawyer, court):
+        case = self._stale_activo_case(db, lawyer, court, datetime.utcnow())
+
+        result = sync_sysgal_estados(db, client=FakeClient(configured=False))
+
+        assert result["skipped"] is True
+        db.refresh(case)
+        assert (case.contrato_estado, case.es_activa) == ("caducado", False)
+
+    def test_recompute_runs_after_a_real_sync(self, db, lawyer, court):
+        case = self._stale_activo_case(db, lawyer, court, datetime.utcnow() - timedelta(days=400))
+        client = FakeClient(answers={"12345678-5": _found("ACTIVO", hasta="2020-01-01")})
+
+        sync_sysgal_estados(db, client=client)
+
+        assert client.batches
+        db.refresh(case)
+        assert (case.contrato_estado, case.es_activa) == ("caducado", False)
+
+
+class TestClienteRutScope:
+    @staticmethod
+    def _causa(db, sid, rut, **kw):
+        from app.models.sysgal_causa import SysgalCausa
+
+        fields = dict(sysgal_id=sid, rol=f"C-{sid}", rol_norm=f"C-{sid}", tribunal="t", rut_cliente=rut,
+                      estado="activa", eliminada=False)
+        fields.update(kw)
+        db.add(SysgalCausa(**fields))
+        db.commit()
+
+    def test_only_active_non_eliminada_causas_add_their_client_rut(self, db):
+        from app.services.sysgal_sync import parte_ruts_in_scope
+
+        self._causa(db, 1, "11111111-1")
+        self._causa(db, 2, "22222222-2", estado="terminada")
+        self._causa(db, 3, "33333333-3", eliminada=True)
+        self._causa(db, 4, "44444444-4", estado=" Activa ")
+
+        assert parte_ruts_in_scope(db) == ["11111111-1", "44444444-4"]

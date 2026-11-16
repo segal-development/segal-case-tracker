@@ -488,3 +488,22 @@ class TestTerminadaFlagAfterSync:
 
         db.expire_all()
         assert case.terminada_en_sysgal is True and case.matriz_computed_at == stamp
+
+
+class TestContratoRecompute:
+    def test_recompute_runs_after_the_causas_sync(self, db, lawyer, court):
+        from datetime import date
+
+        from app.models.cliente_sysgal_estado import ClienteSysgalEstado
+
+        case = _case(db, lawyer, court)
+        case.contrato_estado = "activo"
+        db.add(ClienteSysgalEstado(rut="12345678-5", encontrado=True, estado_codigo="ACTIVO",
+                                   vigencia_hasta=date(2020, 1, 1), synced_at=datetime(2026, 11, 1)))
+        db.commit()
+        assert case.es_activa is True
+
+        sync_sysgal_causas(db, FakeClient(causas=[_causa(10, rut_cliente="12345678-5", estado="activa")]))
+
+        db.refresh(case)
+        assert (case.contrato_estado, case.es_activa) == ("caducado", False)

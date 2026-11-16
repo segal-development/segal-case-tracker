@@ -52,7 +52,7 @@ from app.services.asignacion_engine import (
     NIVELES_REQUERIDOS,
     asignar_automatico,
 )
-from app.services.causa_activa import Excluidas, activa_fields, excluidas_de
+from app.services.causa_activa import CASE_ACTIVA_FILTER, Excluidas, activa_fields, excluidas_de
 from app.services.lawyer_roster import resolved_owner_by_case
 from app.services.traspaso_cartera import (
     TraspasoError,
@@ -469,7 +469,8 @@ async def get_sugerencias(
     niveles = sorted({n for req in NIVELES_REQUERIDOS.values() for n in req})
 
     owners = resolved_owner_by_case(db)
-    counts = Counter(lw.id for lw in owners.values())
+    activas = {cid for (cid,) in db.query(Case.id).filter(Case.id.in_(list(owners)), CASE_ACTIVA_FILTER)} if owners else set()
+    counts = Counter(lw.id for cid, lw in owners.items() if cid in activas)
 
     lawyers = (
         db.query(Lawyer)

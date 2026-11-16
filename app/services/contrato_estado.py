@@ -95,8 +95,8 @@ def _cache_rows(db: Session, ruts: set[str]) -> dict[str, ClienteSysgalEstado]:
     return out
 
 
-def _sysgal_rut_by_case(db: Session, case_ids: Optional[list[int]]) -> dict[int, str]:
-    """Canonical ``rut_cliente`` of each case's own latest active, non-eliminada Sysgal causa."""
+def _sysgal_ruts_by_case(db: Session, case_ids: Optional[list[int]]) -> dict[int, list[str]]:
+    """Canonical ``rut_cliente`` of each case's own active, non-eliminada Sysgal causas, latest first."""
     query = (
         db.query(SysgalCausa.case_id, SysgalCausa.rut_cliente)
         .filter(
@@ -109,14 +109,12 @@ def _sysgal_rut_by_case(db: Session, case_ids: Optional[list[int]]) -> dict[int,
     )
     if case_ids is not None:
         query = query.filter(SysgalCausa.case_id.in_(case_ids))
-    latest: dict[int, str] = {}
-    for case_id, raw in query.all():  # later rows overwrite earlier ones
+    ordered: dict[int, list[str]] = {}
+    for case_id, raw in query.all():  # oldest first
         rut = clean_rut(raw) if raw else ""
         if rut:
-            latest[case_id] = rut
-        else:
-            latest.pop(case_id, None)
-    return latest
+            ordered.setdefault(case_id, []).append(rut)
+    return {cid: list(reversed(ruts)) for cid, ruts in ordered.items()}
 
 
 def compute_contrato_estados(
@@ -134,13 +132,14 @@ def compute_contrato_estados(
         return {}
     today = today or date.today()
 
-    sysgal_ruts = _sysgal_rut_by_case(db, scope)
-    cache = _cache_rows(db, set(sysgal_ruts.values()))
+    sysgal_ruts = _sysgal_ruts_by_case(db, scope)
+    cache = _cache_rows(db, {r for ruts in sysgal_ruts.values() for r in ruts})
     ddo = ddo_info_by_case(db, scope, today)
 
     result: dict[int, str] = {}
     for cid in all_ids:
-        row = cache.get(sysgal_ruts.get(cid, ""))
+        # The latest causa's RUT that Sysgal has answered; an unanswered RUT says nothing, so try the next.
+        row = next((cache[r] for r in sysgal_ruts.get(cid, []) if r in cache), None)
         if row is not None:
             result[cid] = _info(row, today)["cobertura"]
         elif cid in ddo:

@@ -164,3 +164,31 @@ def test_recompute_only_the_given_cases(db, owner, court):
     recompute_contrato_estado(db, case_ids=[a.id], today=TODAY)
     db.expire_all()
     assert a.contrato_estado == "caducado" and b.contrato_estado is None
+
+
+def test_older_active_causa_rut_is_tried_when_the_latest_has_no_cache_row(db, owner, court):
+    case = _case(db, owner, court)
+    _causa(db, case, "11111111-1", updated=datetime(2026, 6, 1))
+    _causa(db, case, "22222222-2", updated=datetime(2026, 10, 1))  # latest, never answered by Sysgal
+    _cache(db, "11111111-1", "MOROSO_INACTIVO")
+    _ddo(db, case, "33333333-3")
+    _cache(db, "33333333-3", "ACTIVO", hasta=date(2027, 1, 1))
+    assert compute_contrato_estados(db, today=TODAY)[case.id] == "moroso"
+
+
+def test_latest_answered_rut_still_wins_over_older_ones(db, owner, court):
+    case = _case(db, owner, court)
+    _causa(db, case, "11111111-1", updated=datetime(2026, 6, 1))
+    _causa(db, case, "22222222-2", updated=datetime(2026, 10, 1))
+    _cache(db, "11111111-1", "MOROSO_INACTIVO")
+    _cache(db, "22222222-2", "ACTIVO", hasta=date(2027, 1, 1))
+    assert compute_contrato_estados(db, today=TODAY)[case.id] == "activo"
+
+
+def test_ddo_is_used_only_when_no_active_causa_rut_has_a_cache_row(db, owner, court):
+    case = _case(db, owner, court)
+    _causa(db, case, "11111111-1", updated=datetime(2026, 6, 1))
+    _causa(db, case, "22222222-2", updated=datetime(2026, 10, 1))
+    _ddo(db, case, "33333333-3")
+    _cache(db, "33333333-3", "ACTIVO", hasta=date(2027, 1, 1))
+    assert compute_contrato_estados(db, today=TODAY)[case.id] == "activo"
