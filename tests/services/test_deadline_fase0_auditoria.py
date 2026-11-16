@@ -228,11 +228,11 @@ class TestS4Escalation:
         DeadlineEngine.recompute_case(db, case)
         assert self._alerts(db) == []
 
-    def test_old_deadline_still_escalates_once(self, db, lawyer, court):
+    def test_old_deadline_does_not_escalate(self, db, lawyer, court):
         case = _recent_case(db, lawyer, court)
         _fatal_row(db, case, TODAY - timedelta(days=90))
         DeadlineEngine.recompute_case(db, case)
-        assert len(self._alerts(db)) == 1  # the lawyer; no admin in this fixture
+        assert self._alerts(db) == []  # outside the 60-day window: listed, never alerted
 
     def test_no_alert_without_fatal_no_cumplido(self, db, lawyer, court):
         _admin(db)
@@ -246,3 +246,89 @@ class TestS4Escalation:
         DeadlineEngine.recompute_case(db, case)
         (a,) = self._alerts(db)
         assert not a.email_sent and not a.webhook_sent
+
+
+class TestFollowUpVolumeAndRaces:
+    def _alerts(self, db):
+        return db.query(Alert).filter(Alert.type == ALERT_TYPE).all()
+
+    def test_gris_case_stays_gris_and_does_not_escalate(self, db, lawyer, court):
+        _admin(db)
+        case = _case(db, lawyer, court, rol="C-9-2026")  # no movements: indeterminate
+        _fatal_row(db, case, date(2026, 10, 19))
+        DeadlineEngine.recompute_case(db, case)
+        assert case.semaforo == "gris"
+        assert case.semaforo_motivo is None
+        assert self._alerts(db) == []
+
+    def test_archived_case_does_not_escalate(self, db, lawyer, court):
+        case = _recent_case(db, lawyer, court)
+        case.status = "archived"
+        _fatal_row(db, case, date(2026, 10, 19))
+        DeadlineEngine.recompute_case(db, case)
+        assert self._alerts(db) == []
+
+    def test_older_than_60_days_does_not_alert(self, db, lawyer, court):
+        case = _recent_case(db, lawyer, court)
+        _fatal_row(db, case, TODAY - timedelta(days=61))
+        DeadlineEngine.recompute_case(db, case)
+        assert self._alerts(db) == []
+
+    def test_exactly_60_days_alerts_once(self, db, lawyer, court):
+        case = _recent_case(db, lawyer, court)
+        _fatal_row(db, case, TODAY - timedelta(days=60))
+        DeadlineEngine.recompute_case(db, case)
+        assert len(self._alerts(db)) == 1
+
+    def test_unique_index_rejects_a_duplicate_escalation_alert(self, db, lawyer, court):
+        from sqlalchemy.exc import IntegrityError
+
+        case = _recent_case(db, lawyer, court)
+        row = _fatal_row(db, case, date(2026, 10, 19))
+
+        def mk():
+            return Alert(lawyer_id=lawyer.id, case_id=case.id, type=ALERT_TYPE,
+                         entity_type="plazo_fatal_escalado", entity_id=row.id, title="t")
+
+        db.add(mk())
+        db.flush()
+        db.add(mk())
+        with pytest.raises(IntegrityError):
+            db.flush()
+        db.rollback()
+
+    def test_race_lost_insert_is_swallowed_and_not_counted(self, db, lawyer, court, monkeypatch):
+        """A concurrent worker inserted the same alert after our SELECT: no error, 0 created."""
+        from app.services import escalamiento_plazos as esc
+
+        case = _recent_case(db, lawyer, court)
+        row = _fatal_row(db, case, date(2026, 10, 19))
+        db.add(Alert(lawyer_id=lawyer.id, case_id=case.id, type=ALERT_TYPE,
+                     entity_type="plazo_fatal_escalado", entity_id=row.id, title="t"))
+        db.flush()
+        real_query = db.query
+
+        def blind(*args, **kw):  # the "existing" lookup sees nothing (stale read)
+            q = real_query(*args, **kw)
+            if len(args) == 2 and args[0] is Alert.entity_id:
+                return q.filter(Alert.id < 0)
+            return q
+
+        monkeypatch.setattr(db, "query", blind)
+        assert esc.escalate_fatal_vencidos(db, case, [row], TODAY) == 0
+        monkeypatch.undo()
+        assert len(self._alerts(db)) == 1
+
+    def test_one_litigante_resolution_per_case(self, db, lawyer, court, monkeypatch):
+        import app.services.lawyer_roster as roster
+
+        calls = []
+        real = roster.resolve_case_alert_recipients
+        monkeypatch.setattr(roster, "resolve_case_alert_recipients",
+                            lambda *a, **k: calls.append(1) or real(*a, **k))
+        case = _recent_case(db, lawyer, court)
+        _fatal_row(db, case, date(2026, 10, 19))
+        from app.services import escalamiento_plazos as esc
+
+        esc.escalate_fatal_vencidos(db, case, db.query(CaseDeadline).all(), TODAY)
+        assert len(calls) == 1

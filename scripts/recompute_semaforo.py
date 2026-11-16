@@ -32,7 +32,9 @@ def compute_report(db, *, dry_run: bool) -> dict:
     from app.models.case import Case
     from app.services.deadline_engine import DeadlineEngine
 
-    def _no_commit(_session):  # pragma: no cover - safety net
+    def _no_commit(session):  # pragma: no cover - safety net
+        if session.in_nested_transaction():
+            return  # savepoint release (engine safe-fail blocks): nothing is persisted
         raise RuntimeError("dry-run: commit is not allowed")
 
     if dry_run:

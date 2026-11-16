@@ -1,7 +1,7 @@
 """Alert model - Movement alerts sent to lawyers."""
 
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean, Text, text
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean, Index, Text, text
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
@@ -11,6 +11,16 @@ class Alert(Base):
     """Alert sent when new movement is detected."""
     
     __tablename__ = "alerts"
+    __table_args__ = (
+        # Fase 0: one escalation alert per (deadline, recipient), enforced by the DB.
+        Index(
+            "uq_alerts_plazo_fatal_escalado",
+            "entity_type", "entity_id", "type", "lawyer_id",
+            unique=True,
+            postgresql_where=text("entity_type = 'plazo_fatal_escalado'"),
+            sqlite_where=text("entity_type = 'plazo_fatal_escalado'"),
+        ),
+    )
     
     id = Column(Integer, primary_key=True, index=True)
     lawyer_id = Column(Integer, ForeignKey("lawyers.id"), nullable=False)

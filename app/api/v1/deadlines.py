@@ -11,6 +11,7 @@ Auth required; lawyer-scoped (404 when case not owned by caller).
 
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime
 from typing import List, Optional
 
@@ -46,6 +47,8 @@ from app.services.business_days import count_business_days_remaining, add_busine
 from app.services.deadline_engine import _today_chile, is_medida_prejudicial
 
 from zoneinfo import ZoneInfo
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -669,9 +672,10 @@ async def update_deadline_status(
         try:
             from app.services.deadline_engine import DeadlineEngine
 
-            DeadlineEngine.recompute_case(db, case)
+            with db.begin_nested():
+                DeadlineEngine.recompute_case(db, case)
         except Exception:  # pragma: no cover - defensive boundary
-            pass
+            logger.exception("recompute_case failed after marking deadline %s", deadline.id)
     db.commit()
     db.refresh(deadline)
     return deadline

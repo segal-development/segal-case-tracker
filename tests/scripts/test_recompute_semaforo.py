@@ -101,3 +101,16 @@ def test_format_report_lines(db, world):
     assert "verde→rojo por abandono: 1" in text
     assert "→rojo por plazo fatal vencido: 1" in text
     assert "alertas de escalamiento a crear: 2" in text
+
+
+def test_first_emit_after_apply_emits_no_semaforo_rojo(db, world):
+    """--apply already moved the cases to rojo: the next sync recompute is not a transition."""
+    from app.services.deadline_engine import DeadlineEngine
+    from app.services.sync_service import emit_deadline_alerts
+
+    compute_report(db, dry_run=False)
+    db.expire_all()
+    for case in db.query(Case).filter(Case.semaforo == "rojo").all():
+        transition = DeadlineEngine.recompute_case(db, case)
+        assert emit_deadline_alerts(db, case, transition) == 0
+    assert db.query(Alert).filter(Alert.type == "semaforo_rojo").count() == 0

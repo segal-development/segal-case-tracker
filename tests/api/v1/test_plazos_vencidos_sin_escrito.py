@@ -110,3 +110,16 @@ def test_case_detail_and_list_expose_the_reason(client, db, people, court):
     assert c.get(f"/api/v1/cases/{case.id}").json()["case"]["semaforo_motivo"] == case.semaforo_motivo
     items = c.get("/api/v1/cases", params={"limit": 50}).json()["items"]
     assert items[0]["semaforo_motivo"] == case.semaforo_motivo
+
+
+def test_over_60_days_is_listed_but_does_not_alert(client, db, people, court):
+    from app.models.alert import Alert
+    from app.services.deadline_engine import DeadlineEngine
+
+    case, _row = _case_with_row(db, people, court, "C-77-2026", date(2026, 8, 1))
+    DeadlineEngine.recompute_case(db, case)
+    db.commit()
+    assert db.query(Alert).filter(Alert.type == "plazo_fatal_vencido_escalado").count() == 0
+    body = _login(client, people["admin"]).get(URL).json()
+    assert [i["rol"] for i in body["items"]] == ["C-77-2026"]
+    assert body["items"][0]["enrojece"] is False

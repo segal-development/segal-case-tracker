@@ -413,3 +413,13 @@ class TestPlazoVencido:
         # el filtro B es solo del feed accionable; en 'all' no se aplica
         r = client.get("/api/v1/alerts?category=all", headers=_headers(SANDY_RUT)).json()
         assert vieja.id in {x["case_id"] for x in r["items"]}
+
+
+class TestFase0EscalationInActionableFeed:
+    def test_plazo_fatal_vencido_escalado_is_actionable(self, client, db, sandy, case):
+        _make_alert(db, sandy.id, case.id, title="Escalado", type="plazo_fatal_vencido_escalado")
+        _make_alert(db, sandy.id, case.id, title="Ruido", type="new_movement")
+        actionable = client.get("/api/v1/alerts?category=actionable", headers=_headers(SANDY_RUT))
+        activity = client.get("/api/v1/alerts?category=activity", headers=_headers(SANDY_RUT))
+        assert [i["title"] for i in actionable.json()["items"]] == ["Escalado"]
+        assert [i["title"] for i in activity.json()["items"]] == ["Ruido"]

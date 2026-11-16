@@ -14,6 +14,7 @@ import logging
 from datetime import date, datetime, timedelta
 from typing import Iterable
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.deadlines_config import DEADLINE_LABELS, FATAL_DEADLINE_VALUES
@@ -52,14 +53,19 @@ def reddens(row: CaseDeadline, today: date) -> bool:
     return row.due_date >= today - timedelta(days=REDDEN_WINDOW_DAYS)
 
 
-def _recipient_ids(db: Session, case: Case) -> list[int]:
+def _owners(db: Session, case: Case) -> list[Lawyer]:
+    """The case's lawyer(s) of record (one resolution per case), owner as fallback."""
     from app.services.lawyer_roster import resolve_case_alert_recipients
 
-    ids = [r.id for r in resolve_case_alert_recipients(db, case)]
-    if not ids:
-        fallback = db.query(Lawyer).filter(Lawyer.id == case.effective_lawyer_id).first()
-        if fallback is not None:
-            ids = [fallback.id]
+    owners = list(resolve_case_alert_recipients(db, case))
+    if owners:
+        return owners
+    fallback = db.query(Lawyer).filter(Lawyer.id == case.effective_lawyer_id).first()
+    return [fallback] if fallback is not None else []
+
+
+def _recipient_ids(db: Session, owners: list[Lawyer]) -> list[int]:
+    ids = [o.id for o in owners]
     admins = db.query(Lawyer.id).filter(Lawyer.role == "admin", Lawyer.is_active.is_(True)).all()
     for (admin_id,) in admins:
         if admin_id not in ids:
@@ -71,10 +77,12 @@ def escalate_fatal_vencidos(
     db: Session, case: Case, rows: Iterable[CaseDeadline], today: date
 ) -> int:
     """Create the missing escalation alerts for ``rows``; returns how many. Flush-only."""
-    rows = [r for r in rows if is_unreviewed_fatal_vencido(r, today)]
-    if not rows:
+    # Only inside the S3 window (older ones are listed, never alerted); gris/archived exempt.
+    rows = [r for r in rows if is_unreviewed_fatal_vencido(r, today) and reddens(r, today)]
+    if not rows or case.status == "archived" or case.semaforo == "gris":
         return 0
-    recipients = _recipient_ids(db, case)
+    owners = _owners(db, case)
+    recipients = _recipient_ids(db, owners)
     if not recipients:
         return 0
     existing = {
@@ -85,7 +93,7 @@ def escalate_fatal_vencidos(
             Alert.entity_id.in_([r.id for r in rows]),
         )
     }
-    owner_ids = [r.id for r in _owners(db, case)]
+    owner_ids = [o.id for o in owners]
     names = dict(db.query(Lawyer.id, Lawyer.name).filter(Lawyer.id.in_(owner_ids)).all()) if owner_ids else {}
     abogado = ", ".join(names[i] for i in owner_ids if i in names) or "sin abogado asignado"
     created = 0
@@ -99,23 +107,17 @@ def escalate_fatal_vencidos(
         for lawyer_id in recipients:
             if (row.id, lawyer_id) in existing:
                 continue
-            db.add(Alert(
-                lawyer_id=lawyer_id, case_id=case.id, type=ALERT_TYPE,
-                entity_type=ALERT_ENTITY_TYPE, entity_id=row.id,
-                title=title, message=message, created_at=datetime.utcnow(),
-            ))
+            try:
+                # Savepoint per insert: a concurrent worker that won the race trips the
+                # partial unique index; that alert already exists, so just move on.
+                with db.begin_nested():
+                    db.add(Alert(
+                        lawyer_id=lawyer_id, case_id=case.id, type=ALERT_TYPE,
+                        entity_type=ALERT_ENTITY_TYPE, entity_id=row.id,
+                        title=title, message=message, created_at=datetime.utcnow(),
+                    ))
+            except IntegrityError:
+                continue
             existing.add((row.id, lawyer_id))
             created += 1
-    if created:
-        db.flush()
     return created
-
-
-def _owners(db: Session, case: Case) -> list[Lawyer]:
-    from app.services.lawyer_roster import resolve_case_alert_recipients
-
-    owners = resolve_case_alert_recipients(db, case)
-    if owners:
-        return owners
-    fallback = db.query(Lawyer).filter(Lawyer.id == case.effective_lawyer_id).first()
-    return [fallback] if fallback is not None else []
