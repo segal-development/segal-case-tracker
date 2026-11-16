@@ -62,10 +62,15 @@ def _scope_cache_put(key, value: frozenset) -> None:
             del _scope_cache[next(iter(_scope_cache))]
 
 
-def clear_case_scope_cache() -> None:
+def _clear_scope_entries() -> None:
     with _scope_cache_lock:
         _scope_cache.clear()
-    sysgal_owner.clear_switch_cache()  # scope and the Sysgal switch always go stale together
+
+
+def clear_case_scope_cache() -> None:
+    """Explicit full reset (tests, bulk writes): scope entries AND the cached Sysgal switch."""
+    _clear_scope_entries()
+    sysgal_owner.clear_switch_cache()
 
 
 # Invalidation: scope inputs are Case ownership/assignment, CaseLitigante rows
@@ -104,21 +109,34 @@ def _changes_scope(obj, *, new_or_deleted: bool) -> bool:
     return False
 
 
+def _is_switch_goal(obj) -> bool:
+    return isinstance(obj, Goal) and obj.key == app_settings.KEY_SYSGAL_DUENIO
+
+
 def _scope_cache_on_flush(session, flush_context) -> None:
     touched = any(_changes_scope(o, new_or_deleted=True) for o in (*session.new, *session.deleted))
     touched = touched or any(_changes_scope(o, new_or_deleted=False) for o in session.dirty)
     if touched:
         session.info["case_scope_dirty"] = True
-        clear_case_scope_cache()
+        _clear_scope_entries()
+        # The switch read is cached (0 extra queries per request): drop it only when the switch
+        # itself changed, not on every scope invalidation.
+        if any(_is_switch_goal(o) for o in (*session.new, *session.deleted, *session.dirty)):
+            session.info["sysgal_switch_dirty"] = True
+            sysgal_owner.clear_switch_cache()
 
 
 def _scope_cache_on_commit(session) -> None:
     if session.info.pop("case_scope_dirty", False):
-        clear_case_scope_cache()
+        _clear_scope_entries()
+    if session.info.pop("sysgal_switch_dirty", False):
+        sysgal_owner.clear_switch_cache()
 
 
 def _scope_cache_on_rollback(session) -> None:
     session.info.pop("case_scope_dirty", None)
+    if session.info.pop("sysgal_switch_dirty", False):
+        sysgal_owner.clear_switch_cache()  # a rolled-back switch change must not stay cached
 
 
 event.listen(Session, "after_flush", _scope_cache_on_flush)
@@ -969,15 +987,15 @@ def acting_lawyer_is_case_abogado(db: Session, case: Case, acting_rut: str) -> b
     lawyer owns/sees a case (it is the firm's single bookkeeping owner).
     """
     acting_norm = normalize_rut(acting_rut)
-    if sysgal_owner.sysgal_duenio_enabled(db):
-        # Same precedence as the scope: override > Sysgal owner > litigantes (a no-op without them).
-        if case.assigned_lawyer_id is not None:
-            assigned = db.get(Lawyer, case.assigned_lawyer_id)
-            return assigned is not None and normalize_rut(assigned.rut) == acting_norm
-        if case.competencia == "civil":
-            owner = sysgal_owner.sysgal_primary_owner_by_case(db, case_id=case.id).get(case.id)
-            if owner is not None:
-                return normalize_rut(owner.rut) == acting_norm
+    if case.competencia == "civil" and sysgal_owner.sysgal_duenio_enabled(db):
+        # Same precedence as the scope, but ONLY for cases that have a Sysgal owner (everything
+        # else keeps the PJUD rule unchanged): override > Sysgal owner.
+        owner = sysgal_owner.sysgal_primary_owner_by_case(db, case_id=case.id).get(case.id)
+        if owner is not None:
+            if case.assigned_lawyer_id is not None:
+                assigned = db.get(Lawyer, case.assigned_lawyer_id)
+                return assigned is not None and normalize_rut(assigned.rut) == acting_norm
+            return normalize_rut(owner.rut) == acting_norm
     litigantes = (
         db.query(CaseLitigante)
         .filter(
