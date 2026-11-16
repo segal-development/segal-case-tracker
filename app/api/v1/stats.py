@@ -56,6 +56,8 @@ class StageCount(BaseModel):
 
 class FirmTotals(BaseModel):
     cases: int
+    # Of ``cases``, those with a firm abogado resolved (the rest have no owner yet).
+    atribuidas: int = 0
     semaforo: SemaforoBreakdown
     stale: int
     actividad_mes: int
@@ -145,14 +147,18 @@ async def get_my_stats(
     if not lawyer:
         raise HTTPException(status_code=404, detail="Lawyer not found")
 
+    # The SAME scope /cases uses (Sysgal owner, bootstrap and pendiente cases included), so totals agree.
+    scope = resolve_case_scope(db, current_lawyer)
+    case_ids = None if scope is ALL_CASES else set(scope)
+
     if lawyer.role == "procurador":
         from app.services import procurador as procurador_svc
 
         abogados = procurador_svc.linked_abogados(db, lawyer.id)
-        stats = procurador_dashboard_stats(db, lawyer.rut, [a.rut for a in abogados])
+        stats = procurador_dashboard_stats(db, lawyer.rut, [a.rut for a in abogados], case_ids=case_ids)
         stats["nombre"] = lawyer.name
     else:
-        stats = lawyer_dashboard_stats(db, lawyer.rut)
+        stats = lawyer_dashboard_stats(db, lawyer.rut, case_ids=case_ids)
 
     # Meta: Goal row with key "monthly_productivity"
     goal = db.query(Goal).filter(Goal.key == "monthly_productivity").first()
@@ -274,6 +280,8 @@ class RiskBoardCriticalCase(BaseModel):
 
 class RiskBoard(BaseModel):
     total: int
+    # Of ``total``, those with a firm abogado resolved (the rest have no owner yet).
+    atribuidas: int = 0
     semaforo: RiskBoardSemaforo
     riesgo: RiskBoardRiesgo
     by_lawyer: list[RiskBoardLawyer]
