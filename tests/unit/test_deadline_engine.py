@@ -379,13 +379,20 @@ class TestDemandadoEscritoClosesExcepciones:
         assert row.verdict_acted_on == self.due
         assert case.semaforo != "rojo"
 
-    def test_escrito_after_due_date_marks_no_cumplido_and_clears_rojo(self, db) -> None:
+    def test_escrito_after_due_date_marks_no_cumplido_and_reddens_until_reviewed(self, db) -> None:
+        # Fase 0 (S3): a lost FATAL plazo no human has reviewed keeps the case rojo
+        # (it used to go green silently); a human mark clears it.
         case = self._seed(db)
         _add_escrito(db, case.id, self.due + timedelta(days=3))
         _recompute(db, case)
         row = self._row(db, case)
         assert row.status == "no_cumplido"
         assert row.verdict == "fuera_de_plazo"
+        assert case.semaforo == "rojo"
+        assert case.semaforo_motivo.startswith("Plazo fatal vencido sin escrito: ")
+        row.marked_at = datetime(2026, 6, 16)
+        db.flush()
+        _recompute(db, case)
         assert case.semaforo != "rojo"
 
     def test_case_and_whitespace_are_normalised(self, db) -> None:
@@ -1595,10 +1602,15 @@ class TestPlazoFatalIncumplido:
         assert case.plazo_fatal_incumplido is True
 
     def test_semaforo_is_unchanged_by_the_flag(self, db) -> None:
-        """Most important: the late case keeps the semáforo it always had
-        (the lost plazo leaves the active set), identical to the on-time one."""
+        """Once a human reviewed the lost plazo (Fase 0 S3) the late case keeps the
+        semáforo it always had (the lost plazo leaves the active set), identical to
+        the on-time one. Unreviewed, it is rojo (see TestDemandadoEscritoClosesExcepciones)."""
         late = self._seed(db)
         _add_escrito(db, late.id, self.due + timedelta(days=3))
+        _recompute(db, late)
+        assert late.semaforo == "rojo"
+        db.query(CaseDeadline).filter_by(case_id=late.id).update({"marked_at": datetime(2026, 6, 16)})
+        db.flush()
         _recompute(db, late)
         assert late.plazo_fatal_incumplido is True
         assert late.semaforo == "verde"

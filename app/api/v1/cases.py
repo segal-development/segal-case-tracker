@@ -12,12 +12,13 @@ from sqlalchemy import nullslast, or_, func, not_, select
 from app.api.deps import (
     get_db,
     get_current_lawyer,
+    require_auditor,
     _resolve_lawyer_id,
     resolve_case_scope,
     apply_case_scope,
     ALL_CASES,
 )
-from app.models.case import Case
+from app.models.case import EFFECTIVE_LAWYER_ID, Case
 from app.models.case_deadline import CaseDeadline
 from app.models.lawyer import Lawyer
 from app.models.case_litigante import CaseLitigante
@@ -82,6 +83,8 @@ class CaseResponse(BaseModel):
     # Procedural deadline engine fields (populated by DeadlineEngine.recompute_case)
     procedural_state: Optional[str] = None
     semaforo: Optional[str] = None
+    # Why the engine forced the semáforo (abandono / plazo fatal vencido); None otherwise.
+    semaforo_motivo: Optional[str] = None
     next_deadline_at: Optional[date] = None
     abandono_disponible: bool = False
     next_deadline_fatal: bool = False
@@ -922,6 +925,7 @@ async def list_cases(
             updated_at=case.updated_at,
             procedural_state=case.procedural_state,
             semaforo=case.semaforo,
+            semaforo_motivo=case.semaforo_motivo,
             next_deadline_at=case.next_deadline_at,
             abandono_disponible=case.abandono_disponible or False,
             next_deadline_fatal=case.next_deadline_fatal or False,
@@ -950,6 +954,73 @@ async def list_cases(
         pages=pages,
         last_sync=last_sync,
     )
+
+
+class PlazoVencidoSinEscritoItem(BaseModel):
+    case_id: int
+    rol: Optional[str] = None
+    tribunal: Optional[str] = None
+    abogado: Optional[str] = None
+    deadline_id: int
+    tipo: str
+    tipo_label: str
+    due_date: date
+    dias_desde: int
+    #: True when the plazo is within the last 60 days, i.e. it still reddens the case.
+    enrojece: bool
+
+
+class PlazosVencidosSinEscritoResponse(BaseModel):
+    total: int
+    items: List[PlazoVencidoSinEscritoItem]
+
+
+@router.get("/plazos-vencidos-sin-escrito", response_model=PlazosVencidosSinEscritoResponse)
+async def plazos_vencidos_sin_escrito(
+    _auditor_rut: str = Depends(require_auditor),
+    db: Session = Depends(get_db),
+):
+    """Fatal plazos lost (``no_cumplido``) that no human has reviewed yet, newest first.
+
+    Admin/auditor only. ``enrojece`` = still within the 60 days that redden the case.
+    """
+    from app.core.deadlines_config import DEADLINE_LABELS, FATAL_DEADLINE_VALUES
+    from app.services import escalamiento_plazos as fase0
+    from app.services.deadline_engine import _today_chile
+
+    today = _today_chile()
+    rows = (
+        db.query(CaseDeadline, Case, Court.name, Lawyer.name)
+        .join(Case, Case.id == CaseDeadline.case_id)
+        .outerjoin(Court, Court.id == Case.court_id)
+        .outerjoin(Lawyer, Lawyer.id == EFFECTIVE_LAWYER_ID)
+        .filter(
+            CaseDeadline.status == "no_cumplido",
+            CaseDeadline.deadline_type.in_(FATAL_DEADLINE_VALUES),
+            CaseDeadline.marked_by.is_(None),
+            CaseDeadline.marked_at.is_(None),
+            CaseDeadline.due_date < today,
+            Case.status != "archived",
+        )
+        .order_by(CaseDeadline.due_date.desc(), CaseDeadline.id.desc())
+        .all()
+    )
+    items = [
+        PlazoVencidoSinEscritoItem(
+            case_id=case.id,
+            rol=case.rol,
+            tribunal=court_name,
+            abogado=lawyer_name,
+            deadline_id=dl.id,
+            tipo=dl.deadline_type,
+            tipo_label=DEADLINE_LABELS.get(dl.deadline_type, dl.deadline_type),
+            due_date=dl.due_date,
+            dias_desde=(today - dl.due_date).days,
+            enrojece=fase0.reddens(dl, today),
+        )
+        for dl, case, court_name, lawyer_name in rows
+    ]
+    return PlazosVencidosSinEscritoResponse(total=len(items), items=items)
 
 
 @router.get("/diagnostico", response_model=DiagnosticoResponse)
@@ -1275,6 +1346,7 @@ async def get_case(
         updated_at=case.updated_at,
         procedural_state=case.procedural_state,
         semaforo=case.semaforo,
+        semaforo_motivo=case.semaforo_motivo,
         next_deadline_at=case.next_deadline_at,
         abandono_disponible=case.abandono_disponible or False,
         next_deadline_fatal=case.next_deadline_fatal or False,
