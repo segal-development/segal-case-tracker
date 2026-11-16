@@ -10,16 +10,18 @@ Every endpoint here is scoped to the CALLING lawyer's own alerts only
 so a lawyer only ever sees or mutates their own, never another lawyer's.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session, joinedload
 
 from app.api.deps import get_current_lawyer, get_db, _resolve_lawyer_id
 from app.models.alert import Alert
 from app.models.case import Case
+from app.services import alert_groups
 
 router = APIRouter()
 
@@ -65,6 +67,7 @@ DEADLINE_ALERT_TYPES = frozenset({"semaforo_rojo", "deadline_fatal", "deadline_a
 STALE_DEADLINE_DAYS = 30
 
 AlertCategory = Literal["actionable", "activity", "all"]
+AlertGroupBy = Literal["case_day"]
 
 
 def _relabel_plazo(message: Optional[str], case: Optional[Case]) -> Optional[str]:
@@ -88,6 +91,30 @@ def _apply_category_filter(query, category: AlertCategory):
     if category == "activity":
         return query.filter(Alert.type.notin_(ACTIONABLE_ALERT_TYPES))
     return query
+
+
+def _scoped_alert_query(db: Session, lawyer_id: int, category: AlertCategory):
+    """The caller's own alerts within ``category`` (incl. the stale-plazo rule)."""
+    base_query = _apply_category_filter(
+        db.query(Alert).filter(Alert.lawyer_id == lawyer_id), category
+    )
+
+    # (B) En "Requiere atención": excluir alertas de plazo cuya causa tiene un plazo
+    # vencido hace más de STALE_DEADLINE_DAYS — ruido histórico, no acción del día.
+    if category == "actionable":
+        from app.services.deadline_engine import _today_chile
+
+        cutoff = _today_chile() - timedelta(days=STALE_DEADLINE_DAYS)
+        stale_cases = (
+            db.query(Case.id).filter(Case.next_deadline_at < cutoff).subquery()
+        )
+        base_query = base_query.filter(
+            ~(
+                Alert.type.in_(DEADLINE_ALERT_TYPES)
+                & Alert.case_id.in_(db.query(stale_cases.c.id))
+            )
+        )
+    return base_query
 
 
 # ============================================================================
@@ -127,8 +154,39 @@ class AlertListResponse(BaseModel):
     unread_count: int
 
 
+class AlertGroupItem(BaseModel):
+    """One (case, Chile day) group of alerts (``group_by=case_day``)."""
+
+    group_key: str
+    case_id: Optional[int] = None
+    rol: Optional[str] = None
+    caratula: Optional[str] = None
+    day: str
+    count: int
+    unread_count: int
+    latest_created_at: datetime
+    latest_title: Optional[str] = None
+    latest_message: Optional[str] = None
+    types: List[str]
+    alert_ids: List[int]
+
+
+class AlertGroupListResponse(BaseModel):
+    items: List[AlertGroupItem]
+    total: int
+    page: int
+    per_page: int
+    pages: int
+    unread_count: int
+
+
 class MarkAllReadResponse(BaseModel):
     marked: int
+
+
+class ReadGroupRequest(BaseModel):
+    group_key: str
+    category: AlertCategory = "activity"
 
 
 # ============================================================================
@@ -166,12 +224,50 @@ def _build_alert_item(alert: Alert, case: Optional[Case]) -> AlertItem:
 # ============================================================================
 
 
+def _grouped_response(db, base_query, page, per_page, unread_only):
+    rows, total, unread_groups = alert_groups.list_groups(
+        db, base_query, page=page, per_page=per_page, unread_only=unread_only
+    )
+    case_ids = {r["case_id"] for r in rows if r["case_id"] is not None}
+    cases_by_id = {}
+    if case_ids:
+        cases_by_id = {
+            c.id: c for c in db.query(Case).filter(Case.id.in_(case_ids)).all()
+        }
+    items = []
+    for r in rows:
+        case = cases_by_id.get(r["case_id"])
+        items.append(
+            AlertGroupItem(
+                group_key=alert_groups.make_group_key(r["case_id"], r["type"], r["day"]),
+                case_id=r["case_id"],
+                rol=case.rol if case else None,
+                caratula=f"{case.plaintiff or ''}/{case.defendant or ''}" if case else None,
+                day=r["day"],
+                count=r["count"],
+                unread_count=r["unread_count"],
+                latest_created_at=r["latest_created_at"],
+                latest_title=r["latest_title"],
+                latest_message=_relabel_plazo(r["latest_message"], case),
+                types=r["types"],
+                alert_ids=r["alert_ids"],
+            )
+        )
+    pages = (total + per_page - 1) // per_page if total > 0 else 0
+    payload = AlertGroupListResponse(
+        items=items, total=total, page=page, per_page=per_page,
+        pages=pages, unread_count=unread_groups,
+    )
+    return JSONResponse(content=payload.model_dump(mode="json"))
+
+
 @router.get("", response_model=AlertListResponse)
 async def list_alerts(
     page: int = Query(1, ge=1),
     per_page: int = Query(20, ge=1, le=100),
     unread_only: bool = Query(False),
     category: AlertCategory = Query("actionable"),
+    group_by: Optional[AlertGroupBy] = Query(None),
     current_lawyer: dict = Depends(get_current_lawyer),
     db: Session = Depends(get_db),
 ):
@@ -188,29 +284,17 @@ async def list_alerts(
     ``unread_count`` reflects the lawyer's unread alerts WITHIN the
     requested ``category``, regardless of the ``unread_only`` filter or the
     current page.
+
+    With ``group_by=case_day`` the items are groups keyed by (case, Chile
+    calendar day) — see ``AlertGroupListResponse``; ``total`` and
+    ``unread_count`` then count groups, and pagination applies to groups.
     """
     lawyer_id = _resolve_lawyer_id(db, current_lawyer)
 
-    base_query = _apply_category_filter(
-        db.query(Alert).filter(Alert.lawyer_id == lawyer_id), category
-    )
+    base_query = _scoped_alert_query(db, lawyer_id, category)
 
-    # (B) En "Requiere atención": excluir alertas de plazo cuya causa tiene un plazo
-    # vencido hace más de STALE_DEADLINE_DAYS — ruido histórico, no acción del día.
-    if category == "actionable":
-        from datetime import timedelta
-        from app.services.deadline_engine import _today_chile
-
-        cutoff = _today_chile() - timedelta(days=STALE_DEADLINE_DAYS)
-        stale_cases = (
-            db.query(Case.id).filter(Case.next_deadline_at < cutoff).subquery()
-        )
-        base_query = base_query.filter(
-            ~(
-                Alert.type.in_(DEADLINE_ALERT_TYPES)
-                & Alert.case_id.in_(db.query(stale_cases.c.id))
-            )
-        )
+    if group_by == "case_day":
+        return _grouped_response(db, base_query, page, per_page, unread_only)
 
     unread_count = base_query.filter(Alert.read.is_(False)).count()
 
@@ -309,4 +393,50 @@ async def mark_all_alerts_read(
     marked = query.update({Alert.read: True, Alert.read_at: now}, synchronize_session=False)
     db.commit()
 
+    return MarkAllReadResponse(marked=marked)
+
+
+@router.post("/read-group", response_model=MarkAllReadResponse)
+async def mark_group_read(
+    body: ReadGroupRequest,
+    current_lawyer: dict = Depends(get_current_lawyer),
+    db: Session = Depends(get_db),
+):
+    """Mark the caller's unread alerts of one ``group_by=case_day`` group as read.
+
+    ``group_key`` is the key returned by the grouped list; ``category``
+    (default ``activity``) must match the tab the group was listed in so
+    alerts of the other category on the same case/day are left untouched.
+    Only the caller's own alerts are touched. Returns the count marked.
+    """
+    try:
+        case_id, type_, day = alert_groups.parse_group_key(body.group_key)
+    except alert_groups.InvalidGroupKey:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid group_key",
+        )
+    lawyer_id = _resolve_lawyer_id(db, current_lawyer)
+
+    ids = [
+        row[0]
+        for row in _scoped_alert_query(db, lawyer_id, body.category)
+        .filter(
+            Alert.read.is_(False),
+            alert_groups.group_filter(db, case_id, type_, day),
+        )
+        .with_entities(Alert.id)
+        .all()
+    ]
+    marked = 0
+    if ids:
+        marked = (
+            db.query(Alert)
+            .filter(Alert.lawyer_id == lawyer_id, Alert.id.in_(ids))
+            .update(
+                {Alert.read: True, Alert.read_at: datetime.utcnow()},
+                synchronize_session=False,
+            )
+        )
+        db.commit()
     return MarkAllReadResponse(marked=marked)
