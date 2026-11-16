@@ -24,6 +24,8 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.models.case_litigante import CaseLitigante
 from app.models.cliente_sysgal_estado import ClienteSysgalEstado
+from app.models.sysgal_causa import SysgalCausa
+from app.services.contrato_estado import recompute_safely
 from app.services.sysgal_client import MAX_RUTS_PER_REQUEST, SysgalClient
 from app.utils.rut import clean_rut, format_rut
 
@@ -110,6 +112,14 @@ def parte_ruts_in_scope(
         .all()
     )
     ruts = {clean_rut(r) for (r,) in rows if r}
+    # The client of every active Sysgal causa (``rut_cliente``) is the first source of the contract state.
+    cliente_rows = (
+        db.query(SysgalCausa.rut_cliente)
+        .filter(SysgalCausa.eliminada.is_(False), SysgalCausa.rut_cliente.isnot(None), SysgalCausa.rut_cliente != "")
+        .distinct()
+        .all()
+    )
+    ruts |= {clean_rut(r) for (r,) in cliente_rows if r}
     ruts.discard("")
 
     if force:
@@ -211,6 +221,8 @@ def sync_sysgal_estados(
                 summary["no_encontrados"] += 1
         db.commit()
 
+    # The cache changed: keep the stored contract state (and es_activa) of the cases in step with it.
+    recompute_safely(db)
     logger.info(
         "Sysgal sync: %d ruts, %d found, %d not found, %d chunk error(s)",
         summary["consultados"], summary["encontrados"], summary["no_encontrados"], summary["errores"],

@@ -31,8 +31,14 @@ from app.models.liberacion import LIB_APLICADO, LiberacionRequest
 from app.models.sync_history import SyncHistory
 from app.models.document import Document
 from app.models.generated_document import GeneratedDocument
-from app.models.cliente_sysgal_estado import ClienteSysgalEstado
-from app.services.sysgal_cobertura import COBERTURAS, derive_cobertura
+from app.services.causa_activa import (
+    CASE_ACTIVA_FILTER,
+    Excluidas,
+    activa_fields,
+    excluidas_query,
+)
+from app.services.contrato_estado import ddo_info_by_case
+from app.services.sysgal_cobertura import COBERTURAS
 from app.services.timeline_service import build_case_timeline
 from app.services.case_diagnostico import classify, days_since
 from app.services.deadline_engine import is_medida_prejudicial
@@ -100,6 +106,10 @@ class CaseResponse(BaseModel):
     patrocinio_pendiente: bool = False
     # Sysgal knows the causa and considers it ended (not counted in the matriz figures).
     terminada_en_sysgal: bool = False
+    # Contract state of the client (activo/moroso/caducado/sin_dato; None = not computed yet) and the single
+    # "causa activa" flag every total uses (see app.services.causa_activa).
+    contrato_estado: Optional[str] = None
+    es_activa: bool = True
     prescripcion_fecha: Optional[date] = None
     # Sysgal cobertura (derived from the demandado's cached commercial state).
     # Populated ONLY for cases in abandono/apremio/prescripción that have a
@@ -203,6 +213,9 @@ class CaseListResponse(BaseModel):
     per_page: int
     pages: int
     last_sync: Optional[datetime] = None
+    # What "activa" means and what the scoped set leaves out (independent of the quick filters).
+    activas_definicion: Optional[str] = None
+    excluidas: Optional[Excluidas] = None
 
 
 class CaseSummaryResponse(BaseModel):
@@ -229,6 +242,10 @@ class CaseSummaryResponse(BaseModel):
     terminada_sysgal: int = 0
     # Per-matriz counts on the exact base `/cases?matriz=X` lists (Causas chips).
     por_matriz: dict[str, int] = {}
+    # Causas whose contract is caducado and that are not terminadas (own chip "Contrato caducado").
+    contrato_caducado: int = 0
+    activas_definicion: Optional[str] = None
+    excluidas: Optional[Excluidas] = None
 
 
 class FacetAbogado(BaseModel):
@@ -474,115 +491,64 @@ def _case_in_sysgal_states(case: Case) -> bool:
 
 
 def _sysgal_info_by_case(db: Session, case_ids, today: Optional[date] = None) -> dict:
-    """Sysgal cobertura per case id, for the given case ids (list or subquery).
+    """Per-case cobertura detail (estado_codigo, vigencia, synced_at) from the DDO RUT inference.
 
-    Two queries total, never N+1: one for the DDO litigante RUTs of those
-    cases, one for the matching cache rows. Cobertura is derived in Python
-    with ``derive_cobertura`` (the single business rule). RUTs are normalised
-    with ``clean_rut`` on our side because litigantes store PJUD's raw form
-    (may carry dots) while the cache is keyed by the canonical form.
-
-    Returns ``{case_id: {"cobertura", "estado_codigo", "vigencia_hasta",
-    "synced_at"}}`` only for cases that have at least one usable DDO RUT. Such
-    a RUT with no cache row derives to ``sin_dato`` (other fields None).
-    Callers must restrict ``case_ids`` to cases in the 3 states.
-
-    **Company parties are skipped: the demandado recorded there is often the
-    creditor, not the client.** Measured on the portfolio, 93.9% of JURIDICA
-    demandados are unknown to Sysgal versus 9.1% of natural persons, and a
-    handful sit as demandado on hundreds of causas each — one credit issuer
-    appears as demandado on 338 and as demandante on 437. Since the rule below
-    keeps the BEST cobertura among the parties, a creditor that resolves as
-    ACTIVO would mask a client whose contract lapsed. A causa left with no
-    natural party reports nothing, which is the honest answer: we do not know
-    who the client is. ``rut_cliente`` from Sysgal's upcoming causas endpoint
-    replaces this inference altogether.
-
-    The filter excludes what is known to be a company rather than allowing a
-    closed list, so an unforeseen ``persona_type`` still gets looked at.
+    The rule lives in ``app.services.contrato_estado.ddo_info_by_case`` (also the fallback source of the
+    stored ``cases.contrato_estado``). Callers restrict ``case_ids`` to cases in the 3 states.
     """
-    lit_rows = (
-        db.query(CaseLitigante.case_id, CaseLitigante.rut)
-        .filter(
-            CaseLitigante.case_id.in_(case_ids),
-            CaseLitigante.participante.ilike("DDO%"),
-            CaseLitigante.persona_type != "JURIDICA",
-            CaseLitigante.rut != "",
-        )
+    return ddo_info_by_case(db, case_ids, today)
+
+
+def _contrato_clause(estado: str):
+    """``contrato_estado == estado``; a never-computed NULL counts as ``sin_dato``."""
+    if estado == "sin_dato":
+        return or_(Case.contrato_estado == "sin_dato", Case.contrato_estado.is_(None))
+    return Case.contrato_estado == estado
+
+
+def _cobertura_scope(estado: str, terminada_sysgal: Optional[bool] = None) -> list:
+    """Conditions of ``?cobertura=``/``?contrato=`` ``estado`` over the 3-state subset or not (see callers).
+
+    ``caducado`` is its own set (out of the activas); any other state is read within the activas.
+    Terminadas stay out unless ``?terminada_sysgal`` was given (the explicit request wins).
+    """
+    clause = [_contrato_clause(estado)]
+    if terminada_sysgal is None:
+        clause.append(CASE_ACTIVA_FILTER if estado != "caducado" else Case.terminada_en_sysgal.is_(False))
+    return clause
+
+
+def _sysgal_summary_counts(base_query) -> dict:
+    """Cobertura chip counts over the scoped set (cases in the 3 states), from the stored contrato_estado.
+
+    activo/moroso/sin_dato count within the activas; caducado counts the caducadas that are not terminadas.
+    """
+    counts = {c: 0 for c in COBERTURAS}
+    rows = (
+        base_query.filter(_SYSGAL_STATE_FLAGS, Case.terminada_en_sysgal.is_(False))
+        .with_entities(Case.contrato_estado, func.count(Case.id))
+        .group_by(Case.contrato_estado)
         .all()
     )
-    ruts_by_case: dict[int, set[str]] = {}
-    for case_id, raw_rut in lit_rows:
-        rut = clean_rut(raw_rut) if raw_rut else ""
-        if rut:
-            ruts_by_case.setdefault(case_id, set()).add(rut)
-    if not ruts_by_case:
-        return {}
-
-    all_ruts = set().union(*ruts_by_case.values())
-    cache = {
-        row.rut: row
-        for row in db.query(ClienteSysgalEstado)
-        .filter(ClienteSysgalEstado.rut.in_(all_ruts))
-        .all()
-    }
-
-    today = today or date.today()
-    result: dict[int, dict] = {}
-    for case_id, ruts in ruts_by_case.items():
-        best = None
-        for rut in sorted(ruts):
-            row = cache.get(rut)
-            if row is None:
-                info = {"cobertura": "sin_dato", "estado_codigo": None,
-                        "vigencia_hasta": None, "synced_at": None}
-            else:
-                info = {
-                    "cobertura": derive_cobertura(
-                        row.estado_codigo, row.vigencia_hasta, row.encontrado, today
-                    ),
-                    "estado_codigo": row.estado_codigo,
-                    "vigencia_hasta": row.vigencia_hasta,
-                    "synced_at": row.synced_at,
-                }
-            if best is None or (
-                _COBERTURA_PRIORITY[info["cobertura"]] < _COBERTURA_PRIORITY[best["cobertura"]]
-            ):
-                best = info
-        result[case_id] = best
-    return result
-
-
-def _sysgal_cobertura_case_ids(db: Session, base_query, cobertura: str) -> set[int]:
-    """Case ids (within ``base_query``, restricted to the 3 states) whose
-    Sysgal cobertura is ``cobertura``.
-
-    Correct over clever: the cobertura is a Python-derived value (stale-ACTIVO
-    catch, RUT normalisation), so it cannot be expressed as a SQL predicate.
-    The in-scope population is small (~1.4k demandado RUTs), so we derive it
-    per case with ``_sysgal_info_by_case`` and hand the id set back to the
-    caller as ``Case.id IN (...)`` — pagination and totals stay exact.
-    """
-    state_ids = base_query.filter(_SYSGAL_STATE_FLAGS).with_entities(Case.id)
-    info = _sysgal_info_by_case(db, state_ids)
-    return {cid for cid, i in info.items() if i["cobertura"] == cobertura}
-
-
-def _sysgal_summary_counts(db: Session, base_query) -> dict:
-    """Cobertura chip counts over the scoped set (cases in the 3 states)."""
-    state_ids = base_query.filter(_SYSGAL_STATE_FLAGS).with_entities(Case.id)
-    counts = {c: 0 for c in COBERTURAS}
-    for i in _sysgal_info_by_case(db, state_ids).values():
-        counts[i["cobertura"]] += 1
+    for estado, n in rows:
+        counts[estado if estado in counts else "sin_dato"] += n
     return counts
 
 
-def _sysgal_fields(info: Optional[dict]) -> dict:
-    """Kwargs for CaseResponse from a ``_sysgal_info_by_case`` entry (or None)."""
+def _sysgal_fields(info: Optional[dict], case: Optional[Case] = None) -> dict:
+    """Kwargs for CaseResponse from a ``_sysgal_info_by_case`` entry (or None).
+
+    The cobertura tag is the STORED ``contrato_estado`` (one source for the tag, the chips and the filters);
+    the detail fields (code, vigencia, synced_at) still come from the DDO lookup. A 3-state case whose state
+    came from Sysgal's own client RUT (no DDO info) still gets its tag when the state is a real one.
+    """
+    stored = case.contrato_estado if case is not None else None
     if not info:
+        if stored in ("activo", "moroso", "caducado"):
+            return {"sysgal_cobertura": stored}
         return {}
     return {
-        "sysgal_cobertura": info["cobertura"],
+        "sysgal_cobertura": stored or info["cobertura"],
         "sysgal_estado_codigo": info["estado_codigo"],
         "sysgal_vigencia_hasta": info["vigencia_hasta"],
         "sysgal_synced_at": info["synced_at"],
@@ -649,9 +615,9 @@ MATRICES = ("M1 Baja", "M1 Alta", "M2", "M3")
 
 
 def _matriz_scope_filters(terminada_sysgal: Optional[bool] = None) -> list:
-    """Extra list conditions that accompany `?matriz=`: terminadas en Sysgal are excluded
-    unless ?terminada_sysgal was given explicitly. Shared with /summary `por_matriz`."""
-    return [Case.terminada_en_sysgal.is_(False)] if terminada_sysgal is None else []
+    """Extra list conditions that accompany `?matriz=`: only causas activas (not terminada en Sysgal, contract
+    not caducado) unless ?terminada_sysgal was given explicitly. Shared with /summary `por_matriz`."""
+    return [CASE_ACTIVA_FILTER] if terminada_sysgal is None else []
 
 
 def _apply_matriz_filter(query, matriz: str, terminada_sysgal: Optional[bool] = None):
@@ -727,6 +693,14 @@ async def list_cases(
             "false = the rest."
         ),
     ),
+    contrato: Optional[Literal["activo", "moroso", "caducado", "sin_dato"]] = Query(
+        None,
+        description=(
+            "Filter by the stored contract state of the client: activo|moroso|caducado|sin_dato. "
+            "'caducado' lists the causas left out of the activas (terminadas stay out unless "
+            "?terminada_sysgal is given)."
+        ),
+    ),
     sort_by: Optional[Literal["criticidad", "ultima_actuacion", "updated_at"]] = Query(
         None,
         description=(
@@ -753,6 +727,9 @@ async def list_cases(
         status_filter=status_filter,
         abogado_rut=abogado_rut,
     )
+
+    # What the scoped set leaves out of the activas (before any quick filter), for the response.
+    excluidas = excluidas_query(query)
 
     # N+1 kill: eager-load the court so building CourtInfo per row is free.
     query = query.options(joinedload(Case.court))
@@ -801,8 +778,11 @@ async def list_cases(
     # set is derived in Python over the scoped 3-state population (see
     # _sysgal_cobertura_case_ids); an empty set yields an empty page.
     if cobertura:
-        matching_ids = _sysgal_cobertura_case_ids(db, query, cobertura)
-        query = query.filter(Case.id.in_(matching_ids))
+        query = query.filter(_SYSGAL_STATE_FLAGS, *_cobertura_scope(cobertura, terminada_sysgal))
+
+    # Stored contract state filter (every case, not only the 3 states).
+    if contrato:
+        query = query.filter(*_cobertura_scope(contrato, terminada_sysgal))
 
     # Matriz de clasificación filter.
     # Terminadas en Sysgal are excluded so the list equals its matriz chip (Sysgal's screen);
@@ -834,6 +814,18 @@ async def list_cases(
         query = query.filter(Case.terminada_en_sysgal.is_(True))
     elif terminada_sysgal is False:
         query = query.filter(Case.terminada_en_sysgal.is_(False))
+
+    # Default view = the causas activas. A list that names its own set (?terminada_sysgal, ?contrato=caducado,
+    # a caducado ?cobertura) or searches (?q) is never narrowed: excluded causas stay reachable.
+    own_set = (
+        terminada_sysgal is not None
+        or contrato is not None
+        or cobertura is not None
+        or bool(q and q.strip())
+        or matriz is not None  # _apply_matriz_filter already scoped it
+    )
+    if not own_set:
+        query = query.filter(CASE_ACTIVA_FILTER)
 
     # Get total count
     total = query.count()
@@ -935,6 +927,8 @@ async def list_cases(
             plazo_fatal_incumplido=case.plazo_fatal_incumplido or False,
             patrocinio_pendiente=case.patrocinio_pendiente or False,
             terminada_en_sysgal=case.terminada_en_sysgal or False,
+            contrato_estado=case.contrato_estado,
+            es_activa=case.es_activa is not False,
             matriz=case.matriz,
             matriz_etapa=case.matriz_etapa,
             matriz_origen=case.matriz_origen,
@@ -943,7 +937,7 @@ async def list_cases(
             asignado=case.assigned_lawyer_id is not None,
             abogado_id=case.effective_lawyer_id,
             abogado_nombre=effective_names.get(case.effective_lawyer_id),
-            **_sysgal_fields(sysgal_info.get(case.id)),
+            **_sysgal_fields(sysgal_info.get(case.id), case if _case_in_sysgal_states(case) else None),
         ))
 
     return CaseListResponse(
@@ -953,6 +947,7 @@ async def list_cases(
         per_page=per_page,
         pages=pages,
         last_sync=last_sync,
+        **activa_fields(excluidas),
     )
 
 
@@ -1166,22 +1161,26 @@ async def cases_summary(
         abogado_rut=abogado_rut,
     )
 
+    excluidas = excluidas_query(base)
+    # Every chip counts within the causas activas, except the two that name an excluded set.
+    terminada_sysgal = base.filter(Case.terminada_en_sysgal.is_(True)).count()
+    activas = base.filter(CASE_ACTIVA_FILTER)
+
     # Semáforo buckets in one grouped pass.
     sem_counts = dict(
-        base.with_entities(Case.semaforo, func.count(Case.id))
+        activas.with_entities(Case.semaforo, func.count(Case.id))
         .group_by(Case.semaforo)
         .all()
     )
 
     total = sum(sem_counts.values())
-    abandono = base.filter(Case.abandono_disponible.is_(True)).count()
-    apremio = base.filter(Case.en_apremio.is_(True)).count()
-    prescripcion = base.filter(Case.prescripcion_cumplida.is_(True)).count()
-    patrocinio_pendiente = base.filter(Case.patrocinio_pendiente.is_(True)).count()
-    terminada_sysgal = base.filter(Case.terminada_en_sysgal.is_(True)).count()
+    abandono = activas.filter(Case.abandono_disponible.is_(True)).count()
+    apremio = activas.filter(Case.en_apremio.is_(True)).count()
+    prescripcion = activas.filter(Case.prescripcion_cumplida.is_(True)).count()
+    patrocinio_pendiente = activas.filter(Case.patrocinio_pendiente.is_(True)).count()
 
-    # Sysgal cobertura chips over the 3-state subset (derived in Python).
-    sysgal = _sysgal_summary_counts(db, base)
+    # Sysgal cobertura chips over the 3-state subset (stored contrato_estado).
+    sysgal = _sysgal_summary_counts(base)
 
     return CaseSummaryResponse(
         total=total,
@@ -1199,6 +1198,8 @@ async def cases_summary(
         sysgal_sin_dato=sysgal["sin_dato"],
         patrocinio_pendiente=patrocinio_pendiente,
         terminada_sysgal=terminada_sysgal,
+        contrato_caducado=excluidas["contrato_caducado"],
+        **activa_fields(excluidas),
         por_matriz=_por_matriz_counts(base),
     )
 
@@ -1356,6 +1357,8 @@ async def get_case(
         plazo_fatal_incumplido=case.plazo_fatal_incumplido or False,
         patrocinio_pendiente=case.patrocinio_pendiente or False,
         terminada_en_sysgal=case.terminada_en_sysgal or False,
+        contrato_estado=case.contrato_estado,
+        es_activa=case.es_activa is not False,
         matriz=case.matriz,
         matriz_etapa=case.matriz_etapa,
         matriz_origen=case.matriz_origen,
@@ -1364,7 +1367,7 @@ async def get_case(
         asignado=case.assigned_lawyer_id is not None,
         abogado_id=case.effective_lawyer_id,
         abogado_nombre=_effective_lawyer_name(case),
-        **_sysgal_fields(sysgal_info),
+        **_sysgal_fields(sysgal_info, case if _case_in_sysgal_states(case) else None),
     )
 
     movements_response = [

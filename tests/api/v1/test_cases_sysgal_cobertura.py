@@ -12,6 +12,7 @@ from app.models.case_litigante import CaseLitigante
 from app.models.cliente_sysgal_estado import ClienteSysgalEstado
 from app.models.court import Court
 from app.models.lawyer import Lawyer
+from app.services.contrato_estado import recompute_contrato_estado
 
 ADMIN_RUT = "11111111-1"
 
@@ -113,6 +114,7 @@ def dataset(db, admin, court):
     _cache(db, "22222222-2", "MOROSO_INACTIVO", hasta=date(2099, 12, 31))
     _cache(db, "33333333-3", "ACTIVO", hasta=date(2020, 1, 1))
     _cache(db, "55555555-5", "ACTIVO", hasta=date(2099, 12, 31))  # AB.DDO rut — must be ignored
+    recompute_contrato_estado(db)  # the tag, chips and filters read the STORED state
 
     return {
         "activo": activo,
@@ -148,6 +150,7 @@ def creditor_dataset(db, admin, court):
 
     _cache(db, "77777777-7", "ACTIVO", hasta=date(2099, 12, 31))
     _cache(db, "88888888-8", "ACTIVO", hasta=date(2020, 1, 1))  # vencido -> caducado
+    recompute_contrato_estado(db)
 
     return {"mixta": mixta, "solo_empresa": solo_empresa}
 
@@ -159,7 +162,8 @@ class TestCreditorIsNotTheClient:
         Today the rule keeps the BEST cobertura among the demandados, so the
         creditor's ACTIVO wins over the client's caducado.
         """
-        items = _by_id(authed_client.get("/api/v1/cases?per_page=100"))
+        # caducado is out of the default view: it lives in its own list.
+        items = _by_id(authed_client.get("/api/v1/cases?per_page=100&contrato=caducado"))
         assert items[creditor_dataset["mixta"].id]["sysgal_cobertura"] == "caducado"
 
     def test_only_company_parties_report_nothing(self, authed_client, creditor_dataset):
@@ -185,7 +189,10 @@ class TestListEnrichment:
         assert a["sysgal_synced_at"] is not None
 
         assert items[dataset["moroso"].id]["sysgal_cobertura"] == "moroso"
-        assert items[dataset["caducado"].id]["sysgal_cobertura"] == "caducado"
+        # caducado is out of the default view: it lives in its own list.
+        assert dataset["caducado"].id not in items
+        caducados = _by_id(authed_client.get("/api/v1/cases?per_page=100&cobertura=caducado"))
+        assert caducados[dataset["caducado"].id]["sysgal_cobertura"] == "caducado"
 
         sd = items[dataset["sin_dato"].id]
         assert sd["sysgal_cobertura"] == "sin_dato"
@@ -216,8 +223,10 @@ class TestCoberturaFilter:
         resp = authed_client.get(f"/api/v1/cases?cobertura={value}")
         assert resp.status_code == 200
         data = resp.json()
-        assert data["total"] == 1
-        assert [i["id"] for i in data["items"]] == [dataset[key].id]
+        # sin_dato also holds the case with no usable RUT at all (stored state sin_dato).
+        expected = {dataset[key].id} | ({dataset["no_ddo"].id} if key == "sin_dato" else set())
+        assert {i["id"] for i in data["items"]} == expected
+        assert data["total"] == len(expected)
 
     def test_bogus_value_is_422(self, authed_client, dataset):
         assert authed_client.get("/api/v1/cases?cobertura=bogus").status_code == 422
@@ -236,11 +245,13 @@ class TestSummaryChips:
         assert data["sysgal_activo"] == 1
         assert data["sysgal_moroso"] == 1
         assert data["sysgal_caducado"] == 1
-        assert data["sysgal_sin_dato"] == 1
+        assert data["sysgal_sin_dato"] == 2  # + the abandono case with no usable RUT
         # Existing chips untouched
         assert data["abandono"] == 3
         assert data["apremio"] == 1
-        assert data["prescripcion"] == 1
+        # the prescripción case is caducado: out of the activas, counted in its own chip
+        assert data["prescripcion"] == 0
+        assert data["contrato_caducado"] == 1
 
 
 class TestDetailEnrichment:

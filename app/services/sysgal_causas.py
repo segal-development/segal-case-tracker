@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session, aliased
 from app.models.case import Case
 from app.models.sysgal_causa import SysgalCausa
 from app.models.sysgal_usuario import SysgalUsuario
+from app.services.contrato_estado import recompute_safely
 from app.services.lawyer_roster import clear_case_scope_cache
 from app.services.matriz_sysgal import ACTIVA, load_sysgal_state, reclassify_cases
 from app.services.sysgal_client import SysgalClient
@@ -90,6 +91,8 @@ def sync_sysgal_causas(db: Session, client: SysgalClient, full: bool = False) ->
     clear_case_scope_cache()
     logger.info("Sysgal causas sync done: %s", stats)
     _reclassify_changed(db, inputs_before, terminadas_before)
+    # New/changed/relinked causas change which RUT is each case's client: refresh contrato_estado (writes diffs only).
+    recompute_safely(db)
     return stats
 
 

@@ -11,12 +11,22 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Text,
+    event,
     func,
     text,
 )
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
+
+
+def compute_es_activa(terminada_en_sysgal, contrato_estado) -> bool:
+    """THE rule of "causa activa": not terminada en Sysgal AND contract not caducado.
+
+    ``activo``, ``moroso``, ``sin_dato`` (and a never-computed NULL) all count as activa. The PJUD "archivada"
+    state is NOT applied yet (``cases.status`` is 'active' for every row): add it here, and only here.
+    """
+    return not terminada_en_sysgal and contrato_estado != "caducado"
 
 
 class Case(Base):
@@ -134,6 +144,12 @@ class Case(Base):
     # with the matriz (recalcular_matriz + the daily Sysgal-sync reclassification). Excluded from
     # the matriz counts; the case itself is untouched.
     terminada_en_sysgal = Column(Boolean, nullable=False, server_default=text("false"), default=False)
+    # Contract state of the case's client (activo/moroso/caducado/sin_dato), stored so lists, filters and
+    # counts are plain SQL. NULL = never computed (counts as sin_dato). Source: app.services.contrato_estado.
+    contrato_estado = Column(String(10), nullable=True, index=True)
+    # "Causa activa" (one definition for every total): see ``compute_es_activa``. Kept in step with
+    # ``terminada_en_sysgal`` / ``contrato_estado`` by the mapper listeners at the bottom of this module.
+    es_activa = Column(Boolean, nullable=False, server_default=text("true"), default=True, index=True)
 
     # Asignación por nivel — override of WHO works this causa internally,
     # independent of ``lawyer_id`` (sync provenance, never touched here) and
@@ -229,3 +245,13 @@ Index(
     func.coalesce(Case.procedure, ""),
     unique=True,
 )
+
+
+def _sync_es_activa(_mapper, _connection, case: Case) -> None:
+    case.es_activa = compute_es_activa(case.terminada_en_sysgal, case.contrato_estado)
+
+
+# Every ORM write of ``terminada_en_sysgal`` / ``contrato_estado`` (sync, matriz reclassification, scripts)
+# recomputes ``es_activa`` in the same INSERT/UPDATE, so the stored flag never drifts from its inputs.
+event.listen(Case, "before_insert", _sync_es_activa)
+event.listen(Case, "before_update", _sync_es_activa)

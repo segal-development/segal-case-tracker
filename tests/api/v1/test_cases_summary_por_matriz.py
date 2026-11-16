@@ -105,8 +105,8 @@ def test_summary_por_matriz_values_and_other_counts_unchanged(client, populated,
     plain = client.get("/api/v1/cases/summary", params={"competencia": "civil", "status": "active"}).json()
 
     assert plain["por_matriz"] == {"M1 Baja": 3, "M1 Alta": 2, "M2": 4, "M3": 1}
-    # total still counts terminadas and null-matriz cases (own visible, civil+active, above floor).
-    assert plain["total"] == 10 + 4 + 1
+    # total counts the activas only (terminadas are out) and still the null-matriz case.
+    assert plain["total"] == 10 + 1
     assert plain["terminada_sysgal"] == 4
 
 

@@ -52,6 +52,7 @@ from app.services.asignacion_engine import (
     NIVELES_REQUERIDOS,
     asignar_automatico,
 )
+from app.services.causa_activa import Excluidas, activa_fields, excluidas_de
 from app.services.lawyer_roster import resolved_owner_by_case
 from app.services.traspaso_cartera import (
     TraspasoError,
@@ -106,6 +107,9 @@ class DesajustesResponse(BaseModel):
     page: int
     page_size: int
     resumen: List[ResumenItem]
+    # Only causas activas are listed/counted; the excluded ones with a desajuste are reported here.
+    activas_definicion: Optional[str] = None
+    excluidas: Optional[Excluidas] = None
 
 
 class ReasignarRequest(BaseModel):
@@ -248,11 +252,15 @@ async def get_desajustes(
         query = query.filter(Case.matriz == matriz)
 
     mismatched: List[tuple] = []
+    excluded_pairs: List[tuple] = []
     for case in query.all():
         owner = owners.get(case.id)
         if owner is None or not _is_mismatch(case.matriz, owner.nivel):
             continue
         if lawyer_id is not None and owner.id != lawyer_id:
+            continue
+        if not case.es_activa:
+            excluded_pairs.append((case.terminada_en_sysgal, case.contrato_estado))
             continue
         mismatched.append((case, owner))
 
@@ -284,7 +292,8 @@ async def get_desajustes(
     ]
 
     return DesajustesResponse(
-        items=items, total=total, page=page, page_size=page_size, resumen=resumen
+        items=items, total=total, page=page, page_size=page_size, resumen=resumen,
+        **activa_fields(excluidas_de(excluded_pairs)),
     )
 
 
