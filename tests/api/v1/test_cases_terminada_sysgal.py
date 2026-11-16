@@ -64,7 +64,8 @@ def test_list_items_and_detail_expose_the_flag(authed_client, db, lawyer, court)
     term = _case(db, lawyer, court, "C-1-2026", terminada_en_sysgal=True)
     reg = _case(db, lawyer, court, "C-2-2026")
 
-    items = {r["id"]: r for r in authed_client.get("/api/v1/cases").json()["items"]}
+    items = {r["id"]: r for r in authed_client.get("/api/v1/cases", params={"terminada_sysgal": True}).json()["items"]}
+    items.update({r["id"]: r for r in authed_client.get("/api/v1/cases").json()["items"]})
     assert items[term.id]["terminada_en_sysgal"] is True
     assert items[reg.id]["terminada_en_sysgal"] is False
     assert authed_client.get(f"/api/v1/cases/{term.id}").json()["case"]["terminada_en_sysgal"] is True
@@ -77,10 +78,11 @@ def test_filter_true_false_and_absent(authed_client, db, lawyer, court):
 
     assert _ids(authed_client.get("/api/v1/cases", params={"terminada_sysgal": True})) == {term.id}
     assert _ids(authed_client.get("/api/v1/cases", params={"terminada_sysgal": False})) == {reg.id}
-    assert _ids(authed_client.get("/api/v1/cases")) == {term.id, reg.id}
+    # the default view is the causas activas: the terminada is only reachable through its own filter
+    assert _ids(authed_client.get("/api/v1/cases")) == {reg.id}
 
 
-def test_summary_counts_within_scope_and_total_is_unchanged(authed_client, db, lawyer, other, court):
+def test_summary_counts_within_scope_and_total_counts_only_activas(authed_client, db, lawyer, other, court):
     _case(db, lawyer, court, "C-1-2026", terminada_en_sysgal=True)
     _case(db, lawyer, court, "C-2-2026")
     _case(db, other, court, "C-3-2026", terminada_en_sysgal=True)  # not visible to `lawyer`
@@ -88,7 +90,8 @@ def test_summary_counts_within_scope_and_total_is_unchanged(authed_client, db, l
     body = authed_client.get("/api/v1/cases/summary").json()
 
     assert body["terminada_sysgal"] == 1
-    assert body["total"] == 2
+    assert body["total"] == 1
+    assert body["excluidas"] == {"terminada_sysgal": 1, "contrato_caducado": 0}
 
 
 def test_matriz_filter_excludes_terminadas_and_equals_the_chip(authed_client, db, lawyer, court):

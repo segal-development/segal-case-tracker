@@ -19,11 +19,14 @@ import logging
 from datetime import date, datetime, timedelta
 from typing import Optional
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models.case_litigante import CaseLitigante
 from app.models.cliente_sysgal_estado import ClienteSysgalEstado
+from app.models.sysgal_causa import SysgalCausa
+from app.services.contrato_estado import recompute_safely
 from app.services.sysgal_client import MAX_RUTS_PER_REQUEST, SysgalClient
 from app.utils.rut import clean_rut, format_rut
 
@@ -110,6 +113,19 @@ def parte_ruts_in_scope(
         .all()
     )
     ruts = {clean_rut(r) for (r,) in rows if r}
+    # The client of every active Sysgal causa (``rut_cliente``) is the first source of the contract state.
+    cliente_rows = (
+        db.query(SysgalCausa.rut_cliente)
+        .filter(
+            SysgalCausa.eliminada.is_(False),
+            func.lower(func.trim(SysgalCausa.estado)) == "activa",
+            SysgalCausa.rut_cliente.isnot(None),
+            SysgalCausa.rut_cliente != "",
+        )
+        .distinct()
+        .all()
+    )
+    ruts |= {clean_rut(r) for (r,) in cliente_rows if r}
     ruts.discard("")
 
     if force:
@@ -166,12 +182,15 @@ def sync_sysgal_estados(
         client = SysgalClient(settings.SYSGAL_BASE_URL, settings.SYSGAL_API_KEY)
     if not client.is_configured:
         logger.warning("Sysgal integration not configured (SYSGAL_BASE_URL/SYSGAL_API_KEY) — skipping sync")
+        # The contract state also ages by date (stale ACTIVO -> caducado): recompute is local, no Sysgal call.
+        recompute_safely(db)
         return _empty_summary(skipped=True)
 
     summary = _empty_summary(skipped=False)
     ruts = parte_ruts_in_scope(db, force=force)
     summary["consultados"] = len(ruts)
     if not ruts:
+        recompute_safely(db)
         return summary
 
     for start in range(0, len(ruts), MAX_RUTS_PER_REQUEST):
@@ -211,6 +230,8 @@ def sync_sysgal_estados(
                 summary["no_encontrados"] += 1
         db.commit()
 
+    # The cache changed: keep the stored contract state (and es_activa) of the cases in step with it.
+    recompute_safely(db)
     logger.info(
         "Sysgal sync: %d ruts, %d found, %d not found, %d chunk error(s)",
         summary["consultados"], summary["encontrados"], summary["no_encontrados"], summary["errores"],

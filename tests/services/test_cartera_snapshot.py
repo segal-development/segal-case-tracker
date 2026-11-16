@@ -130,6 +130,19 @@ def test_snapshot_uses_resolved_owner_not_litigante_nor_lawyer_id(
     assert row.lawyer_id != provenance_lawyer.id
 
 
+def test_new_snapshot_counts_only_activas(db, court, provenance_lawyer):
+    activa = _make_case(db, provenance_lawyer, court, "C-10-2026")
+    _make_case(db, provenance_lawyer, court, "C-11-2026", terminada_en_sysgal=True)
+    _make_case(db, provenance_lawyer, court, "C-12-2026", contrato_estado="caducado")
+
+    summary = tomar_snapshot(db, "2026-10")
+
+    rows = db.query(CarteraSnapshot).filter(CarteraSnapshot.periodo == "2026-10").all()
+    assert [r.case_id for r in rows] == [activa.id]
+    assert db.query(CarteraSnapshotRun).filter_by(periodo="2026-10").one().causas == 1
+    assert summary["causas"] == 1
+
+
 # ---------------------------------------------------------------------------
 # 2. nivel + freshness are frozen at snapshot time
 # ---------------------------------------------------------------------------

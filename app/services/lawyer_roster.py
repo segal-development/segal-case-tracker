@@ -20,6 +20,7 @@ from app.models.procurador import ProcuradorAbogado
 from app.models.sysgal_causa import SysgalCausa
 from app.models.sysgal_usuario import SysgalUsuario
 from app.services import app_settings, sysgal_owner
+from app.services.causa_activa import ACTIVAS_DEFINICION, excluidas_de
 from app.services.deadline_engine import _today_chile
 from app.utils.rut import normalize_rut
 
@@ -394,6 +395,8 @@ def firm_dashboard_stats(db: Session, account_rut: str) -> dict:
             "by_procedural_state": [],
         },
         "by_lawyer": [],
+        "activas_definicion": ACTIVAS_DEFINICION,
+        "excluidas": {"terminada_sysgal": 0, "contrato_caducado": 0},
     }
 
     account_rut_norm = normalize_rut(account_rut)
@@ -429,11 +432,17 @@ def firm_dashboard_stats(db: Session, account_rut: str) -> dict:
     # bookkeeping owner, not the abogado who sees this case, so the case load
     # is NOT restricted to this account's own lawyer_id. Attribution to this
     # account is entirely litigante-derived (abogado_cases above).
-    cases = (
-        db.query(Case.id, Case.semaforo, Case.last_movement_at, Case.procedure, Case.procedural_state)
+    all_cases = (
+        db.query(
+            Case.id, Case.semaforo, Case.last_movement_at, Case.procedure, Case.procedural_state,
+            Case.es_activa, Case.terminada_en_sysgal, Case.contrato_estado,
+        )
         .filter(Case.competencia == "civil")
         .all()
     )
+    # Only the causas activas count; what is left out is reported, not hidden.
+    excluidas = excluidas_de((c.terminada_en_sysgal, c.contrato_estado) for c in all_cases if not c.es_activa)
+    cases = [c for c in all_cases if c.es_activa]
     case_map = {c.id: c for c in cases}
 
     stale_cutoff = datetime.utcnow() - timedelta(days=30)
@@ -523,6 +532,8 @@ def firm_dashboard_stats(db: Session, account_rut: str) -> dict:
             "by_procedural_state": by_procedural_state,
         },
         "by_lawyer": by_lawyer,
+        "activas_definicion": ACTIVAS_DEFINICION,
+        "excluidas": excluidas,
     }
 
 
@@ -566,18 +577,25 @@ def _dashboard_stats_for_ruts(db: Session, account_rut_norm: str, ruts: set) -> 
         "rut": account_rut_norm, "nombre": nombre, "case_count": 0,
         "rojo": 0, "amarillo": 0, "verde": 0, "otros": 0, "stale": 0,
         "actividad_mes": 0, "proyeccion_mes": 0,
+        "activas_definicion": ACTIVAS_DEFINICION,
+        "excluidas": {"terminada_sysgal": 0, "contrato_caducado": 0},
     }
     if not case_ids:
         return empty
 
     # Only THIS lawyer's civil cases — bounded by id, not a full-table scan.
-    cases = (
-        db.query(Case.id, Case.semaforo, Case.last_movement_at)
+    all_cases = (
+        db.query(
+            Case.id, Case.semaforo, Case.last_movement_at,
+            Case.es_activa, Case.terminada_en_sysgal, Case.contrato_estado,
+        )
         .filter(Case.competencia == "civil", Case.id.in_(case_ids))
         .all()
     )
-    if not cases:
+    if not all_cases:
         return empty
+    excluidas = excluidas_de((c.terminada_en_sysgal, c.contrato_estado) for c in all_cases if not c.es_activa)
+    cases = [c for c in all_cases if c.es_activa]
 
     stale_cutoff = datetime.utcnow() - timedelta(days=30)
     sem = {"rojo": 0, "amarillo": 0, "verde": 0, "otros": 0}
@@ -601,6 +619,8 @@ def _dashboard_stats_for_ruts(db: Session, account_rut_norm: str, ruts: set) -> 
         "stale": stale,
         "actividad_mes": actividad_mes,
         "proyeccion_mes": proyeccion_mes,
+        "activas_definicion": ACTIVAS_DEFINICION,
+        "excluidas": excluidas,
     }
 
 
@@ -621,6 +641,9 @@ def firm_dashboard_stats_all(db: Session) -> dict:
             Case.last_movement_at,
             Case.procedure,
             Case.procedural_state,
+            Case.es_activa,
+            Case.terminada_en_sysgal,
+            Case.contrato_estado,
         )
         .filter(Case.competencia == "civil")
         .all()
@@ -634,6 +657,8 @@ def firm_dashboard_stats_all(db: Session) -> dict:
     by_case = _abogado_litigantes_by_case(db)
     firm_ids = _firm_case_ids(db, firm_ruts, by_case=by_case)
     cases = [c for c in cases if c.id in firm_ids]
+    excluidas = excluidas_de((c.terminada_en_sysgal, c.contrato_estado) for c in cases if not c.es_activa)
+    cases = [c for c in cases if c.es_activa]
     case_map = {c.id: c for c in cases}
 
     def _sem_bucket(sem: Optional[str]) -> str:
@@ -730,6 +755,8 @@ def firm_dashboard_stats_all(db: Session) -> dict:
             "by_procedural_state": by_procedural_state,
         },
         "by_lawyer": by_lawyer,
+        "activas_definicion": ACTIVAS_DEFINICION,
+        "excluidas": excluidas,
     }
 
 
@@ -771,6 +798,9 @@ def firm_risk_board(db: Session, account_rut: str) -> dict:
             Case.next_deadline_fatal,
             Case.next_deadline_at,
             Case.plazo_fatal_incumplido,
+            Case.es_activa,
+            Case.terminada_en_sysgal,
+            Case.contrato_estado,
         )
         .filter(Case.competencia == "civil", Case.status != "archived")
         .all()
@@ -784,6 +814,8 @@ def firm_risk_board(db: Session, account_rut: str) -> dict:
     by_case = _abogado_litigantes_by_case(db)
     firm_ids = _firm_case_ids(db, firm_ruts, by_case=by_case)
     cases = [c for c in cases if c.id in firm_ids]
+    excluidas = excluidas_de((c.terminada_en_sysgal, c.contrato_estado) for c in cases if not c.es_activa)
+    cases = [c for c in cases if c.es_activa]
     case_map = {c.id: c for c in cases}
 
     def _sem_bucket(sem: Optional[str]) -> str:
@@ -917,6 +949,8 @@ def firm_risk_board(db: Session, account_rut: str) -> dict:
         "riesgo": riesgo_totals,
         "by_lawyer": by_lawyer,
         "top_critical": top_critical,
+        "activas_definicion": ACTIVAS_DEFINICION,
+        "excluidas": excluidas,
     }
 
 
@@ -1075,6 +1109,8 @@ def admin_dashboard_stats(db: Session, account_rut: str) -> dict:
     from app.models.document import Document
 
     empty = {
+        "activas_definicion": ACTIVAS_DEFINICION,
+        "excluidas": {"terminada_sysgal": 0, "contrato_caducado": 0},
         "sync": {"last_checked_at": None, "checked_1h": 0, "checked_24h": 0, "movements_1h": 0, "pending_detail": 0, "stale_30d": 0},
         "documents": {"stored": 0, "pending": 0, "failed": 0, "unavailable": 0},
         "quality": {
@@ -1096,17 +1132,26 @@ def admin_dashboard_stats(db: Session, account_rut: str) -> dict:
     # Firm-wide civil case load — Approach C: Case.lawyer_id is the firm's
     # bookkeeping owner, not this account specifically, so admin quality/sync
     # metrics span every civil case regardless of which lawyer synced it.
-    cases = (
-        db.query(Case.id, Case.semaforo, Case.last_detail_checked_at, Case.last_movement_at)
+    civil = (
+        db.query(
+            Case.id, Case.semaforo, Case.last_detail_checked_at, Case.last_movement_at,
+            Case.es_activa, Case.terminada_en_sysgal, Case.contrato_estado,
+        )
         .filter(Case.competencia == "civil")
         .all()
     )
-    case_ids = [c.id for c in cases]
-    total_cases = len(cases)
+    # Scrape freshness and the document pipeline span EVERY civil case (the station scrapes the excluded ones
+    # too and they still need fresh PJUD data and documents). Only the "how many causas" figures count the
+    # causas activas; what is left out is reported next to them.
+    activas = [c for c in civil if c.es_activa]
+    activa_ids = {c.id for c in activas}
+    excluidas = excluidas_de((c.terminada_en_sysgal, c.contrato_estado) for c in civil if not c.es_activa)
+    case_ids = [c.id for c in civil]
+    total_cases = len(activas)
 
     last_checked_at: Optional[datetime] = None
     checked_1h = checked_24h = pending_detail = stale_30d = with_semaforo = 0
-    for c in cases:
+    for c in civil:
         lc = c.last_detail_checked_at
         if lc is not None:
             if last_checked_at is None or lc > last_checked_at:
@@ -1119,7 +1164,7 @@ def admin_dashboard_stats(db: Session, account_rut: str) -> dict:
                 stale_30d += 1
         else:
             pending_detail += 1
-        if c.semaforo is not None:
+        if c.es_activa and c.semaforo is not None:
             with_semaforo += 1
 
     # New movements captured in the last hour — live "the scrape is finding stuff"
@@ -1141,12 +1186,12 @@ def admin_dashboard_stats(db: Session, account_rut: str) -> dict:
                 doc_counts[status] = int(cnt)
         with_movements = int(
             db.query(func.count(func.distinct(Movement.case_id)))
-            .filter(Movement.case_id.in_(case_ids))
+            .filter(Movement.case_id.in_(activa_ids))
             .scalar() or 0
         )
         with_litigantes = int(
             db.query(func.count(func.distinct(CaseLitigante.case_id)))
-            .filter(CaseLitigante.case_id.in_(case_ids))
+            .filter(CaseLitigante.case_id.in_(activa_ids))
             .scalar() or 0
         )
 
@@ -1160,7 +1205,7 @@ def admin_dashboard_stats(db: Session, account_rut: str) -> dict:
     # scope the firm's caseload (via _firm_case_ids) and for the assignment
     # check below — avoiding a duplicate firm-wide scan.
     by_case = _abogado_litigantes_by_case(db)
-    firm_ids = _firm_case_ids(db, firm_ruts, by_case=by_case)
+    firm_ids = _firm_case_ids(db, firm_ruts, by_case=by_case) & activa_ids
     assigned: set[int] = set()
     for cid in firm_ids:
         for lit in by_case.get(cid, []):
@@ -1172,6 +1217,8 @@ def admin_dashboard_stats(db: Session, account_rut: str) -> dict:
     sin_asignar = len(firm_ids - assigned)
 
     return {
+        "activas_definicion": ACTIVAS_DEFINICION,
+        "excluidas": excluidas,
         "sync": {
             "last_checked_at": last_checked_at.isoformat() if last_checked_at else None,
             "checked_1h": checked_1h,

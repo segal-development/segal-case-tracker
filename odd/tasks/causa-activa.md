@@ -1,0 +1,23 @@
+# Causa activa única
+One definition of "causa activa" used by every total in the app, so the same question gets the same answer on every screen (audit finding 1, Fase 1).
+Backend: /Users/marcelo/Projects/segal-case-tracker. Frontend: /Users/marcelo/Projects/segal-deudores-web.
+
+## Specs
+- S1. Audit (16-11-2026, verbatim): "No hay un universo único de causas. Cada pantalla muestra otro total: 14.460 en el sistema, 12.507 activas en Supervisor, 12.668 en Avance (cifra de Sysgal) y 7.992 clasificadas en Cartera." Proposal: "no terminada en Sysgal, no archivada en el PJUD y con contrato vigente o moroso. Las causas con contrato caducado van en una vista aparte."
+- S2. Decisions (Marcelo, 2026-11-16): option B — activa = NOT `terminada_en_sysgal` AND contract state vigente (`activo`), `moroso` or `sin_dato` (sin dato counts as activa, "Sí, cuentan como activas"); `caducado` goes apart ("Contrato caducado") and out of totals. "No archivada en el PJUD" is NOT applied yet: `cases.status` is 'active' for all 14,489 (the scrape does not bring the archived state); leave a single place to add it later. Nothing is hidden: excluded cases stay visible to their owner with plazos/alerts.
+- S3. Contract state per case, computed in ONE place and stored on the case (new column `cases.contrato_estado` ∈ activo/moroso/caducado/sin_dato, nullable, next migration) so lists, filters and counts are plain SQL: source 1 = `rut_cliente` of the case's own active, non-eliminated Sysgal causa (latest) → `cliente_sysgal_estados` via `derive_cobertura`; source 2 (fallback) = the existing DDO natural-person RUT inference (`_sysgal_info_by_case` rule); none → sin_dato. Kept current: after the daily Sysgal causas sync and after the client-state cache refresh (find where `cliente_sysgal_estados` is refreshed), for the cases whose inputs changed; plus a script `scripts/recalcular_contrato_estado.py [--dry-run]` (dry-run reports counts per state; writes nothing). Measured 2026-11-16 over the 8,307 non-terminated cases: activo 5,098, moroso 496, caducado 582, sin_dato 2,131 (source: Sysgal rut_cliente 5,262, DDO RUT 1,519, no RUT 1,526).
+- S4. `cases.es_activa` (boolean, stored, same migration) = rule of S2, recomputed wherever `terminada_en_sysgal` or `contrato_estado` change; one SQL predicate helper `CASE_ACTIVA_FILTER` used by every count.
+- S5. Every total/count that answers "how many causas" uses `es_activa`: Causas list default view and its summary `total` (the existing semáforo/matriz/patrocinio/terminada chips count within activas, except the "Terminada en Sysgal" and new "Contrato caducado" chips, which count their own sets); Cartera `/matriz/distribucion` and `/matriz/por-abogado`; Supervisor and Productividad totals (`/stats/firm*`, roster/risk-board loads); `/stats/me`; Asignación desajustes; and Centro operativo counts. Each response that has a total also returns `activas_definicion: "no terminada en Sysgal; contrato vigente, moroso o sin dato"` and `excluidas: {terminada_sysgal: n, contrato_caducado: n}` so the front can show what is left out. Lists keep showing excluded cases only when their own filter is chosen.
+- S6. New list filter `?contrato=caducado` (and `activo|moroso|sin_dato`) on `/cases`, count `contrato_caducado` in `/cases/summary`; the existing Sysgal cobertura chips (Moroso / Caducado / Activo / Sin dato) are replaced by these stored values (same labels) so there is one source.
+- S7. Strict TDD (RED seen): contrato_estado precedence (Sysgal rut_cliente > DDO inference > sin_dato), derive rules (stale ACTIVO → caducado as today), es_activa truth table, every listed endpoint's total equals the count of es_activa within scope (parametrized, lawyer + admin + procurador), excluded counts, filter `contrato`, recompute after sync, dry-run writes nothing, cases not affected keep their other fields. Differential: list contents for explicit filters unchanged vs main.
+
+## Tasks
+- T1 S3-S7 backend — route: worker, branch feat/causa-activa.
+- T2 front: totals labels ("Causas activas"), excluded note, "Contrato caducado" chip — route: worker after T1.
+- T3 verify, PRs, deploy, backup, dry-run, apply, verify the 4 screens show the same total — route: parent.
+
+## Log
+- L1. External audit 16-11-2026, finding 1 and section "Integridad de datos" (quoted in S1).
+- L2. Marcelo: "Dale con la B" (activa = no terminada en Sysgal, no archivada, contrato vigente o moroso; caducadas aparte).
+- L3. Marcelo: sin dato del contrato → "Sí, cuentan como activas (recomendado)".
+- L4. Measurement 2026-11-16 (S3 numbers); archived-in-PJUD not available in data.

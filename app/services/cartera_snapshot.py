@@ -34,6 +34,7 @@ from sqlalchemy.orm import Session
 from app.models.case import Case
 from app.models.cartera_snapshot import CarteraSnapshot, CarteraSnapshotRun
 from app.models.lawyer import Lawyer
+from app.services.causa_activa import CASE_ACTIVA_FILTER
 from app.services.lawyer_roster import resolved_owner_by_case
 
 logger = logging.getLogger(__name__)
@@ -165,7 +166,7 @@ def tomar_snapshot(
             Case.last_movement_at,
             Case.last_detail_checked_at,
         )
-        .filter(Case.competencia == "civil")
+        .filter(Case.competencia == "civil", CASE_ACTIVA_FILTER)
         .all()
     )
     owners = resolved_owner_by_case(db, competencia="civil")

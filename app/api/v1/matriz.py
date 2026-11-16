@@ -27,6 +27,13 @@ from app.api.deps import (
 from app.models.case import Case
 from app.models.lawyer import Lawyer
 from app.models.matriz_pjud_mapeo import MATCH_TIPO_STAGE, MatrizPjudMapeo
+from app.services.causa_activa import (
+    CASE_ACTIVA_FILTER,
+    Excluidas,
+    activa_fields,
+    excluidas_de,
+    excluidas_query,
+)
 from app.services.lawyer_roster import ALL_ABOGADO, _abogado_litigantes_by_case
 from app.services.matriz_classifier import top_unmapped_movements
 from app.utils.rut import normalize_rut
@@ -67,6 +74,8 @@ class MatrizDistribucionResponse(BaseModel):
     computed_at: Optional[datetime] = None
     # Cases Sysgal considers ended: left out of every figure above (same scope).
     terminadas_sysgal: int = 0
+    activas_definicion: Optional[str] = None
+    excluidas: Optional[Excluidas] = None
 
 
 class PorAbogadoItem(BaseModel):
@@ -78,6 +87,8 @@ class PorAbogadoItem(BaseModel):
 
 class PorAbogadoResponse(BaseModel):
     items: List[PorAbogadoItem]
+    activas_definicion: Optional[str] = None
+    excluidas: Optional[Excluidas] = None
 
 
 class MatrizMapeoResponse(BaseModel):
@@ -128,7 +139,9 @@ async def get_distribucion(
     scope = resolve_case_scope(db, current_lawyer)
     scoped = apply_case_scope(db.query(Case), scope)
     terminadas_sysgal = scoped.filter(Case.terminada_en_sysgal.is_(True)).count()
-    query = scoped.filter(Case.terminada_en_sysgal.is_(False))
+    excluidas = excluidas_query(scoped)
+    # Only the causas activas: not terminada en Sysgal and contract not caducado.
+    query = scoped.filter(CASE_ACTIVA_FILTER)
 
     total = query.count()
 
@@ -166,6 +179,7 @@ async def get_distribucion(
         sin_mapear=sin_mapear,
         computed_at=computed_at,
         terminadas_sysgal=terminadas_sysgal,
+        **activa_fields(excluidas),
     )
 
 
@@ -194,13 +208,15 @@ async def get_por_abogado(
                 case_ids_by_rut[normalize_rut(lit.rut)].add(case_id)
 
     all_case_ids = list(by_case.keys())
-    matriz_by_case = dict(
-        db.query(Case.id, Case.matriz)
-        .filter(Case.id.in_(all_case_ids), Case.terminada_en_sysgal.is_(False))
+    rows = (
+        db.query(Case.id, Case.matriz, Case.es_activa, Case.terminada_en_sysgal, Case.contrato_estado)
+        .filter(Case.id.in_(all_case_ids))
         .all()
         if all_case_ids
         else []
     )
+    matriz_by_case = {cid: matriz for cid, matriz, activa, _t, _c in rows if activa}
+    excluidas = excluidas_de((t, c) for _cid, _m, activa, t, c in rows if not activa)
 
     firm_lawyers = (
         db.query(Lawyer)
@@ -211,7 +227,7 @@ async def get_por_abogado(
 
     items = []
     for lawyer in firm_lawyers:
-        # Terminadas en Sysgal are absent from matriz_by_case: not counted.
+        # Causas not activas (terminadas, contract caducado) are absent from matriz_by_case: not counted.
         case_ids = [cid for cid in case_ids_by_rut.get(normalize_rut(lawyer.rut), set()) if cid in matriz_by_case]
         counts = Counter(matriz_by_case.get(cid) for cid in case_ids)
         por_matriz = [
@@ -227,7 +243,7 @@ async def get_por_abogado(
             )
         )
 
-    return PorAbogadoResponse(items=items)
+    return PorAbogadoResponse(items=items, **activa_fields(excluidas))
 
 
 @router.get("/mapeo", response_model=List[MatrizMapeoResponse])

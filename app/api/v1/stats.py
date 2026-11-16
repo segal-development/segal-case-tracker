@@ -16,6 +16,7 @@ from app.api.deps import (
     ALL_CASES,
 )
 from app.models.goal import Goal
+from app.services.causa_activa import Excluidas
 from app.models.lawyer import Lawyer
 from app.services.scraping_health import evaluar_salud_scraping, ultimo_bloqueo_ip
 from app.services.lawyer_roster import (
@@ -81,6 +82,9 @@ class LawyerStats(BaseModel):
 class FirmDashboardStats(BaseModel):
     totals: FirmTotals
     by_lawyer: list[LawyerStats]
+    # Totals count only the causas activas; this says what that means and what is left out.
+    activas_definicion: str | None = None
+    excluidas: Excluidas | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -97,6 +101,8 @@ class MyStatsResponse(BaseModel):
     actividad_mes: int
     proyeccion_mes: int
     meta: int | None
+    activas_definicion: str | None = None
+    excluidas: Excluidas | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -164,6 +170,8 @@ async def get_my_stats(
         actividad_mes=stats["actividad_mes"],
         proyeccion_mes=stats["proyeccion_mes"],
         meta=meta,
+        activas_definicion=stats["activas_definicion"],
+        excluidas=stats["excluidas"],
     )
 
 
@@ -201,6 +209,8 @@ class AdminDashboardStats(BaseModel):
     sync: AdminSync
     documents: AdminDocuments
     quality: AdminQuality
+    activas_definicion: str | None = None
+    excluidas: Excluidas | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -268,6 +278,8 @@ class RiskBoard(BaseModel):
     riesgo: RiskBoardRiesgo
     by_lawyer: list[RiskBoardLawyer]
     top_critical: list[RiskBoardCriticalCase]
+    activas_definicion: str | None = None
+    excluidas: Excluidas | None = None
 
     model_config = ConfigDict(from_attributes=True)
 

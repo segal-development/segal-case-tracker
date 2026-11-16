@@ -572,7 +572,11 @@ class TestRiskBoardEndpoint:
         resp = client.get("/api/v1/stats/risk-board", headers=auditor_headers)
         assert resp.status_code == 200
         data = resp.json()
-        assert set(data.keys()) == {"total", "semaforo", "riesgo", "by_lawyer", "top_critical"}
+        # Causa activa única: every total reports its definition and what it leaves out.
+        assert set(data.keys()) == {
+            "total", "semaforo", "riesgo", "by_lawyer", "top_critical",
+            "activas_definicion", "excluidas",
+        }
         assert set(data["semaforo"].keys()) == {"rojo", "amarillo", "verde", "gris"}
         assert set(data["riesgo"].keys()) == {
             "abandono_disponible", "prescripcion_cumplida", "en_apremio",

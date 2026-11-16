@@ -427,6 +427,16 @@ def test_sugerencias_groups_by_nivel_with_counts(client, db, auditor_headers, ju
     assert junior_row["causas_actuales"] == 0
 
 
+def test_sugerencias_causas_actuales_counts_only_activas(client, db, auditor_headers, pleno, court):
+    for i, fields in enumerate(({}, {"terminada_en_sysgal": True}, {"contrato_estado": "caducado"})):
+        case = _make_case(db, pleno, court, f"C-4{i + 1}-2026", matriz="M2", **fields)
+        _seed_litigante(db, case, pleno.rut, pleno.name)
+
+    body = client.get("/api/v1/asignacion/sugerencias", headers=auditor_headers).json()
+
+    assert next(r for r in body["por_nivel"]["pleno"] if r["lawyer_id"] == pleno.id)["causas_actuales"] == 1
+
+
 # ---------------------------------------------------------------------------
 # Role guards
 # ---------------------------------------------------------------------------
