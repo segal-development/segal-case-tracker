@@ -96,35 +96,41 @@ def sysgal_primary_owner_by_case(
 def reporte_cambio_duenio(db: Session) -> dict[str, dict[str, int]]:
     """``{lawyer name: {gana, pierde}}``: cases each lawyer would gain/lose if the switch were turned on.
 
-    Read-only; never touches the switch. Compares who sees each case with PJUD only vs with the
-    Sysgal layer, using the same resolver the scope uses (so it is exactly the scope delta).
+    For every ACTIVE firm lawyer (not procurador/admin/auditor) it computes the REAL scope the API
+    gives him (``resolve_case_scope``: litigantes, overrides, bootstrap-owned cases and
+    ``patrocinio_pendiente`` incorporations) with the switch at 0 and at 1, and reports the
+    difference. The switch is flipped only inside a SAVEPOINT that is always rolled back (nothing is
+    committed and the switch row stays as it was), and the switch/scope caches are cleared afterwards.
     Lawyers with no change are omitted. Duplicate names are disambiguated with the RUT.
     """
-    from app.services.lawyer_roster import ALL_ABOGADO, _abogado_litigantes_by_case
-    from app.utils.rut import normalize_rut
+    from app.api.deps import resolve_case_scope
+    from app.services import lawyer_roster
 
-    def viewers(sysgal: bool) -> dict[int, set[str]]:
-        return {
-            cid: {normalize_rut(lit.rut) for lit in lits if lit.rut and lit.participante in ALL_ABOGADO}
-            for cid, lits in _abogado_litigantes_by_case(db, sysgal=sysgal).items()
-        }
+    lawyers = (
+        db.query(Lawyer)
+        .filter(Lawyer.is_active.is_(True), Lawyer.is_firm_lawyer.is_(True), Lawyer.role == "lawyer")
+        .order_by(Lawyer.id)
+        .all()
+    )
 
-    before, after = viewers(False), viewers(True)
-    gana: dict[str, int] = {}
-    pierde: dict[str, int] = {}
-    for cid in before.keys() | after.keys():
-        b, a = before.get(cid, set()), after.get(cid, set())
-        for rut in a - b:
-            gana[rut] = gana.get(rut, 0) + 1
-        for rut in b - a:
-            pierde[rut] = pierde.get(rut, 0) + 1
+    def scopes(value: int) -> dict[int, set[int]]:
+        app_settings.set_int(db, app_settings.KEY_SYSGAL_DUENIO, value)  # flush clears the switch cache
+        lawyer_roster.clear_case_scope_cache()
+        return {lw.id: set(resolve_case_scope(db, {"sub": lw.id})) for lw in lawyers}
 
-    ruts = gana.keys() | pierde.keys()
-    lawyers = [lw for lw in db.query(Lawyer).all() if lw.rut and normalize_rut(lw.rut) in ruts]
+    savepoint = db.begin_nested()
+    try:
+        before = scopes(0)
+        after = scopes(1)
+    finally:
+        savepoint.rollback()
+        lawyer_roster.clear_case_scope_cache()
+
     names = [lw.name for lw in lawyers]
     report: dict[str, dict[str, int]] = {}
-    for lw in sorted(lawyers, key=lambda lw: lw.id):
-        key = lw.name if names.count(lw.name) == 1 else f"{lw.name} ({lw.rut})"
-        norm = normalize_rut(lw.rut)
-        report[key] = {"gana": gana.get(norm, 0), "pierde": pierde.get(norm, 0)}
+    for lw in lawyers:
+        gana, pierde = len(after[lw.id] - before[lw.id]), len(before[lw.id] - after[lw.id])
+        if gana or pierde:
+            key = lw.name if names.count(lw.name) == 1 else f"{lw.name} ({lw.rut})"
+            report[key] = {"gana": gana, "pierde": pierde}
     return report

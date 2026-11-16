@@ -215,8 +215,56 @@ class TestReporteCambioDuenio:
 
         assert report == {
             "Eduardo": {"gana": 2, "pierde": 0},
-            "Pjud Abogado": {"gana": 0, "pierde": 2},
+            "Pjud Abogado": {"gana": 0, "pierde": 3},  # C-25 was Pjud's bootstrap case (lawyer_id, no litigantes)
             "Luis": {"gana": 1, "pierde": 0},
         }
         assert sysgal_duenio_enabled(db) is False
         assert db.query(Goal).count() == 0
+
+    def test_report_equals_real_scope_delta_with_bootstrap_and_patrocinio_pendiente(self, db, world):
+        from app.api.deps import resolve_case_scope
+        from app.services import lawyer_roster
+
+        w = world
+        # Bootstrap-owned (no litigantes, lawyer_id = Luis) and Sysgal says Eduardo.
+        for n in range(3):
+            c = make_case(db, w, f"C-3{n}-2026")
+            c.lawyer_id = w["luis"].id
+            db.commit()
+            link(db, c, 10)
+        # Bootstrap-owned by Eduardo, Sysgal says Luis.
+        c = make_case(db, w, "C-39-2026")
+        c.lawyer_id = w["eduardo"].id
+        db.commit()
+        link(db, c, 20)
+        # patrocinio_pendiente incorporated cases owned by Luis (lawyer_id), Sysgal says Eduardo / unchanged.
+        for n, sysgal_id in enumerate((10, 10, 20)):
+            c = make_case(db, w, f"C-4{n}-2026")
+            c.lawyer_id = w["luis"].id
+            c.patrocinio_pendiente = True
+            db.commit()
+            link(db, c, sysgal_id)
+        # Plain PJUD litigante case moving Pjud -> Luis.
+        link(db, make_case(db, w, "C-50-2026", litigante=w["pjud"]), 20)
+
+        report = reporte_cambio_duenio(db)
+
+        assert db.query(Goal).filter_by(key=app_settings.KEY_SYSGAL_DUENIO).count() == 0
+        assert sysgal_duenio_enabled(db) is False
+
+        def scopes():
+            lawyer_roster.clear_case_scope_cache()
+            return {k: set(resolve_case_scope(db, {"sub": w[k].id})) for k in ("pjud", "eduardo", "luis")}
+
+        before = scopes()
+        app_settings.set_int(db, app_settings.KEY_SYSGAL_DUENIO, 1)
+        db.commit()
+        after = scopes()
+        names = {"pjud": "Pjud Abogado", "eduardo": "Eduardo", "luis": "Luis"}
+        expected = {
+            names[k]: {"gana": len(after[k] - before[k]), "pierde": len(before[k] - after[k])}
+            for k in names
+            if after[k] != before[k]
+        }
+        assert expected["Luis"]["pierde"] >= 5  # sanity: the old litigante-only report would have missed these
+        assert report == expected
