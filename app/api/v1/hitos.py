@@ -388,6 +388,9 @@ def _is_procurador(lawyer: Optional[Lawyer]) -> bool:
     return bool(lawyer and lawyer.role == "procurador")
 
 
+_PROCURADOR_CHANGE_DETAIL = "Solo puedes editar o eliminar hitos pendientes que ingresaste tú."
+
+
 def _procurador_may_change(db: Session, actor: Lawyer, hito: Hito) -> bool:
     """A procurador edits/deletes only a hito HE entered, still pendiente, for a lawyer he supports."""
     return (
@@ -408,7 +411,7 @@ def _admin_or_own_procurador_hito(db: Session, current_lawyer: dict, hito_id: in
     if _is_procurador(actor) and not _procurador_may_change(db, actor, hito):
         raise HTTPException(
             status_code=403,
-            detail="Solo puedes editar o eliminar hitos pendientes que ingresaste tú.",
+            detail=_PROCURADOR_CHANGE_DETAIL,
         )
     return actor, hito
 
@@ -2345,7 +2348,7 @@ async def get_evidencia(
     db: Session = Depends(get_db),
     current_lawyer: dict = Depends(get_current_lawyer),
 ):
-    """Stream a hito's PJUD evidence. Admins, or the owning lawyer, only."""
+    """Stream a hito's PJUD evidence. Admins, the owning lawyer, or a procurador on a pending hito he entered, only."""
     actor = _resolve_lawyer(db, current_lawyer)
     hito = db.query(Hito).filter(Hito.id == hito_id).first()
     if hito is None:
@@ -2379,6 +2382,8 @@ async def put_evidencia(
     if _is_procurador(actor):
         if hito.created_by_rut != actor.rut or hito.lawyer_id not in procurador_svc.linked_abogado_ids(db, actor.id):
             raise HTTPException(status_code=403, detail="Sin acceso a esta evidencia")
+        if hito.estado != HITO_PENDIENTE:
+            raise HTTPException(status_code=403, detail=_PROCURADOR_CHANGE_DETAIL)
     elif not _is_admin(actor) and (actor is None or actor.id != hito.lawyer_id):
         raise HTTPException(status_code=403, detail="Sin acceso a esta evidencia")
     return _to_response(await _attach_evidencia(db, hito, evidencia))

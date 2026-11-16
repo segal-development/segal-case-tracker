@@ -111,7 +111,7 @@ def scan_credential_changes(db: Session) -> int:
     recorded = 0
     # Only current staff: a deactivated lawyer (left the firm) is out of the
     # scraping rotation and must not generate change events or alerts.
-    lawyers = db.query(Lawyer).filter(Lawyer.is_active.is_(True)).all()
+    lawyers = db.query(Lawyer).filter(Lawyer.is_active.is_(True), Lawyer.role != "procurador").all()
 
     for lawyer in lawyers:
         for credential_type in CREDENTIAL_TYPES:
@@ -202,7 +202,7 @@ def credential_status(db: Session) -> list[dict]:
     result: list[dict] = []
     # Current staff only — a lawyer who left the firm is deactivated and must
     # not appear in the vault nor count towards the "credentials failing" alert.
-    lawyers = db.query(Lawyer).filter(Lawyer.is_active.is_(True)).order_by(Lawyer.id.asc()).all()
+    lawyers = db.query(Lawyer).filter(Lawyer.is_active.is_(True), Lawyer.role != "procurador").order_by(Lawyer.id.asc()).all()
     for lawyer in lawyers:
         result.append(
             {

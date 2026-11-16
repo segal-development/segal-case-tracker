@@ -41,6 +41,8 @@ class AccountUpdateBody(BaseModel):
     is_active: Optional[bool] = None
     # Procurador only: the 1-2 firm lawyers he supports (ids). Replaces the current links.
     abogado_ids: Optional[list[int]] = None
+    # Accepted only to reject it on a procurador (he has no bono level); ignored otherwise.
+    nivel: Optional[str] = None
 
 
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -163,6 +165,7 @@ def get_sync_status(db: Session = Depends(get_db)):
     results = (
         db.query(Lawyer, sub.c.case_count, sub.c.last_synced_at, sub.c.stale_count)
         .join(sub, Lawyer.id == sub.c.lawyer_id)
+        .filter(Lawyer.role != procurador_svc.ROLE)
         .order_by(sub.c.last_synced_at.asc().nulls_first())
         .all()
     )
@@ -277,6 +280,8 @@ def update_account(
             )
     new_role = body.role if body.role is not None else lawyer.role
     if new_role == procurador_svc.ROLE:
+        if body.nivel is not None:
+            raise HTTPException(status_code=422, detail="Un procurador no tiene nivel de bono.")
         # Validate BEFORE touching anything so a rejected request changes nothing.
         if body.abogado_ids is not None or lawyer.role != procurador_svc.ROLE:
             abogados = procurador_svc.validate_abogado_ids(db, body.abogado_ids)
@@ -286,6 +291,7 @@ def update_account(
             lawyer.nivel = None
     elif lawyer.role == procurador_svc.ROLE:
         procurador_svc.clear_links(db, lawyer)
+        lawyer.is_firm_lawyer = True  # as an account created through the normal path
     if body.role is not None:
         lawyer.role = body.role
 

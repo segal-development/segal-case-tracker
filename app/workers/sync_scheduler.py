@@ -519,7 +519,7 @@ def _active_lawyer_ids_by_staleness(db: Session) -> list[int]:
     query = (
         db.query(Lawyer.id, last_ok.c.last_ok)
         .outerjoin(last_ok, last_ok.c.lawyer_id == Lawyer.id)
-        .filter(Lawyer.is_active.is_(True))
+        .filter(Lawyer.is_active.is_(True), Lawyer.role != "procurador")
     )
     if settings.SYNC_LAWYER_IDS.strip():
         wanted = settings.sync_lawyer_ids_list
