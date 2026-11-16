@@ -54,6 +54,7 @@ class FrescuraBlock(BaseModel):
 class FrescuraPorAbogadoItem(FrescuraBlock):
     lawyer_id: int
     nombre: str
+    nivel: Optional[str] = None  # junior | pleno | senior | None
 
 
 class FrescuraResponse(FrescuraBlock):
