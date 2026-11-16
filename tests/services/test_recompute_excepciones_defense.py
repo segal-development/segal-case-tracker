@@ -106,7 +106,9 @@ def test_apply_closes_row_and_clears_rojo(db, owner):
     assert db.get(CaseDeadline, r_on_time.id).status == "cumplido"
     assert db.get(CaseDeadline, r_late.id).status == "no_cumplido"
     assert db.get(Case, on_time.id).semaforo != "rojo"
-    assert db.get(Case, late.id).semaforo != "rojo"
+    # Audit Fase 0 (S3): a fatal deadline closed as no_cumplido keeps the case rojo
+    # until a lawyer or admin reviews and marks it.
+    assert db.get(Case, late.id).semaforo == "rojo"
 
 
 def test_second_run_finds_nothing(db, owner):

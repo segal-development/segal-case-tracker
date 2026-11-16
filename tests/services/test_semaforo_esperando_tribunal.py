@@ -179,6 +179,10 @@ class TestPersistedByRecompute:
 
     def test_recompute_persists_flag_and_override_wins(self, db, case) -> None:
         _prueba_movements(db, case)
+        # The idle fixture is also an abandono case, which Fase 0 turns rojo (S2); the
+        # terminada_en_sysgal exemption keeps this test about "esperando al tribunal".
+        case.terminada_en_sysgal = True
+        db.commit()
         DeadlineEngine.recompute_case(db, case)
         assert case.esperando_tribunal is True
         assert case.semaforo != "rojo"

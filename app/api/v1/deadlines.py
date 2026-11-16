@@ -662,6 +662,16 @@ async def update_deadline_status(
             created_at=datetime.utcnow(),
         )
         db.add(alert)
+    # A human decision on a lost fatal plazo stops it reddening the case (Fase 0): the
+    # engine reads marked_by/marked_at, so refresh the semáforo now instead of waiting
+    # for the next sync. Best-effort: the mark itself must never fail because of it.
+    if body.status in ("no_cumplido", "cumplido"):
+        try:
+            from app.services.deadline_engine import DeadlineEngine
+
+            DeadlineEngine.recompute_case(db, case)
+        except Exception:  # pragma: no cover - defensive boundary
+            pass
     db.commit()
     db.refresh(deadline)
     return deadline

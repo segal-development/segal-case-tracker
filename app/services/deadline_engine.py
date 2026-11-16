@@ -55,6 +55,7 @@ from app.models.case_deadline import CaseDeadline
 from app.models.case_escrito import CaseEscrito
 from app.models.movement import Movement
 from app.services.business_days import add_business_days, count_business_days_remaining
+from app.services import escalamiento_plazos as _fase0
 from app.services.deadline_verdict import (
     DETECTORS,
     Verdict,
@@ -410,6 +411,8 @@ class SemaforoTransition:
     new_semaforo: Optional[str]
     old_fatal: bool
     new_fatal: bool
+    #: Fase 0 escalation alerts created by this recompute (see ``escalamiento_plazos``).
+    escalations_created: int = 0
 
     @property
     def entered_rojo(self) -> bool:
@@ -491,6 +494,7 @@ class DeadlineEngine:
             new_semaforo=case.semaforo,
             old_fatal=old_fatal,
             new_fatal=bool(case.next_deadline_fatal),
+            escalations_created=int(getattr(case, "_fase0_escalations", 0) or 0),
         )
 
     # ------------------------------------------------------------------
@@ -797,24 +801,11 @@ class DeadlineEngine:
         prescripcion_cumplida, prescripcion_fecha = _compute_prescripcion(case, today, movements)
 
         # Step 8: write denormalized Case columns.
-        case.procedural_state = proc_state.value
-        case.semaforo = cls._apply_semaforo_override(case, semaforo, movements)
-        # A liberación override pins the colour, so the "esperando" label does not apply.
-        case.esperando_tribunal = esperando and case.semaforo == semaforo
-        case.abandono_disponible = abandono
-        case.prescripcion_cumplida = prescripcion_cumplida
-        case.prescripcion_fecha = prescripcion_fecha
-
-        # next_deadline_at = the firm's next action date. Mirror the semáforo
-        # selection: nearest active ACTIONABLE deadline (per-case side), skipping
-        # a past-due OPTIONAL window (closed) — otherwise a VERDE case (e.g.
-        # SENTENCIA with the apelación window already closed) would surface a
-        # stale past date.
-        #
-        # ONE query serves both outputs (every statement is a Cloud SQL
-        # round-trip, see tests/services/test_roundtrips_per_case.py): the
-        # active rows drive next_deadline_at, the no_cumplido ones drive the
-        # compliance flag.
+        # ONE query serves the Fase 0 rules, the compliance flag and next_deadline_at
+        # (every statement is a Cloud SQL round-trip, see
+        # tests/services/test_roundtrips_per_case.py): the active rows drive
+        # next_deadline_at, the no_cumplido ones drive the compliance flag and
+        # the "plazo fatal vencido sin escrito" rule.
         actionable_rows = (
             db.query(CaseDeadline)
             .filter(
@@ -825,6 +816,46 @@ class DeadlineEngine:
             .order_by(CaseDeadline.due_date.asc())
             .all()
         )
+
+        # Fase 0 (auditoría): a case is never "al día" with an abandono available, nor
+        # with a fatal plazo lost (unreviewed, <= 60 days) — forced rojo with a reason.
+        # Gris cases (indeterminate / terminada) and terminada_en_sysgal abandono are exempt.
+        motivo: Optional[str] = None
+        vencidos = [r for r in actionable_rows if _fase0.is_unreviewed_fatal_vencido(r, today)]
+        reddening = [r for r in vencidos if _fase0.reddens(r, today)]
+        if semaforo != "gris":
+            if reddening:
+                last = max(reddening, key=lambda r: r.due_date)
+                motivo = _fase0.motivo_fatal_vencido(last.deadline_type, last.due_date)
+            elif abandono and not case.terminada_en_sysgal:
+                motivo = _fase0.MOTIVO_ABANDONO
+        forced = "rojo" if motivo is not None else semaforo
+
+        case.procedural_state = proc_state.value
+        case.semaforo = cls._apply_semaforo_override(case, forced, movements)
+        # A liberación override pins the colour (the reason no longer applies), and a
+        # forced rojo is not "esperando al tribunal".
+        case.semaforo_motivo = motivo if case.semaforo == forced else None
+        case.esperando_tribunal = esperando and case.semaforo == semaforo
+        case.abandono_disponible = abandono
+        case.prescripcion_cumplida = prescripcion_cumplida
+        case.prescripcion_fecha = prescripcion_fecha
+
+        # S4: one escalation alert per lost fatal plazo (idempotent). Safe-fail: an alert
+        # problem must never break the deadline computation that already succeeded.
+        case._fase0_escalations = 0
+        if vencidos:
+            try:
+                with db.begin_nested():
+                    case._fase0_escalations = _fase0.escalate_fatal_vencidos(db, case, vencidos, today)
+            except Exception:
+                logger.exception("fase0 escalation failed for case_id=%s", case.id)
+
+        # next_deadline_at = the firm's next action date. Mirror the semáforo
+        # selection: nearest active ACTIONABLE deadline (per-case side), skipping
+        # a past-due OPTIONAL window (closed) — otherwise a VERDE case (e.g.
+        # SENTENCIA with the apelación window already closed) would surface a
+        # stale past date.
         active_actionable = [r for r in actionable_rows if r.status == "active"]
         # Compliance axis: a lost FATAL plazo leaves the active set, so the
         # semáforo cannot show it; this flag keeps it visible. Recomputed every
@@ -1617,6 +1648,7 @@ class DeadlineEngine:
         """Set case to GRIS/INDETERMINATE and flush (safe-fail path)."""
         case.procedural_state = ProceduralState.INDETERMINATE.value
         case.semaforo = "gris"
+        case.semaforo_motivo = None
         case.esperando_tribunal = False
         case.next_deadline_at = None
         case.abandono_disponible = False

@@ -100,6 +100,10 @@ class Case(Base):
     semaforo_override_at = Column(DateTime, nullable=True)
     semaforo_override_by = Column(String(255), nullable=True)
 
+    # Why the engine forced the semáforo (Fase 0 auditoría: abandono disponible /
+    # plazo fatal vencido sin escrito). NULL = the colour comes from the plazos as usual.
+    semaforo_motivo = Column(String(255), nullable=True)
+
     # Prescripción (statute of limitations) — populated by DeadlineEngine.recompute_case
     titulo_tipo = Column(String(30), nullable=True)   # input: pagare|letra|cheque|escritura_publica|sentencia|otro
     titulo_fecha = Column(Date, nullable=True)         # input: title's key date
