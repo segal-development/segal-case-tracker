@@ -387,8 +387,8 @@ def frescura_actual(db: Session) -> dict:
     result = _build_frescura(buckets, total)
 
     lawyer_ids = list(por_lawyer_buckets.keys())
-    lawyer_names = (
-        {lw.id: lw.name for lw in db.query(Lawyer).filter(Lawyer.id.in_(lawyer_ids)).all()}
+    lawyers = (
+        {lw.id: lw for lw in db.query(Lawyer).filter(Lawyer.id.in_(lawyer_ids)).all()}
         if lawyer_ids
         else {}
     )
@@ -397,7 +397,9 @@ def frescura_actual(db: Session) -> dict:
     for lawyer_id, lawyer_buckets in por_lawyer_buckets.items():
         entry = _build_frescura(lawyer_buckets, por_lawyer_total[lawyer_id])
         entry["lawyer_id"] = lawyer_id
-        entry["nombre"] = lawyer_names.get(lawyer_id, "")
+        lawyer = lawyers.get(lawyer_id)
+        entry["nombre"] = lawyer.name if lawyer else ""
+        entry["nivel"] = lawyer.nivel if lawyer else None
         por_abogado.append(entry)
     por_abogado.sort(key=lambda item: item["lawyer_id"])
 
