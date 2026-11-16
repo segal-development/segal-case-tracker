@@ -14,7 +14,11 @@ from app.config import settings
 from app.models.case import EFFECTIVE_LAWYER_ID, Case
 from app.models.case_litigante import CaseLitigante
 from app.models.court import Court
+from app.models.goal import Goal
 from app.models.lawyer import Lawyer
+from app.models.sysgal_causa import SysgalCausa
+from app.models.sysgal_usuario import SysgalUsuario
+from app.services import app_settings, sysgal_owner
 from app.services.deadline_engine import _today_chile
 from app.utils.rut import normalize_rut
 
@@ -60,6 +64,7 @@ def _scope_cache_put(key, value: frozenset) -> None:
 def clear_case_scope_cache() -> None:
     with _scope_cache_lock:
         _scope_cache.clear()
+    sysgal_owner.clear_switch_cache()  # scope and the Sysgal switch always go stale together
 
 
 # Invalidation: scope inputs are Case ownership/assignment, CaseLitigante rows
@@ -68,12 +73,25 @@ def clear_case_scope_cache() -> None:
 # between flush and commit cannot leave a pre-commit value behind). Bulk
 # ``query.update()`` bypasses these events; the TTL bounds that staleness.
 _CASE_SCOPE_COLUMNS = ("lawyer_id", "assigned_lawyer_id", "competencia", "patrocinio_pendiente")
-_LAWYER_SCOPE_COLUMNS = ("rut", "role")
+_LAWYER_SCOPE_COLUMNS = ("rut", "role", "is_active")
+# Sysgal ownership inputs (only consulted when the sysgal_es_fuente_duenio switch is on).
+_SYSGAL_CAUSA_SCOPE_COLUMNS = ("case_id", "abogado_sysgal_id", "estado", "eliminada", "sysgal_updated_at")
+_SYSGAL_USUARIO_SCOPE_COLUMNS = ("sysgal_id", "lawyer_id")
 
 
 def _changes_scope(obj, *, new_or_deleted: bool) -> bool:
     if isinstance(obj, CaseLitigante):
         return True
+    if isinstance(obj, Goal):
+        if obj.key != app_settings.KEY_SYSGAL_DUENIO:
+            return False
+        return new_or_deleted or sa_inspect(obj).attrs["value"].history.has_changes()
+    if isinstance(obj, (SysgalCausa, SysgalUsuario)):
+        if new_or_deleted:
+            return True
+        columns = _SYSGAL_CAUSA_SCOPE_COLUMNS if isinstance(obj, SysgalCausa) else _SYSGAL_USUARIO_SCOPE_COLUMNS
+        state = sa_inspect(obj)
+        return any(state.attrs[c].history.has_changes() for c in columns)
     if isinstance(obj, (Case, Lawyer)):
         if new_or_deleted:
             return True
@@ -123,7 +141,9 @@ def _clean_nombre(nombre: str) -> str:
     return _TRAILING_PAREN_RE.sub("", nombre or "").strip()
 
 
-def _abogado_litigantes_by_case(db: Session, *, competencia: str = "civil") -> dict[int, list]:
+def _abogado_litigantes_by_case(
+    db: Session, *, competencia: str = "civil", sysgal: Optional[bool] = None
+) -> dict[int, list]:
     """Load the abogado-of-record attribution for every firm case, grouped by case_id.
 
     This is THE single source of "whose causa is this for business purposes"
@@ -132,8 +152,13 @@ def _abogado_litigantes_by_case(db: Session, *, competencia: str = "civil") -> d
     is built on. Precedence, resolved HERE so it only has to be right once:
 
         asignación-por-nivel override (``Case.assigned_lawyer_id``)
+            > active mapped Sysgal lawyer of the case's own link
+              (ONLY when the ``sysgal_es_fuente_duenio`` switch is on)
             > legal abogado-of-record litigante (``CaseLitigante``)
             > nothing
+
+    ``sysgal`` forces the Sysgal layer on/off (the change report compares both);
+    ``None`` reads the switch. With the switch at 0 the result is exactly the PJUD one.
 
     ``Case.lawyer_id`` (sync/provenance — see ``existing_by_rol`` in
     ``app.services.sync_service``) never contributes here.
@@ -169,8 +194,17 @@ def _abogado_litigantes_by_case(db: Session, *, competencia: str = "civil") -> d
         .filter(Case.competencia == competencia, Case.assigned_lawyer_id.isnot(None))
         .all()
     )
+    overridden = set()
     for case_id, rut, name in overrides:
+        overridden.add(case_id)
         by_case[case_id] = [_AssignedAbogado(rut=rut, nombre=name, participante=_ASSIGNED_PARTICIPANTE)]
+
+    if sysgal if sysgal is not None else sysgal_owner.sysgal_duenio_enabled(db):
+        for case_id, owner in sysgal_owner.sysgal_primary_owner_by_case(db, competencia=competencia).items():
+            if case_id not in overridden:
+                by_case[case_id] = [
+                    _AssignedAbogado(rut=owner.rut, nombre=owner.nombre, participante=_ASSIGNED_PARTICIPANTE)
+                ]
 
     return dict(by_case)
 
@@ -876,7 +910,10 @@ def case_ids_for_abogado(db: Session, account_rut: str, abogado_rut: str) -> set
     """
     abogado_rut_norm = normalize_rut(abogado_rut)
     use_cache = _scope_cache_ttl() > 0
+    sysgal_on = sysgal_owner.sysgal_duenio_enabled(db)
     key = ("abogado", normalize_rut(account_rut), abogado_rut_norm)
+    if sysgal_on:
+        key += ("sysgal",)
     if use_cache:
         cached = _scope_cache_get(key)
         if cached is not None:
@@ -892,13 +929,19 @@ def case_ids_for_abogado(db: Session, account_rut: str, abogado_rut: str) -> set
     }
     # Cases incorporated from Sysgal while the patrocinio is not accredited in PJUD have no firm
     # abogado litigante; their only link to the lawyer is the (effective) owner.
-    result |= {
+    pendientes = {
         case_id
         for (case_id,) in db.query(Case.id)
         .join(Lawyer, Lawyer.id == EFFECTIVE_LAWYER_ID)
         .filter(Case.patrocinio_pendiente.is_(True), Lawyer.rut == abogado_rut)
         .all()
     }
+    if sysgal_on:
+        # A Sysgal owner outranks the incorporation owner (but not an override, which
+        # EFFECTIVE_LAWYER_ID already honours): those cases belong to the Sysgal lawyer only.
+        overridden = {cid for (cid,) in db.query(Case.id).filter(Case.assigned_lawyer_id.isnot(None)).all()}
+        pendientes -= set(sysgal_owner.sysgal_primary_owner_by_case(db, competencia="civil")) - overridden
+    result |= pendientes
     if use_cache:
         _scope_cache_put(key, frozenset(result))
     return result
@@ -913,6 +956,15 @@ def acting_lawyer_is_case_abogado(db: Session, case: Case, acting_rut: str) -> b
     lawyer owns/sees a case (it is the firm's single bookkeeping owner).
     """
     acting_norm = normalize_rut(acting_rut)
+    if sysgal_owner.sysgal_duenio_enabled(db):
+        # Same precedence as the scope: override > Sysgal owner > litigantes (a no-op without them).
+        if case.assigned_lawyer_id is not None:
+            assigned = db.get(Lawyer, case.assigned_lawyer_id)
+            return assigned is not None and normalize_rut(assigned.rut) == acting_norm
+        if case.competencia == "civil":
+            owner = sysgal_owner.sysgal_primary_owner_by_case(db, case_id=case.id).get(case.id)
+            if owner is not None:
+                return normalize_rut(owner.rut) == acting_norm
     litigantes = (
         db.query(CaseLitigante)
         .filter(
@@ -947,6 +999,11 @@ def resolve_case_alert_recipients(db: Session, case: Case) -> list[Lawyer]:
         assigned = db.get(Lawyer, case.assigned_lawyer_id)
         if assigned is not None and assigned.is_active:
             return [assigned]
+
+    if case.competencia == "civil" and sysgal_owner.sysgal_duenio_enabled(db):
+        owner = sysgal_owner.sysgal_primary_owner_by_case(db, case_id=case.id).get(case.id)
+        if owner is not None:
+            return [db.get(Lawyer, owner.lawyer_id)]
 
     litigantes = (
         db.query(CaseLitigante)

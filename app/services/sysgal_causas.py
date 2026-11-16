@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session, aliased
 from app.models.case import Case
 from app.models.sysgal_causa import SysgalCausa
 from app.models.sysgal_usuario import SysgalUsuario
+from app.services.lawyer_roster import clear_case_scope_cache
 from app.services.matriz_sysgal import ACTIVA, load_sysgal_state, reclassify_cases
 from app.services.sysgal_client import SysgalClient
 from app.services.sysgal_matching import AMBIGUA, CALZADA, match_causa, match_causas, normalize_rol
@@ -84,7 +85,9 @@ def sync_sysgal_causas(db: Session, client: SysgalClient, full: bool = False) ->
         db.flush()
 
     db.commit()
+    clear_case_scope_cache()  # belt and braces: ownership may now come from these links
     stats["reenlazadas"] = _rematch_safely(db)
+    clear_case_scope_cache()
     logger.info("Sysgal causas sync done: %s", stats)
     _reclassify_changed(db, inputs_before, terminadas_before)
     return stats
