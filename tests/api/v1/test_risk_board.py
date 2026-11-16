@@ -476,7 +476,8 @@ class TestFirmRiskBoardArchived:
 class TestFirmRiskBoardFirmScope:
     def test_case_with_only_external_abogado_is_excluded(self, db, firm_account, court):
         """A case whose only abogado of record is NOT a firm lawyer (e.g. the
-        opposing counsel) is excluded from the study views — totals and ranking."""
+        opposing counsel) is still a causa activa (it is in the total, like /cases), but it is not
+        attributed to any firm lawyer: not in ``atribuidas`` nor in the ranking."""
         # Firm case: a firm lawyer is the abogado of record → counts.
         c_firm = _make_case(db, firm_account, court, "C-9600-2025", semaforo="rojo")
         _seed_abogado(db, c_firm, LAWYER_A_RUT, "Firm Lawyer A")  # registers A as firm lawyer
@@ -490,8 +491,9 @@ class TestFirmRiskBoardFirmScope:
         db.commit()
 
         result = firm_risk_board(db, ACCOUNT_RUT)
-        assert result["total"] == 1  # only the firm case is the firm's caseload
-        assert result["semaforo"]["rojo"] == 1
+        assert result["total"] == 2  # every causa activa, as /cases counts them
+        assert result["atribuidas"] == 1  # only the firm case has a firm abogado resolved
+        assert result["semaforo"]["rojo"] == 2
         assert {row["rut"] for row in result["by_lawyer"]} == {LAWYER_A_RUT}
 
 
@@ -574,7 +576,7 @@ class TestRiskBoardEndpoint:
         data = resp.json()
         # Causa activa única: every total reports its definition and what it leaves out.
         assert set(data.keys()) == {
-            "total", "semaforo", "riesgo", "by_lawyer", "top_critical",
+            "total", "atribuidas", "semaforo", "riesgo", "by_lawyer", "top_critical",
             "activas_definicion", "excluidas",
         }
         assert set(data["semaforo"].keys()) == {"rojo", "amarillo", "verde", "gris"}

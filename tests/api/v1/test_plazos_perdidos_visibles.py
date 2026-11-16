@@ -152,12 +152,15 @@ class TestRiskBoardIncumplido:
         assert riesgo["plazo_fatal_vencido"] == 1
 
     def test_universe_rule_respected(self, db, lawyer, court):
-        # No firm abogado of record -> outside the board's universe.
+        # Causa activa única: an activa with no firm abogado of record is in the
+        # firm-wide universe (same as /cases); it only stays out of `atribuidas`.
         _case(db, lawyer, court, "C-4-2026", plazo_fatal_incumplido=True)
         # Archived -> outside the universe even with an abogado.
         _case(db, lawyer, court, "C-5-2026", abogado=lawyer, status="archived",
               plazo_fatal_incumplido=True)
-        assert firm_risk_board(db, FIRM_RUT)["riesgo"]["plazo_fatal_incumplido"] == 0
+        board = firm_risk_board(db, FIRM_RUT)
+        assert board["riesgo"]["plazo_fatal_incumplido"] == 1
+        assert board["atribuidas"] == 0
 
     def test_top_critical_puts_flagged_case_first(self, db, lawyer, court):
         today = _today_chile()

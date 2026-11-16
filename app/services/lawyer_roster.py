@@ -537,7 +537,7 @@ def firm_dashboard_stats(db: Session, account_rut: str) -> dict:
     }
 
 
-def lawyer_dashboard_stats(db: Session, account_rut: str) -> dict:
+def lawyer_dashboard_stats(db: Session, account_rut: str, case_ids: Optional[set] = None) -> dict:
     """Per-lawyer numbers for ``/stats/me`` — WITHOUT computing the whole firm.
 
     ``firm_dashboard_stats`` builds the entire firm's semaforo/materia/procedural
@@ -550,28 +550,34 @@ def lawyer_dashboard_stats(db: Session, account_rut: str) -> dict:
     abogado-of-record case ids + display name, then a single query bounded to
     exactly those cases. Output matches the fields ``MyStatsResponse`` needs.
     """
-    return _dashboard_stats_for_ruts(db, normalize_rut(account_rut), {normalize_rut(account_rut)})
-
-
-def procurador_dashboard_stats(db: Session, account_rut: str, abogado_ruts) -> dict:
-    """``/stats/me`` numbers for a procurador: the UNION of his lawyers' cases, each case
-    counted once (co-counsel cases appear under both lawyers)."""
     return _dashboard_stats_for_ruts(
-        db, normalize_rut(account_rut), {normalize_rut(r) for r in abogado_ruts}
+        db, normalize_rut(account_rut), {normalize_rut(account_rut)}, case_ids=case_ids
     )
 
 
-def _dashboard_stats_for_ruts(db: Session, account_rut_norm: str, ruts: set) -> dict:
+def procurador_dashboard_stats(db: Session, account_rut: str, abogado_ruts, case_ids: Optional[set] = None) -> dict:
+    """``/stats/me`` numbers for a procurador: the UNION of his lawyers' cases, each case
+    counted once (co-counsel cases appear under both lawyers)."""
+    return _dashboard_stats_for_ruts(
+        db, normalize_rut(account_rut), {normalize_rut(r) for r in abogado_ruts}, case_ids=case_ids
+    )
+
+
+def _dashboard_stats_for_ruts(db: Session, account_rut_norm: str, ruts: set, case_ids: Optional[set] = None) -> dict:
+    """``case_ids`` is the caller's visibility scope (``resolve_case_scope``): the SAME set /cases counts, so
+    the total agrees with it (bootstrap, pendiente and Sysgal-owner cases included). Without it, only the
+    abogado-of-record attribution counts."""
     # Abogado-of-record civil case ids of any of ``ruts`` + display name (one pass).
-    case_ids: set[int] = set()
+    attributed: set[int] = set()
     nombre = ""
     for cid, litigantes in _abogado_litigantes_by_case(db).items():
         for lit in litigantes:
             if normalize_rut(lit.rut) in ruts and lit.participante in ALL_ABOGADO:
-                case_ids.add(cid)
+                attributed.add(cid)
                 if not nombre:
                     nombre = _clean_nombre(lit.nombre)
                 break
+    case_ids = set(case_ids) if case_ids is not None else attributed
 
     empty = {
         "rut": account_rut_norm, "nombre": nombre, "case_count": 0,
@@ -656,9 +662,11 @@ def firm_dashboard_stats_all(db: Session) -> dict:
     # per-abogado breakdown below — avoiding a duplicate firm-wide scan.
     by_case = _abogado_litigantes_by_case(db)
     firm_ids = _firm_case_ids(db, firm_ruts, by_case=by_case)
-    cases = [c for c in cases if c.id in firm_ids]
+    # The total is EVERY causa activa (same set as /cases for ALL_CASES); those with a firm abogado resolved
+    # are a separate figure (``atribuidas``), never the total.
     excluidas = excluidas_de((c.terminada_en_sysgal, c.contrato_estado) for c in cases if not c.es_activa)
     cases = [c for c in cases if c.es_activa]
+    atribuidas = sum(1 for c in cases if c.id in firm_ids)
     case_map = {c.id: c for c in cases}
 
     def _sem_bucket(sem: Optional[str]) -> str:
@@ -747,6 +755,7 @@ def firm_dashboard_stats_all(db: Session) -> dict:
     return {
         "totals": {
             "cases": len(cases),
+            "atribuidas": atribuidas,
             "semaforo": sem_totals,
             "stale": stale_total,
             "actividad_mes": actividad_mes,
@@ -813,9 +822,11 @@ def firm_risk_board(db: Session, account_rut: str) -> dict:
     # top_critical attribution below — avoiding a duplicate firm-wide scan.
     by_case = _abogado_litigantes_by_case(db)
     firm_ids = _firm_case_ids(db, firm_ruts, by_case=by_case)
-    cases = [c for c in cases if c.id in firm_ids]
+    # The total is EVERY causa activa (same set as /cases for ALL_CASES); those with a firm abogado resolved
+    # are a separate figure (``atribuidas``), never the total.
     excluidas = excluidas_de((c.terminada_en_sysgal, c.contrato_estado) for c in cases if not c.es_activa)
     cases = [c for c in cases if c.es_activa]
+    atribuidas = sum(1 for c in cases if c.id in firm_ids)
     case_map = {c.id: c for c in cases}
 
     def _sem_bucket(sem: Optional[str]) -> str:
@@ -945,6 +956,7 @@ def firm_risk_board(db: Session, account_rut: str) -> dict:
 
     return {
         "total": len(cases),
+        "atribuidas": atribuidas,
         "semaforo": sem_totals,
         "riesgo": riesgo_totals,
         "by_lawyer": by_lawyer,
@@ -1108,22 +1120,8 @@ def admin_dashboard_stats(db: Session, account_rut: str) -> dict:
     from app.models.movement import Movement
     from app.models.document import Document
 
-    empty = {
-        "activas_definicion": ACTIVAS_DEFINICION,
-        "excluidas": {"terminada_sysgal": 0, "contrato_caducado": 0},
-        "sync": {"last_checked_at": None, "checked_1h": 0, "checked_24h": 0, "movements_1h": 0, "pending_detail": 0, "stale_30d": 0},
-        "documents": {"stored": 0, "pending": 0, "failed": 0, "unavailable": 0},
-        "quality": {
-            "total_cases": 0, "with_semaforo": 0, "with_movements": 0,
-            "with_litigantes": 0, "sin_asignar": 0,
-        },
-    }
-
-    account_rut_norm = normalize_rut(account_rut)
-    lawyer = db.query(Lawyer).filter(Lawyer.rut == account_rut_norm).first()
-    if not lawyer:
-        return empty
-
+    # Firm-wide: nothing below depends on the requesting account (the endpoint already resolved it). Looking it
+    # up again by the normalized RUT returned the all-zero ``empty`` for an account stored as "22.222.222-2".
     now = datetime.utcnow()
     cutoff_1h = now - timedelta(hours=1)
     cutoff_24h = now - timedelta(hours=24)
