@@ -50,6 +50,7 @@ from app.models.matriz_tramite_override import MatrizTramiteOverride
 from app.models.matriz_pjud_mapeo import MatrizPjudMapeo
 from app.models.cartera_snapshot import CarteraSnapshot, CarteraSnapshotRun
 from app.models.case_assignment_history import CaseAssignmentHistory
+from app.models.procurador import ProcuradorAbogado
 
 __all__ = [
     "Lawyer",
@@ -100,4 +101,5 @@ __all__ = [
     "CarteraSnapshot",
     "CarteraSnapshotRun",
     "CaseAssignmentHistory",
+    "ProcuradorAbogado",
 ]

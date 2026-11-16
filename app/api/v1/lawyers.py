@@ -15,6 +15,7 @@ from app.api.deps import get_db, get_current_lawyer, require_admin, _resolve_law
 from app.core.security import hash_password
 from app.models.case import Case
 from app.models.lawyer import Lawyer
+from app.services import procurador as procurador_svc
 from app.services.lawyer_roster import firm_roster
 from app.utils.rut import normalize_rut, validate_rut
 
@@ -38,6 +39,8 @@ class AccountUpdateBody(BaseModel):
     new_password: Optional[str] = None
     # False blocks the person (sign-in and open sessions stop; nothing is deleted); True reactivates.
     is_active: Optional[bool] = None
+    # Procurador only: the 1-2 firm lawyers he supports (ids). Replaces the current links.
+    abogado_ids: Optional[list[int]] = None
 
 
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -53,6 +56,8 @@ class LawyerCreateBody(BaseModel):
     # Optional: with a password the person can sign in right away.
     password: Optional[str] = None
     role: str = "lawyer"
+    # Role procurador only: the 1-2 firm lawyers he supports (ids).
+    abogado_ids: Optional[list[int]] = None
 
     @field_validator("password")
     @classmethod
@@ -64,8 +69,8 @@ class LawyerCreateBody(BaseModel):
     @field_validator("role")
     @classmethod
     def _role(cls, v: str) -> str:
-        if v not in {"lawyer", "admin"}:
-            raise ValueError("El rol debe ser 'lawyer' o 'admin'")
+        if v not in {"lawyer", "admin", "procurador"}:
+            raise ValueError("El rol debe ser 'lawyer', 'admin' o 'procurador'")
         return v
 
     @field_validator("rut")
@@ -177,8 +182,10 @@ def get_sync_status(db: Session = Depends(get_db)):
     ]
 
 
-def _account_json(person: Lawyer) -> dict:
-    """What the admin screen needs about one person. Never the password; a missing flag counts as active."""
+def _account_json(person: Lawyer, abogados: Optional[list[Lawyer]] = None) -> dict:
+    """What the admin screen needs about one person. Never the password; a missing flag counts as active.
+    ``abogados`` are the lawyers a procurador supports (empty for everyone else)."""
+    abogados = abogados or []
     return {
         "id": person.id,
         "rut": person.rut,
@@ -188,6 +195,7 @@ def _account_json(person: Lawyer) -> dict:
         "nivel": person.nivel,
         # Carries a cartera (the traspaso wizard lists only these).
         "is_firm_lawyer": bool(person.is_firm_lawyer),
+        "abogados": [{"id": a.id, "rut": a.rut, "name": a.name} for a in abogados],
         "is_active": person.is_active is not False,
         "blocked_at": person.blocked_at.isoformat() if person.blocked_at else None,
         "has_password": person.password_hash is not None,
@@ -199,7 +207,8 @@ def _account_json(person: Lawyer) -> dict:
 def list_accounts(db: Session = Depends(get_db)):
     """List all lawyer accounts with has_password flag (admin only)."""
     lawyers = db.query(Lawyer).order_by(Lawyer.id).all()
-    return [_account_json(person) for person in lawyers]
+    links = procurador_svc.abogados_by_procurador(db, [p.id for p in lawyers if p.role == "procurador"])
+    return [_account_json(person, links.get(person.id)) for person in lawyers]
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -216,21 +225,27 @@ def create_lawyer(
     if body.email and db.query(Lawyer).filter(Lawyer.email == body.email).first() is not None:
         raise HTTPException(status_code=409, detail="Ya existe una persona con ese correo")
 
+    es_procurador = body.role == procurador_svc.ROLE
+    abogados = procurador_svc.validate_abogado_ids(db, body.abogado_ids) if es_procurador else []
+    # A procurador is not a firm lawyer: never an owner, never in rosters, bono or traspaso lists.
     lawyer = Lawyer(
-        rut=body.rut, name=body.name, email=body.email, nivel=body.nivel,
-        role=body.role, is_firm_lawyer=True, is_active=True,
+        rut=body.rut, name=body.name, email=body.email, nivel=None if es_procurador else body.nivel,
+        role=body.role, is_firm_lawyer=not es_procurador, is_active=True,
     )
     if body.password:
         lawyer.password_hash = hash_password(body.password)
         lawyer.password_changed_at = datetime.utcnow()
     db.add(lawyer)
     try:
+        db.flush()
+        if es_procurador:
+            procurador_svc.set_links(db, lawyer, abogados)
         db.commit()
     except IntegrityError:
         db.rollback()
         raise HTTPException(status_code=409, detail="Ya existe una persona con ese RUT o correo")
     db.refresh(lawyer)
-    return _account_json(lawyer)
+    return _account_json(lawyer, abogados)
 
 
 def block_account(lawyer: Lawyer) -> None:
@@ -256,8 +271,22 @@ def update_account(
         raise HTTPException(status_code=404, detail="Lawyer not found")
 
     if body.role is not None:
-        if body.role not in {"admin", "lawyer", "auditor"}:
-            raise HTTPException(status_code=422, detail="Invalid role; must be 'admin', 'lawyer', or 'auditor'")
+        if body.role not in {"admin", "lawyer", "auditor", "procurador"}:
+            raise HTTPException(
+                status_code=422, detail="Invalid role; must be 'admin', 'lawyer', 'auditor' or 'procurador'"
+            )
+    new_role = body.role if body.role is not None else lawyer.role
+    if new_role == procurador_svc.ROLE:
+        # Validate BEFORE touching anything so a rejected request changes nothing.
+        if body.abogado_ids is not None or lawyer.role != procurador_svc.ROLE:
+            abogados = procurador_svc.validate_abogado_ids(db, body.abogado_ids)
+            procurador_svc.set_links(db, lawyer, abogados)
+        if lawyer.role != procurador_svc.ROLE:
+            lawyer.is_firm_lawyer = False
+            lawyer.nivel = None
+    elif lawyer.role == procurador_svc.ROLE:
+        procurador_svc.clear_links(db, lawyer)
+    if body.role is not None:
         lawyer.role = body.role
 
     if body.email is not None:
@@ -280,7 +309,7 @@ def update_account(
 
     db.commit()
     db.refresh(lawyer)
-    return _account_json(lawyer)
+    return _account_json(lawyer, procurador_svc.abogados_by_procurador(db, [lawyer.id])[lawyer.id])
 
 
 def _has_history(db: Session, lawyer_id: int) -> bool:
@@ -319,7 +348,11 @@ def delete_lawyer(
         status_code=409,
         detail="Esta persona tiene historial (causas, hitos, alertas u otros registros) y no se puede eliminar. Bloquéala: no podrá ingresar y se conserva todo.",
     )
+    if lawyer.role == procurador_svc.ROLE:
+        # His own links are not "history": drop them (rolled back if something else refuses).
+        procurador_svc.clear_links(db, lawyer)
     if _has_history(db, lawyer.id):
+        db.rollback()
         raise refusal
     try:
         db.delete(lawyer)

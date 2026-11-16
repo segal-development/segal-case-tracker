@@ -30,6 +30,7 @@ from app.models.hito import (
 from app.models.hito_form_link import FORM_LINK_KIND_PROCURADORES, HitoFormLink
 from app.models.lawyer import Lawyer
 from app.services import bono_cierre_service as cierre_svc
+from app.services import procurador as procurador_svc
 
 # A ROL like "C-9960-2026" embedded anywhere in the free-text descripcion.
 _ROL_RE = re.compile(r"[A-Za-z]+-\d+-\d{4}")
@@ -227,6 +228,7 @@ class HitoResponse(BaseModel):
     origen: str = "manual"          # manual | detector
     confianza: Optional[str] = None  # alta | media | baja (solo detector)
     created_by_name: Optional[str] = None
+    created_by_rut: Optional[str] = None
     aprobado_by_name: Optional[str] = None
     aprobado_at: Optional[datetime] = None
     rechazo_motivo: Optional[str] = None
@@ -382,9 +384,41 @@ def _is_auditor(lawyer: Optional[Lawyer]) -> bool:
     return bool(lawyer and lawyer.role == "auditor")
 
 
+def _is_procurador(lawyer: Optional[Lawyer]) -> bool:
+    return bool(lawyer and lawyer.role == "procurador")
+
+
+def _procurador_may_change(db: Session, actor: Lawyer, hito: Hito) -> bool:
+    """A procurador edits/deletes only a hito HE entered, still pendiente, for a lawyer he supports."""
+    return (
+        hito.created_by_rut == actor.rut
+        and hito.estado == HITO_PENDIENTE
+        and hito.lawyer_id in procurador_svc.linked_abogado_ids(db, actor.id)
+    )
+
+
+def _admin_or_own_procurador_hito(db: Session, current_lawyer: dict, hito_id: int) -> tuple[Optional[Lawyer], Hito]:
+    """Auth for PUT/DELETE /{id}: an admin, or a procurador on a hito he entered (see above)."""
+    actor = _resolve_lawyer(db, current_lawyer)
+    if not (_is_admin(actor) or _is_procurador(actor)):
+        raise HTTPException(status_code=403, detail="Requiere rol admin")
+    hito = db.query(Hito).filter(Hito.id == hito_id).first()
+    if hito is None:
+        raise HTTPException(status_code=404, detail="Hito no encontrado")
+    if _is_procurador(actor) and not _procurador_may_change(db, actor, hito):
+        raise HTTPException(
+            status_code=403,
+            detail="Solo puedes editar o eliminar hitos pendientes que ingresaste tú.",
+        )
+    return actor, hito
+
+
 def _es_abogado_comun(lawyer: Optional[Lawyer]) -> bool:
     """Plain lawyer: role lawyer without ``can_manage_evaluaciones`` (Melissa, Carla
-    and Marcelo are not). Plain lawyers get the strict public-form rules."""
+    and Marcelo are not). Plain lawyers get the strict public-form rules; so does a
+    procurador, who enters hitos on a lawyer's behalf under the same validations."""
+    if lawyer and lawyer.role == "procurador":
+        return True
     return bool(lawyer and lawyer.role == "lawyer" and not lawyer.can_manage_evaluaciones)
 
 
@@ -710,6 +744,7 @@ def _to_response(h: Hito) -> HitoResponse:
         origen=h.origen,
         confianza=h.confianza,
         created_by_name=h.created_by_name,
+        created_by_rut=h.created_by_rut,
         aprobado_by_name=h.aprobado_by_name,
         aprobado_at=h.aprobado_at,
         rechazo_motivo=h.rechazo_motivo,
@@ -758,7 +793,17 @@ async def create_hito(
 
     # A lawyer registers hitos for themselves; only an admin may set another lawyer.
     target_lawyer_id = actor.id
-    if lawyer_id is not None and lawyer_id != actor.id:
+    if _is_procurador(actor):
+        # He enters hitos only for the lawyers he supports; with one lawyer it is preselected.
+        supported = procurador_svc.linked_abogado_ids(db, actor.id)
+        if lawyer_id is None and len(supported) == 1:
+            lawyer_id = next(iter(supported))
+        if lawyer_id is None:
+            raise HTTPException(status_code=422, detail="Elige el abogado para quien ingresas el hito.")
+        if lawyer_id not in supported:
+            raise HTTPException(status_code=403, detail=procurador_svc.MSG_NOT_SUPPORTED)
+        target_lawyer_id = lawyer_id
+    elif lawyer_id is not None and lawyer_id != actor.id:
         if not _is_admin(actor):
             raise HTTPException(status_code=403, detail="Solo un admin puede registrar hitos de otro abogado")
         if db.query(Lawyer).filter(Lawyer.id == lawyer_id).first() is None:
@@ -807,7 +852,12 @@ async def list_hitos(
     q = db.query(Hito).options(
         selectinload(Hito.lawyer), selectinload(Hito.tipo)
     )
-    if not (_is_admin(actor) or _is_auditor(actor)):
+    if _is_procurador(actor):
+        supported = procurador_svc.linked_abogado_ids(db, actor.id)
+        if lawyer_id is not None:
+            supported = supported & {lawyer_id}
+        q = q.filter(Hito.lawyer_id.in_(supported))  # his lawyers' hitos only
+    elif not (_is_admin(actor) or _is_auditor(actor)):
         q = q.filter(Hito.lawyer_id == actor.id)  # lawyers: own hitos only
     elif lawyer_id is not None:
         q = q.filter(Hito.lawyer_id == lawyer_id)
@@ -2086,7 +2136,11 @@ async def list_hito_abogados(
     db: Session = Depends(get_db),
     _lawyer: dict = Depends(get_current_lawyer),
 ):
-    """Firm lawyers for the hito 'abogado' selector (admins register for another)."""
+    """Firm lawyers for the hito 'abogado' selector (admins register for another).
+    A procurador gets only the lawyers he supports."""
+    actor = _resolve_lawyer(db, _lawyer)
+    if _is_procurador(actor):
+        return [HitoAbogado(lawyer_id=lw.id, nombre=lw.name) for lw in procurador_svc.linked_abogados(db, actor.id)]
     lawyers = (
         db.query(Lawyer)
         .filter(Lawyer.is_firm_lawyer.is_(True))
@@ -2100,12 +2154,11 @@ async def list_hito_abogados(
 async def delete_hito(
     hito_id: int,
     db: Session = Depends(get_db),
-    _admin_rut: str = Depends(require_admin),
+    current_lawyer: dict = Depends(get_current_lawyer),
 ):
-    """Delete a hito (admin only) — e.g. one registered for the wrong lawyer."""
-    hito = db.query(Hito).filter(Hito.id == hito_id).first()
-    if hito is None:
-        raise HTTPException(status_code=404, detail="Hito no encontrado")
+    """Delete a hito (admin, or a procurador on a pending hito he entered) — e.g. one
+    registered for the wrong lawyer."""
+    _actor, hito = _admin_or_own_procurador_hito(db, current_lawyer, hito_id)
     if cierre_svc.is_cerrado(db, cierre_svc.periodo_de_fecha(hito.fecha_hito)):
         raise HTTPException(status_code=409, detail="El período de ese hito está cerrado")
     db.delete(hito)
@@ -2127,13 +2180,15 @@ async def update_hito(
     hito_id: int,
     body: HitoUpdate,
     db: Session = Depends(get_db),
-    _admin_rut: str = Depends(require_admin),
+    current_lawyer: dict = Depends(get_current_lawyer),
 ):
-    """Edit a hito (admin only). Re-snapshots the value if the tipo changes.
-    Preserves ETAPA/TRAMITE and evidence; period-close blocks edits both ways."""
-    hito = db.query(Hito).filter(Hito.id == hito_id).first()
-    if hito is None:
-        raise HTTPException(status_code=404, detail="Hito no encontrado")
+    """Edit a hito (admin, or a procurador on a pending hito he entered). Re-snapshots the
+    value if the tipo changes. Preserves ETAPA/TRAMITE and evidence; period-close blocks
+    edits both ways."""
+    actor, hito = _admin_or_own_procurador_hito(db, current_lawyer, hito_id)
+    if _is_procurador(actor) and body.lawyer_id is not None:
+        if body.lawyer_id not in procurador_svc.linked_abogado_ids(db, actor.id):
+            raise HTTPException(status_code=403, detail=procurador_svc.MSG_NOT_SUPPORTED)
     if cierre_svc.is_cerrado(db, cierre_svc.periodo_de_fecha(hito.fecha_hito)):
         raise HTTPException(status_code=409, detail="El período de ese hito está cerrado")
     if cierre_svc.is_cerrado(db, cierre_svc.periodo_de_fecha(body.fecha_hito)):
@@ -2295,7 +2350,10 @@ async def get_evidencia(
     hito = db.query(Hito).filter(Hito.id == hito_id).first()
     if hito is None:
         raise HTTPException(status_code=404, detail="Hito no encontrado")
-    if not _is_admin(actor) and (actor is None or actor.id != hito.lawyer_id):
+    if _is_procurador(actor):
+        if hito.lawyer_id not in procurador_svc.linked_abogado_ids(db, actor.id):
+            raise HTTPException(status_code=403, detail="Sin acceso a esta evidencia")
+    elif not _is_admin(actor) and (actor is None or actor.id != hito.lawyer_id):
         raise HTTPException(status_code=403, detail="Sin acceso a esta evidencia")
     return _stream_evidencia(hito)
 
@@ -2318,6 +2376,9 @@ async def put_evidencia(
     hito = db.query(Hito).filter(Hito.id == hito_id).first()
     if hito is None:
         raise HTTPException(status_code=404, detail="Hito no encontrado")
-    if not _is_admin(actor) and (actor is None or actor.id != hito.lawyer_id):
+    if _is_procurador(actor):
+        if hito.created_by_rut != actor.rut or hito.lawyer_id not in procurador_svc.linked_abogado_ids(db, actor.id):
+            raise HTTPException(status_code=403, detail="Sin acceso a esta evidencia")
+    elif not _is_admin(actor) and (actor is None or actor.id != hito.lawyer_id):
         raise HTTPException(status_code=403, detail="Sin acceso a esta evidencia")
     return _to_response(await _attach_evidencia(db, hito, evidencia))
