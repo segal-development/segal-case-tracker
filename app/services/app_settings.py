@@ -18,6 +18,11 @@ KEY_FRENO_DIA = "sysgal_incorporacion_freno_dia"
 #: 1 = no e-mail leaves, from ANY process (VM or station); read by app/services/email_gate.py.
 KEY_CORREOS_APAGADOS = "correos_apagados"
 
+#: 1 = Sysgal's responsible lawyer decides case ownership (override > Sysgal > PJUD); 0 = PJUD only.
+#: Read through app/services/sysgal_owner.py (short cache). Default OFF.
+KEY_SYSGAL_DUENIO = "sysgal_es_fuente_duenio"
+DEFAULT_SYSGAL_DUENIO = 0
+
 DEFAULT_POR_DIA = 0  # 0 = OFF
 DEFAULT_POR_HORA = 10
 

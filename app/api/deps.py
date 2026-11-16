@@ -348,7 +348,7 @@ def resolve_case_scope(db: Session, current_lawyer: dict):
         raise HTTPException(status_code=401, detail="Invalid token")
 
     from app.models.lawyer import Lawyer
-    from app.services import lawyer_roster
+    from app.services import lawyer_roster, sysgal_owner
 
     if isinstance(sub, int) or (isinstance(sub, str) and sub.isdigit()):
         lawyer = db.query(Lawyer).filter(Lawyer.id == int(sub)).first()
@@ -364,25 +364,43 @@ def resolve_case_scope(db: Session, current_lawyer: dict):
     # Cache key carries id AND rut AND role (the lawyer row is still read per
     # request, so a role change or deleted account is never served stale).
     use_cache = lawyer_roster._scope_cache_ttl() > 0
-    key = ("scope", lawyer.id, lawyer.rut, lawyer.role)
+    sysgal_on = sysgal_owner.sysgal_duenio_enabled(db)
+    key = ("scope", lawyer.id, lawyer.rut, lawyer.role) + (("sysgal",) if sysgal_on else ())
     if use_cache:
         cached = lawyer_roster._scope_cache_get(key)
         if cached is not None:
             return set(cached)
+    sysgal_taken: dict = {}
+    sysgal_overridden: set = set()
+    if sysgal_on:
+        # A case Sysgal assigns to someone else (and no override) is not this lawyer's bootstrap
+        # case. Cases Sysgal assigns to this lawyer are already in ``case_ids_for_abogado``.
+        from app.models.case import Case
+
+        sysgal_overridden = {
+            cid for (cid,) in db.query(Case.id).filter(Case.assigned_lawyer_id.isnot(None)).all()
+        }
+        sysgal_taken = sysgal_owner.sysgal_primary_owner_by_case(db, competencia="civil")
+
+    def _scope_of(abogado) -> set:
+        own = lawyer_roster.case_ids_for_abogado(db, abogado.rut, abogado.rut)
+        bootstrap = _bootstrap_owned_case_ids(db, abogado.id)
+        if sysgal_on:
+            bootstrap -= {
+                cid for cid, o in sysgal_taken.items() if o.lawyer_id != abogado.id and cid not in sysgal_overridden
+            }
+        return own | bootstrap
+
     if lawyer.role == "procurador":
         # Union of the scopes of the ACTIVE firm lawyers he supports, each computed exactly as
-        # that lawyer's own scope. No links -> empty.
+        # that lawyer's own scope (Sysgal precedence included). No links -> empty.
         from app.services import procurador as procurador_svc
 
         scope = set()
         for abogado in procurador_svc.linked_abogados(db, lawyer.id):
-            scope |= lawyer_roster.case_ids_for_abogado(
-                db, abogado.rut, abogado.rut
-            ) | _bootstrap_owned_case_ids(db, abogado.id)
+            scope |= _scope_of(abogado)
     else:
-        scope = lawyer_roster.case_ids_for_abogado(
-            db, lawyer.rut, lawyer.rut
-        ) | _bootstrap_owned_case_ids(db, lawyer.id)
+        scope = _scope_of(lawyer)
     if use_cache:
         lawyer_roster._scope_cache_put(key, frozenset(scope))
     return scope
