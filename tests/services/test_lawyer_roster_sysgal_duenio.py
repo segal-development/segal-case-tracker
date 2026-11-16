@@ -161,6 +161,33 @@ class TestAlertRecipients:
         assert acting_lawyer_is_case_abogado(db, c, w["pjud"].rut) is True
 
 
+def test_override_beats_sysgal_in_alert_recipients_even_if_override_target_is_inactive(db, w):
+    """Sysgal never outranks an override: an unusable override target falls to PJUD (as on main), not Sysgal."""
+    c = case(db, w, lit="pjud", sysgal=10, override="ina")
+    switch(db, 1)
+    assert [r.id for r in resolve_case_alert_recipients(db, c)] == [w["pjud"].id]
+
+
+def test_procurador_union_scope_follows_sysgal_precedence(db, w):
+    from app.models.procurador import ProcuradorAbogado
+
+    proc = Lawyer(rut="77777777-7", name="Proc", role="procurador", is_active=True, is_firm_lawyer=False)
+    db.add(proc)
+    db.flush()
+    db.add_all([ProcuradorAbogado(procurador_id=proc.id, abogado_id=w["edu"].id)])
+    db.commit()
+    moved = case(db, w, lit="pjud", sysgal=10)      # Sysgal moves it pjud -> edu
+    kept = case(db, w, lit="luis")                    # PJUD luis, untouched
+    bare_other = case(db, w, sysgal=20, owner="edu")  # bootstrap under edu but Sysgal says luis
+    bare_own = case(db, w, owner="edu")               # bootstrap under edu, no Sysgal
+    scope = lambda: resolve_case_scope(db, {"sub": proc.rut})  # noqa: E731
+    assert scope() == {bare_other.id, bare_own.id}     # switch 0 = main behaviour (bootstrap only)
+    switch(db, 1)
+    assert scope() == {moved.id, bare_own.id}
+    assert kept.id not in scope()
+    assert scope() == resolve_case_scope(db, {"sub": w["edu"].rut})  # union of one == that lawyer's scope
+
+
 def _fixture_cases(db, w):
     return [
         case(db, w, lit="pjud"),                                   # PJUD only

@@ -84,7 +84,7 @@ async def sysgal_cartera_reporte(
 ):
     lawyers = db.query(Lawyer).all()
     lawyer_by_id = {lw.id: lw for lw in lawyers}
-    propose = _proposals(lawyers)
+    propose = _proposals([lw for lw in lawyers if lw.role != "procurador"])
 
     usuarios = [
         {
@@ -157,7 +157,8 @@ async def set_sysgal_usuario_mapping(
     usuario = db.query(SysgalUsuario).filter_by(sysgal_id=sysgal_id).one_or_none()
     if usuario is None:
         raise HTTPException(status_code=404, detail="Usuario de Sysgal no encontrado")
-    if body.lawyer_id is not None and db.get(Lawyer, body.lawyer_id) is None:
+    target = db.get(Lawyer, body.lawyer_id) if body.lawyer_id is not None else None
+    if body.lawyer_id is not None and (target is None or target.role == "procurador"):
         raise HTTPException(status_code=404, detail="Abogado no encontrado")
 
     usuario.lawyer_id = body.lawyer_id

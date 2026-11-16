@@ -11,6 +11,7 @@ Auth required; lawyer-scoped (404 when case not owned by caller).
 
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime
 from typing import List, Optional
 
@@ -46,6 +47,8 @@ from app.services.business_days import count_business_days_remaining, add_busine
 from app.services.deadline_engine import _today_chile, is_medida_prejudicial
 
 from zoneinfo import ZoneInfo
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -662,6 +665,17 @@ async def update_deadline_status(
             created_at=datetime.utcnow(),
         )
         db.add(alert)
+    # A human decision on a lost fatal plazo stops it reddening the case (Fase 0): the
+    # engine reads marked_by/marked_at, so refresh the semáforo now instead of waiting
+    # for the next sync. Best-effort: the mark itself must never fail because of it.
+    if body.status in ("no_cumplido", "cumplido"):
+        try:
+            from app.services.deadline_engine import DeadlineEngine
+
+            with db.begin_nested():
+                DeadlineEngine.recompute_case(db, case)
+        except Exception:  # pragma: no cover - defensive boundary
+            logger.exception("recompute_case failed after marking deadline %s", deadline.id)
     db.commit()
     db.refresh(deadline)
     return deadline

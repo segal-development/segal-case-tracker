@@ -133,17 +133,26 @@ class TestPrimaryOwner:
         link(db, c, 20)  # created later -> higher id
         assert sysgal_primary_owner_by_case(db)[c.id].lawyer_id == world["luis"].id
 
-    def test_newest_row_unmapped_means_fall_through_not_an_older_lawyer(self, db, world):
+    def test_unmapped_newest_row_is_not_a_candidate_older_mapped_row_decides(self, db, world):
         c = make_case(db, world, "C-6-2026")
         link(db, c, 10, updated=T0)
         link(db, c, 40, updated=T0 + timedelta(days=1))
-        assert c.id not in sysgal_primary_owner_by_case(db)
+        assert sysgal_primary_owner_by_case(db)[c.id].lawyer_id == world["eduardo"].id
 
     def test_terminated_newer_row_does_not_hide_an_older_active_one(self, db, world):
         c = make_case(db, world, "C-7-2026")
         link(db, c, 10, updated=T0)
         link(db, c, 20, estado="terminada", updated=T0 + timedelta(days=1))
         assert sysgal_primary_owner_by_case(db)[c.id].lawyer_id == world["eduardo"].id
+
+    @pytest.mark.parametrize("attrs", [{"role": "procurador", "is_firm_lawyer": False}, {"is_firm_lawyer": False}])
+    def test_non_firm_or_procurador_lawyer_never_owns(self, db, world, attrs):
+        c = make_case(db, world, "C-9-2026")
+        link(db, c, 10)
+        for k, v in attrs.items():
+            setattr(world["eduardo"], k, v)
+        db.commit()
+        assert c.id not in sysgal_primary_owner_by_case(db)
 
     def test_no_sibling_inheritance_only_own_link(self, db, world):
         a = make_case(db, world, "C-8-2026")

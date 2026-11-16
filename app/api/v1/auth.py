@@ -295,13 +295,21 @@ def get_me(
     lawyer = db.query(Lawyer).filter(Lawyer.rut == rut).first()
     if not lawyer:
         raise HTTPException(status_code=404, detail="Lawyer not found")
-    return {
+    me = {
         "rut": lawyer.rut,
         "name": lawyer.name,
         "email": lawyer.email,
         "role": lawyer.role,
         "can_manage_evaluaciones": lawyer.can_manage_evaluaciones,
     }
+    if lawyer.role == "procurador":
+        from app.services import procurador as procurador_svc
+
+        me["abogados_apoyados"] = [
+            {"id": a.id, "rut": a.rut, "name": a.name}
+            for a in procurador_svc.linked_abogados(db, lawyer.id)
+        ]
+    return me
 
 
 @router.put("/password", status_code=200)

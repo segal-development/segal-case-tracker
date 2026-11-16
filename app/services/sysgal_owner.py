@@ -60,16 +60,24 @@ def sysgal_primary_owner_by_case(
 ) -> dict[int, SysgalOwner]:
     """``{case_id: SysgalOwner}`` decided by the case's OWN Sysgal link (ONE query, no N+1).
 
-    Among the case's ACTIVE, non-eliminada rows the most recently updated wins (ties: highest
-    ``id``); only then is its ``abogado_sysgal_id`` mapped (``sysgal_usuarios.lawyer_id``) to an
-    ACTIVE lawyer. If that winner is unmapped/inactive the case has NO Sysgal owner (it falls
-    through to PJUD; an older row never decides). No sibling-cuaderno inheritance. Pure read.
+    Candidates are the case's ACTIVE, non-eliminada rows whose ``abogado_sysgal_id`` maps
+    (``sysgal_usuarios.lawyer_id``) to an ACTIVE firm lawyer (not a procurador); among them the
+    most recently updated wins (ties: highest ``id``). A case with no candidate has NO Sysgal
+    owner and falls through to PJUD. No sibling-cuaderno inheritance. Pure read.
     """
     query = (
         db.query(SysgalCausa.case_id, Lawyer.id, Lawyer.rut, Lawyer.name)
         .join(Case, Case.id == SysgalCausa.case_id)
-        .outerjoin(SysgalUsuario, SysgalUsuario.sysgal_id == SysgalCausa.abogado_sysgal_id)
-        .outerjoin(Lawyer, and_(Lawyer.id == SysgalUsuario.lawyer_id, Lawyer.is_active.is_(True)))
+        .join(SysgalUsuario, SysgalUsuario.sysgal_id == SysgalCausa.abogado_sysgal_id)
+        .join(
+            Lawyer,
+            and_(
+                Lawyer.id == SysgalUsuario.lawyer_id,
+                Lawyer.is_active.is_(True),
+                Lawyer.is_firm_lawyer.is_(True),
+                Lawyer.role != "procurador",
+            ),
+        )
         .filter(
             SysgalCausa.case_id.isnot(None),
             SysgalCausa.eliminada.is_(False),

@@ -1,8 +1,10 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+
+from app.api.deps import procurador_gate
 
 from app.api.v1 import auth, cases, deadlines, movements, courts, scrapper, webhooks, pjud, pjud_ingest, sync, documents, lawyers, stats, goals, alerts, calendar, credentials, hitos, liberaciones, bono, renovaciones, redaccion_keys, evaluaciones, sysgal, sysgal_cartera, avance_cartera, escritos_sysgal, matriz, asignacion, cartera, activity
 
-api_router = APIRouter()
+api_router = APIRouter(dependencies=[Depends(procurador_gate)])
 
 api_router.include_router(auth.router, prefix="/auth", tags=["auth"])
 api_router.include_router(cases.router, prefix="/cases", tags=["cases"])

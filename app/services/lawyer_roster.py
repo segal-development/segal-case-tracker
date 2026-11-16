@@ -16,6 +16,7 @@ from app.models.case_litigante import CaseLitigante
 from app.models.court import Court
 from app.models.goal import Goal
 from app.models.lawyer import Lawyer
+from app.models.procurador import ProcuradorAbogado
 from app.models.sysgal_causa import SysgalCausa
 from app.models.sysgal_usuario import SysgalUsuario
 from app.services import app_settings, sysgal_owner
@@ -73,14 +74,16 @@ def clear_case_scope_cache() -> None:
 # between flush and commit cannot leave a pre-commit value behind). Bulk
 # ``query.update()`` bypasses these events; the TTL bounds that staleness.
 _CASE_SCOPE_COLUMNS = ("lawyer_id", "assigned_lawyer_id", "competencia", "patrocinio_pendiente")
-_LAWYER_SCOPE_COLUMNS = ("rut", "role", "is_active")
+# is_active/is_firm_lawyer matter to a procurador's union (only ACTIVE firm lawyers count)
+# and to the Sysgal owner (only an ACTIVE firm lawyer can own through Sysgal).
+_LAWYER_SCOPE_COLUMNS = ("rut", "role", "is_active", "is_firm_lawyer")
 # Sysgal ownership inputs (only consulted when the sysgal_es_fuente_duenio switch is on).
 _SYSGAL_CAUSA_SCOPE_COLUMNS = ("case_id", "abogado_sysgal_id", "estado", "eliminada", "sysgal_updated_at")
 _SYSGAL_USUARIO_SCOPE_COLUMNS = ("sysgal_id", "lawyer_id")
 
 
 def _changes_scope(obj, *, new_or_deleted: bool) -> bool:
-    if isinstance(obj, CaseLitigante):
+    if isinstance(obj, (CaseLitigante, ProcuradorAbogado)):
         return True
     if isinstance(obj, Goal):
         if obj.key != app_settings.KEY_SYSGAL_DUENIO:
@@ -518,14 +521,24 @@ def lawyer_dashboard_stats(db: Session, account_rut: str) -> dict:
     abogado-of-record case ids + display name, then a single query bounded to
     exactly those cases. Output matches the fields ``MyStatsResponse`` needs.
     """
-    account_rut_norm = normalize_rut(account_rut)
+    return _dashboard_stats_for_ruts(db, normalize_rut(account_rut), {normalize_rut(account_rut)})
 
-    # This lawyer's abogado-of-record civil case ids + display name (one pass).
+
+def procurador_dashboard_stats(db: Session, account_rut: str, abogado_ruts) -> dict:
+    """``/stats/me`` numbers for a procurador: the UNION of his lawyers' cases, each case
+    counted once (co-counsel cases appear under both lawyers)."""
+    return _dashboard_stats_for_ruts(
+        db, normalize_rut(account_rut), {normalize_rut(r) for r in abogado_ruts}
+    )
+
+
+def _dashboard_stats_for_ruts(db: Session, account_rut_norm: str, ruts: set) -> dict:
+    # Abogado-of-record civil case ids of any of ``ruts`` + display name (one pass).
     case_ids: set[int] = set()
     nombre = ""
     for cid, litigantes in _abogado_litigantes_by_case(db).items():
         for lit in litigantes:
-            if normalize_rut(lit.rut) == account_rut_norm and lit.participante in ALL_ABOGADO:
+            if normalize_rut(lit.rut) in ruts and lit.participante in ALL_ABOGADO:
                 case_ids.add(cid)
                 if not nombre:
                     nombre = _clean_nombre(lit.nombre)
@@ -997,10 +1010,10 @@ def resolve_case_alert_recipients(db: Session, case: Case) -> list[Lawyer]:
     """
     if case.assigned_lawyer_id is not None:
         assigned = db.get(Lawyer, case.assigned_lawyer_id)
-        if assigned is not None and assigned.is_active:
+        if assigned is not None and assigned.is_active and assigned.role != "procurador":
             return [assigned]
 
-    if case.competencia == "civil" and sysgal_owner.sysgal_duenio_enabled(db):
+    if case.assigned_lawyer_id is None and case.competencia == "civil" and sysgal_owner.sysgal_duenio_enabled(db):
         owner = sysgal_owner.sysgal_primary_owner_by_case(db, case_id=case.id).get(case.id)
         if owner is not None:
             return [db.get(Lawyer, owner.lawyer_id)]
@@ -1018,7 +1031,7 @@ def resolve_case_alert_recipients(db: Session, case: Case) -> list[Lawyer]:
     seen: set = set()
     result: list[Lawyer] = []
     for lawyer in db.query(Lawyer).filter(Lawyer.rut.in_(ruts)).all() if ruts else []:
-        if lawyer.id in seen:
+        if lawyer.id in seen or lawyer.role == "procurador":  # a procurador never receives alerts
             continue
         seen.add(lawyer.id)
         result.append(lawyer)
