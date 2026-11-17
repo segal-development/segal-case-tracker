@@ -193,6 +193,9 @@ class Settings(BaseSettings):
     # Daily Sysgal causas sync + incorporation queue. Only the QA VM egress IP is whitelisted
     # by Sysgal (the station gets 403), so enable it ONLY there.
     SYSGAL_CAUSAS_SYNC_ENABLED: bool = False
+    # Allow-list of client IPs/CIDRs for the Sysgal patrocinio endpoint (comma-separated).
+    # Empty = no restriction. Defense in depth: the API key is the real gate.
+    SYSGAL_API_ALLOWED_IPS: str = ""
 
     # How long a non-firm-wide user's resolved case scope (which case ids they
     # may see) is reused per process. 0 disables the cache entirely.
