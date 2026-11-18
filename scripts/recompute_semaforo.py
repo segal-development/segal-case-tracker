@@ -1,4 +1,4 @@
-"""Recompute the semáforo of every detailed civil case (Fase 0 auditoría) and report what changes.
+"""Recompute the semáforo of every detailed civil case (and never-detailed ones with abandono available) (Fase 0 auditoría) and report what changes.
 
 Default is a DRY-RUN: the engine runs inside a transaction that is rolled back (a
 ``before_commit`` guard makes a commit impossible), so NOTHING is written. Pass ``--apply``
@@ -27,7 +27,7 @@ _VENCIDO = "Plazo fatal vencido sin escrito"
 
 
 def compute_report(db, *, dry_run: bool) -> dict:
-    from sqlalchemy import event
+    from sqlalchemy import event, or_
 
     from app.models.case import Case
     from app.services.deadline_engine import DeadlineEngine
@@ -43,7 +43,12 @@ def compute_report(db, *, dry_run: bool) -> dict:
     ids = [
         row[0]
         for row in db.query(Case.id)
-        .filter(Case.competencia == "civil", Case.last_detail_checked_at.isnot(None))
+        .filter(
+            Case.competencia == "civil",
+            # Detailed cases, plus never-detailed ones that already flag an available abandono
+            # (they must not stay green; the engine works from movements, not from the detail).
+            or_(Case.last_detail_checked_at.isnot(None), Case.abandono_disponible.is_(True)),
+        )
         .order_by(Case.id)
         .all()
     ]

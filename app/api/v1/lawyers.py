@@ -41,8 +41,16 @@ class AccountUpdateBody(BaseModel):
     is_active: Optional[bool] = None
     # Procurador only: the 1-2 firm lawyers he supports (ids). Replaces the current links.
     abogado_ids: Optional[list[int]] = None
-    # Accepted only to reject it on a procurador (he has no bono level); ignored otherwise.
+    # Bono level for a non-procurador (rejected with 422 on a procurador, who has none).
+    # Absent and null both mean "unchanged": clearing a level goes through PUT /bono/nivel/{id}.
     nivel: Optional[str] = None
+
+    @field_validator("nivel")
+    @classmethod
+    def _nivel(cls, v: str | None) -> str | None:
+        if v is not None and v not in _NIVELES:
+            raise ValueError("El nivel debe ser 'junior' o 'pleno'")
+        return v
 
 
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -294,6 +302,9 @@ def update_account(
         lawyer.is_firm_lawyer = True  # as an account created through the normal path
     if body.role is not None:
         lawyer.role = body.role
+
+    if body.nivel is not None and new_role != procurador_svc.ROLE:
+        lawyer.nivel = body.nivel  # already validated by AccountUpdateBody._nivel
 
     if body.email is not None:
         lawyer.email = body.email
