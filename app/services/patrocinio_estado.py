@@ -110,3 +110,15 @@ def derive_patrocinio_estado(db: Session, case: Case | None) -> PatrocinioEstado
     if not case.patrocinio_pendiente and _has_firm_litigante(db, case):
         return PatrocinioEstado("poder_acreditado")
     return PatrocinioEstado("escrito_presentado")
+
+
+ESTADOS_BLOQUEABLES_POR_MORA = ("escrito_presentado", "poder_pendiente")
+
+
+def bloqueado_por_mora(estado: str, mora: str | None) -> bool:
+    """True when mora blocks the poder: the case is ``mora_bloquea_poder`` and the poder is not yet
+    accredited (``escrito_presentado`` / ``poder_pendiente``). ``sin_causa_pjud`` and
+    ``poder_acreditado`` are never blocked; unknown mora (``sin_informacion``) is not blocked."""
+    from app.services.sysgal_cuotas import MORA_BLOQUEA
+
+    return mora == MORA_BLOQUEA and estado in ESTADOS_BLOQUEABLES_POR_MORA
