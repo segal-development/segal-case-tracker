@@ -11,7 +11,7 @@ import hashlib
 from datetime import datetime
 from typing import Optional
 
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
@@ -50,3 +50,48 @@ def require_sysgal_key(
     key.last_used_at = datetime.utcnow()  # type: ignore[assignment]
     db.commit()
     return key
+
+
+def _allowed_networks():
+    """Parse ``SYSGAL_API_ALLOWED_IPS`` (comma list of IPs/CIDRs). Invalid entries are skipped
+    (with a WARNING), so a typo can only make the list stricter, never open it."""
+    import ipaddress
+    import logging
+
+    from app.config import settings
+
+    networks = []
+    for raw in (settings.SYSGAL_API_ALLOWED_IPS or "").split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(raw, strict=False))
+        except ValueError:
+            logging.getLogger(__name__).warning("Invalid SYSGAL_API_ALLOWED_IPS entry: %r", raw)
+    return networks, bool((settings.SYSGAL_API_ALLOWED_IPS or "").strip())
+
+
+def require_sysgal_allowed_ip(request: Request) -> None:
+    """Optional IP allow-list for the Sysgal patrocinio endpoint (403 when not allowed).
+
+    Empty ``SYSGAL_API_ALLOWED_IPS`` = no restriction. The client IP is the first
+    ``X-Forwarded-For`` hop, then ``X-Real-IP`` (traffic arrives through Vercel), falling back
+    to the ASGI peer. DEFENSE IN DEPTH ONLY: those headers are client-supplied, so the API key
+    stays the real gate.
+    """
+    import ipaddress
+
+    from app.services.activity_audit import client_ip
+
+    networks, configured = _allowed_networks()
+    if not configured:
+        return
+    peer = request.client.host if request.client else None
+    ip = client_ip(dict(request.headers), peer)
+    try:
+        addr = ipaddress.ip_address(ip) if ip else None
+    except ValueError:
+        addr = None
+    if addr is None or not any(addr in net for net in networks):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="IP not allowed")
