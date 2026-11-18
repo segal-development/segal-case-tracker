@@ -49,6 +49,8 @@ services:
     environment:
       - ENABLE_SCHEDULER=false
       - APP_COMMIT=${APP_COMMIT:-}
+      # ITDS (Sysgal) server IP for /api/sysgal/v1/patrocinio (not a secret)
+      - SYSGAL_API_ALLOWED_IPS=35.225.238.115
     volumes:
       - ./sa-key.json:/secrets/sa-key.json:ro
     depends_on:

@@ -12,7 +12,7 @@ other `/api/sysgal/v1` endpoints). No other `/api/sysgal/v1` doc exists, so this
 | `actualizado_desde` | ISO datetime. Only causas whose `actualizado_at` is at/after it. |
 | `page`, `per_page` | Default 1 / 50, `per_page` max 200. |
 
-With no filter, every Sysgal causa is returned (ordered by `sysgal_causa_id`).
+With no filter, every Sysgal causa is returned (ordered by `sysgal_causa_id`). Causas deleted in Sysgal (`eliminada`) are never returned, not even by id.
 
 ## Response
 
