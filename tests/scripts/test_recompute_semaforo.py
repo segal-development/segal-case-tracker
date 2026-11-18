@@ -103,6 +103,42 @@ def test_format_report_lines(db, world):
     assert "alertas de escalamiento a crear: 2" in text
 
 
+def _never_detailed(db, world, rol, *, abandono):
+    base = world["ab"]
+    c = Case(lawyer_id=base.lawyer_id, court_id=base.court_id, rol=rol, competencia="civil",
+             procedure="Principal", status="active", filed_at=datetime(2020, 1, 1),
+             last_detail_checked_at=None, semaforo="verde", abandono_disponible=abandono)
+    db.add(c)
+    db.flush()
+    db.add(CaseLitigante(case_id=c.id, participante="AB.DDO", rut="11111111-1",
+                         persona_type="NATURAL", nombre="Ab", natural_key=f"k{rol}"))
+    _mv(db, c, TODAY - relativedelta(years=5), "Gestión", "NOTIFICACIÓN DE DEMANDA (Exitosa)")
+    _mv(db, c, TODAY - relativedelta(years=4), "Tramitación", "Citación a oír sentencia")
+    _mv(db, c, TODAY - relativedelta(months=42), "Tramitación", "Dicta Sentencia Definitiva")
+    db.commit()
+    return c
+
+
+def test_never_detailed_case_with_abandono_is_visited_and_reddened(db, world):
+    c = _never_detailed(db, world, "C-9-2026", abandono=True)
+    report = compute_report(db, dry_run=True)
+    db.expire_all()
+    assert report["total"] == 4  # the 3 detailed + this one
+    assert report["abandono_verde_a_rojo"] == 2
+    assert db.get(Case, c.id).semaforo == "verde"  # dry-run wrote nothing
+    compute_report(db, dry_run=False)
+    db.expire_all()
+    assert db.get(Case, c.id).semaforo == "rojo"
+
+
+def test_never_detailed_case_without_abandono_is_skipped(db, world):
+    c = _never_detailed(db, world, "C-8-2026", abandono=False)
+    report = compute_report(db, dry_run=False)
+    db.expire_all()
+    assert report["total"] == 3
+    assert db.get(Case, c.id).semaforo == "verde"  # never visited
+
+
 def test_first_emit_after_apply_emits_no_semaforo_rojo(db, world):
     """--apply already moved the cases to rojo: the next sync recompute is not a transition."""
     from app.services.deadline_engine import DeadlineEngine
