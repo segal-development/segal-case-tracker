@@ -13,11 +13,11 @@ files the cobro request when it sees ``poder_pendiente`` with the block.
 Also restricted by ``SYSGAL_API_ALLOWED_IPS`` (defense in depth; the API key is the real gate).
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, field_serializer
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -43,6 +43,17 @@ class SysgalPatrocinioItem(BaseModel):
     escrito_presentado_at: Optional[datetime] = None
     actualizado_at: Optional[datetime] = None
     cuotas_actualizadas_al: Optional[datetime] = None
+
+    @field_serializer(
+        "poder_acreditado_at", "escrito_presentado_at", "actualizado_at", "cuotas_actualizadas_al"
+    )
+    def _utc_z(self, value: Optional[datetime]) -> Optional[str]:
+        """Stored datetimes are naive UTC: emit them as explicit UTC (``...Z``)."""
+        if value is None:
+            return None
+        if value.tzinfo is not None:
+            value = value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value.isoformat() + "Z"
 
 
 class SysgalPatrocinioResponse(BaseModel):
@@ -74,7 +85,8 @@ def list_patrocinio(
     rol: Optional[str] = Query(None, description="ROL (requires tribunal)"),
     tribunal: Optional[str] = Query(None, description="Tribunal name (requires rol)"),
     actualizado_desde: Optional[datetime] = Query(
-        None, description="ISO datetime; only causas updated at/after it"
+        None,
+        description="ISO datetime; only causas updated at/after it. Naive = UTC; offsets are converted",
     ),
     page: int = Query(1, ge=1),
     per_page: int = Query(50, ge=1, le=200),
@@ -112,7 +124,9 @@ def list_patrocinio(
         stamps = [s.replace(tzinfo=None) for s in stamps if s is not None]
         return max(stamps) if stamps else None
 
-    since = actualizado_desde.replace(tzinfo=None) if actualizado_desde else None
+    since = actualizado_desde
+    if since is not None and since.tzinfo is not None:
+        since = since.astimezone(timezone.utc).replace(tzinfo=None)  # convert, don't drop the offset
     rows = []
     for causa, case in q.order_by(SysgalCausa.sysgal_id).all():
         updated = _updated(causa, case)

@@ -211,6 +211,61 @@ def test_actualizado_desde(client, seeded):
     assert r3.json()["items"][0]["actualizado_at"].startswith("2026-11-10")
 
 
+def _only_104(client, since):
+    r = client.get(
+        URL, headers=_auth(), params={"sysgal_causa_id": "104", "actualizado_desde": since}
+    )
+    assert r.status_code == 200
+    return [i["sysgal_causa_id"] for i in r.json()["items"]]
+
+
+def test_actualizado_desde_offset_is_converted_to_utc(client, seeded):
+    # 104 is stamped 2026-11-10T00:00 UTC.
+    assert _only_104(client, "2026-11-09T21:00:00-03:00") == [104]  # == 00:00Z
+    assert _only_104(client, "2026-11-09T22:00:00-03:00") == []  # == 01:00Z (offset not dropped)
+    assert _only_104(client, "2026-11-10T02:00:00+02:00") == [104]  # == 00:00Z
+
+
+def test_actualizado_desde_utc_designators(client, seeded):
+    assert _only_104(client, "2026-11-10T00:00:00Z") == [104]
+    assert _only_104(client, "2026-11-10T00:00:01Z") == []
+    assert _only_104(client, "2026-11-10T00:00:00+00:00") == [104]
+    assert _only_104(client, "2026-11-10T00:00:01+00:00") == []
+
+
+def test_actualizado_desde_naive_is_utc(client, seeded):
+    assert _only_104(client, "2026-11-10T00:00:00") == [104]
+    assert _only_104(client, "2026-11-10T00:00:01") == []
+
+
+def test_response_datetimes_are_explicit_utc(client, seeded):
+    items = client.get(URL, headers=_auth()).json()["items"]
+    fields = ("actualizado_at", "poder_acreditado_at", "escrito_presentado_at", "cuotas_actualizadas_al")
+    by_id = {i["sysgal_causa_id"]: i for i in items}
+    assert by_id[104]["actualizado_at"] == "2026-11-10T00:00:00Z"
+    for item in items:
+        for f in fields:
+            assert item[f] is None or item[f].endswith("Z"), (f, item[f])
+    assert by_id[102]["escrito_presentado_at"] == "2026-10-01T00:00:00Z"
+    assert all(i["cuotas_actualizadas_al"] is None for i in items)
+    assert by_id[104]["poder_acreditado_at"] is None and by_id[104]["escrito_presentado_at"] is None
+
+
+def test_item_serializes_every_datetime_as_utc_z():
+    from app.api.sysgal.patrocinio import SysgalPatrocinioItem
+
+    stamp = datetime(2026, 11, 18, 10, 30, 5)
+    item = SysgalPatrocinioItem(
+        sysgal_causa_id=1, rol="C-1-2026", tribunal="T", estado="poder_acreditado",
+        poder_acreditado_at=stamp, escrito_presentado_at=stamp, actualizado_at=stamp,
+        cuotas_actualizadas_al=stamp,
+    ).model_dump(mode="json")
+    for f in ("poder_acreditado_at", "escrito_presentado_at", "actualizado_at", "cuotas_actualizadas_al"):
+        assert item[f] == "2026-11-18T10:30:05Z"
+    empty = SysgalPatrocinioItem(sysgal_causa_id=1, rol="r", tribunal="t", estado="e").model_dump(mode="json")
+    assert empty["poder_acreditado_at"] is None and empty["cuotas_actualizadas_al"] is None
+
+
 def test_pagination(client, seeded):
     p = {"sysgal_causa_id": "101,102,103,104", "per_page": 2}
     first = client.get(URL, headers=_auth(), params={**p, "page": 1}).json()

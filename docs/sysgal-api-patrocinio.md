@@ -9,7 +9,7 @@ other `/api/sysgal/v1` endpoints). No other `/api/sysgal/v1` doc exists, so this
 |---|---|
 | `sysgal_causa_id` | Sysgal causa id. Repeatable (`?sysgal_causa_id=1&sysgal_causa_id=2`) or comma list (`=1,2`). Non-integer -> 422. Unknown ids are simply absent from `items`. |
 | `rol` + `tribunal` | Must be sent together (else 422). `rol` is normalized like Sysgal ROLs; `tribunal` matches case-insensitively. |
-| `actualizado_desde` | ISO datetime. Only causas whose `actualizado_at` is at/after it. |
+| `actualizado_desde` | ISO datetime, compared in UTC. A naive value (`2026-11-18T10:00:00`) is taken as UTC; a value with an offset or `Z` (`2026-11-18T07:00:00-03:00`, `...Z`, `...+00:00`) is converted to UTC. Only causas whose `actualizado_at` is at/after it. |
 | `page`, `per_page` | Default 1 / 50, `per_page` max 200. |
 
 With no filter, every Sysgal causa is returned (ordered by `sysgal_causa_id`). Causas deleted in Sysgal (`eliminada`) are never returned, not even by id.
@@ -20,9 +20,11 @@ With no filter, every Sysgal causa is returned (ordered by `sysgal_causa_id`). C
 {"total": 1, "page": 1, "per_page": 50, "items": [{
   "sysgal_causa_id": 102, "case_id": 55, "rol": "C-2-2026", "tribunal": "Juzgado PA",
   "estado": "poder_pendiente", "bloqueado_por_mora": false,
-  "poder_acreditado_at": null, "escrito_presentado_at": "2026-10-05T00:00:00",
-  "actualizado_at": "2026-11-17T09:00:00", "cuotas_actualizadas_al": "2026-11-18T07:00:00"}]}
+  "poder_acreditado_at": null, "escrito_presentado_at": "2026-10-05T00:00:00Z",
+  "actualizado_at": "2026-11-17T09:00:00Z", "cuotas_actualizadas_al": "2026-11-18T07:00:00Z"}]}
 ```
+
+All times in the response are UTC and carry an explicit `Z` suffix (`poder_acreditado_at`, `escrito_presentado_at`, `actualizado_at`, `cuotas_actualizadas_al`); `null` stays `null`.
 
 `estado`:
 - `sin_causa_pjud`: the Sysgal causa has no linked case yet (`case_id` null).
