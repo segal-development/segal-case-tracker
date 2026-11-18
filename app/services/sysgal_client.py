@@ -41,6 +41,11 @@ _ESTADISTICAS_CARTERA_PATH = "/api_sync/estadisticas_cartera"
 _SIN_GESTION_PATH = "/api_sync/causas_sin_gestion"
 _ESCRITOS_ESTADISTICAS_PATH = "/api_sync/escritos_estadisticas"
 _ESCRITOS_PATH = "/api_sync/escritos"
+_CUOTAS_PATH = "/api_sync/cuotas"
+
+# Safety net against a cuotas cursor that never ends. The endpoint returns ONE ROW PER CUOTA
+# (100 per page), so a full copy is many pages.
+MAX_CUOTAS_PAGES = 5000
 
 # Hard cap on ``limite`` for GET /api_sync/causas_sin_gestion.
 MAX_SIN_GESTION_PER_PAGE = 500
@@ -81,6 +86,26 @@ class SysgalUsuarioDTO:
     perfil: Optional[str] = None
     estado: Optional[str] = None
     correo: Optional[str] = None
+
+
+@dataclass
+class SysgalContratoCuotasDTO:
+    """Contract-level mora data from ``/api_sync/cuotas`` (data minimization: no client/RUT/amounts)."""
+
+    contrato: str
+    cuota_actual: Optional[int]
+    contrato_moroso: bool
+    contrato_al_dia: bool
+    id_causas: list[int]
+
+
+@dataclass
+class SysgalCuotasResult:
+    """Full cuotas copy. ``encontrado=False`` means Sysgal has NO information (never "al día")."""
+
+    encontrado: bool
+    copia_at: Optional[datetime]
+    contratos: list[SysgalContratoCuotasDTO]
 
 
 def _text(value: Any) -> Optional[str]:
@@ -300,6 +325,80 @@ class SysgalClient:
                 raise SysgalError("Sysgal causas cursor did not advance")
             cursor = nxt
         raise SysgalError(f"Sysgal causas exceeded {MAX_CAUSAS_PAGES} pages")
+
+    def cuotas_contratos(self) -> SysgalCuotasResult:
+        """``GET /api_sync/cuotas`` fully paginated (``desde_id`` / ``siguiente_desde_id``), folded per contract.
+
+        The endpoint has one row per cuota with the contract fields repeated; the first row seen
+        for a contract wins and ``id_causas`` are unioned. If rows of one contract disagree on
+        cuota_actual / contrato_moroso / contrato_al_dia, that contract is never reported moroso.
+        ``copia_at`` is the envelope's ``actualizado`` (e.g. ``"2026-11-18 07:06:47"``), falling
+        back to the rows' ``actualizado``; ``actualizacion`` is only a description
+        (``"diaria (~07:00)"``) and is never used. Any failure, or any item that is not an object
+        or lacks ``contrato``, raises ``SysgalError`` and returns nothing (no partial result).
+        """
+        contratos: dict[str, SysgalContratoCuotasDTO] = {}
+        signatures: dict[str, tuple] = {}
+        inconsistent: set[str] = set()
+        copia_at: Optional[datetime] = None
+        cursor = 0
+        for page_no in range(MAX_CUOTAS_PAGES):
+            body = self._get_json(_CUOTAS_PATH, {"desde_id": cursor})
+            if not isinstance(body, dict):
+                raise SysgalError("Sysgal cuotas body is not an object (HTTP 200)")
+            if body.get("encontrado") is False:
+                if page_no == 0:
+                    return SysgalCuotasResult(False, None, [])
+                raise SysgalError("Sysgal cuotas reported encontrado=false mid-pagination")
+            if not isinstance(body.get("data"), list):
+                raise SysgalError("Sysgal cuotas body has no 'data' list (HTTP 200)")
+            if copia_at is None:
+                copia_at = _to_datetime(body.get("actualizado"))
+            for raw in body["data"]:
+                if not isinstance(raw, dict):
+                    raise SysgalError("Sysgal cuotas item is not an object")
+                contrato = _text(raw.get("contrato"))
+                if contrato is None:
+                    raise SysgalError("Sysgal cuotas item has no usable 'contrato'")
+                if copia_at is None:
+                    copia_at = _to_datetime(raw.get("actualizado"))
+                causas = [c for c in (_to_int(x) for x in (raw.get("id_causas") or [])) if c is not None]
+                single = _to_int(raw.get("id_causa"))
+                if single is not None and single not in causas:
+                    causas.append(single)
+                signature = (
+                    _to_int(raw.get("cuota_actual")),
+                    raw.get("contrato_moroso") is True,
+                    raw.get("contrato_al_dia") is True,
+                )
+                dto = contratos.get(contrato)
+                if dto is None:
+                    contratos[contrato] = SysgalContratoCuotasDTO(
+                        contrato=contrato,
+                        cuota_actual=signature[0],
+                        contrato_moroso=signature[1],
+                        contrato_al_dia=signature[2],
+                        id_causas=causas,
+                    )
+                    signatures[contrato] = signature
+                else:
+                    dto.id_causas.extend(c for c in causas if c not in dto.id_causas)
+                    if signature != signatures[contrato]:
+                        inconsistent.add(contrato)
+            nxt = _to_int(body.get("siguiente_desde_id"))
+            if nxt is None:
+                if inconsistent:
+                    for contrato in inconsistent:
+                        contratos[contrato].contrato_moroso = False
+                    logger.warning(
+                        "Sysgal cuotas: %d contract(s) with inconsistent rows; not reported moroso",
+                        len(inconsistent),
+                    )
+                return SysgalCuotasResult(True, copia_at, list(contratos.values()))
+            if nxt <= cursor:
+                raise SysgalError("Sysgal cuotas cursor did not advance")
+            cursor = nxt
+        raise SysgalError(f"Sysgal cuotas exceeded {MAX_CUOTAS_PAGES} pages")
 
     def usuarios(self) -> list[SysgalUsuarioDTO]:
         """``GET /api_sync/usuarios`` mapped to DTOs."""

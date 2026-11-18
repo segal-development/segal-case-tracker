@@ -285,6 +285,43 @@ def _maybe_sync_sysgal_causas(db: Session) -> None:
         logger.exception("Sysgal causas sync failed (non-fatal)")
 
 
+# Chile day of the last successful Sysgal cuotas sync; process-local (a restart repeats one sync).
+_last_sysgal_cuotas_day: Optional[date] = None
+# Sysgal refreshes the cuotas copy ~07:00 Chile; read it after this hour.
+SYSGAL_CUOTAS_SYNC_AFTER_HOUR = 8
+
+
+def _maybe_sync_sysgal_cuotas(db: Session) -> None:
+    """Mirror Sysgal's cuotas (mora) once per Chile day, from 08:00 on.
+
+    Gated by ``SYSGAL_CUOTAS_SYNC_ENABLED`` + base URL/key. SAFE-FAIL: a failure rolls back (the
+    stored data stays as it was), is logged, and is retried next cycle; the day is marked done
+    only on success.
+    """
+    global _last_sysgal_cuotas_day
+    if not settings.SYSGAL_CUOTAS_SYNC_ENABLED:
+        return
+    now = _chile_now()
+    today = now.date()
+    if now.hour < SYSGAL_CUOTAS_SYNC_AFTER_HOUR or _last_sysgal_cuotas_day == today:
+        return
+    try:
+        from app.services.sysgal_client import SysgalClient
+        from app.services.sysgal_cuotas import sync_sysgal_cuotas
+
+        client = SysgalClient(settings.SYSGAL_BASE_URL, settings.SYSGAL_API_KEY)
+        if not client.is_configured:
+            logger.warning("Sysgal cuotas sync enabled but SYSGAL_BASE_URL/SYSGAL_API_KEY are empty")
+            return
+        stats = sync_sysgal_cuotas(db, client)
+        db.commit()
+        logger.info("Sysgal cuotas sync: %s", stats)
+        _last_sysgal_cuotas_day = today
+    except Exception:
+        db.rollback()
+        logger.exception("Sysgal cuotas sync failed (non-fatal)")
+
+
 # Chile day on which the previous month's avance-de-cartera snapshot was settled (taken, or
 # already there / closed); process-local, a restart only repeats a cheap existence check.
 _last_avance_snapshot_day: Optional[date] = None
@@ -1315,6 +1352,7 @@ async def _run_sync_cycle(timer: CycleTimer):
         # Daily Sysgal causas sync + incorporation queue (VM only; see the setting).
         _maybe_sync_sysgal_causas(setup_db)
         _maybe_take_avance_snapshot(setup_db)
+        _maybe_sync_sysgal_cuotas(setup_db)
 
         # Salud del scraping: mirar sync_history y avisar si viene fallando.
         # Va al FINAL del ciclo, cuando las corridas de esta vuelta ya quedaron

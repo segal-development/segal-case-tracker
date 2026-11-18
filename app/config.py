@@ -193,6 +193,9 @@ class Settings(BaseSettings):
     # Daily Sysgal causas sync + incorporation queue. Only the QA VM egress IP is whitelisted
     # by Sysgal (the station gets 403), so enable it ONLY there.
     SYSGAL_CAUSAS_SYNC_ENABLED: bool = False
+    # Daily Sysgal cuotas (mora) sync, run once per Chile day after 08:00 (Sysgal copies ~07:00).
+    # Same VM-only constraint as the causas sync.
+    SYSGAL_CUOTAS_SYNC_ENABLED: bool = False
     # Allow-list of client IPs/CIDRs for the Sysgal patrocinio endpoint (comma-separated).
     # Empty = no restriction. Defense in depth: the API key is the real gate.
     SYSGAL_API_ALLOWED_IPS: str = ""

@@ -13,6 +13,7 @@ from app.models.lawyer import Lawyer
 from app.models.movement import Movement
 from app.models.sysgal_api_key import SysgalApiKey
 from app.models.sysgal_causa import SysgalCausa
+from app.models.sysgal_contrato import SysgalContrato
 
 URL = "/api/sysgal/v1/patrocinio"
 VALID_KEY = "sysgal-patrocinio-key"
@@ -150,10 +151,12 @@ def test_each_state_and_item_shape(client, seeded):
         "poder_acreditado_at",
         "escrito_presentado_at",
         "actualizado_at",
+        "cuotas_actualizadas_al",
     }
     assert by_id[102]["rol"] == "C-2-2026" and by_id[102]["tribunal"] == "Juzgado PA"
     assert by_id[104]["case_id"] is None
     assert all(i["bloqueado_por_mora"] is False for i in body["items"])
+    assert all(i["cuotas_actualizadas_al"] is None for i in body["items"])
 
 
 def test_repeatable_param_and_unknown_id(client, seeded):
@@ -240,3 +243,50 @@ def test_existing_routers_not_ip_restricted(client, seeded, monkeypatch):
     monkeypatch.setattr(settings, "SYSGAL_API_ALLOWED_IPS", ALLOWED_IP)
     r = client.get("/api/sysgal/v1/causas", headers=_auth(), params={"cliente_rut": "1-9"})
     assert r.status_code == 200
+
+
+COPIA = datetime(2026, 11, 18, 7, 0)
+
+
+def _contrato(db, n, causas, cuota=1, moroso=True):
+    db.add(
+        SysgalContrato(
+            contrato=str(n), cuota_actual=cuota, contrato_moroso=moroso,
+            contrato_al_dia=not moroso, id_causas=causas, copia_at=COPIA,
+            synced_at=datetime(2026, 11, 18, 9, 0),
+        )
+    )
+    db.commit()
+
+
+def _by_id(client):
+    r = client.get(URL, headers=_auth())
+    assert r.status_code == 200
+    return {i["sysgal_causa_id"]: i for i in r.json()["items"]}
+
+
+def test_bloqueado_por_mora_only_while_poder_is_not_accredited(client, seeded):
+    # moroso cuota 1/2 on every causa: 101 escrito_presentado, 102 poder_pendiente,
+    # 103 poder_acreditado, 104 sin_causa_pjud
+    _contrato(seeded, 1, [101, 102, 103, 104], cuota=2)
+    items = _by_id(client)
+    assert items[101]["bloqueado_por_mora"] is True
+    assert items[102]["bloqueado_por_mora"] is True
+    assert items[103]["bloqueado_por_mora"] is False
+    assert items[104]["bloqueado_por_mora"] is False
+    assert all(i["cuotas_actualizadas_al"].startswith("2026-11-18T07:00") for i in items.values())
+
+
+@pytest.mark.parametrize("cuota,moroso", [(3, True), (1, False)])
+def test_not_blocked_when_cuota_or_mora_do_not_apply(client, seeded, cuota, moroso):
+    _contrato(seeded, 1, [101, 102], cuota=cuota, moroso=moroso)
+    items = _by_id(client)
+    assert items[101]["bloqueado_por_mora"] is False
+    assert items[102]["bloqueado_por_mora"] is False
+
+
+def test_no_contract_info_is_not_blocked(client, seeded):
+    _contrato(seeded, 1, [999])
+    items = _by_id(client)
+    assert all(i["bloqueado_por_mora"] is False for i in items.values())
+    assert items[101]["cuotas_actualizadas_al"] is not None

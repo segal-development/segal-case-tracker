@@ -21,7 +21,7 @@ With no filter, every Sysgal causa is returned (ordered by `sysgal_causa_id`). C
   "sysgal_causa_id": 102, "case_id": 55, "rol": "C-2-2026", "tribunal": "Juzgado PA",
   "estado": "poder_pendiente", "bloqueado_por_mora": false,
   "poder_acreditado_at": null, "escrito_presentado_at": "2026-10-05T00:00:00",
-  "actualizado_at": "2026-11-17T09:00:00"}]}
+  "actualizado_at": "2026-11-17T09:00:00", "cuotas_actualizadas_al": "2026-11-18T07:00:00"}]}
 ```
 
 `estado`:
@@ -30,7 +30,9 @@ With no filter, every Sysgal causa is returned (ordered by `sysgal_causa_id`). C
 - `poder_acreditado`: that order was complied with (`poder_acreditado_at` = compliance movement), or there is no order, the case is no longer `patrocinio_pendiente` and a firm AB./AP. litigante is on it (date null).
 - `escrito_presentado`: in PJUD, none of the above.
 
-`bloqueado_por_mora` is **always `false` for now**: the cuotas source (ITDS endpoint, tasks T1/T2) does not exist yet. Sysgal knows who is moroso and generates the cobro request itself.
+`bloqueado_por_mora` is `true` when mora blocks the acreditación de poder: any Sysgal contract (ITDS `GET /api_sync/cuotas`) that lists one of the case's causas is `contrato_moroso` with `cuota_actual` 1 or 2, **and** `estado` is `escrito_presentado` or `poder_pendiente`. It is `false` for `poder_acreditado` and `sin_causa_pjud`, and when there is no contract information for the case (unknown is not blocked, and is not "al día" either). Sysgal generates the cobro request itself when it sees `poder_pendiente` with the block.
+
+`cuotas_actualizadas_al`: timestamp of Sysgal's daily cuotas copy (~07:00 Chile), taken from the cuotas envelope's `actualizado` (e.g. `2026-11-18 07:06:47`; the envelope's `actualizacion` is just the text `diaria (~07:00)` and is not used). It backs `bloqueado_por_mora`; `null` if the cuotas were never synced. Mora can lag by up to one day (a client who paid today stays blocked until the next copy).
 
 `actualizado_at`: latest of the causa's `synced_at`/`sysgal_updated_at` and, when linked, the case's `updated_at`/`last_movement_at`.
 

@@ -4,9 +4,11 @@ Patrocinio/poder status per Sysgal causa (pull, ``actualizado_desde``). Keyed by
 (``sysgal_causa_id``, repeatable or comma list) and/or ``rol`` + ``tribunal``; with neither, every
 Sysgal causa. State derivation lives in ``app.services.patrocinio_estado``.
 
-``bloqueado_por_mora`` is ALWAYS ``false`` for now: the cuotas source (ITDS cuotas endpoint,
-tasks T1/T2) does not exist yet. Sysgal itself knows who is moroso and files the cobro request
-when it sees ``poder_pendiente`` with the block.
+``bloqueado_por_mora`` is true when the case is blocked by mora (``app.services.sysgal_cuotas``:
+a contract listing one of its causas is moroso on cuota 1 or 2) and the estado is
+``escrito_presentado`` or ``poder_pendiente``. Unknown mora (no contract info) is NOT blocked.
+``cuotas_actualizadas_al`` is the date of Sysgal's cuotas copy (null if never synced). Sysgal
+files the cobro request when it sees ``poder_pendiente`` with the block.
 
 Also restricted by ``SYSGAL_API_ALLOWED_IPS`` (defense in depth; the API key is the real gate).
 """
@@ -23,7 +25,8 @@ from app.api.deps import get_db
 from app.api.sysgal.deps import require_sysgal_allowed_ip, require_sysgal_key
 from app.models.case import Case
 from app.models.sysgal_causa import SysgalCausa
-from app.services.patrocinio_estado import derive_patrocinio_estado
+from app.services.patrocinio_estado import bloqueado_por_mora, derive_patrocinio_estado
+from app.services.sysgal_cuotas import cuotas_actualizadas_al, load_mora_por_case
 from app.services.sysgal_matching import normalize_rol
 
 router = APIRouter()
@@ -39,6 +42,7 @@ class SysgalPatrocinioItem(BaseModel):
     poder_acreditado_at: Optional[datetime] = None
     escrito_presentado_at: Optional[datetime] = None
     actualizado_at: Optional[datetime] = None
+    cuotas_actualizadas_al: Optional[datetime] = None
 
 
 class SysgalPatrocinioResponse(BaseModel):
@@ -118,6 +122,8 @@ def list_patrocinio(
 
     total = len(rows)
     page_rows = rows[(page - 1) * per_page : page * per_page]
+    mora = load_mora_por_case(db, [case.id for _, case, _ in page_rows if case is not None])
+    cuotas_al = cuotas_actualizadas_al(db)
     items = []
     for causa, case, updated in page_rows:
         derived = derive_patrocinio_estado(db, case)
@@ -128,10 +134,11 @@ def list_patrocinio(
                 rol=causa.rol,
                 tribunal=causa.tribunal,
                 estado=derived.estado,
-                bloqueado_por_mora=False,
+                bloqueado_por_mora=bloqueado_por_mora(derived.estado, mora.get(case.id) if case else None),
                 poder_acreditado_at=derived.poder_acreditado_at,
                 escrito_presentado_at=derived.escrito_presentado_at,
                 actualizado_at=updated,
+                cuotas_actualizadas_al=cuotas_al,
             )
         )
     return SysgalPatrocinioResponse(total=total, page=page, per_page=per_page, items=items)
