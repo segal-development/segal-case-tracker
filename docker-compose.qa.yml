@@ -72,6 +72,9 @@ services:
     env_file: .env.qa
     environment:
       - ENABLE_SCHEDULER=true
+      # Daily Sysgal cuotas copy (feeds the estado de pago badges). bloqueado_por_mora for ITDS
+      # stays OFF via the goals switch sysgal_bloqueo_por_mora_activo.
+      - SYSGAL_CUOTAS_SYNC_ENABLED=true
       # El scraping de PJUD lo hace la ESTACION (un Mac en red residencial), no
       # esta VM. Desde la IP de GCP, Shape rechaza la sesion restaurada y cada
       # ciclo terminaba `{'synced': 0, 'skipped': 11, 'failed': 12}`, con dos

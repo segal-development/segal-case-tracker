@@ -36,6 +36,7 @@ from app.services.business_days import count_business_days_remaining
 from app.services.deadline_engine import medida_prejudicial_clause
 from app.services.deadline_semaforo import Assessment, assess
 from app.services.estado_diario_probe import normalize_court_name
+from app.services.sysgal_cuotas import EstadoPago, estado_pago_por_case
 from app.services.semaforo_alerts import (
     _confirmed_term,
     _is_ours,
@@ -77,6 +78,8 @@ class PanelRow:
     #: filed, late. Showing both as "sin presentar" tells a lawyer he never
     #: filed something he filed, which is how the panel loses its credibility.
     verdict: Optional[str] = None
+    #: Sysgal payment state of the case's client (display only); None = no Sysgal causa.
+    estado_pago: Optional[EstadoPago] = None
 
 
 @dataclass
@@ -212,7 +215,10 @@ def build_panel(
     db: Session, today: date, case_ids: Optional[Collection[int]] = None
 ) -> Panel:
     """The panel as of ``today``. ``case_ids`` None = the whole firm."""
-    return Panel(
-        por_vencer=_por_vencer(db, today, case_ids),
-        vencidos=_vencidos(db, today, case_ids),
-    )
+    por_vencer = _por_vencer(db, today, case_ids)
+    vencidos = _vencidos(db, today, case_ids)
+    # One batch for every row of both groups.
+    pagos = estado_pago_por_case(db, {r.case_id for r in por_vencer + vencidos})
+    for r in por_vencer + vencidos:
+        r.estado_pago = pagos.get(r.case_id)
+    return Panel(por_vencer=por_vencer, vencidos=vencidos)

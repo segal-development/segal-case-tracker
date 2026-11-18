@@ -10,6 +10,8 @@ a contract listing one of its causas is moroso on cuota 1 or 2) and the estado i
 ``cuotas_actualizadas_al`` is the date of Sysgal's cuotas copy (null if never synced). Sysgal
 files the cobro request when it sees ``poder_pendiente`` with the block.
 
+Only reported while the goals switch ``sysgal_bloqueo_por_mora_activo`` is 1 (default 0: always false).
+
 Also restricted by ``SYSGAL_API_ALLOWED_IPS`` (defense in depth; the API key is the real gate).
 """
 
@@ -25,6 +27,11 @@ from app.api.deps import get_db
 from app.api.sysgal.deps import require_sysgal_allowed_ip, require_sysgal_key
 from app.models.case import Case
 from app.models.sysgal_causa import SysgalCausa
+from app.services.app_settings import (
+    DEFAULT_SYSGAL_BLOQUEO_POR_MORA,
+    KEY_SYSGAL_BLOQUEO_POR_MORA,
+    get_int,
+)
 from app.services.patrocinio_estado import bloqueado_por_mora, derive_patrocinio_estado
 from app.services.sysgal_cuotas import cuotas_actualizadas_al, load_mora_por_case
 from app.services.sysgal_matching import normalize_rol
@@ -136,7 +143,13 @@ def list_patrocinio(
 
     total = len(rows)
     page_rows = rows[(page - 1) * per_page : page * per_page]
-    mora = load_mora_por_case(db, [case.id for _, case, _ in page_rows if case is not None])
+    # S10: while the switch is OFF, ITDS always sees bloqueado_por_mora=false.
+    bloqueo_activo = get_int(db, KEY_SYSGAL_BLOQUEO_POR_MORA, DEFAULT_SYSGAL_BLOQUEO_POR_MORA) == 1
+    mora = (
+        load_mora_por_case(db, [case.id for _, case, _ in page_rows if case is not None])
+        if bloqueo_activo
+        else {}
+    )
     cuotas_al = cuotas_actualizadas_al(db)
     items = []
     for causa, case, updated in page_rows:

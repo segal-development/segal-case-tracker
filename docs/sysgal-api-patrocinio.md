@@ -36,6 +36,8 @@ All times in the response are UTC and carry an explicit `Z` suffix (`poder_acred
 
 `cuotas_actualizadas_al`: timestamp of Sysgal's daily cuotas copy (~07:00 Chile), taken from the cuotas envelope's `actualizado` (e.g. `2026-11-18 07:06:47`; the envelope's `actualizacion` is just the text `diaria (~07:00)` and is not used). It backs `bloqueado_por_mora`; `null` if the cuotas were never synced. Mora can lag by up to one day (a client who paid today stays blocked until the next copy).
 
+**Switch.** `bloqueado_por_mora` is only reported while the `goals` key `sysgal_bloqueo_por_mora_activo` is `1`. Default `0` (absent = 0): the API then returns `bloqueado_por_mora: false` for every item, even if blocking data is stored. The internal estado de pago (Semáforo, causa detail) is computed regardless. Turn it on with `set_int(db, "sysgal_bloqueo_por_mora_activo", 1)` once Carla confirms.
+
 `actualizado_at`: latest of the causa's `synced_at`/`sysgal_updated_at` and, when linked, the case's `updated_at`/`last_movement_at`.
 
 ## IP restriction

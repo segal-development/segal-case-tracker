@@ -1,6 +1,7 @@
 """Cases endpoints - Read from database."""
 
 import io
+from dataclasses import asdict
 import logging
 import re
 from typing import List, Literal, Optional
@@ -38,7 +39,9 @@ from app.services.causa_activa import (
     excluidas_query,
 )
 from app.services.contrato_estado import ddo_info_by_case
+from app.api.v1.deadlines import EstadoPagoResponse
 from app.services.sysgal_cobertura import COBERTURAS
+from app.services.sysgal_cuotas import estado_pago_por_case
 from app.services.timeline_service import build_case_timeline
 from app.services.case_diagnostico import classify, days_since
 from app.services.deadline_engine import is_medida_prejudicial
@@ -417,6 +420,8 @@ class CaseDetailResponse(BaseModel):
     # Court acts of the excepciones window; [] outside it (see _window_resolutions).
     window_resolutions: List[WindowResolution] = []
     liberacion: Optional[LiberacionSummary] = None
+    # Sysgal payment state; null when the case has no Sysgal causa. Display only.
+    estado_pago: Optional[EstadoPagoResponse] = None
 
 
 # ============================================================================
@@ -1390,6 +1395,11 @@ async def get_case(
         stage_dates=_stage_dates(case, movements),
         window_resolutions=_window_resolutions(case, movements),
         liberacion=_liberacion_summary(db, case),
+        estado_pago=(
+            EstadoPagoResponse(**asdict(pago))
+            if (pago := estado_pago_por_case(db, [case.id]).get(case.id))
+            else None
+        ),
         litigantes=[LitiganteResponse.model_validate(r) for r in litigantes],
         litigantes_count=len(litigantes),
         notificaciones=[NotificacionResponse.model_validate(r) for r in notificaciones],

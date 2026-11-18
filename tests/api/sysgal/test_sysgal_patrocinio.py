@@ -314,6 +314,15 @@ def _contrato(db, n, causas, cuota=1, moroso=True):
     db.commit()
 
 
+@pytest.fixture(autouse=True)
+def _switch_on(db):
+    """Today's behaviour = switch ON; the OFF tests turn it off explicitly."""
+    from app.services.app_settings import KEY_SYSGAL_BLOQUEO_POR_MORA, set_int
+
+    set_int(db, KEY_SYSGAL_BLOQUEO_POR_MORA, 1)
+    db.commit()
+
+
 def _by_id(client):
     r = client.get(URL, headers=_auth())
     assert r.status_code == 200
@@ -345,3 +354,31 @@ def test_no_contract_info_is_not_blocked(client, seeded):
     items = _by_id(client)
     assert all(i["bloqueado_por_mora"] is False for i in items.values())
     assert items[101]["cuotas_actualizadas_al"] is not None
+
+
+# ---- S10: separate switch, default OFF ----
+def test_switch_key_and_default_are_off(db):
+    from app.models.goal import Goal
+    from app.services.app_settings import (
+        DEFAULT_SYSGAL_BLOQUEO_POR_MORA,
+        KEY_SYSGAL_BLOQUEO_POR_MORA,
+        get_int,
+    )
+
+    assert KEY_SYSGAL_BLOQUEO_POR_MORA == "sysgal_bloqueo_por_mora_activo"
+    db.query(Goal).filter_by(key=KEY_SYSGAL_BLOQUEO_POR_MORA).delete()  # undo the autouse ON
+    db.commit()
+    assert DEFAULT_SYSGAL_BLOQUEO_POR_MORA == 0
+    assert get_int(db, KEY_SYSGAL_BLOQUEO_POR_MORA, DEFAULT_SYSGAL_BLOQUEO_POR_MORA) == 0
+
+
+def test_switch_off_reports_false_even_with_blocking_data(client, seeded):
+    from app.services.app_settings import KEY_SYSGAL_BLOQUEO_POR_MORA, set_int
+
+    _contrato(seeded, 1, [101, 102], cuota=1)
+    set_int(seeded, KEY_SYSGAL_BLOQUEO_POR_MORA, 0)
+    seeded.commit()
+    items = _by_id(client)
+    assert items[101]["bloqueado_por_mora"] is False
+    assert items[102]["bloqueado_por_mora"] is False
+    assert items[101]["cuotas_actualizadas_al"].startswith("2026-11-18T07:00")
