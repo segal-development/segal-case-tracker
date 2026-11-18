@@ -138,6 +138,7 @@ def _hito_existente(
     *,
     solo_estado: Optional[str] = None,
     excluir_id: Optional[int] = None,
+    nivel: Optional[str] = None,
 ) -> Optional[tuple]:
     """Return the row of the hito that already covers this causa for
     ``lawyer_id``, or ``None``.
@@ -147,8 +148,13 @@ def _hito_existente(
     ``solo_estado`` only hitos in that estado count (approval uses it to refuse a
     second approved hito for the causa); ``excluir_id`` ignores the hito itself.
 
+    ``nivel`` ('junior' | 'pleno', the ``HitoTipo.nivel`` of the hito being
+    filed) scopes the rule: a Junior hito never covers a Pleno one on the same
+    causa and vice versa (a lawyer promoted to Pleno files the same causa
+    again). ``None`` keeps the any-type behaviour (``/verificar`` without a tipo).
+
     Single source of truth for the dedup rule keyed on ``(lawyer, rol_causa,
-    _causa_key(descripcion), _tribunal_collides(tribunal))`` — shared by
+    _causa_key(descripcion), nivel, _tribunal_collides(tribunal))`` — shared by
     ``_create_hito`` (which turns a hit into the 409) and the public
     ``/verificar`` preview endpoints (which turn it into a warning shown
     before the form is filled). Both MUST call this one function: a preview
@@ -168,6 +174,8 @@ def _hito_existente(
     query = db.query(Hito.descripcion, Hito.tribunal, Hito.fecha_hito, Hito.estado, Hito.created_by_name).filter(
         Hito.lawyer_id == lawyer_id, Hito.rol_causa == rol_norm
     )
+    if nivel is not None:
+        query = query.join(HitoTipo, HitoTipo.id == Hito.hito_tipo_id).filter(HitoTipo.nivel == nivel)
     if solo_estado is not None:
         query = query.filter(Hito.estado == solo_estado)
     else:
@@ -326,6 +334,15 @@ _SIN_EVIDENCIA_DETAIL = "El hito no tiene evidencia adjunta; no se puede aprobar
 _YA_APROBADO_DETAIL = "Esta causa ya tiene un hito aprobado de este abogado; no se puede aprobar otro."
 
 
+def _nivel_de_tipo(db: Session, hito_tipo_id: Optional[int]) -> Optional[str]:
+    """Nivel of an active hito type for the ``/verificar`` previews. No (or an unknown)
+    tipo -> ``None`` = today's any-type answer, never an error: the preview is advisory
+    and the POST still validates the tipo."""
+    if hito_tipo_id is None:
+        return None
+    return db.query(HitoTipo.nivel).filter(HitoTipo.id == hito_tipo_id, HitoTipo.activo.is_(True)).scalar()
+
+
 def _otro_aprobado(db: Session, hito: "Hito") -> bool:
     """True when another APPROVED hito already covers this hito's causa (same rule as the
     duplicate check). A rejected hito may be filed again, so this keeps the old rejected one
@@ -333,6 +350,7 @@ def _otro_aprobado(db: Session, hito: "Hito") -> bool:
     return _hito_existente(
         db, hito.lawyer_id, hito.rol_causa, hito.descripcion, hito.tribunal,
         solo_estado=HITO_APROBADO, excluir_id=hito.id,
+        nivel=hito.tipo.nivel if hito.tipo is not None else None,
     ) is not None
 _EVIDENCIA_ESTADO_DETAIL = "Solo se puede adjuntar evidencia a un hito pendiente, sugerido o rechazado."
 _EVIDENCIA_OBLIGATORIA_DETAIL = "La evidencia es obligatoria"
@@ -531,7 +549,7 @@ async def _create_hito(
     # Checked before storing evidence so a rejected duplicate never uploads a file.
     rol_norm = (rol_causa or "").strip() or None
     tribunal_norm = (tribunal or "").strip() or None
-    choque = _hito_existente(db, target_lawyer_id, rol_causa, descripcion, tribunal)
+    choque = _hito_existente(db, target_lawyer_id, rol_causa, descripcion, tribunal, nivel=tipo.nivel)
     if choque is not None:
         # Name the existing hito instead of just refusing. A procurador filing
         # through the shared link cannot see what is already loaded, so a bare
@@ -1066,6 +1084,7 @@ async def public_verificar_duplicado(
     rol_causa: Optional[str] = Query(None, description="RUT del cliente"),
     descripcion: Optional[str] = Query(None, description="ROL de la causa"),
     tribunal: Optional[str] = Query(None),
+    hito_tipo_id: Optional[int] = Query(None, description="Tipo de hito a cargar (acota el choque a su nivel)"),
     db: Session = Depends(get_db),
 ):
     """PUBLIC (no auth). Preview: does the token's lawyer already have a hito for
@@ -1078,7 +1097,9 @@ async def public_verificar_duplicado(
     warning and the 409 it previews always agree.
     """
     lawyer = _lawyer_by_token(db, token)
-    choque = _hito_existente(db, lawyer.id, rol_causa, descripcion, tribunal)
+    choque = _hito_existente(
+        db, lawyer.id, rol_causa, descripcion, tribunal, nivel=_nivel_de_tipo(db, hito_tipo_id)
+    )
     if choque is None:
         return HitoVerificarResponse(existe=False, detalle=None)
     return HitoVerificarResponse(existe=True, detalle=_duplicado_detail(choque))
@@ -1157,6 +1178,7 @@ async def public_procuradores_verificar_duplicado(
     rol_causa: Optional[str] = Query(None, description="RUT del cliente"),
     descripcion: Optional[str] = Query(None, description="ROL de la causa"),
     tribunal: Optional[str] = Query(None),
+    hito_tipo_id: Optional[int] = Query(None, description="Tipo de hito a cargar (acota el choque a su nivel)"),
     db: Session = Depends(get_db),
 ):
     """PUBLIC (no auth). Same preview as the per-lawyer form, but for the shared
@@ -1166,7 +1188,9 @@ async def public_procuradores_verificar_duplicado(
     """
     _procuradores_link_or_404(db, token)
     lawyer = _procuradores_lawyer_or_422(db, lawyer_id)
-    choque = _hito_existente(db, lawyer.id, rol_causa, descripcion, tribunal)
+    choque = _hito_existente(
+        db, lawyer.id, rol_causa, descripcion, tribunal, nivel=_nivel_de_tipo(db, hito_tipo_id)
+    )
     if choque is None:
         return HitoVerificarResponse(existe=False, detalle=None)
     return HitoVerificarResponse(existe=True, detalle=_duplicado_detail(choque))
@@ -1848,7 +1872,7 @@ class _HitoRowResult:
 
 
 class _HitoDedupTracker:
-    """(abogado, RUT, causa, tribunal) dedup state shared by preview and import.
+    """(abogado, RUT, causa, nivel, tribunal) dedup state shared by preview and import.
 
     Loads the existing DB rows once, then also tracks rows seen so far THIS run
     so within-file duplicates are caught the same way for both. Mirrors the old
@@ -1862,23 +1886,24 @@ class _HitoDedupTracker:
         self.seen3: set = set()
         self.seen4: set = set()
         for h in (
-            db.query(Hito.lawyer_id, Hito.rol_causa, Hito.descripcion, Hito.tribunal)
+            db.query(Hito.lawyer_id, Hito.rol_causa, Hito.descripcion, Hito.tribunal, HitoTipo.nivel)
+            .join(HitoTipo, HitoTipo.id == Hito.hito_tipo_id)
             .filter((Hito.rol_causa.isnot(None)) | (Hito.descripcion.isnot(None)))
             .all()
         ):
             causa = _causa_key(h.descripcion)
             if h.rol_causa is None and causa is None:
                 continue
-            self.existing3.add((h.lawyer_id, h.rol_causa, causa))
-            self.existing4.add((h.lawyer_id, h.rol_causa, causa, _tribunal_key(h.tribunal)))
+            self.existing3.add((h.lawyer_id, h.rol_causa, causa, h.nivel))
+            self.existing4.add((h.lawyer_id, h.rol_causa, causa, h.nivel, _tribunal_key(h.tribunal)))
 
     def check(self, lawyer_id: int, rol_causa: Optional[str], causa: Optional[str],
-              tribunal_norm: Optional[str]):
+              tribunal_norm: Optional[str], nivel: Optional[str]):
         """Returns ``(is_dup, motivo)``; records the row as seen when not a dup."""
         if rol_causa is None and causa is None:
             return False, None
         trib = _tribunal_key(tribunal_norm)
-        k3 = (lawyer_id, rol_causa, causa)
+        k3 = (lawyer_id, rol_causa, causa, nivel)
         k4 = k3 + (trib,)
         if trib is None:
             is_dup = k3 in self.existing3 or k3 in self.seen3
@@ -1952,7 +1977,7 @@ def _resolve_and_evaluate_row(
             "Sin tribunal: se va a considerar la misma causa que cualquier hito de este cliente en este ROL."
         )
 
-    is_dup, motivo_dup = dedup.check(lawyer.id, rol_causa, desc_norm, tribunal_norm)
+    is_dup, motivo_dup = dedup.check(lawyer.id, rol_causa, desc_norm, tribunal_norm, tipo.nivel)
     if is_dup:
         return _HitoRowResult(
             hoja=raw.hoja, fila=raw.fila, resultado="duplicada", estado=estado_txt, valor=valor,
@@ -2221,10 +2246,12 @@ async def update_hito(
         trib = _tribunal_key(tribunal_norm)
         prior = (
             db.query(Hito.descripcion, Hito.tribunal)
+            .join(HitoTipo, HitoTipo.id == Hito.hito_tipo_id)
             .filter(
                 Hito.id != hito.id,
                 Hito.lawyer_id == hito.lawyer_id,
                 Hito.rol_causa == rol_norm,
+                HitoTipo.nivel == tipo.nivel,  # the NEW tipo's nivel: one Junior + one Pleno per causa
             )
             .all()
         )
