@@ -106,6 +106,23 @@ def _estados(body):
     return {i["sysgal_causa_id"]: i["estado"] for i in body["items"]}
 
 
+def test_eliminada_causas_are_excluded(client, seeded):
+    # A causa deleted in Sysgal is not reported, neither in the listing nor by id.
+    case = seeded.query(Case).filter(Case.rol == "C-1-2026").one()
+    seeded.add(
+        SysgalCausa(
+            sysgal_id=199, rol="C-1-2026", rol_norm="C-1-2026", tribunal="Juzgado PA",
+            case_id=case.id, synced_at=datetime(2026, 11, 1), eliminada=True,
+        )
+    )
+    seeded.commit()
+    listing = client.get(URL, headers=_auth()).json()
+    assert 199 not in _estados(listing)
+    assert listing["total"] == 4
+    by_id = client.get(URL, params={"sysgal_causa_id": "199"}, headers=_auth()).json()
+    assert by_id["items"] == [] and by_id["total"] == 0
+
+
 def test_requires_api_key(client, seeded):
     assert client.get(URL).status_code == 401
     assert client.get(URL, headers={"X-API-Key": "wrong"}).status_code == 401

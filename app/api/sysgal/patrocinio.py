@@ -87,7 +87,12 @@ def list_patrocinio(
         raise HTTPException(status_code=422, detail="rol and tribunal must be sent together")
     ids = _parse_ids(sysgal_causa_id)
 
-    q = db.query(SysgalCausa, Case).outerjoin(Case, Case.id == SysgalCausa.case_id)
+    # Causas deleted in Sysgal are not reported.
+    q = (
+        db.query(SysgalCausa, Case)
+        .outerjoin(Case, Case.id == SysgalCausa.case_id)
+        .filter(SysgalCausa.eliminada.is_(False))
+    )
     if ids:
         q = q.filter(SysgalCausa.sysgal_id.in_(ids))
     if rol is not None and tribunal is not None:
