@@ -177,3 +177,102 @@ def test_load_mora_por_case(db):
     got = load_mora_por_case(db, [c.id for c in cases])
     assert got == {cases[0].id: MORA_BLOQUEA, cases[1].id: MORA_NO_BLOQUEA, cases[2].id: MORA_SIN_INFO}
     assert load_mora_por_case(db, []) == {}
+
+
+# ---- estado de pago (S9) ----
+from sqlalchemy import event  # noqa: E402
+
+from app.services.sysgal_cuotas import EstadoPago, estado_pago_por_case  # noqa: E402
+
+
+def _pago_world(db, spec):
+    """spec: {sysgal_id: case_idx}; returns cases. One lawyer/court."""
+    lawyer = Lawyer(rut="16021492-9", name="L", is_active=True)
+    court = Court(code="EP1", name="J", region="RM", type="civil")
+    db.add_all([lawyer, court])
+    db.commit()
+    cases = []
+    for i in range(max(spec.values()) + 1):
+        c = Case(lawyer_id=lawyer.id, court_id=court.id, rol=f"C-{i}-2026", status="active")
+        db.add(c)
+        cases.append(c)
+    db.commit()
+    for sid, idx in spec.items():
+        db.add(SysgalCausa(sysgal_id=sid, rol="r", rol_norm="r", tribunal="t",
+                           case_id=cases[idx].id, synced_at=datetime(2026, 11, 1)))
+    db.commit()
+    return cases
+
+
+def _con(db, n, causas, cuota, moroso=False, al_dia=False, copia=COPIA):
+    db.add(SysgalContrato(contrato=str(n), cuota_actual=cuota, contrato_moroso=moroso,
+                          contrato_al_dia=al_dia, id_causas=list(causas), copia_at=copia,
+                          synced_at=datetime(2026, 11, 18, 9)))
+    db.commit()
+
+
+@pytest.mark.parametrize(
+    "cuota,moroso,al_dia,estado,bloquea",
+    [
+        (1, True, False, "moroso", True),
+        (2, True, False, "moroso", True),
+        (3, True, False, "moroso", False),
+        (None, True, False, "moroso", False),
+        (1, False, True, "al_dia", False),
+        (2, False, False, "pendiente", False),
+    ],
+)
+def test_estado_pago_per_contract(db, cuota, moroso, al_dia, estado, bloquea):
+    (c,) = _pago_world(db, {10: 0})
+    _con(db, 1, [10], cuota, moroso, al_dia)
+    got = estado_pago_por_case(db, [c.id])
+    assert got == {c.id: EstadoPago(estado, cuota, bloquea, COPIA)}
+
+
+def test_estado_pago_worst_contract_wins_and_reports_its_cuota(db):
+    c1, c2, c3 = _pago_world(db, {10: 0, 11: 0, 20: 1, 21: 1, 30: 2})
+    _con(db, 1, [10], 5, al_dia=True)
+    _con(db, 2, [11], 4)                       # pendiente
+    _con(db, 3, [20], 5, al_dia=True)
+    _con(db, 4, [21], 1, moroso=True)          # moroso beats al_dia
+    _con(db, 5, [30], 7, al_dia=True)
+    got = estado_pago_por_case(db, [c1.id, c2.id, c3.id])
+    assert got[c1.id] == EstadoPago("pendiente", 4, False, COPIA)
+    assert got[c2.id] == EstadoPago("moroso", 1, True, COPIA)
+    assert got[c3.id].estado == "al_dia"
+
+
+def test_estado_pago_moroso_prefers_the_blocking_contract(db):
+    (c,) = _pago_world(db, {10: 0, 11: 0})
+    _con(db, 1, [10], 3, moroso=True)
+    _con(db, 2, [11], 2, moroso=True)
+    assert estado_pago_por_case(db, [c.id])[c.id] == EstadoPago("moroso", 2, True, COPIA)
+
+
+def test_estado_pago_sin_informacion_vs_no_causa_and_deleted_causa(db):
+    c_sin, c_nocausa, c_del = _pago_world(db, {10: 0, 30: 2})
+    db.query(SysgalCausa).filter_by(sysgal_id=30).update({"eliminada": True})
+    db.commit()
+    _con(db, 1, [30], 1, moroso=True)  # only reaches the deleted causa
+    got = estado_pago_por_case(db, [c_sin.id, c_nocausa.id, c_del.id])
+    assert got == {c_sin.id: EstadoPago("sin_informacion", None, False, None)}
+    assert estado_pago_por_case(db, []) == {}
+
+
+def test_estado_pago_query_count_does_not_depend_on_cases(db):
+    cases = _pago_world(db, {100 + i: i for i in range(12)})
+    for i in range(12):
+        _con(db, i, [100 + i], 1, moroso=True)
+
+    def count(ids):
+        n = []
+        eng = db.get_bind()
+        cb = lambda *a, **k: n.append(1)  # noqa: E731
+        event.listen(eng, "before_cursor_execute", cb)
+        try:
+            estado_pago_por_case(db, ids)
+        finally:
+            event.remove(eng, "before_cursor_execute", cb)
+        return len(n)
+
+    assert count([cases[0].id]) == count([c.id for c in cases]) <= 3

@@ -23,6 +23,11 @@ KEY_CORREOS_APAGADOS = "correos_apagados"
 KEY_SYSGAL_DUENIO = "sysgal_es_fuente_duenio"
 DEFAULT_SYSGAL_DUENIO = 0
 
+#: 1 = the patrocinio API reports ``bloqueado_por_mora`` to ITDS; 0 = it always reports false
+#: (the internal estado de pago is still computed). Default OFF until Carla answers (S10).
+KEY_SYSGAL_BLOQUEO_POR_MORA = "sysgal_bloqueo_por_mora_activo"
+DEFAULT_SYSGAL_BLOQUEO_POR_MORA = 0
+
 DEFAULT_POR_DIA = 0  # 0 = OFF
 DEFAULT_POR_HORA = 10
 

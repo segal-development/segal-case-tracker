@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Iterable, Protocol
 
@@ -129,3 +130,87 @@ def load_mora_por_case(db: Session, case_ids: list[int]) -> dict[int, str]:
 def cuotas_actualizadas_al(db: Session) -> datetime | None:
     """Copy timestamp of the stored cuotas (None if never synced)."""
     return db.query(func.max(SysgalContrato.copia_at)).scalar()
+
+
+# ---- estado de pago per case (S9, display only: blocks nothing) ----
+PAGO_MOROSO = "moroso"
+PAGO_PENDIENTE = "pendiente"
+PAGO_AL_DIA = "al_dia"
+PAGO_SIN_INFO = "sin_informacion"
+
+# Worst first: moroso > pendiente > al_dia.
+_PAGO_RANK = {PAGO_MOROSO: 0, PAGO_PENDIENTE: 1, PAGO_AL_DIA: 2}
+
+
+@dataclass(frozen=True)
+class EstadoPago:
+    estado: str
+    cuota_actual: int | None
+    #: moroso AND cuota_actual in (1, 2): the case the poder gate would hold.
+    bloquearia_poder: bool
+    copia_at: datetime | None
+
+
+def _estado_de_contrato(c: _ContratoLike) -> str:
+    if c.contrato_moroso:
+        return PAGO_MOROSO
+    if getattr(c, "contrato_al_dia", False):
+        return PAGO_AL_DIA
+    return PAGO_PENDIENTE
+
+
+def derive_estado_pago(causas_por_case: dict[int, set[int]], contratos: Iterable) -> dict[int, EstadoPago]:
+    """Pure: ``{case_id: EstadoPago}`` for cases WITH Sysgal causas.
+
+    Several contracts: the worst estado wins. Ties: a moroso contract that would block
+    (cuota 1/2) first, then the lowest cuota_actual, then the contract number (deterministic).
+    """
+    contratos = list(contratos)
+    por_causa: dict[int, list] = defaultdict(list)
+    for contrato in contratos:
+        for causa_id in contrato.id_causas or []:
+            por_causa[causa_id].append(contrato)
+    out: dict[int, EstadoPago] = {}
+    for case_id, causas in causas_por_case.items():
+        if not causas:
+            continue
+        linked = {c.contrato: c for causa_id in causas for c in por_causa.get(causa_id, [])}
+        if not linked:
+            out[case_id] = EstadoPago(PAGO_SIN_INFO, None, False, None)
+            continue
+
+        def key(c):
+            estado = _estado_de_contrato(c)
+            bloquea = estado == PAGO_MOROSO and c.cuota_actual in CUOTAS_QUE_BLOQUEAN
+            cuota = c.cuota_actual if c.cuota_actual is not None else 10**6
+            return (_PAGO_RANK[estado], not bloquea, cuota, c.contrato)
+
+        best = min(linked.values(), key=key)
+        estado = _estado_de_contrato(best)
+        out[case_id] = EstadoPago(
+            estado,
+            best.cuota_actual,
+            estado == PAGO_MOROSO and best.cuota_actual in CUOTAS_QUE_BLOQUEAN,
+            best.copia_at,
+        )
+    return out
+
+
+def estado_pago_por_case(db: Session, case_ids: Iterable[int]) -> dict[int, EstadoPago]:
+    """Batch ``derive_estado_pago``: two queries for any number of cases.
+
+    Cases without any (non-deleted) Sysgal causa are absent from the result (-> null).
+    """
+    ids = list(case_ids)
+    if not ids:
+        return {}
+    causas_por_case: dict[int, set[int]] = {}
+    for sysgal_id, case_id in (
+        db.query(SysgalCausa.sysgal_id, SysgalCausa.case_id)
+        .filter(SysgalCausa.case_id.in_(ids), SysgalCausa.eliminada.is_(False))
+        .all()
+    ):
+        causas_por_case.setdefault(case_id, set()).add(sysgal_id)
+    if not causas_por_case:
+        return {}
+    return derive_estado_pago(causas_por_case, db.query(SysgalContrato).all())

@@ -473,6 +473,18 @@ class SemaforoReadingResponse(BaseModel):
     level: Optional[str] = None
 
 
+class EstadoPagoResponse(BaseModel):
+    """Sysgal payment state of the case's client. Display only: it blocks nothing."""
+    #: "moroso" | "pendiente" | "al_dia" | "sin_informacion"
+    estado: str
+    #: cuota_actual of the contract that decided the estado; null if unknown.
+    cuota_actual: Optional[int] = None
+    #: moroso on cuota 1 or 2: the poder acreditación would be held.
+    bloquearia_poder: bool = False
+    #: Date of Sysgal's daily cuotas copy; null for sin_informacion.
+    copia_at: Optional[datetime] = None
+
+
 class SemaforoPanelRowResponse(BaseModel):
     deadline_id: int
     case_id: int
@@ -497,6 +509,8 @@ class SemaforoPanelRowResponse(BaseModel):
     #: Every lawyer on the plazo (several when the same case is stored under
     #: more than one firm lawyer and was collapsed into this row).
     abogados: List[str] = []
+    #: null when the case has no Sysgal causa at all.
+    estado_pago: Optional[EstadoPagoResponse] = None
 
 
 class SemaforoPanelResponse(BaseModel):
