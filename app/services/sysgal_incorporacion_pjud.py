@@ -101,6 +101,18 @@ def _classify(exc: Exception) -> str:
     return KIND_OTHER
 
 
+def _raise_site(exc: BaseException) -> str:
+    """``file:line in function`` of the innermost frame that raised ``exc`` (never the message)."""
+    import os
+    import traceback
+
+    frames = traceback.extract_tb(exc.__traceback__)
+    if not frames:
+        return "desconocido"
+    last = frames[-1]
+    return f"{os.path.basename(last.filename)}:{last.lineno} in {last.name}"
+
+
 def _stored_error(exc: Exception, kind: str) -> str:
     """Text kept in ``ultimo_error``: the kind, plus only the class name when unexpected (never the message)."""
     text = f"{KIND_OTHER}: {type(exc).__name__}" if kind == KIND_OTHER else kind
@@ -301,7 +313,10 @@ async def run_incorporacion(
             detail = await fetch(rol, corte)
         except Exception as exc:  # noqa: BLE001 — classified; the message is never stored
             kind = _classify(exc)
-            logger.warning("Sysgal incorporacion: PJUD failure (%s) for %s", _stored_error(exc, kind), rol)
+            logger.warning(
+                "Sysgal incorporacion: PJUD failure (%s) for %s at %s",
+                _stored_error(exc, kind), rol, _raise_site(exc),
+            )
             db.rollback()
             if kind == KIND_LOGIN:
                 stats["frenada"] = True

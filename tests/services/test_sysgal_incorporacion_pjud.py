@@ -442,6 +442,25 @@ async def test_unexpected_failure_stores_only_the_exception_class_name(db, court
 
 
 @pytest.mark.asyncio
+async def test_unexpected_failure_logs_where_it_was_raised_without_the_message(db, court, lawyer, caplog):
+    # 19-11-2026: three ValueError tripped the brake and nothing said where they came from.
+    _ritmo(db, dia=100, hora=100)
+    _item(db, court, 1)
+    db.commit()
+
+    async def failing_fetch(rol, corte):
+        raise ValueError("super-secret <html>page body</html>")
+
+    with caplog.at_level("WARNING"):
+        await run_incorporacion(db, failing_fetch, notify=lambda _m: True, egress_ok=lambda: True)
+
+    failure = next(r.getMessage() for r in caplog.records if "PJUD failure" in r.getMessage())
+    assert "error inesperado: ValueError" in failure
+    assert "test_sysgal_incorporacion_pjud.py:" in failure and "failing_fetch" in failure
+    assert "super-secret" not in caplog.text and "<html>" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_unexpected_failure_class_name_is_truncated_to_the_column_length(db, court, lawyer):
     _ritmo(db, dia=100, hora=100)
     _, row = _item(db, court, 1)
