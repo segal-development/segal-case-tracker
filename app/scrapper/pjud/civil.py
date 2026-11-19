@@ -80,6 +80,13 @@ def locate_movement_columns(cleaned_cells: List[str]) -> Tuple[str, str, Optiona
         None,
     )
     if date_idx is None:
+        # Diagnostic: such rows are later skipped as corrupted (fecha=''); log the raw cells
+        # (each cut to 40 chars) so the real layout of the cuaderno can be seen.
+        logger.warning(
+            "movement row without date n_cells=%d cells=%r",
+            len(cleaned_cells),
+            [c[:40] for c in cleaned_cells[:12]],
+        )
         return cell(_FIRST_DESCRIPTION_CELL) or "", "", cell(_FIRST_DESCRIPTION_CELL + 2)
     return cell(date_idx - 1) or "", cleaned_cells[date_idx], cell(date_idx + 1)
 
