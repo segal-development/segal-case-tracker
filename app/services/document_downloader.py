@@ -31,6 +31,22 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def order_priority_first(docs: List["Document"]) -> List["Document"]:
+    """Priority-requested documents first (oldest request first), then the rest.
+
+    Stable: documents without a request keep the caller's order.
+    """
+    def _requested(d):
+        value = getattr(d, "prioridad_solicitada_at", None)
+        return value if isinstance(value, datetime) else None
+
+    prioritized = sorted(
+        (d for d in docs if _requested(d) is not None), key=_requested
+    )
+    rest = [d for d in docs if _requested(d) is None]
+    return prioritized + rest
+
+
 class DocumentDownloader:
     """Fetch each pending document from PJUD and store it via StorageService.
 
@@ -76,7 +92,7 @@ class DocumentDownloader:
             logger.debug("DocumentDownloader: DOC_DOWNLOAD_ENABLED=False — skipping all")
             return
 
-        for doc in pending_docs:
+        for doc in order_priority_first(pending_docs):
             # FIX 6: retry "failed" docs (transient errors); skip "stored" and "unavailable"
             if doc.status not in ("pending", "failed"):
                 logger.debug(

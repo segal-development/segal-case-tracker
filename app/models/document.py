@@ -56,6 +56,10 @@ class Document(Base):
     stored_at = Column(DateTime, nullable=True)  # Set when status -> "stored"
     failed_at = Column(DateTime, nullable=True)  # Set when status -> "failed"
 
+    # Set (first request wins) when a user asks to open a document that is not
+    # stored yet; the station's downloader takes these first (migration 090).
+    prioridad_solicitada_at = Column(DateTime, nullable=True, index=True)
+
     # Relationships
     case = relationship("Case", back_populates="documents")
     escrito = relationship("CaseEscrito", backref="documents")

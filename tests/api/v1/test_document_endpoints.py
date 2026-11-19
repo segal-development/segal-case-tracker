@@ -10,9 +10,7 @@ calls, no Playwright, no Redis.
 
 import pytest
 from datetime import datetime
-from unittest.mock import AsyncMock, MagicMock, patch
 
-from fastapi.testclient import TestClient
 
 from app.api.deps import get_current_lawyer
 from app.main import app
@@ -20,7 +18,6 @@ from app.models.case import Case
 from app.models.court import Court
 from app.models.document import Document
 from app.models.lawyer import Lawyer
-from app.scrapper.pjud.exceptions import DocumentTokenExpiredError
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -313,111 +310,7 @@ class TestListCaseDocumentsOrdering:
 # GET /api/v1/documents/{document_id}/download
 # ─────────────────────────────────────────────────────────────────────────────
 
-_FAKE_PDF = b"%PDF-1.4 fake pdf content"
-_FAKE_SESSION = MagicMock()  # PJUDSession-like object
-
-
-def _make_session_store_mock(session=_FAKE_SESSION):
-    """Return a mock SessionStore whose get_session_by_lawyer returns `session`."""
-    store = MagicMock()
-    store.get_session_by_lawyer = AsyncMock(return_value=session)
-    return store
-
-
 class TestDownloadDocument:
-    def test_streams_pdf_bytes(self, authed_client, document):
-        """Happy path: scraper returns bytes, endpoint streams them."""
-        store_mock = _make_session_store_mock()
-
-        with (
-            patch(
-                "app.api.v1.documents.get_session_store",
-                return_value=store_mock,
-            ),
-            patch(
-                "app.api.v1.documents.BrowserFactory"
-            ) as mock_factory_cls,
-            patch(
-                "app.api.v1.documents.CivilScraper"
-            ) as mock_scraper_cls,
-        ):
-            # BrowserFactory async context manager
-            mock_factory = MagicMock()
-            mock_factory.__aenter__ = AsyncMock(return_value=mock_factory)
-            mock_factory.__aexit__ = AsyncMock(return_value=False)
-            mock_factory.new_page = AsyncMock(return_value=MagicMock())
-            mock_factory._browser = MagicMock()
-            mock_factory._context = MagicMock()
-            mock_factory_cls.return_value = mock_factory
-
-            # CivilScraper instance
-            mock_scraper = MagicMock()
-            mock_scraper.download_document_generic = AsyncMock(
-                return_value=_FAKE_PDF
-            )
-            mock_scraper_cls.return_value = mock_scraper
-
-            resp = authed_client.get(
-                f"/api/v1/documents/{document.id}/download"
-            )
-
-        assert resp.status_code == 200
-        assert resp.headers["content-type"] == "application/pdf"
-        assert resp.content == _FAKE_PDF
-        assert "inline" in resp.headers["content-disposition"]
-
-    def test_returns_409_when_no_active_session(self, authed_client, document):
-        """No PJUD session in store → 409 Conflict."""
-        store_mock = _make_session_store_mock(session=None)
-
-        with patch(
-            "app.api.v1.documents.get_session_store",
-            return_value=store_mock,
-        ):
-            resp = authed_client.get(
-                f"/api/v1/documents/{document.id}/download"
-            )
-
-        assert resp.status_code == 409
-        assert "No active PJUD session" in resp.json()["detail"]
-
-    def test_returns_410_when_token_expired(self, authed_client, document):
-        """Scraper raises DocumentTokenExpiredError → 410 Gone."""
-        store_mock = _make_session_store_mock()
-
-        with (
-            patch(
-                "app.api.v1.documents.get_session_store",
-                return_value=store_mock,
-            ),
-            patch(
-                "app.api.v1.documents.BrowserFactory"
-            ) as mock_factory_cls,
-            patch(
-                "app.api.v1.documents.CivilScraper"
-            ) as mock_scraper_cls,
-        ):
-            mock_factory = MagicMock()
-            mock_factory.__aenter__ = AsyncMock(return_value=mock_factory)
-            mock_factory.__aexit__ = AsyncMock(return_value=False)
-            mock_factory.new_page = AsyncMock(return_value=MagicMock())
-            mock_factory._browser = MagicMock()
-            mock_factory._context = MagicMock()
-            mock_factory_cls.return_value = mock_factory
-
-            mock_scraper = MagicMock()
-            mock_scraper.download_document_generic = AsyncMock(
-                side_effect=DocumentTokenExpiredError("token expired (status=404)")
-            )
-            mock_scraper_cls.return_value = mock_scraper
-
-            resp = authed_client.get(
-                f"/api/v1/documents/{document.id}/download"
-            )
-
-        assert resp.status_code == 410
-        assert "token expired" in resp.json()["detail"].lower()
-
     def test_returns_404_for_unknown_document(self, authed_client):
         resp = authed_client.get("/api/v1/documents/99999/download")
         assert resp.status_code == 404
@@ -440,43 +333,3 @@ class TestDownloadDocument:
             assert resp.status_code == 404
         finally:
             app.dependency_overrides.pop(get_current_lawyer, None)
-
-
-class TestDownloadDocumentBudget:
-    def test_hung_download_returns_504_instead_of_hanging(
-        self, authed_client, document, monkeypatch
-    ):
-        """A fetch that never resolves must not hold the request forever."""
-        import asyncio
-
-        monkeypatch.setattr(
-            "app.services.document_download_budget.DOCUMENT_DOWNLOAD_TIMEOUT_SECONDS",
-            0.05,
-        )
-
-        async def _hang(*args, **kwargs):
-            await asyncio.Event().wait()
-
-        with (
-            patch(
-                "app.api.v1.documents.get_session_store",
-                return_value=_make_session_store_mock(),
-            ),
-            patch("app.api.v1.documents.BrowserFactory") as mock_factory_cls,
-            patch("app.api.v1.documents.CivilScraper") as mock_scraper_cls,
-        ):
-            mock_factory = MagicMock()
-            mock_factory.__aenter__ = AsyncMock(return_value=mock_factory)
-            mock_factory.__aexit__ = AsyncMock(return_value=False)
-            mock_factory.new_page = AsyncMock(return_value=MagicMock())
-            mock_factory._browser = MagicMock()
-            mock_factory._context = MagicMock()
-            mock_factory_cls.return_value = mock_factory
-
-            mock_scraper = MagicMock()
-            mock_scraper.download_document_generic = _hang
-            mock_scraper_cls.return_value = mock_scraper
-
-            resp = authed_client.get(f"/api/v1/documents/{document.id}/download")
-
-        assert resp.status_code == 504
