@@ -8,18 +8,17 @@ GET /api/v1/documents/{document_id}/download
     Serve document bytes.
     - Primary path: if doc.status == "stored", retrieve bytes from StorageService
       directly — no PJUD call, no session required.
-    - Fallback path: if not stored and an active PJUD session is available,
-      download live from PJUD (pre-Slice-2 behaviour, kept for graceful degradation).
-    - Returns 409 if not stored and no session is available.
+    - Not stored: the request is recorded as a priority download for the
+      station (202); the API never calls PJUD.
+    - Returns 409 if the document has no PJUD token or is unavailable.
 """
 
-import asyncio
 import logging
 from datetime import date, datetime
 from typing import AsyncIterator, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from fastapi.responses import RedirectResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import DateTime, func, text as sql_text
 from sqlalchemy.orm import Session
@@ -35,11 +34,6 @@ from app.config import settings
 from app.models.document import Document
 from app.models.case import Case
 from app.models.movement import Movement
-from app.scrapper.pjud.civil import CivilScraper
-from app.scrapper.pjud.browser import BrowserFactory
-from app.scrapper.pjud.exceptions import DocumentTokenExpiredError, ScrapingError
-from app.services.document_download_budget import download_with_budget
-from app.services.session_store import get_session_store
 from app.services.storage_service import StorageService, get_storage_backend
 
 router = APIRouter()
@@ -272,7 +266,7 @@ async def get_document_redirect(
 
 
 # ---------------------------------------------------------------------------
-# GET /{document_id}/download — storage-first, PJUD fallback
+# GET /{document_id}/download — storage-first, else priority request
 # ---------------------------------------------------------------------------
 
 @router.get("/{document_id}/download")
@@ -289,17 +283,16 @@ async def download_document(
         are retrieved from StorageService and streamed directly.  No PJUD call
         is made.
 
-    Fallback path (session required):
-        When the document is not yet stored, the endpoint falls back to a live
-        PJUD download using the authenticated browser session stored in Redis.
-        This preserves the pre-Slice-2 behavior for documents that have not
-        been downloaded during sync yet.
+    Not stored (no PJUD call from the API):
+        With a PJUD token the request marks the document for priority download
+        (``prioridad_solicitada_at``, first request wins; a ``failed`` document
+        is requeued to ``pending`` once) and answers 202
+        ``{"estado": "en_descarga", "detail": ..., "solicitado_at": ISO}``.
 
     Error codes:
         404 — document not found or not visible to the authenticated lawyer.
-        409 — document not stored AND no active PJUD session available.
-        410 — document token expired; re-sync the case to refresh tokens.
-        500 — unexpected download failure.
+        409 — ``{"estado": "sin_token"|"no_disponible", "detail": ...}``.
+        202 — queued for priority download (see above).
     """
     lawyer_id = _resolve_lawyer_id(db, current_lawyer)
     if not lawyer_id:
@@ -350,67 +343,36 @@ async def download_document(
                 detail="Document storage unavailable — contact support",
             )
 
-    # ── 3. Fallback: live PJUD download ───────────────────────────────────
+    # ── 3. Not stored: queue it for the station (never PJUD from the API) ──
+    if doc.status == "unavailable":
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "estado": "no_disponible",
+                "detail": "Documento no disponible en el PJUD",
+            },
+        )
     if not doc.pjud_endpoint or not doc.pjud_token:
-        raise HTTPException(
+        return JSONResponse(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Document has no PJUD token — re-sync the case first",
+            content={
+                "estado": "sin_token",
+                "detail": "Document has no PJUD token — re-sync the case first",
+            },
         )
 
-    try:
-        lawyer_id_int = int(lawyer_id)
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=401, detail="Invalid lawyer_id in token")
+    if doc.prioridad_solicitada_at is None:
+        doc.prioridad_solicitada_at = datetime.utcnow()
+        if doc.status == "failed":
+            doc.status = "pending"
+        db.commit()
+        db.refresh(doc)
 
-    pjud_session = await get_session_store().get_session_by_lawyer(lawyer_id_int)
-    if not pjud_session:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="No active PJUD session — login again",
-        )
-
-    try:
-        async with BrowserFactory() as factory:
-            page = await factory.new_page(pjud_session)
-
-            scraper = CivilScraper()
-            scraper._page = page
-            scraper._browser = factory._browser
-            scraper._context = factory._context
-
-            pdf_bytes = await download_with_budget(
-                scraper,
-                session=pjud_session,
-                endpoint=doc.pjud_endpoint,
-                doc_type=doc.doc_type or "resolution",
-                token=doc.pjud_token,
-            )
-
-    except DocumentTokenExpiredError as exc:
-        _logger.warning("Document %s token expired: %s", document_id, exc)
-        raise HTTPException(
-            status_code=status.HTTP_410_GONE,
-            detail="Document token expired — re-sync the case",
-        )
-    except asyncio.TimeoutError:
-        _logger.error("Download of document %s timed out", document_id)
-        raise HTTPException(
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail="Download timed out — try again later",
-        )
-    except ScrapingError as exc:
-        _logger.error("Scraping error for document %s: %s", document_id, exc)
-        raise HTTPException(status_code=500, detail=f"Download failed: {exc}")
-    except Exception as exc:
-        _logger.error("Unexpected error for document %s: %s", document_id, exc)
-        raise HTTPException(status_code=500, detail="Unexpected download error")
-
-    safe_name = (doc.filename or f"document_{document_id}").replace(" ", "_")
-    if not safe_name.endswith(".pdf"):
-        safe_name += ".pdf"
-
-    return StreamingResponse(
-        _pdf_stream(pdf_bytes),
-        media_type="application/pdf",
-        headers={"Content-Disposition": f"inline; filename={safe_name}"},
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={
+            "estado": "en_descarga",
+            "detail": "Documento en cola prioritaria de descarga",
+            "solicitado_at": doc.prioridad_solicitada_at.isoformat(),
+        },
     )

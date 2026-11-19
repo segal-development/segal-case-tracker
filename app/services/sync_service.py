@@ -369,6 +369,39 @@ def _cap_historical_documents(
     case-level document (no movement) has no date BY DESIGN — texto_demanda,
     cert_envio and the multi-MB ebook — so it stays historical and capped.
     """
+    # A document a user asked to open (``prioridad_solicitada_at``) is never
+    # deferred or dropped: not by the cap, the recent-days window or
+    # DOC_HISTORICAL_ENABLED=False. They go first, oldest request first, and
+    # they count against the cap of the historical remainder.
+    def _requested(d):
+        v = getattr(d, "prioridad_solicitada_at", None)
+        return v if isinstance(v, datetime) else None
+
+    prioritized = sorted(
+        (d for d in pending_docs if _requested(d) is not None), key=_requested
+    )
+    if prioritized:
+        rest = [d for d in pending_docs if _requested(d) is None]
+        if cap > 0:
+            remaining = cap - len(prioritized)
+            # Cap used up by priority docs: only the recent ones still pass.
+            others = _cap_historical_documents(
+                rest,
+                recent_days=recent_days,
+                cap=max(remaining, 1),
+                rol=rol,
+                historical_enabled=historical_enabled and remaining > 0,
+            )
+        else:
+            others = _cap_historical_documents(
+                rest,
+                recent_days=recent_days,
+                cap=cap,
+                rol=rol,
+                historical_enabled=historical_enabled,
+            )
+        return prioritized + others
+
     if cap <= 0 and historical_enabled:
         return pending_docs
     cutoff = datetime.utcnow() - timedelta(days=recent_days)
@@ -2363,6 +2396,24 @@ def _select_cases_for_detail_rotation(
             .scalar_subquery()
         )
         order_clauses.insert(0, pending_docs.desc())
+
+    # A document a user asked to open (prioridad_solicitada_at) and that is
+    # still pending/failed puts its case at the very front, oldest request
+    # first. Correlated scalar subquery: one statement, no N+1.
+    oldest_priority_request = (
+        select(func.min(Document.prioridad_solicitada_at))
+        .where(
+            Document.case_id == Case.id,
+            Document.prioridad_solicitada_at.isnot(None),
+            Document.status.in_(("pending", "failed")),
+        )
+        .correlate(Case)
+        .scalar_subquery()
+    )
+    order_clauses[0:0] = [
+        oldest_priority_request.is_(None).asc(),
+        oldest_priority_request.asc(),
+    ]
 
     base_filter = (case_belongs_to_lawyer(lawyer_id), Case.competencia == competencia)
 

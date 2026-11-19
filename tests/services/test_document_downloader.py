@@ -750,3 +750,63 @@ class TestDocumentDownloadBudget:
 
         assert doc1.status == "failed"
         storage_svc.upload.assert_called_once_with(doc2, b"%PDF second")
+
+
+# ---------------------------------------------------------------------------
+# Priority-requested documents go first (documento-descarga-prioritaria S3)
+# ---------------------------------------------------------------------------
+
+class TestDocumentDownloaderPriorityOrder:
+    @staticmethod
+    def _doc(doc_id, requested_at=None, status="pending"):
+        doc = _make_pending_doc(doc_id)
+        doc.status = status
+        doc.prioridad_solicitada_at = requested_at
+        return doc
+
+    @pytest.mark.asyncio
+    async def test_priority_first_oldest_request_first_then_rest_in_order(self):
+        from datetime import datetime
+        from app.services.document_downloader import DocumentDownloader
+
+        t = datetime(2026, 11, 19, 12, 0)
+        docs = [
+            self._doc(1),
+            self._doc(2, requested_at=t.replace(minute=30)),
+            self._doc(3),
+            self._doc(4, requested_at=t.replace(minute=5)),
+            self._doc(5, requested_at=t.replace(minute=10), status="failed"),
+        ]
+        order = []
+
+        async def _dl(session, endpoint, doc_type, token):
+            return b"%PDF"
+
+        scraper = MagicMock()
+        scraper.download_document_generic = AsyncMock(side_effect=_dl)
+        storage = _make_storage_svc()
+        storage.upload.side_effect = lambda d, b: order.append(d.id)
+
+        await DocumentDownloader().download_and_store(
+            pending_docs=docs, scraper=scraper, pjud_session=MagicMock(),
+            db=MagicMock(), storage_service=storage, limiter=_make_limiter(),
+            enabled=True,
+        )
+        assert order == [4, 5, 2, 1, 3]
+
+    @pytest.mark.asyncio
+    async def test_priority_doc_survives_a_budget_that_stops_early(self):
+        """The loop is budgeted by the caller's slice: the first N of the
+        ordered list are what a budget of N downloads."""
+        from datetime import datetime
+        from app.services.document_downloader import DocumentDownloader, order_priority_first
+
+        docs = [self._doc(1), self._doc(2), self._doc(3, requested_at=datetime(2026, 11, 19))]
+        assert [d.id for d in order_priority_first(docs)][:1] == [3]
+
+    @pytest.mark.asyncio
+    async def test_no_priority_keeps_given_order(self):
+        from app.services.document_downloader import order_priority_first
+
+        docs = [self._doc(3), self._doc(1), self._doc(2)]
+        assert [d.id for d in order_priority_first(docs)] == [3, 1, 2]

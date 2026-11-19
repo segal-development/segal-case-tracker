@@ -8,9 +8,8 @@ Strategy: mock StorageService and scraper — no disk I/O, no network, no Playwr
 """
 import pytest
 from datetime import datetime
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
-from fastapi.testclient import TestClient
 
 from app.api.deps import get_current_lawyer
 from app.main import app
@@ -169,14 +168,6 @@ class TestGetDocumentRedirect:
 # ---------------------------------------------------------------------------
 
 _FAKE_PDF = b"%PDF-1.4 fake pdf content"
-_FAKE_SESSION = MagicMock()
-
-
-def _make_session_store_mock(session=_FAKE_SESSION):
-    store = MagicMock()
-    store.get_session_by_lawyer = AsyncMock(return_value=session)
-    return store
-
 
 class TestDownloadDocumentFromStorage:
     def test_stored_document_served_without_pjud_call(
@@ -188,15 +179,6 @@ class TestDownloadDocumentFromStorage:
                 "app.api.v1.documents.StorageService.retrieve",
                 return_value=_FAKE_PDF,
             ),
-            patch(
-                "app.api.v1.documents.get_session_store"
-            ) as mock_store,
-            patch(
-                "app.api.v1.documents.BrowserFactory"
-            ) as mock_factory,
-            patch(
-                "app.api.v1.documents.CivilScraper"
-            ) as mock_scraper_cls,
         ):
             resp = authed_client.get(
                 f"/api/v1/documents/{stored_document.id}/download"
@@ -205,49 +187,6 @@ class TestDownloadDocumentFromStorage:
         assert resp.status_code == 200
         assert resp.headers["content-type"] == "application/pdf"
         assert resp.content == _FAKE_PDF
-        # PJUD should never have been touched
-        mock_store.assert_not_called()
-        mock_factory.assert_not_called()
-        mock_scraper_cls.assert_not_called()
-
-    def test_pending_document_falls_back_to_pjud(
-        self, authed_client, pending_document
-    ):
-        """A non-stored document falls back to live PJUD download."""
-        store_mock = _make_session_store_mock()
-
-        with (
-            patch(
-                "app.api.v1.documents.get_session_store",
-                return_value=store_mock,
-            ),
-            patch(
-                "app.api.v1.documents.BrowserFactory"
-            ) as mock_factory_cls,
-            patch(
-                "app.api.v1.documents.CivilScraper"
-            ) as mock_scraper_cls,
-        ):
-            mock_factory = MagicMock()
-            mock_factory.__aenter__ = AsyncMock(return_value=mock_factory)
-            mock_factory.__aexit__ = AsyncMock(return_value=False)
-            mock_factory.new_page = AsyncMock(return_value=MagicMock())
-            mock_factory._browser = MagicMock()
-            mock_factory._context = MagicMock()
-            mock_factory_cls.return_value = mock_factory
-
-            mock_scraper = MagicMock()
-            mock_scraper.download_document_generic = AsyncMock(return_value=_FAKE_PDF)
-            mock_scraper_cls.return_value = mock_scraper
-
-            resp = authed_client.get(
-                f"/api/v1/documents/{pending_document.id}/download"
-            )
-
-        assert resp.status_code == 200
-        assert resp.content == _FAKE_PDF
-        # Scraper WAS called for the live fallback
-        mock_scraper.download_document_generic.assert_called_once()
 
 
 class TestDownloadDocumentStorageFailure:
@@ -260,19 +199,12 @@ class TestDownloadDocumentStorageFailure:
                 "app.api.v1.documents.StorageService.retrieve",
                 side_effect=OSError("disk read failed"),
             ),
-            patch("app.api.v1.documents.get_session_store") as mock_store,
-            patch("app.api.v1.documents.BrowserFactory") as mock_factory,
-            patch("app.api.v1.documents.CivilScraper") as mock_scraper_cls,
         ):
             resp = authed_client.get(
                 f"/api/v1/documents/{stored_document.id}/download"
             )
 
         assert resp.status_code == 503
-        # PJUD fallback must NOT have been invoked
-        mock_store.assert_not_called()
-        mock_factory.assert_not_called()
-        mock_scraper_cls.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
