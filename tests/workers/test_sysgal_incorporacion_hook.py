@@ -1,10 +1,21 @@
 """Scheduler hook that runs the Sysgal incorporation between lawyer units."""
 
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from app.workers import sync_scheduler as ss
+
+_CHILE = ZoneInfo("America/Santiago")
+
+
+@pytest.fixture(autouse=True)
+def _outside_restart_window():
+    """Pin the clock to midday Chile so tests never depend on the real time of day."""
+    with patch.object(ss, "_chile_now", return_value=datetime(2026, 6, 15, 12, 0, tzinfo=_CHILE)):
+        yield
 
 
 @pytest.mark.asyncio
@@ -59,6 +70,48 @@ async def test_off_by_default_does_no_egress_lookup_and_no_session():
 
     egress.assert_not_called()
     opener.assert_not_called()
+
+
+# --- Station restart window (03:30-04:30 Chile wall clock): no run, no egress lookup, no PJUD ---
+
+
+async def _run_at(moment):
+    egress = MagicMock(return_value=(True, "9.9.9.9", "allowed"))
+    run = AsyncMock(return_value={"estado": "ok"})
+    fetcher = MagicMock()
+    fetcher.aclose = AsyncMock()
+    opener = MagicMock(return_value=fetcher)
+    with patch.object(ss, "_chile_now", return_value=moment), \
+         patch.object(ss, "egress_allowed", egress), patch.object(ss, "_open_firm_consulta", opener), \
+         patch("app.services.sysgal_incorporacion_pjud.run_incorporacion", run), \
+         patch("app.services.app_settings.get_ritmo", return_value={"por_dia": 5, "por_hora": 5}):
+        await ss._maybe_run_sysgal_incorporacion(MagicMock())
+    return egress, opener, run
+
+
+# winter = UTC-4 (June), summer = UTC-3 (December): the window is wall-clock in both.
+@pytest.mark.asyncio
+@pytest.mark.parametrize("month", [6, 12])
+@pytest.mark.parametrize("hh,mm", [(3, 30), (3, 53), (4, 0), (4, 29)])
+async def test_inside_restart_window_skips_everything(month, hh, mm, caplog):
+    caplog.set_level("INFO", logger=ss.logger.name)
+    egress, opener, run = await _run_at(datetime(2026, month, 15, hh, mm, tzinfo=_CHILE))
+
+    egress.assert_not_called()
+    opener.assert_not_called()
+    run.assert_not_called()
+    msgs = [r.getMessage() for r in caplog.records if "skipped" in r.getMessage()]
+    assert msgs == ["Sysgal incorporacion skipped: ventana de reinicio de la estación 03:30-04:30"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("month", [6, 12])
+@pytest.mark.parametrize("hh,mm", [(3, 29), (4, 30), (12, 0)])
+async def test_outside_restart_window_runs(month, hh, mm):
+    egress, opener, run = await _run_at(datetime(2026, month, 15, hh, mm, tzinfo=_CHILE))
+
+    egress.assert_called_once()
+    run.assert_awaited_once()
 
 
 # --- Firm session = the firm lawyer's own PJUD session (captcha or Clave Única) ---------------
