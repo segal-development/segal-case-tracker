@@ -491,6 +491,12 @@ def _open_firm_consulta(db: Session):
     return _LawyerSessionConsulta(firm, get_session_store(), db)
 
 
+# The Windows station restarts/self-updates daily at 04:00 Chile, closing the Playwright browser
+# mid-run and tripping the incorporation brake. Wall-clock Chile time, [start, end).
+INCORPORACION_VENTANA_REINICIO_INICIO = time(3, 30)
+INCORPORACION_VENTANA_REINICIO_FIN = time(4, 30)
+
+
 async def _maybe_run_sysgal_incorporacion(db: Session) -> None:
     """Consume the Sysgal incorporation queue between lawyer units (SAFE-FAIL, egress-guarded).
 
@@ -503,6 +509,13 @@ async def _maybe_run_sysgal_incorporacion(db: Session) -> None:
 
         if app_settings.get_ritmo(db)["por_dia"] <= 0:
             return  # OFF (default): no egress lookup, no PJUD, nothing
+        if (
+            INCORPORACION_VENTANA_REINICIO_INICIO
+            <= _chile_now().time()
+            < INCORPORACION_VENTANA_REINICIO_FIN
+        ):
+            logger.info("Sysgal incorporacion skipped: ventana de reinicio de la estación 03:30-04:30")
+            return
         allowed, ip, reason = await asyncio.to_thread(egress_allowed)
         if not allowed:
             logger.warning("Sysgal incorporacion skipped: egress %s (ip=%s)", reason, ip or "desconocida")
