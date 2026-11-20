@@ -12,6 +12,7 @@ States:
 
 import asyncio
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -72,6 +73,8 @@ class CircuitBreaker:
     _success_count: int = field(default=0, init=False)
     _last_failure_time: float = field(default=0.0, init=False)
     _half_open_calls: int = field(default=0, init=False)
+    _half_open_since: float = field(default=0.0, init=False)
+    _half_open_generation: int = field(default=0, init=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
     
     @property
@@ -97,11 +100,21 @@ class CircuitBreaker:
     @property
     def time_until_recovery(self) -> int:
         """Seconds until circuit may transition to half-open."""
-        if not self.is_open:
+        if self._state == CircuitState.OPEN:
+            start = self._last_failure_time
+        elif self._state == CircuitState.HALF_OPEN:
+            start = self._half_open_since
+        else:
             return 0
-        elapsed = time.time() - self._last_failure_time
-        remaining = self.config.recovery_timeout - elapsed
-        return max(0, int(remaining))
+        remaining = self.config.recovery_timeout - (time.time() - start)
+        return max(0, math.ceil(remaining))
+
+    def _enter_half_open(self) -> None:
+        self._state = CircuitState.HALF_OPEN
+        self._half_open_calls = 0
+        self._success_count = 0
+        self._half_open_since = time.time()
+        self._half_open_generation += 1
     
     async def _check_state_transition(self) -> None:
         """Check if state should transition based on time."""
@@ -111,9 +124,19 @@ class CircuitBreaker:
                 logger.info(
                     f"Circuit {self.name}: OPEN -> HALF_OPEN after {elapsed:.1f}s"
                 )
-                self._state = CircuitState.HALF_OPEN
-                self._half_open_calls = 0
-                self._success_count = 0
+                self._enter_half_open()
+        elif (
+            self._state == CircuitState.HALF_OPEN
+            and self._half_open_calls >= self.config.half_open_max_calls
+            and time.time() - self._half_open_since >= self.config.recovery_timeout
+        ):
+            # Safety net: probes were admitted but never reported back for a
+            # full recovery window. Treat the window as expired, open a new one.
+            logger.warning(
+                f"Circuit {self.name}: HALF_OPEN slots stuck for "
+                f"{self.config.recovery_timeout}s, granting a new probe window"
+            )
+            self._enter_half_open()
     
     async def call(self, func: Callable, *args, **kwargs) -> Any:
         """Execute function through circuit breaker.
@@ -145,10 +168,13 @@ class CircuitBreaker:
                 if self._half_open_calls >= self.config.half_open_max_calls:
                     raise CircuitOpenError(
                         competencia=self.name,
-                        recovery_time=self.config.recovery_timeout,
+                        recovery_time=self.time_until_recovery,
                     )
                 self._half_open_calls += 1
+            generation = self._half_open_generation
+            probing = self._state == CircuitState.HALF_OPEN
         
+        recorded = False
         try:
             # Execute the function
             if asyncio.iscoroutinefunction(func):
@@ -156,16 +182,37 @@ class CircuitBreaker:
             else:
                 result = func(*args, **kwargs)
             
+            recorded = True
             await self.record_success()
             return result
 
         except Exception as e:
-            if isinstance(e, self.config.ignored_exceptions):
-                # Not a health signal for the protected endpoint — propagate
-                # untouched, neither a failure nor a success.
-                raise
-            await self.record_failure()
+            if isinstance(e, (*self.config.ignored_exceptions, CircuitOpenError)):
+                # Not a health signal for the protected endpoint (or a nested
+                # breaker rejection): neither failure nor success, but the
+                # probe slot must be freed.
+                await self._release_slot(probing, generation)
+            elif not recorded:
+                await self.record_failure()
             raise
+
+        except BaseException:
+            # Cancellation (e.g. a caller's asyncio.wait_for timeout) and
+            # KeyboardInterrupt are not PJUD health signals: never a failure,
+            # but the half-open slot must be freed, even if cancelled again.
+            await asyncio.shield(self._release_slot(probing, generation))
+            raise
+
+    async def _release_slot(self, probing: bool, generation: int) -> None:
+        if not probing:
+            return
+        async with self._lock:
+            if (
+                self._state == CircuitState.HALF_OPEN
+                and self._half_open_generation == generation
+                and self._half_open_calls > 0
+            ):
+                self._half_open_calls -= 1
     
     async def record_success(self) -> None:
         """Record a successful call."""
@@ -197,6 +244,7 @@ class CircuitBreaker:
                 )
                 self._state = CircuitState.OPEN
                 self._half_open_calls = 0
+                self._success_count = 0
                 
             elif self._state == CircuitState.CLOSED:
                 if self._failure_count >= self.config.failure_threshold:
