@@ -50,7 +50,10 @@ _selector_registry: Optional[SelectorRegistry] = None
 
 
 _HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
-_MOVEMENT_DATE = re.compile(r"^\d{2}/\d{2}/\d{4}$")
+# A date cell is dd/mm/yyyy, optionally followed by the diligence date in
+# parentheses (receptor actuations: "27/05/2025 (20/05/2025)"). Group 1 is the
+# movement date; the parenthesised one is ignored.
+_MOVEMENT_DATE = re.compile(r"^(\d{2}/\d{2}/\d{4})(?:\s*\(\d{2}/\d{2}/\d{4}\))?$")
 # Columns before Description: Folio, Doc, Anexo, Etapa, Trámite.
 _FIRST_DESCRIPTION_CELL = 5
 
@@ -79,6 +82,8 @@ def locate_movement_columns(cleaned_cells: List[str]) -> Tuple[str, str, Optiona
         ),
         None,
     )
+    if date_idx is not None:
+        fecha = _MOVEMENT_DATE.match(cleaned_cells[date_idx]).group(1)
     if date_idx is None:
         # Diagnostic: such rows are later skipped as corrupted (fecha=''); log the raw cells
         # (each cut to 40 chars) so the real layout of the cuaderno can be seen.
@@ -88,7 +93,7 @@ def locate_movement_columns(cleaned_cells: List[str]) -> Tuple[str, str, Optiona
             [c[:40] for c in cleaned_cells[:12]],
         )
         return cell(_FIRST_DESCRIPTION_CELL) or "", "", cell(_FIRST_DESCRIPTION_CELL + 2)
-    return cell(date_idx - 1) or "", cleaned_cells[date_idx], cell(date_idx + 1)
+    return cell(date_idx - 1) or "", fecha, cell(date_idx + 1)
 
 
 def get_selector_registry() -> SelectorRegistry:
