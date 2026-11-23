@@ -33,3 +33,11 @@ Backend: /Users/marcelo/Projects/segal-case-tracker, branch feat/estacion-reinic
 ## Log
 - L1. Marcelo, 23-11-2026: "Pero no puedes reiniciar tu ?" / "Si hacelo".
 - L2. Parent decision: soft reset first, because the station launcher is not in the repo and whether the task restarts an exited process is unknown.
+- L3. Implementation findings, from the worker and an independent verifier (both PASS, no blockers):
+  - Two breaker registries are reset: `integration._circuit_breakers` and `circuit_breaker._circuit_breakers`, the latter holding `pjud-detail`. Both limiter registries are reset too.
+  - The SessionStore singleton is dropped, and Redis sessions are kept so the login pace is unchanged.
+  - Station marker: `PJUD_SCRAPING_ENABLED`.
+  - Spec deviations (accepted):
+    - (a) No browser-close step. The scheduler holds no long-lived browser between units; browsers are per unit and closed in their own finally.
+    - (b) The existing activity audit records only the POST, not the GET.
+  - A reset can allow at most one already-configured burst (up to 3 logins, 3 lists, 2 details, 1 document) if the buckets were drained.
