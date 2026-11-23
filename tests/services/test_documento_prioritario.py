@@ -1,6 +1,9 @@
 """Priority document requests in the station's case rotation and doc cap."""
 from datetime import datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from app.models.case import Case
 from app.models.court import Court
@@ -116,3 +119,128 @@ class TestCapPriority:
         )
         assert [d.id for d in kept][:2] == [2, 1]
         assert 3 not in {d.id for d in kept}
+
+
+# ---------------------------------------------------------------------------
+# Year floor (DOC_DOWNLOAD_MIN_YEAR) must not block a requested document
+# ---------------------------------------------------------------------------
+
+_DL = "app.services.document_downloader.DocumentDownloader.download_and_store"
+
+
+def _floor_setup(db, rol, requested_flags, rut="00000099-9"):
+    """Case ``rol`` with one pending old doc per flag (True = user requested it)."""
+    lawyer, court = _setup(db, rut)
+    court.pjud_corte = 1  # sync_via_consulta skips courts without it
+    case = _case(db, lawyer, court, rol)
+    now = datetime.utcnow()
+    docs = []
+    for i, requested in enumerate(requested_flags):
+        d = Document(
+            case_id=case.id, doc_type="resolution", status="pending",
+            pjud_token=f"t{i}", pjud_token_hash=f"floor-{rol}-{i}",
+            document_date=now - timedelta(days=700 + i),
+            prioridad_solicitada_at=(now - timedelta(days=4)) if requested else None,
+        )
+        db.add(d)
+        docs.append(d)
+    db.commit()
+    return lawyer, case, docs
+
+
+async def _run_detect(db, lawyer, rol, docs):
+    from app.services import sync_service
+    from app.services.sync_service import detect_and_sync_movements
+
+    detail = MagicMock()
+    detail.case_documents = []
+    detail.movements = []
+    detail.litigantes = []
+    detail.notificaciones = []
+    detail.escritos = []
+    detail.exhortos = []
+    detail.case = MagicMock()
+    detail.case.rol = rol
+    api_case = MagicMock()
+    api_case.rol = rol
+    api_case.case_token = "tok"
+    scraper = MagicMock()
+    scraper.get_case_detail = AsyncMock(return_value=detail)
+    with patch.object(sync_service.settings, "DOC_DOWNLOAD_ENABLED", True), \
+         patch.object(sync_service.settings, "DOC_DOWNLOAD_MIN_YEAR", 2024), \
+         patch.object(sync_service.settings, "DOC_MAX_PER_CASE", 0), \
+         patch.object(sync_service.settings, "DOC_HISTORICAL_ENABLED", True), \
+         patch.object(sync_service.DocumentPersistenceService,
+                      "persist_from_detail", return_value=docs), \
+         patch(_DL, new_callable=AsyncMock) as dl:
+        await detect_and_sync_movements(
+            db=db, scraper=scraper, pjud_session=MagicMock(),
+            lawyer_id=lawyer.id, api_cases=[api_case], selected_cases=[api_case],
+        )
+    return dl.await_args.kwargs["pending_docs"] if dl.await_args_list else None
+
+
+async def _run_consulta(db, lawyer, case, docs):
+    from app.services import sync_service
+    from app.services.sync_service import sync_via_consulta
+
+    detail = MagicMock()
+    detail.movements = []
+    detail.litigantes = []
+    detail.notificaciones = []
+    detail.escritos = []
+    detail.exhortos = []
+    scraper = MagicMock()
+    scraper.consulta_by_rol = AsyncMock(return_value=detail)
+    with patch.object(sync_service.settings, "DOC_DOWNLOAD_ENABLED", True), \
+         patch.object(sync_service.settings, "DOC_DOWNLOAD_MIN_YEAR", 2024), \
+         patch.object(sync_service.DocumentPersistenceService,
+                      "persist_from_detail", return_value=docs), \
+         patch("app.services.sync_service._maybe_recompute_deadlines"), \
+         patch(_DL, new_callable=AsyncMock) as dl:
+        await sync_via_consulta(db, lawyer, scraper, MagicMock(), [case])
+    return dl.await_args.kwargs["pending_docs"] if dl.await_args_list else None
+
+
+@pytest.mark.asyncio
+class TestYearFloorDetect:
+    async def test_old_rol_requested_doc_is_downloaded(self, db):
+        lawyer, case, docs = _floor_setup(db, "C-10371-2023", [True])
+        sent = await _run_detect(db, lawyer, case.rol, docs)
+        assert sent == [docs[0]]
+
+    async def test_old_rol_without_request_is_not_downloaded(self, db):
+        lawyer, case, docs = _floor_setup(db, "C-10371-2023", [False, False])
+        assert await _run_detect(db, lawyer, case.rol, docs) is None
+
+    async def test_old_rol_only_the_requested_doc_among_old_ones(self, db):
+        lawyer, case, docs = _floor_setup(db, "C-10371-2023", [False, True, False])
+        sent = await _run_detect(db, lawyer, case.rol, docs)
+        assert sent == [docs[1]]
+
+    async def test_recent_rol_downloads_everything_pending(self, db):
+        lawyer, case, docs = _floor_setup(db, "C-10371-2025", [False, True, False])
+        sent = await _run_detect(db, lawyer, case.rol, docs)
+        assert sent is not None and {d.id for d in sent} == {d.id for d in docs}
+
+
+@pytest.mark.asyncio
+class TestYearFloorConsulta:
+    async def test_old_rol_requested_doc_is_downloaded(self, db):
+        lawyer, case, docs = _floor_setup(db, "C-10371-2023", [True], "00000098-8")
+        assert await _run_consulta(db, lawyer, case, docs) == [docs[0]]
+
+    async def test_old_rol_without_request_is_not_downloaded(self, db):
+        lawyer, case, docs = _floor_setup(db, "C-10371-2023", [False], "00000097-7")
+        assert await _run_consulta(db, lawyer, case, docs) is None
+
+    async def test_old_rol_only_the_requested_doc_among_old_ones(self, db):
+        lawyer, case, docs = _floor_setup(
+            db, "C-10371-2023", [False, True, False], "00000096-6")
+        assert await _run_consulta(db, lawyer, case, docs) == [docs[1]]
+
+    async def test_recent_rol_downloads_everything_pending(self, db):
+        lawyer, case, docs = _floor_setup(
+            db, "C-10371-2025", [False, True, False], "00000095-5")
+        sent = await _run_consulta(db, lawyer, case, docs)
+        assert sent is not None and {d.id for d in sent} == {d.id for d in docs}

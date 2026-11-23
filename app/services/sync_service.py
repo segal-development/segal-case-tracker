@@ -337,6 +337,20 @@ def doc_download_year_ok(rol: str) -> bool:
     return _rol_year_at_least(rol, settings.DOC_DOWNLOAD_MIN_YEAR)
 
 
+def _docs_to_download(rol: str, persisted_docs: list) -> list:
+    """Persisted documents the station should try to download for ``rol``.
+
+    Year floor (``DOC_DOWNLOAD_MIN_YEAR``): for ROLs below it only the documents
+    a user explicitly asked to open (``prioridad_solicitada_at``) are kept; every
+    other old document stays in PJUD exactly as before. At/above the floor all
+    ``pending``/``failed`` documents are returned.
+    """
+    pending = [d for d in persisted_docs if d.status in ("pending", "failed")]
+    if doc_download_year_ok(rol):
+        return pending
+    return [d for d in pending if getattr(d, "prioridad_solicitada_at", None) is not None]
+
+
 def _cap_historical_documents(
     pending_docs: list,
     *,
@@ -3444,18 +3458,20 @@ async def detect_and_sync_movements(
             # freshly-parsed JWT tokens are still valid (1-hour expiry window).
             # Year floor: only download docs for recent cases (DOC_DOWNLOAD_MIN_YEAR);
             # older cases are still detailed, their docs just stay in PJUD.
-            if settings.DOC_DOWNLOAD_ENABLED and persisted_docs and doc_download_year_ok(db_case.rol):
+            pending_docs = (
+                _docs_to_download(db_case.rol, persisted_docs)
+                if settings.DOC_DOWNLOAD_ENABLED and persisted_docs
+                else []
+            )
+            if pending_docs:
                 from app.services.document_downloader import (
                     DocumentDownloader,
                     AsyncSleepLimiter,
                 )
                 from app.services.storage_service import StorageService, get_storage_backend
 
-                # Include "failed" docs so transient download failures are retried
-                # on the next scheduled run.
-                pending_docs = [
-                    d for d in persisted_docs if d.status in ("pending", "failed")
-                ]
+                # "failed" docs are included so transient download failures are
+                # retried on the next scheduled run.
                 pending_docs = _cap_historical_documents(
                     pending_docs,
                     recent_days=settings.DOC_RECENT_DAYS,
@@ -4039,7 +4055,12 @@ async def sync_via_consulta(
                 db.commit()
 
                 # Year floor: only recent cases' docs are downloaded (DOC_DOWNLOAD_MIN_YEAR).
-                if settings.DOC_DOWNLOAD_ENABLED and persisted_docs and doc_download_year_ok(case.rol):
+                pending_docs = (
+                    _docs_to_download(case.rol, persisted_docs)
+                    if settings.DOC_DOWNLOAD_ENABLED and persisted_docs
+                    else []
+                )
+                if pending_docs:
                     from app.services.document_downloader import (
                         DocumentDownloader,
                         AsyncSleepLimiter,
@@ -4048,20 +4069,16 @@ async def sync_via_consulta(
                         StorageService,
                         get_storage_backend,
                     )
-                    pending_docs = [
-                        d for d in persisted_docs if d.status in ("pending", "failed")
-                    ]
-                    if pending_docs:
-                        storage_svc = StorageService(get_storage_backend(settings))
-                        await DocumentDownloader().download_and_store(
-                            pending_docs=pending_docs,
-                            scraper=scraper,
-                            pjud_session=session,
-                            db=db,
-                            storage_service=storage_svc,
-                            limiter=AsyncSleepLimiter(delay=settings.DOCUMENT_INTER_DELAY),
-                            enabled=True,
-                        )
+                    storage_svc = StorageService(get_storage_backend(settings))
+                    await DocumentDownloader().download_and_store(
+                        pending_docs=pending_docs,
+                        scraper=scraper,
+                        pjud_session=session,
+                        db=db,
+                        storage_service=storage_svc,
+                        limiter=AsyncSleepLimiter(delay=settings.DOCUMENT_INTER_DELAY),
+                        enabled=True,
+                    )
             else:
                 logger.info(
                     "sync_via_consulta [dry_run]: case_id=%s rol=%s → %d movements "
