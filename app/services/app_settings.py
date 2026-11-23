@@ -28,6 +28,11 @@ DEFAULT_SYSGAL_DUENIO = 0
 KEY_SYSGAL_BLOQUEO_POR_MORA = "sysgal_bloqueo_por_mora_activo"
 DEFAULT_SYSGAL_BLOQUEO_POR_MORA = 0
 
+#: Remote soft reset of the scraping station (epoch seconds; pending when solicitado > hecho).
+#: Read/written through app/services/estacion_reinicio.py.
+KEY_REINICIO_SOLICITADO = "estacion_reinicio_solicitado_at"
+KEY_REINICIO_HECHO = "estacion_reinicio_hecho_at"
+
 DEFAULT_POR_DIA = 0  # 0 = OFF
 DEFAULT_POR_HORA = 10
 

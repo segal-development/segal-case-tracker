@@ -13,6 +13,7 @@ Usage:
 
 import asyncio
 import logging
+import time as _time
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 from typing import Optional
@@ -64,6 +65,10 @@ logger = logging.getLogger("sync_scheduler")
 
 # Scheduler instance
 _scheduler: Optional[AsyncIOScheduler] = None
+
+# When THIS process started: a remote soft-reset request older than this is already
+# satisfied by the fresh process (see app/services/estacion_reinicio.py).
+_PROCESS_STARTED_AT: datetime = datetime.fromtimestamp(_time.time()).astimezone()
 
 # (started_at, ended_at) of the previous cycle run by THIS process, so the next
 # cycle can log the gap. None until the first cycle ends (it is per process: a
@@ -532,6 +537,22 @@ async def _maybe_run_sysgal_incorporacion(db: Session) -> None:
     finally:
         if firm is not None:
             await firm.aclose()
+
+
+async def _maybe_reiniciar_estacion(db: Session) -> None:
+    """Apply a pending admin "soft reset" request (SAFE-FAIL; station process only).
+
+    Called only between lawyer units / at cycle start, never inside a unit. The VM worker
+    (PJUD_SCRAPING_ENABLED=false) never acts on it.
+    """
+    if not settings.PJUD_SCRAPING_ENABLED:
+        return
+    try:
+        from app.services import estacion_reinicio
+
+        await estacion_reinicio.aplicar_si_pendiente(db, _PROCESS_STARTED_AT, _wall_now())
+    except Exception:
+        logger.exception("Estacion reinicio hook failed (non-fatal)")
 
 
 # Max age before considering data stale (in hours)
@@ -1403,6 +1424,9 @@ async def _run_sync_cycle(timer: CycleTimer):
         # Only lawyer IDs are needed downstream — sync_lawyer_cases re-resolves the
         # Lawyer row from whatever session it is handed. Ordered by staleness so
         # a cycle interrupted by a worker restart resumes with whoever waited most.
+        # Remote soft reset at cycle start: nothing is mid-case here.
+        await _maybe_reiniciar_estacion(setup_db)
+
         lawyer_ids = _active_lawyer_ids_by_staleness(setup_db)
         logger.info("Sync order (oldest successful sync first): %s", lawyer_ids)
     finally:
@@ -1522,6 +1546,8 @@ async def _run_sync_cycle(timer: CycleTimer):
             finally:
                 # Sysgal incorporation: after the unit's batch ended, never inside it.
                 await _maybe_run_sysgal_incorporacion(work_db)
+                # Remote soft reset: the unit's batch is over (also on `continue`), never mid-case.
+                await _maybe_reiniciar_estacion(work_db)
                 work_db.close()
 
             if len(consecutive_rejections) >= reject_trip:

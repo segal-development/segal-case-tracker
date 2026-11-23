@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.deps import get_db
+from app.api.deps import get_db, procurador_gate
 from app.api.v1.router import api_router
 from app.api.sysgal.causas import router as sysgal_causas_router
 from app.api.sysgal.plazos import router as sysgal_plazos_router
@@ -16,6 +16,7 @@ from app.api.sysgal.patrocinio import router as sysgal_patrocinio_router
 from app.api.redaccion.buscar import router as redaccion_buscar_router
 from app.api.redaccion.detalle import router as redaccion_detalle_router
 from app.api.presentacion.presentaciones import router as presentacion_router
+from app.api.v1.admin import router as admin_router
 from app.config import settings
 from app.middleware.activity_audit import ActivityAuditMiddleware
 
@@ -60,6 +61,8 @@ app.add_middleware(ActivityAuditMiddleware)
 
 # Routes
 app.include_router(api_router, prefix="/api/v1")
+# Admin-only operational endpoints (require_admin on each route).
+app.include_router(admin_router, prefix="/api/v1/admin", tags=["admin"], dependencies=[Depends(procurador_gate)])
 
 # External read-only API for the Sysgal CRM. Mounted SEPARATELY (own prefix,
 # own auth) so it is fully isolated from the internal /api/v1 app.
