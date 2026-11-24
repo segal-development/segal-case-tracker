@@ -183,6 +183,26 @@ def classify_login_failure(page_content: str) -> tuple:
     return False, ""
 
 
+def _record_shape_rejection(action: str) -> None:
+    """Measurement only: count a Shape/TSPD block. Never raises."""
+    try:
+        from app.services import pjud_metrics
+
+        pjud_metrics.record_rejection(pjud_metrics.KIND_SHAPE, action)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _counted_shape(action: str, exc: "ShapeChallengeError") -> "ShapeChallengeError":
+    """Count a Shape block once and mark *exc* so later catchers do not recount."""
+    _record_shape_rejection(action)
+    try:
+        exc._pjud_counted = True  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        pass
+    return exc
+
+
 def detect_shape_challenge(page_content: str | None, url: str = "") -> tuple[bool, str]:
     """Detect PJUD Shape/TSPD challenge pages using conservative markers."""
     url_text = url or ""
@@ -957,12 +977,12 @@ class PJUDBaseScraper(ABC):
                 content = ""
             is_shape, marker = detect_shape_challenge(content, page.url)
             if is_shape:
-                raise ShapeChallengeError(
+                raise _counted_shape("login", ShapeChallengeError(
                     url=page.url,
                     jquery_present=False,
                     looks_like_login=True,
                     marker=marker,
-                ) from None
+                )) from None
             raise
 
     async def login_with_token(
@@ -1266,12 +1286,12 @@ class PJUDBaseScraper(ABC):
             f"content_len={diag.content_len}, nav_error={nav_error_text[:120]!r}"
         )
         if diag.is_shape_challenge:
-            raise ShapeChallengeError(
+            raise _counted_shape("list", ShapeChallengeError(
                 url=diag.url,
                 jquery_present=diag.jquery_present,
                 looks_like_login=diag.looks_like_login,
                 marker=diag.shape_marker,
-            )
+            ))
         verdict = classify_missing_miscausas(diag.url, diag.content_len, nav_error_text)
         if verdict == "transient":
             reason = nav_error_text.strip() or (
@@ -1611,9 +1631,9 @@ class PJUDBaseScraper(ABC):
             snippet,
         )
         if is_shape:
-            raise ShapeChallengeError(
+            raise _counted_shape("detail", ShapeChallengeError(
                 url=url, jquery_present=False, looks_like_login=False, marker=marker
-            )
+            ))
         if verdict == "session":
             raise SessionExpiredError(
                 f"Sesión PJUD vencida durante el detalle (modal de {size} caracteres)"

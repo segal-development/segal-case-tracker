@@ -332,6 +332,16 @@ def _maybe_sync_sysgal_cuotas(db: Session) -> None:
 _last_avance_snapshot_day: Optional[date] = None
 
 
+def _flush_pjud_metrics(db: Session) -> None:
+    """Flush the PJUD request counters (measurement only; never raises)."""
+    try:
+        from app.services import pjud_metrics
+
+        pjud_metrics.flush(db)
+    except Exception:  # noqa: BLE001
+        logger.warning("PJUD metrics flush failed (non-fatal)")
+
+
 def _maybe_take_avance_snapshot(db: Session) -> None:
     """On day 1 (Chile, after 01:00) to day 5 freeze the previous month's Sysgal cartera stats.
 
@@ -859,6 +869,12 @@ async def _reauth(
             _audit_validation(lawyer, "clave_unica", ok=False, detail="login_page")
             return None, f"reauth_failed: {exc}"
         except Exception as exc:
+            if isinstance(exc, ShapeChallengeError) and not getattr(
+                exc, "_pjud_counted", False
+            ):
+                from app.services import pjud_metrics
+
+                pjud_metrics.record_rejection(pjud_metrics.KIND_SHAPE, "login")
             logger.error("Re-auth (clave_unica) failed for lawyer %d: %s", lawyer.id, exc)
             return None, f"reauth_failed: {exc}"
 
@@ -1293,6 +1309,9 @@ async def sync_lawyer_cases(
             and not isinstance(e, ShapeChallengeError)
         ):
             failure[AUTH_REJECTED_KEY] = True
+            from app.services import pjud_metrics
+
+            pjud_metrics.record_rejection(pjud_metrics.KIND_SESSION_BLOCKED, "login")
         return failure
 
     finally:
@@ -1342,6 +1361,28 @@ async def sync_all_lawyers():
         ended = _wall_now()
         _previous_cycle = (started, ended)
         _log_cycle_summary(timer, ended)
+
+
+#: Separate handle on the session factory so the metrics flush never consumes
+#: sessions meant for the work units (and tests can swap it independently).
+_metrics_session_factory = SessionLocal
+
+
+def _flush_unit_metrics() -> None:
+    """Flush on its own short-lived session: never commit/rollback a unit's work_db."""
+    try:
+        db = _metrics_session_factory()
+    except Exception:  # noqa: BLE001
+        logger.warning("PJUD metrics cycle-end flush failed (non-fatal)")
+        return
+    try:
+        _flush_pjud_metrics(db)
+    finally:
+        db.close()
+
+
+def _flush_cycle_end_metrics() -> None:
+    _flush_unit_metrics()
 
 
 async def _run_sync_cycle(timer: CycleTimer):
@@ -1504,6 +1545,8 @@ async def _run_sync_cycle(timer: CycleTimer):
             # the next iteration opens a clean connection instead of the
             # whole cycle failing on a shared, poisoned session.
             work_db = SessionLocal()
+            from app.services import pjud_metrics as _pm
+            _pm_token = _pm.set_lawyer(lawyer_id)
             try:
                 # Check if sync is needed
                 sync_service = SyncService(work_db)
@@ -1544,6 +1587,9 @@ async def _run_sync_cycle(timer: CycleTimer):
                 )
                 results["failed"] += 1
             finally:
+                # PJUD footprint counters: flush at every lawyer-unit boundary.
+                _flush_unit_metrics()
+                _pm.reset_lawyer(_pm_token)
                 # Sysgal incorporation: after the unit's batch ended, never inside it.
                 await _maybe_run_sysgal_incorporacion(work_db)
                 # Remote soft reset: the unit's batch is over (also on `continue`), never mid-case.
@@ -1573,6 +1619,7 @@ async def _run_sync_cycle(timer: CycleTimer):
             with timed("waits"):
                 await asyncio.sleep(2)
 
+    _flush_cycle_end_metrics()
     logger.info("=" * 60)
     logger.info(f"Sync complete: {results}")
     logger.info("=" * 60)

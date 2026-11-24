@@ -209,6 +209,10 @@ class CivilScraper(PJUDBaseScraper):
                 }});
             }}
         """)
+        if isinstance(result, str) and result.startswith("ERROR:"):
+            from app.services import pjud_metrics
+
+            pjud_metrics.record_http_status(result[len("ERROR:"):], "list")
         return result
     
     def _parse_cases_html(self, html: str) -> List[PJUDCase]:
@@ -958,6 +962,9 @@ class CivilScraper(PJUDBaseScraper):
         """)
         
         if 'error' in result:
+            from app.services import pjud_metrics
+
+            pjud_metrics.record_http_status(result['error'], "document")
             raise ScrapingError(f"Download failed with status {result['error']}")
         
         pdf_bytes = bytes(result['data'])
