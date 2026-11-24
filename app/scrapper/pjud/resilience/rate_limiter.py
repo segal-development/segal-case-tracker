@@ -74,6 +74,16 @@ class TokenBucketLimiter:
         self._tokens = min(self.config.burst, self._tokens + new_tokens)
         self._last_refill = now
     
+    def _count_pjud_request(self) -> None:
+        """Measurement only: count a granted ``pjud:<action>`` token. Never raises."""
+        try:
+            if self.name.startswith("pjud:"):
+                from app.services import pjud_metrics
+
+                pjud_metrics.record_request(self.name[len("pjud:"):])
+        except Exception:  # noqa: BLE001
+            pass
+
     async def acquire(self, timeout: Optional[float] = None) -> bool:
         """Acquire a token, waiting if necessary.
         
@@ -97,6 +107,7 @@ class TokenBucketLimiter:
                 
                 if self._tokens >= 1.0:
                     self._tokens -= 1.0
+                    self._count_pjud_request()
                     return True
                 
                 # Calculate wait time for one token

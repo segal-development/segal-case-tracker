@@ -52,6 +52,7 @@ from app.models.matriz_pjud_mapeo import MatrizPjudMapeo
 from app.models.cartera_snapshot import CarteraSnapshot, CarteraSnapshotRun
 from app.models.case_assignment_history import CaseAssignmentHistory
 from app.models.procurador import ProcuradorAbogado
+from app.models.pjud_request_count import PjudRequestCount
 
 __all__ = [
     "Lawyer",
@@ -104,4 +105,5 @@ __all__ = [
     "CarteraSnapshotRun",
     "CaseAssignmentHistory",
     "ProcuradorAbogado",
+    "PjudRequestCount",
 ]

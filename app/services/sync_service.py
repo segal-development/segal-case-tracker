@@ -3004,6 +3004,17 @@ def _maybe_classify_matriz(
     case.matriz_computed_at = datetime.utcnow()
 
 
+def _count_connection_reset(exc: BaseException) -> None:
+    """Measurement only: count a ``net::ERR_CONNECTION_RESET``. Never raises."""
+    try:
+        if "ERR_CONNECTION_RESET" in str(exc):
+            from app.services import pjud_metrics
+
+            pjud_metrics.record_rejection(pjud_metrics.KIND_CONNECTION_RESET, "detail")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _is_transient_navigation_error(exc: BaseException) -> bool:
     """True when *exc* means the page did not load (retry, never re-auth).
 
@@ -3508,6 +3519,7 @@ async def detect_and_sync_movements(
                 except Exception as exc:
                     if not _is_transient_navigation_error(exc):
                         raise
+                    _count_connection_reset(exc)
                     # Partial rows from the aborted attempt must not leak into
                     # the retry's commit; the live page may also be poisoned.
                     try:
