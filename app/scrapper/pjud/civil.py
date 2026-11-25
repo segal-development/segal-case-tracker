@@ -25,7 +25,12 @@ from app.scrapper.pjud.base import (
     CompetencyConfig,
     PJUD_BASE_URL,
 )
-from app.scrapper.pjud.exceptions import ConsultaSessionExpired, DocumentTokenExpiredError, ScrapingError
+from app.scrapper.pjud.exceptions import (
+    ConsultaSessionExpired,
+    DetailEmptyError,
+    DocumentTokenExpiredError,
+    ScrapingError,
+)
 from app.scrapper.pjud.selectors import SelectorRegistry
 from app.services.pjud_session import PJUDSession
 
@@ -1211,7 +1216,6 @@ async () => {
         searches all tribunals of that corte (avoids needing the exact tribunal).
         """
         from datetime import datetime
-        from app.scrapper.pjud.base import PJUD_INDEX_URL
 
         if "-" in rol:
             parts = rol.split("-")
@@ -1222,12 +1226,38 @@ async () => {
             tipo_causa, numero, anio = "C", rol, str(datetime.now().year)
 
         page = await self._get_page(session)
-        if "indexN.php" not in (page.url or ""):
+        for attempt in (1, 2):
+            fetched = await self._consulta_fetch_modal(page, rol, corte, tribunal, tipo_causa, numero, anio)
+            if fetched is None:
+                return None
+            jwt, detail_html = fetched
+            try:
+                detail = self._parse_case_detail_html(detail_html, jwt)
+            except ValueError:
+                # An empty modal (no ROL at all) is a transient page problem, not bad data.
+                if re.search(r"<strong>ROL:</strong>\s*[^<\s]", detail_html, re.IGNORECASE):
+                    raise
+                if attempt == 1:
+                    logger.warning(f"consulta_by_rol {rol}: detail without ROL, reloading and retrying once")
+                    self._consulta_needs_reload = True
+                    continue
+                raise DetailEmptyError(f"consulta_by_rol {rol}: detail modal has no ROL after retry")
+            await self._load_other_cuadernos(page, detail)
+            return detail
+
+    async def _consulta_fetch_modal(self, page, rol, corte, tribunal, tipo_causa, numero, anio):
+        """Run search + open detail for one ROL on a clean page; (jwt, modal html) or None."""
+        from app.scrapper.pjud.base import PJUD_INDEX_URL
+
+        if getattr(self, "_consulta_needs_reload", False) or "indexN.php" not in (page.url or ""):
             await page.goto(PJUD_INDEX_URL, wait_until="domcontentloaded")
+            self._consulta_needs_reload = False
             await asyncio.sleep(1)
-        # Load the consulta form so detalleCausaCivil() is defined.
+        # Load the consulta form so detalleCausaCivil() is defined, and empty any modal
+        # left over from the previous consulta so stale content can never be read.
         await page.evaluate(
-            "() => { if (typeof consultaUnificada === 'function') consultaUnificada(); }"
+            "() => { const m = document.querySelector('#modalDetalleCivil'); if (m) m.innerHTML = '';"
+            " if (typeof consultaUnificada === 'function') consultaUnificada(); }"
         )
         await asyncio.sleep(3)
 
@@ -1278,9 +1308,7 @@ async () => {
         if not detail_html:
             logger.warning(f"consulta_by_rol {rol}: detail modal empty")
             return None
-        detail = self._parse_case_detail_html(detail_html, jwt)
-        await self._load_other_cuadernos(page, detail)
-        return detail
+        return jwt, detail_html
 
     async def _load_other_cuadernos(self, page, detail) -> None:
         """Accumulate movements from the NON-default cuadernos (e.g. Apremio).
@@ -1320,6 +1348,15 @@ async () => {
                 logger.warning(
                     f"cuaderno load failed: {type(e).__name__}: {str(e)[:120]}"
                 )
+                # The modal may be half-loaded: restore a clean page for the next consulta.
+                self._consulta_needs_reload = True
+                try:
+                    from app.scrapper.pjud.base import PJUD_INDEX_URL
+                    await page.goto(PJUD_INDEX_URL, wait_until="domcontentloaded")
+                    self._consulta_needs_reload = False
+                except Exception:
+                    pass
+                return
 
     def _parse_search_results_html(self, html: str) -> List[PJUDCase]:
         """Parse search results from Consulta Unificada."""
