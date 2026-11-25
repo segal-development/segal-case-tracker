@@ -69,6 +69,10 @@ class ScrapingError(PJUDError):
     pass
 
 
+class DetailEmptyError(ScrapingError):
+    """The consulta detail modal came back without a ROL, even after a page reload."""
+
+
 class PartialListingError(ScrapingError):
     """Raised when the list pagination dies AFTER some pages were fetched.
 

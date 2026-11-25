@@ -24,7 +24,12 @@ from app.models.sysgal_causa import SysgalCausa
 from app.models.sysgal_incorporacion import SysgalIncorporacion
 from app.models.sysgal_usuario import SysgalUsuario
 from app.models.webhook import Webhook
-from app.scrapper.pjud.exceptions import ConsultaSessionExpired, InvalidCredentialsError, LoginPageError
+from app.scrapper.pjud.exceptions import (
+    ConsultaSessionExpired,
+    DetailEmptyError,
+    InvalidCredentialsError,
+    LoginPageError,
+)
 from app.services import app_settings
 from app.services.document_persistence import DocumentPersistenceService
 from app.services.matriz_classifier import MatrizMappingCache
@@ -61,6 +66,7 @@ SIN_ABOGADO = "abogado sin relacionar"
 KIND_SESSION = "sesión de PJUD expirada"
 KIND_EMPTY = "detalle vacío"
 KIND_HTTP = "error HTTP de PJUD"
+KIND_NO_ROL = "detalle sin ROL"
 KIND_OTHER = "error inesperado"
 KIND_LOGIN = "login rechazado por PJUD"
 
@@ -96,6 +102,8 @@ def _classify(exc: Exception) -> str:
         return KIND_LOGIN
     if isinstance(exc, ConsultaSessionExpired):
         return KIND_SESSION
+    if isinstance(exc, DetailEmptyError):
+        return KIND_NO_ROL
     if isinstance(exc, httpx.HTTPError):
         return KIND_HTTP
     return KIND_OTHER

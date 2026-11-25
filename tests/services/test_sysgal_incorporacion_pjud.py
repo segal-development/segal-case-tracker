@@ -15,7 +15,11 @@ from app.models.sysgal_causa import SysgalCausa
 from app.models.sysgal_incorporacion import SysgalIncorporacion
 from app.models.sysgal_usuario import SysgalUsuario
 from app.scrapper.pjud.base import PJUDCase, PJUDCaseDetail, PJUDMovement
-from app.scrapper.pjud.exceptions import ConsultaSessionExpired, InvalidCredentialsError
+from app.scrapper.pjud.exceptions import (
+    ConsultaSessionExpired,
+    DetailEmptyError,
+    InvalidCredentialsError,
+)
 from app.services import app_settings
 from app.services.sysgal_incorporacion_pjud import run_incorporacion
 
@@ -518,3 +522,20 @@ async def test_classified_kinds_keep_their_stored_text(db, court, lawyer):
 
     db.refresh(row)
     assert row.ultimo_error == "sesión de PJUD expirada"
+
+
+@pytest.mark.asyncio
+async def test_detail_without_rol_is_a_named_kind_in_error_and_brake_message(db, court, lawyer):
+    _ritmo(db, dia=100, hora=100)
+    rows = [_item(db, court, n)[1] for n in range(1, 6)]
+    db.commit()
+    fetch = Fake(DetailEmptyError("no rol"))
+
+    stats, notify = await _run(db, fetch)
+
+    assert len(fetch.calls) == 3  # brake rule unchanged: 3 consecutive same kind
+    assert stats["frenada"] is True
+    notify.assert_called_once_with(
+        "Incorporación desde Sysgal detenida: detalle sin ROL. Se reintenta mañana.")
+    errores = {r.ultimo_error for r in rows if (db.refresh(r) or True) and r.ultimo_error}
+    assert errores == {"detalle sin ROL"}
