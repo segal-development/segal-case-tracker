@@ -324,6 +324,15 @@ class Settings(BaseSettings):
     #: el dia anterior, porque la causa no se releia hace 18 horas. Ese dia
     #: habia 14 plazos fatales venciendo en <=1 dia sin relectura.
     DETAIL_FATAL_PLAZO_DAYS: int = 2
+    # Causas prioritarias (S5): a causa a lawyer marked as priority (a
+    # ``case_priority`` row, any lawyer) goes right after the fatal-plazo slot
+    # when it was never read or last read more than MIN_HOURS ago. At most
+    # MAX_PER_BATCH slots per batch (scaled like DETAIL_FEED_MAX_PER_BATCH when
+    # the caller's batch differs from DETAIL_BATCH_SIZE), so the age rotation
+    # keeps its floor. The mark never overrides poda_at or DETAIL_MIN_YEAR.
+    DETAIL_PRIORITY_ENABLED: bool = True
+    DETAIL_PRIORITY_MIN_HOURS: int = Field(default=4, ge=0)
+    DETAIL_PRIORITY_MAX_PER_BATCH: int = Field(default=10, ge=0)
     DETAIL_MIN_YEAR: int = 2021    # Only detail-scrape cases with ROL year >= this (0 = all)
     DETAIL_PENDING_DOCS_FIRST: bool = False  # when true, detail rotation prioritizes cases with the most pending documents (PDF backfill)
     # Which side of the freshness/backlog cut this station works on. "all" = no cut
