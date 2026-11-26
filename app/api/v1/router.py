@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends
 
 from app.api.deps import procurador_gate
 
-from app.api.v1 import auth, cases, deadlines, movements, courts, scrapper, webhooks, pjud, pjud_ingest, sync, documents, lawyers, stats, goals, alerts, calendar, credentials, hitos, liberaciones, bono, renovaciones, redaccion_keys, evaluaciones, sysgal, sysgal_cartera, avance_cartera, escritos_sysgal, matriz, asignacion, cartera, activity
+from app.api.v1 import auth, cases, deadlines, movements, courts, scrapper, webhooks, pjud, pjud_ingest, sync, documents, lawyers, stats, goals, alerts, calendar, credentials, hitos, liberaciones, priority_cases, bono, renovaciones, redaccion_keys, evaluaciones, sysgal, sysgal_cartera, avance_cartera, escritos_sysgal, matriz, asignacion, cartera, activity
 
 api_router = APIRouter(dependencies=[Depends(procurador_gate)])
 
@@ -36,3 +36,4 @@ api_router.include_router(matriz.router, prefix="/matriz", tags=["matriz"])
 api_router.include_router(asignacion.router, prefix="/asignacion", tags=["asignacion"])
 api_router.include_router(cartera.router, prefix="/cartera", tags=["cartera"])
 api_router.include_router(activity.router, prefix="/activity", tags=["activity"])
+api_router.include_router(priority_cases.router, tags=["priority-cases"])

@@ -40,6 +40,7 @@ from app.services.causa_activa import (
 )
 from app.services.contrato_estado import ddo_info_by_case
 from app.api.v1.deadlines import EstadoPagoResponse
+from app.api.v1.priority_cases import own_lawyer_id, priority_case_ids
 from app.services.sysgal_cobertura import COBERTURAS
 from app.services.sysgal_cuotas import estado_pago_por_case
 from app.services.timeline_service import build_case_timeline
@@ -136,6 +137,8 @@ class CaseResponse(BaseModel):
     # Optional so an unknown lawyer never breaks the payload.
     abogado_id: Optional[int] = None
     abogado_nombre: Optional[str] = None
+    # Marked as priority by the CURRENT lawyer (personal; see app.api.v1.priority_cases).
+    is_priority: bool = False
 
     class Config:
         from_attributes = True
@@ -895,6 +898,9 @@ async def list_cases(
         else {}
     )
 
+    # Priority marks of the CURRENT lawyer for this page (1 query, no N+1).
+    priority_ids = priority_case_ids(db, own_lawyer_id(db, current_lawyer), [c.id for c in cases])
+
     # Build response with court info
     items = []
     for case in cases:
@@ -942,6 +948,7 @@ async def list_cases(
             asignado=case.assigned_lawyer_id is not None,
             abogado_id=case.effective_lawyer_id,
             abogado_nombre=effective_names.get(case.effective_lawyer_id),
+            is_priority=case.id in priority_ids,
             **_sysgal_fields(sysgal_info.get(case.id), case if _case_in_sysgal_states(case) else None),
         ))
 
@@ -1372,6 +1379,7 @@ async def get_case(
         asignado=case.assigned_lawyer_id is not None,
         abogado_id=case.effective_lawyer_id,
         abogado_nombre=_effective_lawyer_name(case),
+        is_priority=bool(priority_case_ids(db, own_lawyer_id(db, current_lawyer), [case.id])),
         **_sysgal_fields(sysgal_info, case if _case_in_sysgal_states(case) else None),
     )
 
