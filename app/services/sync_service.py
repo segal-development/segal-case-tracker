@@ -23,7 +23,7 @@ from dataclasses import dataclass, field, fields as dataclass_fields
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Iterable, List, Optional, Tuple, Awaitable, TypeVar
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, case as sa_case, func, or_, select
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 logger = logging.getLogger(__name__)
@@ -109,6 +109,7 @@ from app.models.lawyer import Lawyer
 from app.utils.rut import normalize_rut
 from app.models.sync_history import SyncHistory
 from app.models.webhook import Webhook
+from app.models.case_priority import CasePriority
 from app.models.case_deadline import CaseDeadline
 from app.services.egress_guard import EGRESS_REASON_PREFIX, egress_allowed_cached
 from app.core.deadlines_config import FATAL_DEADLINE_VALUES
@@ -2379,6 +2380,38 @@ def _select_cases_for_detail_rotation(
     # the dominant backfill signal, so it goes FIRST — ahead of reserved/
     # last_detail/filed. A correlated scalar subquery keeps it portable across
     # Postgres and SQLite (no LEFT JOIN + GROUP BY needed).
+    # Causas prioritarias (S5): a causa some lawyer marked (EXISTS a
+    # case_priority row) that was never read or not read in the last
+    # DETAIL_PRIORITY_MIN_HOURS goes to the front of the rotation. Inserted at
+    # the head HERE, before the fatal-plazo / pending-docs / requested-docs
+    # blocks below insert theirs at index 0, so the final order is: requested
+    # docs > pending docs > fatal plazo > pending priority > cuaderno /
+    # dormancy demotions > age. Correlated EXISTS: same single statement, no
+    # N+1. The same expression is also selected as a column so the Python loop
+    # knows which rows are hits without another query.
+    priority_pending = None
+    if settings.DETAIL_PRIORITY_ENABLED:
+        priority_cutoff = datetime.utcnow() - timedelta(
+            hours=settings.DETAIL_PRIORITY_MIN_HOURS
+        )
+        priority_pending = sa_case(
+            (
+                and_(
+                    select(CasePriority.id)
+                    .where(CasePriority.case_id == Case.id)
+                    .correlate(Case)
+                    .exists(),
+                    or_(
+                        Case.last_detail_checked_at.is_(None),
+                        Case.last_detail_checked_at < priority_cutoff,
+                    ),
+                ),
+                1,
+            ),
+            else_=0,
+        )
+        order_clauses.insert(0, priority_pending.desc())
+
     # HIGHEST priority: a FATAL plazo about to expire. Re-reading the case
     # before the window closes is the only way to notice the firm already
     # acted -- otherwise we keep telling a lawyer to do what he did (real
@@ -2460,12 +2493,24 @@ def _select_cases_for_detail_rotation(
             scope, lawyer_id, competencia, selected, left_outside,
         )
 
-    db_cases = (
-        db.query(Case)
-        .filter(*base_filter, Case.poda_at.is_(None), *scope_filter)  # podadas no consumen presupuesto de scraping
+    # podadas no consumen presupuesto de scraping
+    rotation_query = (
+        db.query(Case, priority_pending.label("priority_pending"))
+        if priority_pending is not None
+        else db.query(Case)
+    )
+    rotation_rows = (
+        rotation_query
+        .filter(*base_filter, Case.poda_at.is_(None), *scope_filter)
         .order_by(*order_clauses)
         .all()
     )
+    if priority_pending is not None:
+        db_cases = [row[0] for row in rotation_rows]
+        priority_ids = {row[0].id for row in rotation_rows if row[1]}
+    else:
+        db_cases = rotation_rows
+        priority_ids = set()
 
     if not db_cases:
         # Distinguish "no Case rows at all for this lawyer+competencia" (DB
@@ -2518,6 +2563,28 @@ def _select_cases_for_detail_rotation(
         if batch_size != base_lote:
             tope = int(round(tope * batch_size / base_lote))
         feed_slots = min(tope, batch_size)
+
+    # Causas prioritarias (S5) take up to ``priority_slots`` places, scaled by
+    # batch_size / DETAIL_BATCH_SIZE exactly like the feed cap. Unused slots go
+    # back to the rotation; hits beyond the cap wait for a later cycle (they do
+    # NOT leak into rotation slots).
+    #
+    # COMPOSITION WITH THE FEED CAP: the feed fills first (feed_slots), then the
+    # priority hits (priority_slots), and the age rotation keeps the rest, i.e.
+    # a floor of ``max(batch_size - feed_slots - priority_slots, 0)``. Both
+    # caps are enforced on their own hits, so when feed + priority together
+    # exceed the batch the final trim to batch_size cuts the tail (rotation
+    # first) and neither cap is ever exceeded. A causa that is BOTH a feed hit
+    # and a priority hit is counted as a feed hit.
+    priority_slots = 0
+    if priority_ids:
+        base_lote_p = max(settings.DETAIL_BATCH_SIZE, 1)
+        tope_p = max(settings.DETAIL_PRIORITY_MAX_PER_BATCH, 0)
+        if batch_size != base_lote_p:
+            tope_p = int(round(tope_p * batch_size / base_lote_p))
+        priority_slots = min(tope_p, batch_size)
+    priority_picked_n = 0
+    priority_waiting = 0
 
     def _is_pending_feed_hit(db_case) -> bool:
         if db_case.rol.strip().upper() not in feed_keys:
@@ -2583,6 +2650,11 @@ def _select_cases_for_detail_rotation(
             else:
                 feed_waiting += 1
             continue
+        if db_case.id in priority_ids:
+            if priority_picked_n >= priority_slots:
+                priority_waiting += 1
+                continue
+            priority_picked_n += 1
         rotation_picked.append(api_case)
         picked_causas.add(causa)
         used_api_ids.add(id(api_case))
@@ -2597,6 +2669,14 @@ def _select_cases_for_detail_rotation(
             "feed_selected=%d feed_over_cap=%d rotation_selected=%d cap=%d",
             lawyer_id, competencia, len(feed_keys), len(feed_picked), feed_waiting,
             len(result) - len(feed_picked), feed_slots,
+        )
+
+    if priority_ids:
+        logger.info(
+            "Detail rotation causas prioritarias: lawyer_id=%s competencia=%s "
+            "pending=%d selected=%d over_cap=%d cap=%d",
+            lawyer_id, competencia, len(priority_ids), priority_picked_n,
+            priority_waiting, priority_slots,
         )
 
     # Ghost-case guard: DB had rows but none matched live api_cases (stale/archived

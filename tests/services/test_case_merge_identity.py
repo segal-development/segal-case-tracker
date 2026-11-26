@@ -17,6 +17,7 @@ from app.core.database import Base
 from app.models.cartera_snapshot import CarteraSnapshot
 from app.models.case import Case
 from app.models.case_lawyer_source import CaseLawyerSource
+from app.models.case_priority import CasePriority
 from app.models.court import Court
 from app.models.generated_document import GeneratedDocument
 from app.models.hito import Hito, HitoTipo
@@ -272,6 +273,62 @@ class TestNewChildTablesMerged:
         run_case_merge(db)
 
         pairs = sorted((r.case_id, r.lawyer_id) for r in db.query(CaseLawyerSource).all())
+        assert pairs == sorted([(winner_id, carla.id), (winner_id, sandy.id)])
+        _assert_no_row_references(db, [loser_id])
+
+    def test_priority_mark_only_on_loser_moves_to_winner(self, db, carla, sandy, court):
+        winner = _case(db, carla, court)
+        loser = _case(db, sandy, court)
+        db.add(_movement(winner.id, "1", "rich"))
+        db.add_all(
+            [
+                CasePriority(case_id=loser.id, lawyer_id=sandy.id),
+            ]
+        )
+        db.flush()
+        loser_id, winner_id = loser.id, winner.id
+
+        run_case_merge(db)
+
+        pairs = sorted((r.case_id, r.lawyer_id) for r in db.query(CasePriority).all())
+        assert pairs == sorted([(winner_id, sandy.id)])
+        _assert_no_row_references(db, [loser_id])
+
+    def test_priority_same_lawyer_on_both_keeps_one_row(self, db, carla, sandy, court):
+        winner = _case(db, carla, court)
+        loser = _case(db, sandy, court)
+        db.add(_movement(winner.id, "1", "rich"))
+        db.add_all(
+            [
+                CasePriority(case_id=winner.id, lawyer_id=sandy.id),
+                CasePriority(case_id=loser.id, lawyer_id=sandy.id),
+            ]
+        )
+        db.flush()
+        loser_id, winner_id = loser.id, winner.id
+
+        run_case_merge(db)
+
+        pairs = sorted((r.case_id, r.lawyer_id) for r in db.query(CasePriority).all())
+        assert pairs == sorted([(winner_id, sandy.id)])
+        _assert_no_row_references(db, [loser_id])
+
+    def test_priority_different_lawyers_are_both_kept(self, db, carla, sandy, court):
+        winner = _case(db, carla, court)
+        loser = _case(db, sandy, court)
+        db.add(_movement(winner.id, "1", "rich"))
+        db.add_all(
+            [
+                CasePriority(case_id=winner.id, lawyer_id=carla.id),
+                CasePriority(case_id=loser.id, lawyer_id=sandy.id),
+            ]
+        )
+        db.flush()
+        loser_id, winner_id = loser.id, winner.id
+
+        run_case_merge(db)
+
+        pairs = sorted((r.case_id, r.lawyer_id) for r in db.query(CasePriority).all())
         assert pairs == sorted([(winner_id, carla.id), (winner_id, sandy.id)])
         _assert_no_row_references(db, [loser_id])
 
