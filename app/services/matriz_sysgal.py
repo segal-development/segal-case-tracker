@@ -70,10 +70,28 @@ def load_terminada_ids(db: Session) -> set[int]:
     return load_sysgal_state(db)[1]
 
 
+def _recompute_semaforo(db: Session, case: Case) -> None:
+    """Safe-fail semáforo recompute (never raises; see ``_maybe_recompute_deadlines``)."""
+    from app.services.sync_service import (
+        _maybe_recompute_deadlines,  # lazy: avoids an import cycle
+    )
+
+    # Savepoint: a DB-level failure inside the engine rolls back only this recompute,
+    # never the matriz/terminada writes of the batch.
+    try:
+        with db.begin_nested():
+            _maybe_recompute_deadlines(db, case)
+    except Exception:
+        logger.exception("semaforo recompute failed for case_id=%s; reclassify continues", case.id)
+
+
 def reclassify_cases(db: Session, case_ids: Iterable[int]) -> int:
     """Recompute and persist the matriz of the given civil cases (and only those).
 
-    Commits once at the end; returns how many cases were rewritten.
+    Commits once at the end; returns how many cases were rewritten. A case whose
+    ``terminada_en_sysgal`` flag flips gets its semáforo recomputed (the engine exempts a
+    terminada abandono from the forced rojo, so a reactivated causa must be re-evaluated);
+    an engine failure is logged and never breaks the sync.
     """
     from app.services.matriz_classifier import MatrizMappingCache, classify_case
 
@@ -95,7 +113,11 @@ def reclassify_cases(db: Session, case_ids: Iterable[int]) -> int:
             case.matriz_etapa = result.matriz_etapa
             case.matriz_origen = result.origen
             case.matriz_computed_at = datetime.utcnow()
-            case.terminada_en_sysgal = case.id in cache.sysgal_terminadas
+            terminada = case.id in cache.sysgal_terminadas
+            flag_changed = bool(case.terminada_en_sysgal) != terminada
+            case.terminada_en_sysgal = terminada
+            if flag_changed:
+                _recompute_semaforo(db, case)
             done += 1
     db.commit()
     return done
