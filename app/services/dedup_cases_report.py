@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import firm_lawyer_id
 from app.models.case import Case
 from app.models.case_lawyer_source import CaseLawyerSource
+from app.models.case_priority import CasePriority
 from app.models.case_litigante import CaseLitigante
 from app.models.document import Document
 from app.models.hito import Hito
@@ -40,6 +41,9 @@ QUERIES_PER_LOSER_ESTIMATE = 40
 ROUND_TRIP_SECONDS = 0.135
 
 CASE_LAWYER_SOURCE_TABLE = CaseLawyerSource.__tablename__
+CASE_PRIORITY_TABLE = CasePriority.__tablename__
+# Tables whose loser rows are carried to the winner, not substantive history.
+CARRIED_TABLES = frozenset({CASE_LAWYER_SOURCE_TABLE, CASE_PRIORITY_TABLE})
 
 MovementKey = Tuple[object, object]
 
@@ -85,8 +89,8 @@ class DedupReport:
     surplus_rows_by_copies: Dict[int, int] = field(default_factory=dict)
 
     # Loser tiers. EMPTY: zero rows in every child table. SOURCE_ONLY: only
-    # case_lawyer_source rows (the T3a backfill gives every case one for its own
-    # lawyer), so the sighting must be carried to the winner before deleting.
+    # case_lawyer_source / case_priority rows (the T3a backfill gives every case one
+    # source for its own lawyer), carried to the winner before deleting.
     empty_losers: int = 0
     source_only_losers: int = 0
     non_empty_losers: int = 0
@@ -236,8 +240,9 @@ def _build(db: Session) -> DedupReport:
             per_table = {name: counts[name].get(loser.id, 0) for name in group_rows_by_table}
             for name, n in per_table.items():
                 group_rows_by_table[name] += n
-            others = sum(n for name, n in per_table.items() if name != CASE_LAWYER_SOURCE_TABLE)
-            if others == 0 and per_table.get(CASE_LAWYER_SOURCE_TABLE, 0) == 0:
+            others = sum(n for name, n in per_table.items() if name not in CARRIED_TABLES)
+            carried = sum(n for name, n in per_table.items() if name in CARRIED_TABLES)
+            if others == 0 and carried == 0:
                 empty_ids.append(loser.id)
             elif others == 0:
                 source_only_ids.append(loser.id)

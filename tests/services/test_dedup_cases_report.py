@@ -454,7 +454,8 @@ class TestReadOnlyAndFixedCost:
 
         assert len(small) > 0
         assert len(small) == len(large)
-        assert len(large) <= 20
+        # Fixed cost: one grouped count per child table (case_priority made it 21).
+        assert len(large) <= 21
 
     def test_report_never_calls_run_case_merge(self, db, monkeypatch, carla, sandy, court):
         _case(db, carla, court)

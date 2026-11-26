@@ -36,6 +36,7 @@ from app.models.case_deadline import CaseDeadline
 from app.models.case_escrito import CaseEscrito
 from app.models.case_exhorto import CaseExhorto
 from app.models.case_lawyer_source import CaseLawyerSource
+from app.models.case_priority import CasePriority
 from app.models.case_litigante import CaseLitigante
 from app.models.case_merge_audit import CaseMergeAudit
 from app.models.case_notificacion import CaseNotificacion
@@ -68,6 +69,7 @@ CHILD_TABLES_WITH_CASE_ID = [
     GeneratedDocument,
     CarteraSnapshot,
     CaseLawyerSource,
+    CasePriority,
     CaseAssignmentHistory,
     SysgalCausa,
     SysgalIncorporacion,
@@ -452,6 +454,7 @@ def _merge_children(db: Session, loser_id: int, winner_id: int) -> None:
     _merge_documents(db, loser_id, winner_id)
     _merge_alerts(db, loser_id, winner_id)
     _merge_case_lawyer_sources(db, loser_id, winner_id)
+    _merge_case_priorities(db, loser_id, winner_id)
     _merge_cartera_snapshots(db, loser_id, winner_id)
     # No per-case constraint: plain repoint.
     for model in (Hito, LiberacionRequest, GeneratedDocument, CaseAssignmentHistory):
@@ -626,6 +629,22 @@ def _merge_case_lawyer_sources(db: Session, loser_id: int, winner_id: int) -> No
         for row in db.query(CaseLawyerSource).filter(CaseLawyerSource.case_id == winner_id).all()
     }
     for row in db.query(CaseLawyerSource).filter(CaseLawyerSource.case_id == loser_id).order_by(CaseLawyerSource.id).all():
+        if row.lawyer_id in seen:
+            db.delete(row)
+        else:
+            row.case_id = winner_id
+            seen.add(row.lawyer_id)
+
+
+def _merge_case_priorities(db: Session, loser_id: int, winner_id: int) -> None:
+    """Unique per (case_id, lawyer_id): a lawyer's personal priority mark must
+    survive the merge. Marks the winner already has for the same lawyer win;
+    the loser's other marks are repointed so no lawyer loses a mark."""
+    seen = {
+        row.lawyer_id
+        for row in db.query(CasePriority).filter(CasePriority.case_id == winner_id).all()
+    }
+    for row in db.query(CasePriority).filter(CasePriority.case_id == loser_id).order_by(CasePriority.id).all():
         if row.lawyer_id in seen:
             db.delete(row)
         else:
