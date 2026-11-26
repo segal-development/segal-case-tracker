@@ -19,6 +19,7 @@ from app.api.deps import (
     apply_case_scope,
     ALL_CASES,
 )
+from app.models.alert import Alert
 from app.models.case import EFFECTIVE_LAWYER_ID, Case
 from app.models.case_deadline import CaseDeadline
 from app.models.lawyer import Lawyer
@@ -40,7 +41,12 @@ from app.services.causa_activa import (
 )
 from app.services.contrato_estado import ddo_info_by_case
 from app.api.v1.deadlines import EstadoPagoResponse
-from app.api.v1.priority_cases import own_lawyer_id, priority_case_ids
+from app.api.v1.priority_cases import (
+    movimiento_nuevo_case_ids,
+    own_lawyer_id,
+    priority_case_ids,
+    unread_movement_alert_clause,
+)
 from app.services.sysgal_cobertura import COBERTURAS
 from app.services.sysgal_cuotas import estado_pago_por_case
 from app.services.timeline_service import build_case_timeline
@@ -139,6 +145,8 @@ class CaseResponse(BaseModel):
     abogado_nombre: Optional[str] = None
     # Marked as priority by the CURRENT lawyer (personal; see app.api.v1.priority_cases).
     is_priority: bool = False
+    # The CURRENT lawyer has an unread movement alert (Novedades) on this causa.
+    movimiento_nuevo: bool = False
 
     class Config:
         from_attributes = True
@@ -717,6 +725,13 @@ async def list_cases(
             "DESC NULLS LAST (most-recent actuación first). Default: updated_at DESC."
         ),
     ),
+    movimiento_nuevo: Optional[bool] = Query(
+        None,
+        description=(
+            "true -> only causas with an unread movement alert (alerts.movement_id set, "
+            "unread) for the current lawyer."
+        ),
+    ),
     current_lawyer: dict = Depends(get_current_lawyer),
     db: Session = Depends(get_db),
 ):
@@ -835,6 +850,11 @@ async def list_cases(
     if not own_set:
         query = query.filter(CASE_ACTIVA_FILTER)
 
+    me_id = own_lawyer_id(db, current_lawyer)
+    if movimiento_nuevo is True:
+        unread = db.query(Alert.case_id).filter(*unread_movement_alert_clause(me_id))
+        query = query.filter(Case.id.in_(unread))
+
     # Get total count
     total = query.count()
 
@@ -899,7 +919,9 @@ async def list_cases(
     )
 
     # Priority marks of the CURRENT lawyer for this page (1 query, no N+1).
-    priority_ids = priority_case_ids(db, own_lawyer_id(db, current_lawyer), [c.id for c in cases])
+    priority_ids = priority_case_ids(db, me_id, [c.id for c in cases])
+    # Unread movement alerts of the CURRENT lawyer for this page (1 query, no N+1).
+    nuevo_ids = movimiento_nuevo_case_ids(db, me_id, [c.id for c in cases])
 
     # Build response with court info
     items = []
@@ -949,6 +971,7 @@ async def list_cases(
             abogado_id=case.effective_lawyer_id,
             abogado_nombre=effective_names.get(case.effective_lawyer_id),
             is_priority=case.id in priority_ids,
+            movimiento_nuevo=case.id in nuevo_ids,
             **_sysgal_fields(sysgal_info.get(case.id), case if _case_in_sysgal_states(case) else None),
         ))
 

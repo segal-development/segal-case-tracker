@@ -1,22 +1,30 @@
 """Causas prioritarias: each lawyer's personal marks (max 20)."""
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.api.deps import apply_case_scope, get_current_lawyer, get_db, resolve_case_scope
+from app.models.alert import Alert
 from app.models.case import Case
 from app.models.case_priority import CasePriority
 from app.models.court import Court
 from app.models.lawyer import Lawyer
+from app.models.movement import Movement
 
 router = APIRouter()
 
 MAX_PRIORITY_CASES = 20
 CAP_DETAIL = f"Máximo {MAX_PRIORITY_CASES} causas prioritarias por abogado."
+
+
+class UltimoMovimiento(BaseModel):
+    descripcion: str
+    fecha: date
 
 
 class PriorityCaseItem(BaseModel):
@@ -27,12 +35,16 @@ class PriorityCaseItem(BaseModel):
     semaforo: Optional[str] = None
     last_detail_checked_at: Optional[datetime] = None
     marcada_at: datetime
+    ultimo_movimiento: Optional[UltimoMovimiento] = None
+    movimiento_nuevo: bool = False
 
 
 class PriorityCaseListResponse(BaseModel):
     items: List[PriorityCaseItem]
     total: int
     max: int = MAX_PRIORITY_CASES
+    con_movimiento_nuevo: int = 0
+    ultima_revision: Optional[datetime] = None
 
 
 class PriorityBulkRequest(BaseModel):
@@ -71,6 +83,53 @@ def priority_case_ids(db: Session, lawyer_id: int, case_ids) -> set:
     return {r[0] for r in rows}
 
 
+def unread_movement_alert_clause(lawyer_id: int):
+    """Alert rows that make a causa "movimiento nuevo" for ``lawyer_id``."""
+    return (
+        Alert.lawyer_id == lawyer_id,
+        Alert.movement_id.isnot(None),
+        # Same 'unread' as Novedades (alerts.py, alert_groups.py): the boolean,
+        # not read_at, which older rows may lack even when read.
+        Alert.read.is_(False),
+    )
+
+
+def movimiento_nuevo_case_ids(db: Session, lawyer_id: int, case_ids) -> set:
+    """Which of ``case_ids`` have an unread movement alert for the lawyer (ONE query)."""
+    ids = list(case_ids)
+    if not ids:
+        return set()
+    rows = (
+        db.query(Alert.case_id)
+        .filter(*unread_movement_alert_clause(lawyer_id), Alert.case_id.in_(ids))
+        .distinct()
+        .all()
+    )
+    return {r[0] for r in rows}
+
+
+def _ultimo_movimiento_by_case(db: Session, case_ids) -> dict:
+    """Latest movement (description, date) per case (ONE query)."""
+    ids = list(case_ids)
+    if not ids:
+        return {}
+    rank = func.row_number().over(
+        partition_by=Movement.case_id,
+        order_by=(Movement.movement_date.desc(), Movement.id.desc()),
+    ).label("rn")
+    sub = (
+        db.query(Movement.case_id.label("case_id"), Movement.description.label("d"),
+                 Movement.movement_date.label("f"), rank)
+        .filter(Movement.case_id.in_(ids))
+        .subquery()
+    )
+    rows = db.query(sub.c.case_id, sub.c.d, sub.c.f).filter(sub.c.rn == 1).all()
+    return {cid: (d, f) for cid, d, f in rows}
+
+
+_SEMAFORO_RANK = {"rojo": 0, "amarillo": 1, "verde": 2}
+
+
 def _scoped_existing_ids(db: Session, current_lawyer: dict, ids: set) -> set:
     scope = resolve_case_scope(db, current_lawyer)
     rows = apply_case_scope(db.query(Case.id).filter(Case.id.in_(ids)), scope).all()
@@ -99,19 +158,41 @@ async def list_priority_cases(
         .order_by(CasePriority.created_at.desc(), CasePriority.id.desc())
         .all()
     )
-    items = [
-        PriorityCaseItem(
-            case_id=c.id,
-            rol=c.rol,
-            caratula=f"{c.plaintiff or ''}/{c.defendant or ''}",
-            tribunal=court_name,
-            semaforo=c.semaforo,
-            last_detail_checked_at=c.last_detail_checked_at,
-            marcada_at=marcada,
+    rows = list(rows)
+    case_ids = [c.id for c, _, _ in rows]
+    ultimos = _ultimo_movimiento_by_case(db, case_ids)
+    nuevos = movimiento_nuevo_case_ids(db, lawyer_id, case_ids)
+    items = []
+    for c, court_name, marcada in rows:
+        last = ultimos.get(c.id)
+        items.append(
+            PriorityCaseItem(
+                case_id=c.id,
+                rol=c.rol,
+                caratula=f"{c.plaintiff or ''}/{c.defendant or ''}",
+                tribunal=court_name,
+                semaforo=c.semaforo,
+                last_detail_checked_at=c.last_detail_checked_at,
+                marcada_at=marcada,
+                ultimo_movimiento=(
+                    UltimoMovimiento(descripcion=last[0] or "", fecha=last[1].date()) if last else None
+                ),
+                movimiento_nuevo=c.id in nuevos,
+            )
         )
-        for c, court_name, marcada in rows
-    ]
-    return PriorityCaseListResponse(items=items, total=len(items), max=MAX_PRIORITY_CASES)
+    # semáforo rank, then latest movement date desc (nulls last), then marcada_at desc.
+    # Stable sorts, least significant key first.
+    items.sort(key=lambda i: i.marcada_at, reverse=True)
+    items.sort(key=lambda i: i.ultimo_movimiento.fecha if i.ultimo_movimiento else date.min, reverse=True)
+    items.sort(key=lambda i: _SEMAFORO_RANK.get(i.semaforo, 3))
+    checked = [i.last_detail_checked_at for i in items if i.last_detail_checked_at]
+    return PriorityCaseListResponse(
+        items=items,
+        total=len(items),
+        max=MAX_PRIORITY_CASES,
+        con_movimiento_nuevo=sum(1 for i in items if i.movimiento_nuevo),
+        ultima_revision=max(checked) if checked else None,
+    )
 
 
 @router.put("/cases/{case_id}/priority", status_code=status.HTTP_204_NO_CONTENT)

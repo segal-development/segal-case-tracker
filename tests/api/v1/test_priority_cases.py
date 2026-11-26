@@ -248,15 +248,15 @@ class TestListShape:
         c1 = _case(db, ana, court, "C-1-2025", semaforo="rojo",
                    last_detail_checked_at=datetime(2026, 5, 1, 10, 0))
         c2 = _case(db, ana, court, "C-2-2025")
-        _mark_many(db, ana, [c1, c2])  # c2 marked later
+        _mark_many(db, ana, [c1, c2])  # c2 marked later, but c1 is rojo (S6 order)
         data = as_ana.get("/api/v1/priority-cases").json()
         assert data["max"] == 20
         assert data["total"] == 2
-        assert [i["case_id"] for i in data["items"]] == [c2.id, c1.id]
-        item = data["items"][1]
+        assert [i["case_id"] for i in data["items"]] == [c1.id, c2.id]
+        item = data["items"][0]
         assert set(item) == {
             "case_id", "rol", "caratula", "tribunal", "semaforo",
-            "last_detail_checked_at", "marcada_at",
+            "last_detail_checked_at", "marcada_at", "ultimo_movimiento", "movimiento_nuevo",
         }
         assert item["rol"] == "C-1-2025"
         assert item["caratula"] == "Banco/Juan"
@@ -266,7 +266,9 @@ class TestListShape:
         assert item["marcada_at"].startswith("2026-01-01T00:00")
 
     def test_empty_list(self, as_ana):
-        assert as_ana.get("/api/v1/priority-cases").json() == {"items": [], "total": 0, "max": 20}
+        assert as_ana.get("/api/v1/priority-cases").json() == {
+            "items": [], "total": 0, "max": 20, "con_movimiento_nuevo": 0, "ultima_revision": None,
+        }
 
     def test_mark_leaving_scope_is_not_listed(self, as_ana, db, ana, beto, court):
         c = _case(db, ana, court, "C-1-2025")
@@ -317,3 +319,141 @@ class TestIsPriority:
         assert item["court"]["name"] == "Juzgado PC"
         assert item["is_priority"] is False
         assert "ruts" in item and "abogado_nombre" in item
+
+
+# --- S6: ultimo_movimiento / movimiento_nuevo / counters / ordering -----------------
+
+from app.models.alert import Alert  # noqa: E402
+from app.models.movement import Movement  # noqa: E402
+
+
+def _mov(db, case, when, desc="Mov"):
+    m = Movement(case_id=case.id, description=desc, movement_date=when, folio="1")
+    db.add(m)
+    db.commit()
+    db.refresh(m)
+    return m
+
+
+def _alert(db, lawyer, case, movement=None, read=False, type_="new_movement"):
+    a = Alert(
+        lawyer_id=lawyer.id, case_id=case.id, movement_id=movement.id if movement else None,
+        type=type_, title="t", read=read,
+    )
+    db.add(a)
+    db.commit()
+    return a
+
+
+def _items(client):
+    return {i["case_id"]: i for i in client.get("/api/v1/priority-cases").json()["items"]}
+
+
+class TestUltimoMovimiento:
+    def test_picks_latest_movement_and_date_only(self, as_ana, db, ana, court):
+        c = _case(db, ana, court, "C-1-2025")
+        _mov(db, c, datetime(2026, 3, 1, 9, 0), "Antiguo")
+        _mov(db, c, datetime(2026, 4, 5, 15, 30), "Reciente")
+        _mov(db, c, datetime(2026, 2, 1, 9, 0), "Mas antiguo")
+        _mark_many(db, ana, [c])
+        assert _items(as_ana)[c.id]["ultimo_movimiento"] == {
+            "descripcion": "Reciente", "fecha": "2026-04-05",
+        }
+
+    def test_null_without_movements(self, as_ana, db, ana, court):
+        c = _case(db, ana, court, "C-1-2025")
+        _mark_many(db, ana, [c])
+        assert _items(as_ana)[c.id]["ultimo_movimiento"] is None
+
+
+class TestMovimientoNuevo:
+    def _setup(self, db, ana, court):
+        c = _case(db, ana, court, "C-1-2025")
+        m = _mov(db, c, datetime(2026, 4, 1))
+        _mark_many(db, ana, [c])
+        return c, m
+
+    def test_unread_movement_alert_is_true(self, as_ana, db, ana, court):
+        c, m = self._setup(db, ana, court)
+        _alert(db, ana, c, m)
+        assert _items(as_ana)[c.id]["movimiento_nuevo"] is True
+
+    def test_no_alert_is_false(self, as_ana, db, ana, court):
+        c, _ = self._setup(db, ana, court)
+        assert _items(as_ana)[c.id]["movimiento_nuevo"] is False
+
+    def test_read_alert_is_false(self, as_ana, db, ana, court):
+        c, m = self._setup(db, ana, court)
+        _alert(db, ana, c, m, read=True)
+        assert _items(as_ana)[c.id]["movimiento_nuevo"] is False
+
+    def test_other_lawyers_alert_is_false(self, as_ana, db, ana, beto, court):
+        c, m = self._setup(db, ana, court)
+        _alert(db, beto, c, m)
+        assert _items(as_ana)[c.id]["movimiento_nuevo"] is False
+
+    def test_non_movement_alert_is_false(self, as_ana, db, ana, court):
+        c, _ = self._setup(db, ana, court)
+        _alert(db, ana, c, None, type_="plazo_fatal")
+        assert _items(as_ana)[c.id]["movimiento_nuevo"] is False
+
+
+class TestTopLevelAndOrdering:
+    def test_counters(self, as_ana, db, ana, court):
+        a = _case(db, ana, court, "C-1-2025", last_detail_checked_at=datetime(2026, 5, 1, 10, 0))
+        b = _case(db, ana, court, "C-2-2025", last_detail_checked_at=datetime(2026, 6, 1, 12, 0))
+        c = _case(db, ana, court, "C-3-2025")
+        _mark_many(db, ana, [a, b, c])
+        _alert(db, ana, a, _mov(db, a, datetime(2026, 4, 1)))
+        _alert(db, ana, c, _mov(db, c, datetime(2026, 4, 1)))
+        data = as_ana.get("/api/v1/priority-cases").json()
+        assert data["con_movimiento_nuevo"] == 2
+        assert data["ultima_revision"].startswith("2026-06-01T12:00")
+
+    def test_empty_counters(self, as_ana):
+        data = as_ana.get("/api/v1/priority-cases").json()
+        assert data["con_movimiento_nuevo"] == 0
+        assert data["ultima_revision"] is None
+        assert data["items"] == []
+
+    def test_order_semaforo_then_movement_desc_nulls_last_then_marcada(self, as_ana, db, ana, court):
+        v = _case(db, ana, court, "C-V-2025", semaforo="verde")
+        n = _case(db, ana, court, "C-N-2025")
+        a_old = _case(db, ana, court, "C-AO-2025", semaforo="amarillo")
+        a_new = _case(db, ana, court, "C-AN-2025", semaforo="amarillo")
+        a_none1 = _case(db, ana, court, "C-A1-2025", semaforo="amarillo")
+        a_none2 = _case(db, ana, court, "C-A2-2025", semaforo="amarillo")
+        r = _case(db, ana, court, "C-R-2025", semaforo="rojo")
+        g = _case(db, ana, court, "C-G-2025", semaforo="gris")
+        _mov(db, a_old, datetime(2026, 1, 1))
+        _mov(db, a_new, datetime(2026, 3, 1))
+        _mov(db, v, datetime(2026, 9, 1))
+        # marked order (later = marcada newer): a_none1 before a_none2
+        _mark_many(db, ana, [v, n, a_old, a_new, a_none1, a_none2, r, g])
+        ids = [i["case_id"] for i in as_ana.get("/api/v1/priority-cases").json()["items"]]
+        # rest rank (gris / null) ties, newest mark first: g was marked after n
+        assert ids == [r.id, a_new.id, a_old.id, a_none2.id, a_none1.id, v.id, g.id, n.id]
+
+    def test_bounded_queries(self, as_ana, db, ana, court):
+        cases = _own_cases(db, ana, court, 6)
+        for c in cases:
+            _alert(db, ana, c, _mov(db, c, datetime(2026, 4, 1)))
+        _mark_many(db, ana, cases)
+        seen = {"alerts": 0, "movements": 0}
+
+        def spy(conn, cursor, statement, *a):
+            s = statement.lower()
+            if "from alerts" in s:
+                seen["alerts"] += 1
+            if "from movements" in s:
+                seen["movements"] += 1
+
+        engine = db.get_bind()
+        event.listen(engine, "before_cursor_execute", spy)
+        try:
+            r = as_ana.get("/api/v1/priority-cases")
+        finally:
+            event.remove(engine, "before_cursor_execute", spy)
+        assert r.status_code == 200 and len(r.json()["items"]) == 6
+        assert seen["alerts"] <= 1
+        assert seen["movements"] <= 1
