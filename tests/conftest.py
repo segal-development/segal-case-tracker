@@ -133,6 +133,9 @@ def egress_guard_off(monkeypatch):
     from app.services import egress_guard
 
     monkeypatch.setattr(settings, "FORBIDDEN_EGRESS_IPS", "")
+    monkeypatch.setattr(settings, "ALLOWED_EGRESS_IPS", "")
+    # The allow-list DB read must never reach a real database from the suite.
+    monkeypatch.setattr(egress_guard, "_session_factory", TestingSessionLocal)
     egress_guard.reset_state()
     yield
     egress_guard.reset_state()

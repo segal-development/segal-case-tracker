@@ -54,6 +54,7 @@ from app.models.case_assignment_history import CaseAssignmentHistory
 from app.models.procurador import ProcuradorAbogado
 from app.models.pjud_request_count import PjudRequestCount
 from app.models.case_priority import CasePriority
+from app.models.app_text_setting import AppTextSetting
 
 __all__ = [
     "Lawyer",
@@ -72,6 +73,7 @@ __all__ = [
     "CaseExhorto",
     "CaseDeadline",
     "Goal",
+    "AppTextSetting",
     "PendingConnection",
     "IngestKey",
     "CaseLawyerSource",

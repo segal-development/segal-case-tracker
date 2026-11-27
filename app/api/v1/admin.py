@@ -2,14 +2,15 @@
 
 from datetime import UTC, datetime, timedelta
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, require_admin
 from app.models.lawyer import Lawyer
 from app.models.pjud_request_count import PjudRequestCount
-from app.services import estacion_reinicio
+from app.services import app_settings, estacion_reinicio
+from app.services.egress_guard import parse_entry
 from app.services.pjud_metrics import KIND_REQUEST
 
 router = APIRouter()
@@ -37,6 +38,39 @@ def solicitar_reinicio(_: str = Depends(require_admin), db: Session = Depends(ge
 @router.get("/estacion/reinicio", response_model=ReinicioEstado)
 def estado_reinicio(_: str = Depends(require_admin), db: Session = Depends(get_db)):
     return estacion_reinicio.estado(db)
+
+
+class IpsPermitidas(BaseModel):
+    ips: list[str]
+
+
+def _read_ips(db: Session) -> list[str]:
+    raw = app_settings.get_text(db, app_settings.KEY_IPS_PERMITIDAS, "") or ""
+    return [p.strip() for p in raw.split(",") if p.strip()]
+
+
+@router.get("/estacion/ips-permitidas", response_model=IpsPermitidas)
+def get_ips_permitidas(_: str = Depends(require_admin), db: Session = Depends(get_db)):
+    """Egress allow-list the station reads (DB value; empty = allow-list off unless env sets one)."""
+    return {"ips": _read_ips(db)}
+
+
+@router.put("/estacion/ips-permitidas", response_model=IpsPermitidas)
+def put_ips_permitidas(
+    body: IpsPermitidas, _: str = Depends(require_admin), db: Session = Depends(get_db)
+):
+    """Replace the allow-list. Every entry must be an IP or CIDR; otherwise 422 and nothing is saved."""
+    entries: list[str] = []
+    for entry in body.ips:
+        entry = entry.strip()
+        net = None if "," in entry else parse_entry(entry, strict=True)
+        if net is None or net.prefixlen == 0:
+            raise HTTPException(status_code=422, detail=f"Entrada inválida (IP o CIDR esperado): {entry!r}")
+        if entry not in entries:
+            entries.append(entry)
+    app_settings.set_text(db, app_settings.KEY_IPS_PERMITIDAS, ",".join(entries))
+    db.commit()
+    return {"ips": entries}
 
 
 @router.get("/pjud/actividad")

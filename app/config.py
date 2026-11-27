@@ -262,6 +262,9 @@ class Settings(BaseSettings):
     # Comma-separated egress IPs the worker must never scrape PJUD from (the office
     # IP, blocked by PJUD 28/10-06/11). Empty = guard off. See services/egress_guard.py.
     FORBIDDEN_EGRESS_IPS: str = "186.10.251.189"
+    # Comma-separated IPs/CIDRs the worker may scrape PJUD from (the 5G modem). Fallback of the
+    # DB setting ``estacion_ips_permitidas``. Empty (and no DB value) = allow-list off.
+    ALLOWED_EGRESS_IPS: str = ""
     # Resolve the PJUD host ourselves (direct UDP query) and pass Chromium
     # --host-resolver-rules=MAP, so the browser never calls the macOS system
     # resolver for it. See app/scrapper/pjud/dns_resolver.py for the evidence:
