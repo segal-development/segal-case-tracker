@@ -196,6 +196,12 @@ class Settings(BaseSettings):
     # Daily Sysgal cuotas (mora) sync, run once per Chile day after 08:00 (Sysgal copies ~07:00).
     # Same VM-only constraint as the causas sync.
     SYSGAL_CUOTAS_SYNC_ENABLED: bool = False
+    # Daily PJUD public "Búsqueda por Fecha" (Invitado): new civil causas with no defendant lawyer.
+    # Station only (PJUD egress). Off by default.
+    PUBLICO_FECHA_ENABLED: bool = False
+    PUBLICO_FECHA_AFTER_HOUR: int = 7           # Chile hour after which the daily run may start
+    PUBLICO_FECHA_CORTES: str = "90,91"         # comma-separated PJUD corte codes (90 Santiago, 91 San Miguel)
+    PUBLICO_FECHA_MAX_DETALLES: int = 150       # daily cap on modal + document reads
     # Allow-list of client IPs/CIDRs for the Sysgal patrocinio endpoint (comma-separated).
     # Empty = no restriction. Defense in depth: the API key is the real gate.
     SYSGAL_API_ALLOWED_IPS: str = ""

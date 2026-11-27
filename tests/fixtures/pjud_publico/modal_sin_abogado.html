@@ -1,0 +1,132 @@
+<div class="modal in" id="modalDetalleCivil" tabindex="-1" style="z-index: 1040; display: block;"><script>
+$(document).ready(function(){
+	$(".topTool").tooltip({ placement: "right" });
+});
+</script>
+	<div class="modal-dialog modal-lg">
+		<div class="modal-content">
+			<div class="modal-header">
+				<button type="button" class="close" data-dismiss="modal">×</button>
+				<h4 class="modal-title" style="color:#337ab7;">Detalle Causa Civil</h4>
+			</div>
+			<div class="modal-body">
+				<div class="panel with-nav-tabs">
+					<div class="panel panel-default">
+						<table class="table table-responsive table-titulos">
+							<tbody>
+								<tr>
+									<td><strong>ROL:</strong> C-1002-2026 <span title="Causa LTE" class="label label-primary topTool"></span></td>
+									<td colspan="2"><strong>F. Ing.:</strong> 25/11/2026</td>
+									<td>BANCO EJEMPLO S.A./FICTICIA TRES                  </td>
+								</tr>
+								<tr>
+									<td><strong>Est. Adm.: </strong><span class="topTool">Sin archivar</span></td>
+									<td><strong>Proc.:</strong> Ejecutivo Obligación de Dar</td>
+									<td colspan="2"><strong>Ubicación:</strong> Digital                       </td>
+								</tr>
+								<tr>
+									<td><strong>Estado Proc.:</strong> Tramitación                   </td>
+									<td><strong>Etapa:</strong> 1 Notificación demanda y su proveído      </td>
+									<td colspan="2"><strong>Tribunal:</strong> 1º Juzgado Civil de Santiago                      </td>
+								</tr>
+							</tbody>
+						</table>
+						<table class="table table-responsive table-titulos">
+							<tbody>
+								<tr>
+									<td>
+										<strong>Texto Demanda:</strong>
+										<form name="form" action="ADIR_871/civil/documentos/docu.php" method="get" target="txtD">
+											<input type="hidden" name="valorEncTxtDmda" value="FAKE.JWT.DEMANDA-2">
+											<a href="#" onclick="$(this).closest(&quot;form&quot;).submit();" title="Archivo Texto Demanda" role="img">
+												<i title="Texto Demanda" class="fa fa-file-pdf-o fa-lg" aria-hidden="true"></i><span class="sr-only">Texto Demanda</span>
+											</a>
+										</form>
+									</td>
+									<td>
+										<strong>Certificado de Envío:</strong>
+										<form name="certCivil" action="ADIR_871/civil/documentos/docCertificadoDemanda.php" method="get" target="cert">
+											<input type="hidden" name="dtaCert" value="FAKE.JWT.CERT-2">
+										</form>
+									</td>
+								</tr>
+							</tbody>
+						</table>
+					</div>
+					<div class="panel-heading">
+						<ul class="nav nav-tabs" style="display:inline-block">
+							<li class="active"><a data-toggle="tab" href="#historiaCiv">Historia</a></li>
+							<li><a data-toggle="tab" href="#litigantesCiv">Litigantes</a></li>
+							<li><a data-toggle="tab" href="#notificacionesCiv">Notificaciones</a></li>
+						</ul>
+					</div>
+					<div class="tab-content" id="loadHistCuadernoCiv">
+						<div class="tab-pane fade in active" id="historiaCiv">
+							<div class="panel panel-default"><div class="table-responsive">
+								<table class="table table-bordered table-striped table-hover">
+									<thead><tr><th>Folio</th><th>Doc.</th><th>Anexo</th><th>Etapa</th></tr></thead>
+									<tbody>
+									</tbody>
+								</table>
+							</div></div>
+						</div>
+						<div class="tab-pane fade" id="litigantesCiv">
+							<div class="panel panel-default">
+								<div class="table-responsive">
+									<table class="table table-bordered table-striped table-hover">
+										<thead>
+											<tr>
+												<th>Participante</th>
+												<th>Rut</th>
+												<th>Persona</th>
+												<th>Nombre o Razón Social</th>
+											</tr>
+										</thead>
+										<tbody>
+											<tr>
+												<td>DTE.  </td>
+												<td>33333333-3</td>
+												<td>JURIDICA                      </td>
+												<td>BANCO EJEMPLO  S.A   </td>				
+											</tr>
+											<tr>
+												<td>AB.DTE</td>
+												<td>44444444-4</td>
+												<td>NATURAL                       </td>
+												<td>ABOGADA FICTICIA DTE (Poder Amplio)</td>				
+											</tr>
+											<tr>
+												<td>AP.DTE</td>
+												<td>55555555-5</td>
+												<td>NATURAL                       </td>
+												<td>APODERADO FICTICIO DTE (Poder Amplio)</td>				
+											</tr>
+											<tr>
+												<td>DDO.  </td>
+												<td>66666666-6</td>
+												<td>NATURAL                       </td>
+												<td>DEMANDADA FICTICIA TRES </td>				
+											</tr>
+										</tbody>
+									</table>
+								</div>
+							</div>
+						</div>
+						<div class="tab-pane fade" id="notificacionesCiv">
+							<div class="panel panel-default"><div class="table-responsive">
+								<table class="table table-bordered table-striped table-hover">
+									<thead><tr><th>ROL</th><th>Est. Notif.</th></tr></thead>
+									<tbody>
+									</tbody>
+								</table>
+							</div></div>
+						</div>
+					</div>
+				</div>
+			</div>
+			<div class="modal-footer">
+				<button type="button" class="btn btn-default" data-dismiss="modal">Cerrar</button>
+			</div>
+		</div>
+	</div>
+</div>

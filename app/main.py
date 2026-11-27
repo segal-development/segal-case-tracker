@@ -17,6 +17,7 @@ from app.api.redaccion.buscar import router as redaccion_buscar_router
 from app.api.redaccion.detalle import router as redaccion_detalle_router
 from app.api.presentacion.presentaciones import router as presentacion_router
 from app.api.v1.admin import router as admin_router
+from app.api.v1.publico_demandas import router as publico_demandas_router
 from app.config import settings
 from app.middleware.activity_audit import ActivityAuditMiddleware
 
@@ -63,6 +64,16 @@ app.add_middleware(ActivityAuditMiddleware)
 app.include_router(api_router, prefix="/api/v1")
 # Admin-only operational endpoints (require_admin on each route).
 app.include_router(admin_router, prefix="/api/v1/admin", tags=["admin"], dependencies=[Depends(procurador_gate)])
+
+# Public no-login pages (secret-link token in the path). No auth dependency; the
+# procurador gate is attached like on every /api/v1 route and lets anonymous calls
+# through (the two routes are also in PROCURADOR_ALLOWED).
+app.include_router(
+    publico_demandas_router,
+    prefix="/api/v1/publico",
+    tags=["publico"],
+    dependencies=[Depends(procurador_gate)],
+)
 
 # External read-only API for the Sysgal CRM. Mounted SEPARATELY (own prefix,
 # own auth) so it is fully isolated from the internal /api/v1 app.

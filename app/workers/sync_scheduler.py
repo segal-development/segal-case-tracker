@@ -549,6 +549,94 @@ async def _maybe_run_sysgal_incorporacion(db: Session) -> None:
             await firm.aclose()
 
 
+# Chile day on which the public "Búsqueda por Fecha" run was attempted; process-local. A restart
+# the same day re-checks the runs table, which is what makes it idempotent (done days are skipped).
+_last_publico_fecha_day: Optional[date] = None
+
+
+PUBLICO_FECHA_RETRY_DAYS = 7
+
+
+def _publico_fecha_ranges(db: Session, cortes: list[str], yesterday: date) -> list[tuple[date, date, str]]:
+    """Per corte: contiguous runs of the last 7 days up to yesterday that have no ``done`` run.
+
+    Never earlier than the first run ever recorded for the corte (no runs yet → yesterday only),
+    so a ``partial``/``failed`` day is retried even after a later day is ``done`` and a weekend
+    is caught up; days older than the window are never retried.
+    """
+    from app.models.busqueda_fecha_run import BusquedaFechaRun
+
+    ranges: list[tuple[date, date, str]] = []
+    for corte in cortes:
+        runs = db.query(BusquedaFechaRun.fecha, BusquedaFechaRun.status).filter(BusquedaFechaRun.corte == corte).all()
+        if not runs:
+            ranges.append((yesterday, yesterday, corte))
+            continue
+        done = {f for f, st in runs if st == "done"}
+        first = min(f for f, _ in runs)
+        day = max(first, yesterday - timedelta(days=PUBLICO_FECHA_RETRY_DAYS - 1))
+        start: Optional[date] = None
+        while day <= yesterday:
+            if day in done:
+                if start is not None:
+                    ranges.append((start, day - timedelta(days=1), corte))
+                    start = None
+            elif start is None:
+                start = day
+            day += timedelta(days=1)
+        if start is not None:
+            ranges.append((start, yesterday, corte))
+    return ranges
+
+
+async def _run_publico_fecha(db: Session, desde: date, hasta: date, cortes: list[str]) -> dict:
+    """Search in a FRESH logged-out browser context (never a lawyer's session)."""
+    from app.scrapper.pjud.civil import CivilScraper
+    from app.scrapper.pjud.publico_fecha import PublicoFechaDriver
+    from app.services.pjud_busqueda_fecha import run_busqueda
+
+    scraper = CivilScraper(headless=True)
+    try:
+        page = await scraper.open_public_page()
+        return await run_busqueda(db, PublicoFechaDriver(page), desde, hasta, cortes)
+    finally:
+        try:
+            await scraper.stop()
+        except Exception:
+            logger.warning("Publico fecha: browser close failed (non-fatal)")
+
+
+async def _maybe_run_publico_fecha(db: Session) -> None:
+    """Once per Chile day after ``PUBLICO_FECHA_AFTER_HOUR``: public date search of new C causas.
+
+    OFF unless ``PUBLICO_FECHA_ENABLED``; needs ``PJUD_SCRAPING_ENABLED``, an allowed egress and
+    runs outside the station restart window. SAFE-FAIL: errors are logged and retried next cycle.
+    """
+    global _last_publico_fecha_day
+    if not settings.PUBLICO_FECHA_ENABLED or not settings.PJUD_SCRAPING_ENABLED:
+        return
+    now = _chile_now()
+    today = now.date()
+    if now.hour < settings.PUBLICO_FECHA_AFTER_HOUR or _last_publico_fecha_day == today:
+        return
+    if INCORPORACION_VENTANA_REINICIO_INICIO <= now.time() < INCORPORACION_VENTANA_REINICIO_FIN:
+        logger.info("Publico fecha skipped: ventana de reinicio de la estación 03:30-04:30")
+        return
+    try:
+        allowed, ip, reason = await asyncio.to_thread(egress_allowed)
+        if not allowed:
+            logger.warning("Publico fecha skipped: egress %s (ip=%s)", reason, ip or "desconocida")
+            return
+        cortes = [c.strip() for c in settings.PUBLICO_FECHA_CORTES.split(",") if c.strip()]
+        for desde, hasta, corte in _publico_fecha_ranges(db, cortes, today - timedelta(days=1)):
+            stats = await _run_publico_fecha(db, desde, hasta, [corte])
+            logger.info("Publico fecha corte=%s %s..%s: %s", corte, desde, hasta, stats)
+        _last_publico_fecha_day = today
+    except Exception:
+        db.rollback()
+        logger.exception("Publico fecha failed (non-fatal)")
+
+
 async def _maybe_reiniciar_estacion(db: Session) -> None:
     """Apply a pending admin "soft reset" request (SAFE-FAIL; station process only).
 
@@ -1592,6 +1680,8 @@ async def _run_sync_cycle(timer: CycleTimer):
                 _pm.reset_lawyer(_pm_token)
                 # Sysgal incorporation: after the unit's batch ended, never inside it.
                 await _maybe_run_sysgal_incorporacion(work_db)
+                # Public date search: once per Chile day, also between units, never inside one.
+                await _maybe_run_publico_fecha(work_db)
                 # Remote soft reset: the unit's batch is over (also on `continue`), never mid-case.
                 await _maybe_reiniciar_estacion(work_db)
                 work_db.close()

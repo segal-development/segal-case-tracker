@@ -55,6 +55,9 @@ from app.models.procurador import ProcuradorAbogado
 from app.models.pjud_request_count import PjudRequestCount
 from app.models.case_priority import CasePriority
 from app.models.app_text_setting import AppTextSetting
+from app.models.demanda_publica import DemandaPublica
+from app.models.busqueda_fecha_run import BusquedaFechaRun
+from app.models.public_link_token import PublicLinkToken
 
 __all__ = [
     "Lawyer",
@@ -110,4 +113,7 @@ __all__ = [
     "ProcuradorAbogado",
     "PjudRequestCount",
     "CasePriority",
+    "DemandaPublica",
+    "BusquedaFechaRun",
+    "PublicLinkToken",
 ]
