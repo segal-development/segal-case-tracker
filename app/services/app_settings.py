@@ -8,6 +8,7 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
+from app.models.app_text_setting import AppTextSetting
 from app.models.goal import Goal
 
 KEY_POR_DIA = "sysgal_incorporacion_por_dia"
@@ -33,6 +34,11 @@ DEFAULT_SYSGAL_BLOQUEO_POR_MORA = 0
 KEY_REINICIO_SOLICITADO = "estacion_reinicio_solicitado_at"
 KEY_REINICIO_HECHO = "estacion_reinicio_hecho_at"
 
+#: Egress allow-list (comma-separated IPs/CIDRs; text setting, ``app_text_settings``). Absent =
+#: fall back to env ``ALLOWED_EGRESS_IPS``; present but empty = allow-list off.
+#: Read by app/services/egress_guard.py, written by the admin endpoint.
+KEY_IPS_PERMITIDAS = "estacion_ips_permitidas"
+
 DEFAULT_POR_DIA = 0  # 0 = OFF
 DEFAULT_POR_HORA = 10
 
@@ -51,6 +57,21 @@ def set_int(db: Session, key: str, value: int) -> None:
     row = _row(db, key)
     if row is None:
         db.add(Goal(key=key, value=value))
+    else:
+        row.value = value
+    db.flush()
+
+
+def get_text(db: Session, key: str, default: Optional[str] = None) -> Optional[str]:
+    row = db.query(AppTextSetting).filter_by(key=key).first()
+    return row.value if row is not None and isinstance(row.value, str) else default
+
+
+def set_text(db: Session, key: str, value: str) -> None:
+    """Upsert without committing; the caller owns the transaction."""
+    row = db.query(AppTextSetting).filter_by(key=key).first()
+    if row is None:
+        db.add(AppTextSetting(key=key, value=value))
     else:
         row.value = value
     db.flush()
