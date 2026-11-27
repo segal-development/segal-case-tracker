@@ -668,6 +668,7 @@ class PJUDBaseScraper(ABC):
         When CDP-attached (per-abogado), only DISCONNECT — do NOT close the real
         Chrome's page/context, which belong to the external, human-driven browser.
         """
+        await self._close_public()
         cdp = getattr(self, "_cdp_attached", False)
         if self._page and not cdp:
             await self._page.close()
@@ -792,6 +793,37 @@ class PJUDBaseScraper(ABC):
         self._page = await self._context.new_page()
         self._page_session_key = session_key
         return self._page
+
+    async def open_public_page(self) -> Page:
+        """Open a page in a FRESH, logged-out context (public consulta, never a lawyer's session).
+
+        Does not touch ``self._context`` / ``self._page``. With a persistent profile (which may
+        hold a login) a separate ephemeral browser is launched instead. Closed by ``stop()``.
+        """
+        if not self._browser and not self._context:
+            await self.start()
+        browser = self._browser
+        if self._persistent_context or browser is None:
+            assert self._playwright is not None
+            if getattr(self, "_public_browser", None) is None:
+                self._public_browser = await self._playwright.chromium.launch(
+                    headless=self.headless,
+                    executable_path=settings.PJUD_CHROME_PATH or None,
+                    args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+                )
+            browser = self._public_browser
+        self._public_context = await browser.new_context(user_agent=_CHROME_UA)
+        return await self._public_context.new_page()
+
+    async def _close_public(self) -> None:
+        for attr in ("_public_context", "_public_browser"):
+            obj = getattr(self, attr, None)
+            setattr(self, attr, None)
+            if obj is not None:
+                try:
+                    await obj.close()
+                except Exception:
+                    logger.debug("public %s close failed (non-fatal)", attr)
 
     async def _add_stealth_init_script(self, context: BrowserContext) -> None:
         # Patch navigator.webdriver before pages are created; Shape checks this signal.
