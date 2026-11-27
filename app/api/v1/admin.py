@@ -1,14 +1,16 @@
 """Admin-only operational endpoints (mounted at /api/v1/admin)."""
 
+import secrets
 from datetime import UTC, datetime, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, require_admin
 from app.models.lawyer import Lawyer
 from app.models.pjud_request_count import PjudRequestCount
+from app.models.public_link_token import PURPOSE_DEMANDAS_PUBLICAS, PublicLinkToken
 from app.services import app_settings, estacion_reinicio
 from app.services.egress_guard import parse_entry
 from app.services.pjud_metrics import KIND_REQUEST
@@ -129,3 +131,55 @@ def pjud_actividad(
             for k, c in sorted(rejections.items(), key=lambda kv: (kv[0][0], kv[0][1], kv[0][2], kv[0][3] or 0))
         ],
     }
+
+
+# --- Secret link for the public "causas sin abogado" page ---------------------------------
+
+def _active_demandas_link(db: Session):
+    return (
+        db.query(PublicLinkToken)
+        .filter(PublicLinkToken.purpose == PURPOSE_DEMANDAS_PUBLICAS, PublicLinkToken.revoked_at.is_(None))
+        .order_by(PublicLinkToken.id.desc())
+        .all()
+    )
+
+
+@router.get("/demandas-publicas/link")
+def estado_link_demandas(_: str = Depends(require_admin), db: Session = Depends(get_db)):
+    """Whether a link is active. Never returns the token (only its hash is stored)."""
+    active = _active_demandas_link(db)
+    if not active:
+        return {"activo": False, "creado_at": None, "last_used_at": None}
+    row = active[0]
+    return {"activo": True, "creado_at": row.created_at, "last_used_at": row.last_used_at}
+
+
+@router.post("/demandas-publicas/link")
+def rotar_link_demandas(rut: str = Depends(require_admin), db: Session = Depends(get_db)):
+    """Create a new link and revoke the previous one. The token is shown only here."""
+    from app.api.v1.publico_demandas import hash_token
+
+    now = datetime.utcnow()
+    for old in _active_demandas_link(db):
+        old.revoked_at = now
+    lawyer = db.query(Lawyer).filter(Lawyer.rut == rut).first()
+    token = secrets.token_urlsafe(32)
+    db.add(
+        PublicLinkToken(
+            purpose=PURPOSE_DEMANDAS_PUBLICAS,
+            token_hash=hash_token(token),
+            created_at=now,
+            created_by=lawyer.id if lawyer else None,
+        )
+    )
+    db.commit()
+    return {"token": token}
+
+
+@router.delete("/demandas-publicas/link", status_code=204)
+def revocar_link_demandas(_: str = Depends(require_admin), db: Session = Depends(get_db)):
+    now = datetime.utcnow()
+    for old in _active_demandas_link(db):
+        old.revoked_at = now
+    db.commit()
+    return Response(status_code=204)

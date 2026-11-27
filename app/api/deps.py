@@ -465,6 +465,9 @@ PROCURADOR_ALLOWED = frozenset(
         ("PUT", "/hitos/{hito_id}/evidencia"),
         # own page-view audit trail (no data returned)
         ("POST", "/activity/views"),
+        # public secret-link pages (no login; the token is the guard)
+        ("GET", "/publico/demandas/{token}"),
+        ("GET", "/publico/demandas/{token}/{demanda_id}"),
     }
 )
 PROCURADOR_FORBIDDEN_DETAIL = "Tu perfil de procurador no tiene acceso a esta sección."
